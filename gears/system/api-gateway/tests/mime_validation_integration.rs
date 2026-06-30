@@ -66,7 +66,7 @@ async fn test_middleware_allows_configured_content_type() {
         authenticated: false,
         exposed: false,
         license_requirement: None,
-        rate_limit: None,
+        throttling: None,
         allowed_request_content_types: Some(vec!["application/json"]),
         vendor_extensions: VendorExtensions::default(),
     }];
@@ -111,7 +111,7 @@ async fn test_middleware_strips_content_type_parameters() {
         authenticated: false,
         exposed: false,
         license_requirement: None,
-        rate_limit: None,
+        throttling: None,
         allowed_request_content_types: Some(vec!["application/json"]),
         vendor_extensions: VendorExtensions::default(),
     }];
@@ -156,7 +156,7 @@ async fn test_middleware_rejects_disallowed_content_type() {
         authenticated: false,
         exposed: false,
         license_requirement: None,
-        rate_limit: None,
+        throttling: None,
         allowed_request_content_types: Some(vec!["application/json"]),
         vendor_extensions: VendorExtensions::default(),
     }];
@@ -217,7 +217,7 @@ async fn test_middleware_rejects_missing_content_type() {
         authenticated: false,
         exposed: false,
         license_requirement: None,
-        rate_limit: None,
+        throttling: None,
         allowed_request_content_types: Some(vec!["multipart/form-data"]),
         vendor_extensions: VendorExtensions::default(),
     }];
@@ -307,7 +307,7 @@ async fn test_middleware_allows_multiple_content_types() {
         authenticated: false,
         exposed: false,
         license_requirement: None,
-        rate_limit: None,
+        throttling: None,
         allowed_request_content_types: Some(vec![
             "application/json",
             "application/xml",

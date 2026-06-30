@@ -91,6 +91,9 @@ pub struct ApiGateway {
     // `separate`/`both` mode and merged onto the main router in `main`/`both` mode. Cached
     // so repeat `health_router()`/`build_health_router()` calls are cheap.
     pub(crate) health_router: OnceLock<axum::Router>,
+    // Pending throttling keyed-store pruner from the last middleware build;
+    // consumed by `serve` to spawn a prune task bound to the lifecycle token.
+    pub(crate) throttle_key_pruner: Mutex<Option<middleware::throttling::ThrottleKeyPruner>>,
 
     // Duplicate detection (per (method, path) and per handler id)
     pub(crate) registered_routes: DashMap<(Method, String), ()>,
@@ -121,6 +124,7 @@ impl Default for ApiGateway {
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             health_router: OnceLock::new(),
+            throttle_key_pruner: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
@@ -214,6 +218,7 @@ impl ApiGateway {
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             health_router: OnceLock::new(),
+            throttle_key_pruner: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
@@ -371,7 +376,8 @@ impl ApiGateway {
         //
         // Desired request execution order (outermost -> innermost):
         // SetRequestId -> PropagateRequestId -> Trace -> push_req_id_to_extensions
-        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> RateLimit -> ErrorMapping -> Auth -> ScopeEnforcement -> License -> Router
+        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> PreAuthThrottling -> ErrorMapping
+        // -> Auth -> ScopeEnforcement -> PostAuthThrottling -> License -> Router
         //
         // Therefore we must add layers in the reverse order (innermost -> outermost) below.
         // Due future refactoring, this order must be maintained.
@@ -387,7 +393,10 @@ impl ApiGateway {
 
         let config = self.get_cached_config();
 
-        // Collect specs once; used by MIME validation + rate limiting maps.
+        // Fail fast on invalid throttling configuration (undefined zone refs, zero limits, etc.).
+        config.validate_throttling()?;
+
+        // Collect specs once; used by MIME validation + throttling maps.
         let specs: Vec<_> = self
             .openapi_registry
             .operation_specs
@@ -402,6 +411,24 @@ impl ApiGateway {
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let map = license_map.clone();
                 middleware::license_validation::license_validation_middleware(map, req, next)
+            },
+        ));
+
+        // Build both throttling partitions together so a zone referenced from
+        // both pre-auth and post-auth operations shares a single limiter/gate
+        // instance. The pre-auth map is layered later (step 9b).
+        let (throttling_map, throttling_map_noauth, throttle_key_pruner) =
+            middleware::throttling::build_maps(&specs, &config)?;
+        // Hand the keyed-store pruner to `serve`, which owns the lifecycle
+        // CancellationToken needed to bound the background prune task.
+        *self.throttle_key_pruner.lock() = Some(throttle_key_pruner);
+
+        // 11b) Post-auth throttling (identity-keyed zones). Added before the auth
+        // layer so it runs AFTER auth and can read SecurityContext for identity keys.
+        router = router.layer(from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let map = throttling_map.clone();
+                middleware::throttling::throttling_middleware(map, req, next)
             },
         ));
 
@@ -471,13 +498,13 @@ impl ApiGateway {
         // 11) Error mapping (outer to auth so it can translate auth/handler errors)
         router = router.layer(from_fn(toolkit::api::error_layer::error_mapping_middleware));
 
-        // 10) Per-route rate limiting & in-flight limits
-        let rate_map = middleware::rate_limit::RateLimiterMap::from_specs(&specs, &config)?;
-
+        // 9b) Pre-auth throttling (IP-keyed zones). Added after the auth layer so
+        // it runs BEFORE auth; identity keying is not available here. The map was
+        // built together with the post-auth map (above) to share zone runtimes.
         router = router.layer(from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let map = rate_map.clone();
-                middleware::rate_limit::rate_limit_middleware(map, req, next)
+                let map = throttling_map_noauth.clone();
+                middleware::throttling::throttling_no_auth_middleware(map, req, next)
             },
         ));
 
@@ -714,6 +741,17 @@ impl ApiGateway {
         let cfg = self.get_cached_config();
         let addr = Self::parse_bind_address(&cfg.bind_addr)?;
         let router = self.get_or_build_router()?;
+
+        // Bound the throttling keyed stores: spawn the periodic pruner produced
+        // during middleware build, tied to the lifecycle token so it stops on
+        // shutdown. Without this the keyed stores grow one entry per distinct
+        // (attacker-influenced) key with no eviction, and pruning off the hot
+        // path avoids per-request all-shard write-locking scans under a flood.
+        if let Some(pruner) = self.throttle_key_pruner.lock().take() {
+            // The task self-terminates when `cancel` fires, so the handle is
+            // intentionally discarded rather than joined.
+            drop(pruner.spawn(cancel.clone()));
+        }
 
         // Bind the main socket.
         let listener = tokio::net::TcpListener::bind(addr).await?;

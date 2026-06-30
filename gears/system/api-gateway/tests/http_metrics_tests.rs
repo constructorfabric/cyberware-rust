@@ -21,7 +21,10 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use toolkit::{
-    Gear, api::OperationBuilder, config::ConfigProvider, context::GearCtx,
+    Gear,
+    api::{OperationBuilder, ThrottlingSpec},
+    config::ConfigProvider,
+    context::GearCtx,
     contracts::ApiGatewayCapability,
 };
 use tower::ServiceExt;
@@ -142,6 +145,39 @@ fn histogram_bounds(exporter: &InMemoryMetricExporter, name: &str) -> Option<Vec
     None
 }
 
+/// Sum of all data points of a `u64` counter whose data points carry the given
+/// attribute values.
+fn counter_sum_with_attributes(
+    exporter: &InMemoryMetricExporter,
+    name: &str,
+    expected_attrs: &[(&str, &str)],
+) -> u64 {
+    let metrics = exporter.get_finished_metrics().unwrap();
+    let mut total = 0u64;
+    for resource_metrics in &metrics {
+        for scope_metrics in resource_metrics.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data()
+                {
+                    for dp in sum.data_points() {
+                        let attrs: Vec<_> = dp.attributes().collect();
+                        let all_match = expected_attrs.iter().all(|(key, val)| {
+                            attrs
+                                .iter()
+                                .any(|kv| kv.key.as_str() == *key && kv.value.as_str() == *val)
+                        });
+                        if all_match {
+                            total += dp.value();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    total
+}
+
 async fn ok_handler() -> impl IntoResponse {
     StatusCode::OK
 }
@@ -153,9 +189,6 @@ fn base_config() -> serde_json::Value {
                 "bind_addr": "127.0.0.1:0",
                 "cors_enabled": false,
                 "auth_disabled": true,
-                "defaults": {
-                    "rate_limit": { "rps": 1000, "burst": 1000, "in_flight": 64 }
-                },
             }
         }
     })
@@ -224,9 +257,7 @@ async fn metrics_capture_mime_rejection() -> Result<()> {
     let api = api_gateway::ApiGateway::default();
     api.init(&ctx).await?;
 
-    let mut builder = OperationBuilder::post("/tests/v1/items");
-    builder.require_rate_limit(1000, 1000, 64);
-    let router = builder
+    let router = OperationBuilder::post("/tests/v1/items")
         .operation_id("test:create-item")
         .summary("Create item")
         .anonymous()
@@ -280,8 +311,13 @@ async fn metrics_capture_rate_limit() -> Result<()> {
                 "bind_addr": "127.0.0.1:0",
                 "cors_enabled": false,
                 "auth_disabled": true,
-                "defaults": {
-                    "rate_limit": { "rps": 1, "burst": 1, "in_flight": 64 }
+                "rate_limit_zones": {
+                    "rl_limited": {
+                        "rate_limit": "1/s",
+                        "burst_limit": 1,
+                        "key": { "type": "ip" },
+                        "max_keys": 1000
+                    }
                 },
             }
         }
@@ -292,12 +328,17 @@ async fn metrics_capture_rate_limit() -> Result<()> {
     let api = api_gateway::ApiGateway::default();
     api.init(&ctx).await?;
 
-    let mut builder = OperationBuilder::get("/tests/v1/limited");
-    builder.require_rate_limit(1, 1, 64);
-    let router = builder
+    let router = OperationBuilder::get("/tests/v1/limited")
         .operation_id("test:limited")
         .summary("Rate-limited endpoint")
         .anonymous()
+        .with_throttling(ThrottlingSpec {
+            rate_limit_zone: Some("rl_limited".to_owned()),
+            in_flight_limit_zone: None,
+            identity_key_func: None,
+            require_security_context: false,
+            dry_run: false,
+        })
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::get(ok_handler))
         .register(Router::new(), &api);
@@ -345,6 +386,17 @@ async fn metrics_capture_rate_limit() -> Result<()> {
             &[("http.response.status_code", "429"),]
         ),
         "duration histogram should record 429 from rate limiting"
+    );
+
+    // Enforced rejection must bump the throttling counter, labeled by zone/kind.
+    let rejections = counter_sum_with_attributes(
+        &exporter,
+        "throttling.rejections",
+        &[("zone", "rl_limited"), ("kind", "rate_limit")],
+    );
+    assert_eq!(
+        rejections, 1,
+        "throttling.rejections must count the enforced 429 for zone/kind"
     );
 
     Ok(())
@@ -515,9 +567,6 @@ fn prefixed_config() -> serde_json::Value {
                 "cors_enabled": false,
                 "auth_disabled": true,
                 "metrics": { "prefix": "myapp" },
-                "defaults": {
-                    "rate_limit": { "rps": 1000, "burst": 1000, "in_flight": 64 }
-                },
             }
         }
     })

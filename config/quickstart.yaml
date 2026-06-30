@@ -99,14 +99,57 @@ gears:
         description: "CF/Gears Example Server API Documentation"
       defaults:
         body_limit_bytes: 64000000
-        rate_limit:
-          rps: 1000
-          burst: 200
-          in_flight: 64
 
       # Authentication: disabled for local development (uses default root SecurityContext).
       # Set to false to enable bearer-token auth via authn-resolver pipeline below.
       auth_disabled: true
+
+      # ----------------------------------------------------------------------
+      # Zone-based throttling for the mini-chat "create chat" endpoint
+      #   POST /mini-chat/v1/chats  (operation_id: mini_chat.create_chat)
+      #   - rate limit:     10 requests/second (per client IP)
+      #   - in-flight limit: 100 concurrent requests (per client IP)
+      #
+      # NOTE on paths: the mini-chat gear mounts its routes under url_prefix
+      # "/mini-chat" (gear default). The gateway also strips its own `prefix_path`
+      # (/cf) before matching, so the runtime path is "/mini-chat/v1/chats"
+      # (the public URL is "/cf/mini-chat/v1/chats").
+      #
+      # NOTE on enforcement (see middleware/throttling.rs): enforcement is driven
+      # by the `ThrottlingSpec` attached to the operation IN CODE, which references
+      # these zone names. That binding is already wired in the mini-chat gear at
+      # gears/mini-chat/.../api/rest/routes/chats.rs (create_chat):
+      #   ThrottlingSpec {
+      #     rate_limit_zone:        "rl_mini_chat_chat",
+      #     in_flight_limit_zone:   "ifl_mini_chat_chat",
+      #     key_type:               "ip",
+      #     identity_key_func:      None,
+      #     require_security_context: false,   // IP-keyed => enforced before auth
+      #   }
+      #
+      # `ip` keying is used so it works with auth_disabled (no identity available
+      # pre-auth). Switch both zones to `key: { type: identity }` and the spec to
+      # `require_security_context: true` to throttle per authenticated subject.
+      # ----------------------------------------------------------------------
+      rate_limit_zones:
+        rl_mini_chat_chat:
+          rate_limit: 10/s          # steady-state: 10 requests per second
+          burst_limit: 10           # token-bucket capacity (max burst)
+          response_status_code: 429 # Too Many Requests
+          response_retry_after: auto # compute Retry-After from the token bucket
+          key:
+            type: ip                # one bucket per client IP
+          max_keys: 10000           # max distinct IPs tracked
+
+      in_flight_limit_zones:
+        ifl_mini_chat_chat:
+          in_flight_limit: 100      # max concurrent in-flight requests per IP
+          backlog_limit: 0          # no queue: reject immediately once full
+          backlog_timeout: 0s       # (unused when backlog_limit = 0)
+          response_status_code: 429
+          key:
+            type: ip
+          max_keys: 10000
 
   gear-orchestrator:
     config: {}

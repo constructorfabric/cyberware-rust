@@ -106,14 +106,32 @@ gears:
         description: "CF/Gears Server API Documentation"
       defaults:
         body_limit_bytes: 64000000
-        rate_limit:
-          rps: 1000
-          burst: 200
-          in_flight: 64
 
       # Authentication Configuration
       auth_disabled: false
       require_auth_by_default: true
+
+      # Throttling zones referenced by the mini-chat create_chat route
+      # (ThrottlingSpec in gears/mini-chat/.../api/rest/routes/chats.rs).
+      # These must be defined or gateway startup fails validation.
+      rate_limit_zones:
+        rl_mini_chat_chat:
+          rate_limit: 10/s
+          burst_limit: 10
+          response_status_code: 429
+          response_retry_after: auto
+          key:
+            type: ip
+          max_keys: 10000
+      in_flight_limit_zones:
+        ifl_mini_chat_chat:
+          in_flight_limit: 100
+          backlog_limit: 0
+          backlog_timeout: 0s
+          response_status_code: 429
+          key:
+            type: ip
+          max_keys: 10000
 
   # --- Tenant Resolver example (gateway + plugins) ---
   types-registry:

@@ -156,16 +156,6 @@ impl OpenApiRegistryImpl {
             // Vendor extensions
             let mut ext = utoipa::openapi::extensions::Extensions::default();
 
-            // Rate limit
-            if let Some(rl) = spec.rate_limit.as_ref() {
-                ext.insert("x-rate-limit-rps".to_owned(), serde_json::json!(rl.rps));
-                ext.insert("x-rate-limit-burst".to_owned(), serde_json::json!(rl.burst));
-                ext.insert(
-                    "x-in-flight-limit".to_owned(),
-                    serde_json::json!(rl.in_flight),
-                );
-            }
-
             // Pagination
             if let Some(pagination) = spec.vendor_extensions.x_odata_filter.as_ref()
                 && let Ok(value) = serde_json::to_value(pagination)
@@ -664,7 +654,7 @@ mod tests {
             handler_id: handler.to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -715,7 +705,7 @@ mod tests {
             handler_id: "get_test".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -888,7 +878,7 @@ mod tests {
             handler_id: "get_users_id".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -949,7 +939,7 @@ mod tests {
             handler_id: "post_upload".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: Some(vec!["application/octet-stream"]),
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -1029,7 +1019,7 @@ mod tests {
             handler_id: "get_test".to_owned(),
             authenticated: false,
             exposed: false,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,
@@ -1084,7 +1074,7 @@ mod tests {
             handler_id: "get_ping".to_owned(),
             authenticated: false,
             exposed: true,
-            rate_limit: None,
+            throttling: None,
             allowed_request_content_types: None,
             vendor_extensions: VendorExtensions::default(),
             license_requirement: None,

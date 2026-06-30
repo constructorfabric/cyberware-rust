@@ -1,6 +1,6 @@
 use axum::Router;
 use toolkit::api::OpenApiRegistry;
-use toolkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt};
+use toolkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt, ThrottlingSpec};
 
 use super::AiChatLicense;
 use crate::api::rest::{dto, handlers};
@@ -19,6 +19,21 @@ pub(super) fn register_chat_routes(
         .summary("Create a new chat")
         .tag(API_TAG)
         .authenticated()
+        // Zone-based throttling: 10 rps + 100 concurrent in-flight per client IP.
+        // Limits live in the gateway config zones referenced by name below; this
+        // binding is what the gateway evaluates at request time. IP-keyed, so it
+        // runs before auth (require_security_context = false).
+        //
+        // dry_run: the gateway observes limits and logs would-be rejections but
+        // never returns 429, so functional tests and clients are not throttled.
+        // Operators can enforce for real by flipping this to false.
+        .with_throttling(ThrottlingSpec {
+            rate_limit_zone: Some("rl_mini_chat_chat".to_owned()),
+            in_flight_limit_zone: Some("ifl_mini_chat_chat".to_owned()),
+            identity_key_func: None,
+            require_security_context: false,
+            dry_run: true,
+        })
         .require_license_features([&AiChatLicense])
         .json_request::<dto::CreateChatReq>(openapi, "Chat creation data")
         .handler(handlers::chats::create_chat)
