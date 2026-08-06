@@ -10,9 +10,10 @@ use uuid::Uuid;
 use super::commit::TxCommitHandle;
 #[cfg(feature = "db")]
 use super::offset_manager::CommitOffsetInTx;
-use crate::api::{AssignedPartition, ResolvedPosition};
+use crate::api::{AssignedPartition, Position};
 use crate::error::{ConsumerError, EventBrokerError};
 use crate::ids::{ConsumerGroupId, EventTypeId, SubscriptionId, TopicId};
+use crate::sequence::Sequence;
 
 /// Raw event delivered to v1 handlers. `data` is untyped JSON;
 /// typed dispatch is deferred to v2.
@@ -25,8 +26,8 @@ pub struct RawEvent {
     pub subject: String,
     pub subject_type: String,
     pub partition: u32,
-    pub sequence: i64,
-    pub offset: i64,
+    pub sequence: Sequence,
+    pub offset: Sequence,
     pub occurred_at: DateTime<Utc>,
     pub sequence_time: DateTime<Utc>,
     pub trace_parent: Option<String>,
@@ -45,7 +46,7 @@ pub enum HandlerOutcome {
 #[derive(Debug, Clone)]
 pub enum BatchHandlerOutcome {
     Success,
-    AdvanceThrough { offset: i64 },
+    AdvanceThrough { offset: Sequence },
     Retry { reason: String },
 }
 
@@ -85,15 +86,15 @@ impl<'a> EventBatch<'a> {
 /// Tracks the committed frontier for one topic partition.
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionFrontier {
-    committed: i64,
+    committed: Sequence,
 }
 
 impl PartitionFrontier {
-    pub(crate) fn new(committed: i64) -> Self {
+    pub(crate) fn new(committed: Sequence) -> Self {
         Self { committed }
     }
 
-    pub(crate) fn committed(&self) -> i64 {
+    pub(crate) fn committed(&self) -> Sequence {
         self.committed
     }
 }
@@ -608,8 +609,8 @@ pub struct PartitionBufferStateSnapshot {
     pub trigger: Option<SlowConsumerTrigger>,
     pub buffered_count: usize,
     pub capacity: usize,
-    pub latest_observed_offset: Option<i64>,
-    pub last_delivered_offset: Option<i64>,
+    pub latest_observed_offset: Option<Sequence>,
+    pub last_delivered_offset: Option<Sequence>,
     pub consecutive_slow_handlers: u16,
 }
 
@@ -631,7 +632,7 @@ pub struct PartitionProgress {
     pub topic_id: TopicId,
     pub topic: String,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
 }
 
 #[derive(Debug, Clone)]
@@ -690,13 +691,13 @@ pub enum ConsumerRuntimeEvent {
         topic_id: TopicId,
         topic: String,
         partition: u32,
-        position: ResolvedPosition,
+        position: Position,
     },
     OffsetCommitted {
         topic_id: TopicId,
         topic: String,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     },
     RetryScheduled {
         topic_id: TopicId,

@@ -1,7 +1,8 @@
 //! Mirrors scenarios/producer/single/. Tests migrated per mock-reference-alignment.
 
-#[cfg(test)]
 use super::super::helpers::*;
+#[cfg(test)]
+use crate::sequence::Sequence;
 
 use super::super::helpers::{broker_with_topic, ctx, wire_event};
 use crate::api::{EventBrokerApi, IngestOutcome};
@@ -263,7 +264,7 @@ async fn s1_01_offsets_are_monotonic_per_partition() {
     let stored = h.stored(TOPIC, 0).await;
     assert_eq!(stored.len(), 5);
     for (i, se) in stored.iter().enumerate() {
-        // Offsets are 1-based (A6/A7): the i-th stored event has offset i+1.
-        assert_eq!(se.event.offset.unwrap(), (i as i64) + 1);
+        // Sequences are 1-based (A6/A7): the i-th stored event has sequence i+1.
+        assert_eq!(se.event.sequence.unwrap(), Sequence::assigned((i as i64) + 1));
     }
 }

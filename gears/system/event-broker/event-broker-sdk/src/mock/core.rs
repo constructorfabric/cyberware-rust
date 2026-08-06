@@ -11,6 +11,7 @@ use crate::api::{ProducerMode, SubscriptionInterest};
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use crate::models::ConsumerGroupKind;
 use crate::models::{Event, EventType, Topic};
+use crate::sequence::Sequence;
 
 // --- Topic & event log --------------------------------------------------------
 
@@ -193,14 +194,14 @@ impl TopicState {
     pub(super) fn read(
         &self,
         partition: u32,
-        start_offset: i64,
+        start_offset: Sequence,
         max_count: usize,
     ) -> Vec<&StoredEvent> {
         self.log
             .get(&partition)
             .map(|log| {
                 log.iter()
-                    .skip(start_offset.max(0) as usize)
+                    .skip(start_offset.as_i64().max(0) as usize)
                     .take(max_count)
                     .collect()
             })
@@ -222,16 +223,16 @@ pub(super) struct ProducerReg {
 pub(super) struct GroupReg {
     pub kind: ConsumerGroupKind,
     pub owner_tenant: Uuid,
-    pub owner_principal: String,
+    pub owner_principal: Uuid,
 }
 
 /// Group-scoped cursor position (per-`(topic, partition)`).
 #[derive(Debug, Clone, Default)]
 pub struct CursorEntry {
-    /// Session cursor set by SEEK. Broker emits from offset+1.
-    pub offset: i64,
+    /// Session cursor set by SEEK. Broker emits from strictly after it.
+    pub offset: Sequence,
     /// Highest offset the broker has scanned for this group/partition (offset-adviser).
-    pub last_examined: i64,
+    pub last_examined: Sequence,
 }
 
 /// Runtime state for a group with ≥1 active subscription.
@@ -264,6 +265,8 @@ impl GroupState {
 #[derive(Debug)]
 pub(super) struct SubState {
     pub group: ConsumerGroupId,
+    /// RFC 9110 User-Agent grammar; echoed on the subscription (informational).
+    pub client_agent: String,
     /// Per-member interests (topic-anchored typed-filter selections; C8/C8a rolling deploy).
     pub interests: Vec<SubscriptionInterest>,
     /// Derived from interests; used by rebalance eligibility check.
@@ -278,15 +281,15 @@ pub(super) struct SubState {
     /// Refreshed on stream/seek; `expires_at = now + session_timeout`.
     pub expires_at: Instant,
     /// Explicit per-partition seek override (set by SEEK; last-processed offset).
-    pub seek: HashMap<(String, u32), i64>,
+    pub seek: HashMap<(String, u32), Sequence>,
     /// Highest offset delivered per `(topic, partition)` (last-processed; SEEK is the
     /// only cursor-advance mechanism - there is no ack). Reset on partition migration
     /// for at-least-once redelivery.
-    pub sent: HashMap<(String, u32), i64>,
+    pub sent: HashMap<(String, u32), Sequence>,
     /// Highest offset SCANNED per `(topic, partition)` regardless of filter match
     /// (the offset-adviser frontier). Drives `Control{Progress}` emission and the
     /// read skip-cursor so server-side-filtered events are not re-scanned.
-    pub scanned: HashMap<(String, u32), i64>,
+    pub scanned: HashMap<(String, u32), Sequence>,
     /// Set when the subscription is terminated by a gain / lose-all rebalance
     /// (after emitting the terminal control frame). Any reuse of this
     /// `subscription_id` thereafter returns `410 SubscriptionTerminated`.

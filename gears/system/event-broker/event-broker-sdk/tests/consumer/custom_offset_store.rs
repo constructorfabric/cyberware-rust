@@ -1,11 +1,12 @@
+use event_broker_sdk::Sequence;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use event_broker_sdk::{
     CommitOffset, ConsumerBuilder, ConsumerCommitMode, ConsumerError, ConsumerGroupId,
-    ConsumerGroupRef, Fallback, HandlerOutcome, OffsetManagerError, OffsetStore, RawEvent,
-    ResolvedPosition, SingleEventHandler, TopicId,
+    ConsumerGroupRef, Fallback, HandlerOutcome, OffsetManagerError, OffsetStore, Position,
+    RawEvent, SingleEventHandler, TopicId,
 };
 
 use super::common::{publish_json, topic_fixture, wait_until};
@@ -31,7 +32,7 @@ impl OffsetStore for RecordingOffsetStore {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
+    ) -> Result<Position, OffsetManagerError> {
         self.loads.lock().unwrap().push((*group, *topic, partition));
         Ok(Fallback::Earliest.into())
     }
@@ -44,12 +45,12 @@ impl CommitOffset for RecordingOffsetStore {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         self.commits
             .lock()
             .unwrap()
-            .push((*group, *topic, partition, offset));
+            .push((*group, *topic, partition, offset.as_i64()));
         Ok(())
     }
 }

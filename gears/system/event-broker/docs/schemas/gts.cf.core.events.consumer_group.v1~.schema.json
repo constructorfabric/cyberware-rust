@@ -30,7 +30,10 @@
       "readOnly": true
     },
     "description": {
-      "type": "string"
+      "description": "Free-text note about the group. Printable ASCII; up to 1024 bytes.",
+      "type": "string",
+      "pattern": "^[\\x20-\\x7E]*$",
+      "maxLength": 1024
     },
     "created_at": {
       "type": "string",
@@ -53,7 +56,10 @@
           "maxLength": 256
         },
         "description": {
-          "type": "string"
+          "description": "Free-text note about the group. Printable ASCII; up to 1024 bytes. An empty string is permitted and equivalent to omitting the field.",
+          "type": "string",
+          "pattern": "^[\\x20-\\x7E]*$",
+          "maxLength": 1024
         }
       }
     }

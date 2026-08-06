@@ -1,0 +1,5 @@
+error: unknown #[temporary] argument - expected `tracking` or `reason`
+ --> tests/ui/fail/temporary_unknown_argument.rs:3:58
+  |
+3 | #[temporary(tracking = "gears-rust#1", reason = "valid", extra = "not allowed")]
+  |                                                          ^^^^^^^^^^^^^^^^^^^^^

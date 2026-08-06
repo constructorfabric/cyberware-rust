@@ -134,8 +134,6 @@ impl ProducerOutboxEnvelope {
             partition: None,
             sequence: None,
             sequence_time: None,
-            offset: None,
-            offset_time: None,
             meta,
         })
     }

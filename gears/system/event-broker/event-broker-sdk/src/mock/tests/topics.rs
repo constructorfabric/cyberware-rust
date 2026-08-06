@@ -27,21 +27,15 @@ async fn s1_01_positive_list_topics() {
     // Registration order is not listing order - the mock holds topics in a map.
     topics.sort_by(|a, b| a.id.as_ref().cmp(b.id.as_ref()));
 
-    assert_eq!(
-        serde_json::to_value(&topics).unwrap(),
-        serde_json::json!([
-            {
-                "id": TOPIC,
-                "description": format!("Mock topic {TOPIC}"),
-                "retention": null,
-            },
-            {
-                "id": TOPIC2,
-                "description": format!("Mock topic {TOPIC2}"),
-                "retention": null,
-            },
-        ])
-    );
+    // Public models carry no serde; assert fields directly. The JSON wire form
+    // is pinned in the rest wire-DTO tests.
+    assert_eq!(topics.len(), 2);
+    assert_eq!(topics[0].id.as_ref(), TOPIC);
+    assert_eq!(topics[0].description, format!("Mock topic {TOPIC}"));
+    assert_eq!(topics[0].retention, None);
+    assert_eq!(topics[1].id.as_ref(), TOPIC2);
+    assert_eq!(topics[1].description, format!("Mock topic {TOPIC2}"));
+    assert_eq!(topics[1].retention, None);
 }
 
 /// Scenario: topics/1.02-positive-list-topic-segments.md
@@ -64,17 +58,12 @@ async fn s1_02_positive_list_topic_segments() {
         end_offset: None,
         limit: 100,
     };
-    let segments = broker
+    // The wire returns a single manifest per (topic, partition).
+    let seg = broker
         .list_topic_segments(&c, TOPIC, 0, range)
         .await
         .unwrap();
 
-    assert_eq!(
-        segments.len(),
-        1,
-        "non-empty partition yields a segment manifest"
-    );
-    let seg = &segments[0];
     assert_eq!(seg.topic, TOPIC, "manifest echoes the requested topic");
     assert_eq!(seg.partition, 0, "manifest echoes the requested partition");
     assert!(
@@ -136,55 +125,59 @@ async fn s1_04_positive_list_event_types() {
     // Registration order is not listing order - the mock holds types in a map.
     types.sort_by(|a, b| a.id.as_ref().cmp(b.id.as_ref()));
 
+    // Public models carry no serde; assert fields directly. The JSON wire form
+    // is pinned in the rest wire-DTO tests.
+    assert_eq!(types.len(), 2);
+
+    assert_eq!(types[0].id.as_ref(), EVT);
+    assert_eq!(types[0].partition_key, "/tenant_id");
+    assert_eq!(types[0].topic.as_ref(), TOPIC);
+    assert_eq!(types[0].description, None);
+    assert!(types[0].allowed_subject_types.is_empty());
     assert_eq!(
-        serde_json::to_value(&types).unwrap(),
-        serde_json::json!([
-            {
-                "id": EVT,
-                "partition_key": "/tenant_id",
-                "topic": TOPIC,
-                "description": null,
-                "allowed_subject_types": [],
-                "data_schema": {
-                    "allOf": [
-                        {
-                            "additionalProperties": true,
-                            "default": null,
-                            "description": BASE_DATA_DESCRIPTION,
-                            "type": ["object", "null"],
-                        },
-                        { "type": "object" },
-                    ],
+        types[0].data_schema,
+        serde_json::json!({
+            "allOf": [
+                {
+                    "additionalProperties": true,
+                    "default": null,
+                    "description": BASE_DATA_DESCRIPTION,
+                    "type": ["object", "null"],
                 },
-            },
-            {
-                "id": EVT2,
-                "partition_key": "/tenant_id",
-                "topic": TOPIC,
-                "description": null,
-                "allowed_subject_types": ["test-type"],
-                "data_schema": {
-                    "allOf": [
-                        {
-                            "additionalProperties": true,
-                            "default": null,
-                            "description": BASE_DATA_DESCRIPTION,
-                            "type": ["object", "null"],
-                        },
-                        { "type": "object", "required": ["kind"] },
-                    ],
-                },
-            },
-        ])
+                { "type": "object" },
+            ],
+        })
     );
 
-    // get_event_type serves the same DTO for a known id, and rejects an unknown
-    // one.
-    let one = broker.get_event_type(&c, EVT).await.unwrap();
+    assert_eq!(types[1].id.as_ref(), EVT2);
+    assert_eq!(types[1].partition_key, "/tenant_id");
+    assert_eq!(types[1].topic.as_ref(), TOPIC);
+    assert_eq!(types[1].description, None);
+    assert_eq!(types[1].allowed_subject_types, vec!["test-type".to_owned()]);
     assert_eq!(
-        serde_json::to_value(&one).unwrap(),
-        serde_json::to_value(&types[0]).unwrap()
+        types[1].data_schema,
+        serde_json::json!({
+            "allOf": [
+                {
+                    "additionalProperties": true,
+                    "default": null,
+                    "description": BASE_DATA_DESCRIPTION,
+                    "type": ["object", "null"],
+                },
+                { "type": "object", "required": ["kind"] },
+            ],
+        })
     );
+
+    // get_event_type serves the same projection for a known id, and rejects an
+    // unknown one.
+    let one = broker.get_event_type(&c, EVT).await.unwrap();
+    assert_eq!(one.id.as_ref(), types[0].id.as_ref());
+    assert_eq!(one.topic.as_ref(), types[0].topic.as_ref());
+    assert_eq!(one.partition_key, types[0].partition_key);
+    assert_eq!(one.description, types[0].description);
+    assert_eq!(one.allowed_subject_types, types[0].allowed_subject_types);
+    assert_eq!(one.data_schema, types[0].data_schema);
 
     let ghost = gts_id!("cf.core.events.event.v1~example.mock.broker.ghost.v1~");
     let err = broker.get_event_type(&c, ghost).await.unwrap_err();

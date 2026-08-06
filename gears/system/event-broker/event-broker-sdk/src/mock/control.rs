@@ -4,6 +4,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
+use crate::sequence::Sequence;
 
 /// A `(topic, partition)` pair from a subscription assignment.
 /// Returned by [`MockBrokerHandle::assignment`].
@@ -95,7 +96,9 @@ impl MockBrokerHandle {
             super::core::GroupReg {
                 kind: crate::models::ConsumerGroupKind::Named,
                 owner_tenant: uuid::Uuid::nil(),
-                owner_principal: "types-registry".to_owned(),
+                // A types-registry-provisioned group has no real principal uuid
+                // in the mock; the nil uuid stands in for it.
+                owner_principal: uuid::Uuid::nil(),
             },
         );
     }
@@ -203,7 +206,7 @@ impl MockBrokerHandle {
         group: &ConsumerGroupId,
         topic: &str,
         partition: u32,
-    ) -> Option<i64> {
+    ) -> Option<Sequence> {
         self.core
             .lock()
             .await
@@ -219,7 +222,7 @@ impl MockBrokerHandle {
         group: &ConsumerGroupId,
         topic: &str,
         partition: u32,
-    ) -> Option<i64> {
+    ) -> Option<Sequence> {
         self.core
             .lock()
             .await

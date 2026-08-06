@@ -74,7 +74,8 @@ A third, narrower question fell out of scaffolding the module tree: does the dis
 **Not decided here (explicitly out of scope):**
 - Which cluster-gear *profile name* `event-broker` binds to in cluster mode — operator-config surface, deferred to whichever ticket first wires real cluster-mode config.
 - Whether `evbk.*` notification cache keys carry a payload or are pure version-bump signals — inherits `DESIGN.md` §4.7's still-open long-poll cache/backfill question.
-- Handler bodies (#4346), the dispatcher routing algorithm (#4345), and any real backend (#4347/#4348/#4349/#4350).
+- Handler bodies (#4346), the dispatcher's pass-through forwarding (#4345, delivered) and its
+  real per-instance routing algorithm (#4438), and any real backend (#4347/#4348/#4349/#4350).
 
 ### Confirmation
 

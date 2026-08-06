@@ -354,10 +354,11 @@ mod tx_typestate {
 
     use super::*;
     use crate::consumer::{
-        CommitOffsetInTx, ConsumerOffsetManager, OffsetManagerError, OffsetStore, ResolvedPosition,
+        CommitOffsetInTx, ConsumerOffsetManager, OffsetManagerError, OffsetStore, Position,
         TxCommitHandle, TxConsumerHandler, TxSingleEventHandler, WithTx,
     };
     use crate::ids::{ConsumerGroupId, TopicId};
+    use crate::sequence::Sequence;
 
     #[derive(Default)]
     struct RecordingTxOffsetManager;
@@ -369,7 +370,7 @@ mod tx_typestate {
             _group: &ConsumerGroupId,
             _topic: &TopicId,
             _partition: u32,
-        ) -> Result<ResolvedPosition, OffsetManagerError> {
+        ) -> Result<Position, OffsetManagerError> {
             Ok(Fallback::Earliest.into())
         }
     }
@@ -382,7 +383,7 @@ mod tx_typestate {
             _group: &ConsumerGroupId,
             _topic: &TopicId,
             _partition: u32,
-            _offset: i64,
+            _offset: Sequence,
         ) -> Result<(), OffsetManagerError>
         where
             TX: toolkit_db::secure::DBRunner + Sync,
@@ -413,7 +414,7 @@ mod tx_typestate {
             _group: &ConsumerGroupId,
             _topic: &TopicId,
             _partition: u32,
-        ) -> Result<ResolvedPosition, OffsetManagerError> {
+        ) -> Result<Position, OffsetManagerError> {
             Ok(Fallback::Earliest.into())
         }
     }
@@ -427,7 +428,7 @@ mod tx_typestate {
             _group: &ConsumerGroupId,
             _topic: &TopicId,
             _partition: u32,
-            _offset: i64,
+            _offset: Sequence,
         ) -> Result<(), OffsetManagerError>
         where
             TX: toolkit_db::secure::DBRunner + Sync,
@@ -634,8 +635,6 @@ mod tx_typestate {
                     partition: None,
                     sequence: None,
                     sequence_time: None,
-                    offset: None,
-                    offset_time: None,
                     meta: None,
                 },
             )

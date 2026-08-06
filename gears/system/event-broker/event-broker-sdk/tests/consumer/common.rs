@@ -115,8 +115,6 @@ pub async fn publish_json_with_partition_key(request: PublishJson<'_>) {
                 partition: None,
                 sequence: None,
                 sequence_time: None,
-                offset: None,
-                offset_time: None,
                 meta: None,
             },
         )

@@ -12,6 +12,7 @@ use event_broker_sdk::gts::{EventV1, TopicV1};
 use serde_json::json;
 use types_registry_sdk::{GtsInstance, GtsTypeSchema};
 
+use crate::api::rest::handlers::ingest::dto::EventTypeDto;
 use crate::domain::error::DomainError;
 use crate::domain::projection;
 
@@ -119,14 +120,10 @@ fn topic_projects_a_document_that_declares_no_retention() {
         "description": "Audit stream.",
     }));
 
-    assert_eq!(
-        serde_json::to_value(projection::topic(&instance).unwrap()).unwrap(),
-        json!({
-            "id": AUDIT_TOPIC,
-            "description": "Audit stream.",
-            "retention": null,
-        })
-    );
+    let topic = projection::topic(&instance).unwrap();
+    assert_eq!(topic.id.as_ref(), AUDIT_TOPIC);
+    assert_eq!(topic.description, "Audit stream.");
+    assert_eq!(topic.retention, None);
 }
 
 #[test]
@@ -139,13 +136,12 @@ fn topic_projects_a_declared_retention_in_canonical_units() {
         "retention": "P7D",
     }));
 
+    let topic = projection::topic(&instance).unwrap();
+    assert_eq!(topic.id.as_ref(), NOTIFY_TOPIC);
+    assert_eq!(topic.description, "Notification stream.");
     assert_eq!(
-        serde_json::to_value(projection::topic(&instance).unwrap()).unwrap(),
-        json!({
-            "id": NOTIFY_TOPIC,
-            "description": "Notification stream.",
-            "retention": "PT168H",
-        })
+        topic.retention.map(|r| r.to_string()).as_deref(),
+        Some("PT168H")
     );
 }
 
@@ -195,7 +191,7 @@ fn event_type_defaults_allowed_subject_types_to_empty() {
     );
 
     assert_eq!(
-        serde_json::to_value(projection::event_type(&schema).unwrap()).unwrap(),
+        serde_json::to_value(EventTypeDto::from(projection::event_type(&schema).unwrap())).unwrap(),
         json!({
             "id": ORDER_TYPE,
             "topic": AUDIT_TOPIC,
@@ -232,7 +228,7 @@ fn event_type_inherits_traits_from_an_ancestor() {
     );
 
     assert_eq!(
-        serde_json::to_value(projection::event_type(&schema).unwrap()).unwrap(),
+        serde_json::to_value(EventTypeDto::from(projection::event_type(&schema).unwrap())).unwrap(),
         json!({
             "id": ORDER_EU_TYPE,
             "topic": NOTIFY_TOPIC,
@@ -271,7 +267,7 @@ fn event_type_composes_the_data_narrowings_with_the_leaf_last() {
     );
 
     assert_eq!(
-        serde_json::to_value(projection::event_type(&schema).unwrap()).unwrap(),
+        serde_json::to_value(EventTypeDto::from(projection::event_type(&schema).unwrap())).unwrap(),
         json!({
             "id": ORDER_TYPE,
             "topic": AUDIT_TOPIC,

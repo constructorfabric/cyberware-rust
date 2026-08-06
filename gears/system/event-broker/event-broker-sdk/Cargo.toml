@@ -26,6 +26,20 @@ db = ["dep:sea-orm", "dep:toolkit-db", "toolkit-db/sqlite"]
 outbox = ["db"]
 integration = []
 test-util = ["dep:async-stream"]
+# REST transport implementation of `EventBrokerApi` (src/rest/) and the
+# `cf-evctl` binary. Off by default so a plain SDK build pulls in no HTTP or
+# wire dependencies (base-trait purity, docs/arch/toolkit-contract-binding).
+rest-client = [
+    "dep:reqwest",
+    "dep:toolkit-http",
+    "dep:bytes",
+    "dep:serde_html_form",
+    "dep:async-stream",
+    "dep:clap",
+    "dep:secrecy",
+    "dep:http-body-util",
+    "dep:http-body",
+]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -58,6 +72,21 @@ toolkit-utils = { workspace = true, features = ["serde", "schemars"] }
 schemars = { workspace = true }
 toolkit-db = { workspace = true, optional = true }
 sea-orm = { workspace = true, optional = true }
+
+# --- REST transport (feature = "rest-client") -------------------------------
+reqwest = { workspace = true, optional = true }
+toolkit-http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+serde_html_form = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+
+[[bin]]
+name = "cf-evctl"
+path = "src/bin/evctl.rs"
+required-features = ["rest-client"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }

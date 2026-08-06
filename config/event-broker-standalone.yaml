@@ -1,0 +1,161 @@
+# Minimal working config for `cf-gears-event-broker-server` in standalone
+# mode (eb-single-process-implementation design.md D7) - one process, one
+# SQLite file, no cluster/network dependencies.
+#
+# Run it from the repo root:
+#   cargo run -p cf-gears-event-broker --bin cf-gears-event-broker-server \
+#     -- --config config/event-broker-standalone.yaml run
+#
+# Then, e.g.:
+#   curl http://127.0.0.1:8080/event-broker/v1/topics       # seeded demo topic below
+#   curl http://127.0.0.1:8080/event-broker/v1/event-types  # seeded demo event type
+#   curl http://127.0.0.1:8080/docs        # Swagger UI (enable_docs: true)
+#
+# Topics and event types are `types-registry` entities, seeded here via its
+# `entities:` startup config (the same mechanism operators use via its
+# `POST /types-registry/v1/entities` REST API at runtime). They are entities of
+# different *kinds*: a topic is an instance, an event type is a derived type
+# schema. `event-broker` reads them during its start phase - after
+# `types-registry` has committed them, which is why the load is not in `init()`
+# - and re-reads them on the cadence
+# `workers.specification_refresh_interval_secs` sets, so a topic registered
+# while the process runs becomes resolvable without a restart.
+
+server:
+  home_dir: "~/.cf-gears-event-broker"
+
+# The global `database:` section must be present (even empty) for ANY gear's
+# per-gear `database:` config below to be honored at all - `toolkit::
+# bootstrap::run::resolve_db_options` skips DB wiring entirely otherwise.
+database:
+  servers: {}
+
+gears:
+  types-registry:
+    config:
+      entities:
+        # A topic is an *instance* of the topic base type, carrying the stream's
+        # own data. How many partitions back it is `event-broker` configuration,
+        # below, not something the topic says.
+        - id: "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
+          description: "Demo stream for the standalone quickstart."
+        # An event type is a *derived type schema* of the abstract event base:
+        # it narrows the base's `data` member into its own payload contract and
+        # fixes the traits that govern it. Nothing here is a field a publisher
+        # sends - a published event names only this type, and the broker
+        # resolves both the topic and the partition key from it.
+        - $id: "gts://gts.cf.core.events.event.v1~cf.core.demo.greeting.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Demo event type for the standalone quickstart."
+          x-gts-traits:
+            topic: "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
+            allowed_subject_types: ["gts.cf.core.demo.subject.v1~"]
+            # The base defaults this to the tenant; stated here so the
+            # quickstart shows where routing is decided.
+            partition_key: "/tenant_id"
+          type: object
+          allOf:
+            - $ref: "gts://gts.cf.core.events.event.v1~"
+            - type: object
+              properties:
+                # No constraints of its own, so it admits whatever the base
+                # allows. An empty schema here would be *wider* than the base,
+                # and registration refuses a derived type that widens.
+                data:
+                  type: ["object", "null"]
+
+  # Binds the "event-broker" cluster profile (`domain::cluster::
+  # EventBrokerCluster::resolve`'s profile name) to the zero-dependency
+  # standalone cache provider - no external cache/coordination service
+  # needed for single-process deployments.
+  cluster:
+    config:
+      profiles:
+        event-broker:
+          cache:
+            provider: standalone
+
+  # AuthN/AuthZ pipelines - required for `api-gateway`'s route registration
+  # even with `auth_disabled: true` below (permission checks still run
+  # against a default-tenant SecurityContext). See `config/quickstart.yaml`
+  # for the full multi-gear pattern this is a minimal slice of.
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      # `accept_all`: no real bearer-token verification. Fine here since
+      # `api-gateway.auth_disabled: true` below means this plugin's actual
+      # token check is never reached anyway - dev/local only either way.
+      mode: accept_all
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  event-broker:
+    database:
+      # The gear's own database: ingest and delivery metadata only - cursors,
+      # consumer groups, producers, the specification cache and the ingest
+      # outbox. The event log is not among them; it lives in the storage
+      # backend's own database, configured under `topics` below.
+      #
+      # `engine` must be explicit here - there's no global `servers:`
+      # template to infer it from (see `config/quickstart.yaml`'s
+      # `sqlite_users` template for the alternative, multi-gear-sharing
+      # style).
+      engine: sqlite
+      file: "event_broker.db" # -> ~/.cf-gears-event-broker/event-broker/event_broker.db
+      # These are not optional tuning. The config-driven connect path applies
+      # no SQLite defaults of its own, so without them the database runs with
+      # `busy_timeout = 0` on a rollback journal: a second writer is refused
+      # immediately with "database is locked" rather than waiting, and readers
+      # block writers. Concurrent publishes then surface that as a 503.
+      params:
+        journal_mode: "WAL"
+        busy_timeout: "5000"
+        synchronous: "NORMAL"
+    config:
+      mode: standalone
+      # The backend a topic's events are stored by when its own settings name
+      # none, as a GTS backend type rather than a short alias. Checked at
+      # startup against the backend this build links, so a name nothing
+      # implements fails to boot instead of being served by whichever backend
+      # happened to be compiled in.
+      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+
+      # Per-topic settings, keyed by topic GTS identifier. A key with an empty
+      # instance part supplies the settings every topic of that type shares.
+      # `partitions` is omitted here on purpose: configuration always carries an
+      # entry for the topic type, and its built-in count is 8.
+      topics:
+        "gts.cf.core.events.topic.v1~":
+          backend:
+            # Which backend, and then that backend's own settings beside it.
+            # Everything under `type` belongs to the named backend, which
+            # publishes the schema that validates it - so a second backend's
+            # block looks nothing like this one and the gear needs no change.
+            type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+            # Where this deployment keeps its event log. A file, so events
+            # outlive the process; `:memory:` would be a broker that starts
+            # empty on every boot. Naming no path at all means `:memory:` -
+            # nothing tells the backend where a deployment keeps its data, so
+            # it invents no location on disk.
+            path: "~/.cf-gears-event-broker/event-broker/event_log.db"
+
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8080"
+      enable_docs: true
+      # Single-user/local only - see the warning `api-gateway` itself logs
+      # at startup with this set. Real deployments need a real IdP wired
+      # through `authn-resolver` instead.
+      auth_disabled: true

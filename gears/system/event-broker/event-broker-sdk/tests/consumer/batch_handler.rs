@@ -29,7 +29,7 @@ impl ConsumerHandler for BatchProjector {
         let chunk = batch.next_chunk(batch.len());
         self.batches.lock().unwrap().push((
             chunk[0].partition,
-            chunk.iter().map(|event| event.offset).collect(),
+            chunk.iter().map(|event| event.offset.as_i64()).collect(),
         ));
         Ok(BatchHandlerOutcome::AdvanceThrough {
             offset: chunk.last().expect("showcase batch is not empty").offset,

@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::consumer::RawEvent;
 use crate::error::ConsumerError;
 use crate::ids::{ConsumerGroupId, TopicId};
+use crate::sequence::Sequence;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadLetterRecord {
@@ -15,7 +16,7 @@ pub struct DeadLetterRecord {
     pub subject: String,
     pub subject_type: String,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
     pub attempts: Option<u16>,
     pub reason: String,
     pub payload: serde_json::Value,

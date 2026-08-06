@@ -1,0 +1,43 @@
+[package]
+name = "cf-gears-sqlite-event-broker-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQLite storage backend plugin for the event-broker gear: the durable event log, its per-partition bookkeeping, and per-partition retention"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "sqlite_event_broker_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The `EventBrokerBackend` trait this crate implements, its provider seam, and
+# the `Event` projection it persists and reads back. This crate depends on the
+# SDK only, never on the gear.
+event-broker-sdk = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toolkit-security = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+# All DB access goes through SecureORM (`toolkit_db::secure`); a raw connection
+# is never held. The `sqlite` feature is this backend's whole point.
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+toolkit-db-macros = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

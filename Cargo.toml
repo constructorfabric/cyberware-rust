@@ -167,6 +167,7 @@ members = [
     "gears/system/license-resolver/license-resolver-sdk",
     "gears/system/license-resolver/license-resolver",
     "gears/system/license-resolver/plugins/static-license-plugin",
+    "gears/system/event-broker/plugins/sqlite-event-broker-plugin",
 ]
 exclude = ["tools/fuzz"]
 resolver = "3"
@@ -355,6 +356,11 @@ oagw = { package = "cf-gears-oagw", version = "0.5.0", path = "gears/system/oagw
 account-management = { package = "cf-gears-account-management", version = "0.8.0", path = "gears/system/account-management/account-management" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.3.0", path = "gears/system/usage-collector/usage-collector" }
 cluster = { package = "cf-gears-cluster", version = "0.2.3", path = "gears/system/cluster/cluster" }
+api-gateway = { package = "cf-gears-api-gateway", version = "0.4.12", path = "gears/system/api-gateway" }
+# Concrete plugins needed to link a standalone-mode binary.
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.13", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
+static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.33", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.3", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 
 cf-gears-cluster-sdk = { version = "0.2.3", path = "gears/system/cluster/cluster-sdk" }
 cf-gears-cluster-conformance = { version = "0.3.3", path = "gears/system/cluster/cluster-conformance" }
@@ -369,6 +375,8 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.4.0
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.1", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.11", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.9", path = "gears/system/usage-collector/usage-collector-sdk" }
+event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.1", path = "gears/system/event-broker/event-broker-sdk" }
+sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.1.4", path = "gears/bss/ledger/ledger-sdk" }
@@ -435,7 +443,7 @@ serde_urlencoded = "0.7"
 # extractor. Unlike `serde_urlencoded` it round-trips repeated keys into a
 # sequence, which is what makes `Vec<T>` query fields work end to end.
 serde_html_form = "0.4"
-schemars = { version = "1.2", features = ["derive", "uuid1"] }
+schemars = { version = "1.2", features = ["derive", "uuid1", "chrono04"] }
 
 # Error handling
 anyhow = "1.0"
@@ -656,6 +664,9 @@ k8s-openapi = { version = "0.27", default-features = false }
 # DSN parsing
 dsn = "1.1.1"
 humantime = "2.3.0"
+# Human-readable byte sizes in operator config (`128mb`), the byte-size
+# counterpart to `humantime`'s durations. No transitive dependencies of its own
+# beyond the optional serde support this workspace enables.
 
 # URL parsing
 url = "2.5"

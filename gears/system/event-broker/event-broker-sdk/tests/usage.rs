@@ -208,35 +208,33 @@ async fn mock_registers_order_topic_and_event_type() -> TestResult {
     // A topic reports the instance document's own values; an event type's topic
     // binding is a resolved trait, and `data_schema` is the payload contract
     // composed out of the base event's `data` member and this type's narrowing.
+    // The public SDK models carry no serde, so the shape is asserted field by
+    // field; the JSON wire form is pinned in the rest wire-DTO tests.
+    assert_eq!(topics.len(), 1);
+    assert_eq!(topics[0].id.as_ref(), ORDERS_TOPIC);
+    assert_eq!(topics[0].description, format!("Mock topic {ORDERS_TOPIC}"));
+    assert_eq!(topics[0].retention, None);
+
+    assert_eq!(event_type.id.as_ref(), ORDER_CREATED);
+    assert_eq!(event_type.topic.as_ref(), ORDERS_TOPIC);
+    assert_eq!(event_type.partition_key, "/tenant_id");
+    assert_eq!(event_type.description, None);
     assert_eq!(
-        serde_json::to_value(&topics)?,
-        serde_json::json!([
-            {
-                "id": ORDERS_TOPIC,
-                "description": format!("Mock topic {ORDERS_TOPIC}"),
-                "retention": null,
-            },
-        ])
+        event_type.allowed_subject_types,
+        vec![ORDER_SUBJECT.to_owned()]
     );
     assert_eq!(
-        serde_json::to_value(&event_type)?,
+        event_type.data_schema,
         serde_json::json!({
-            "id": ORDER_CREATED,
-            "topic": ORDERS_TOPIC,
-            "partition_key": "/tenant_id",
-            "description": null,
-            "allowed_subject_types": [ORDER_SUBJECT],
-            "data_schema": {
-                "allOf": [
-                    {
-                        "additionalProperties": true,
-                        "default": null,
-                        "description": BASE_DATA_DESCRIPTION,
-                        "type": ["object", "null"],
-                    },
-                    order_created_schema(),
-                ],
-            },
+            "allOf": [
+                {
+                    "additionalProperties": true,
+                    "default": null,
+                    "description": BASE_DATA_DESCRIPTION,
+                    "type": ["object", "null"],
+                },
+                order_created_schema(),
+            ],
         })
     );
 

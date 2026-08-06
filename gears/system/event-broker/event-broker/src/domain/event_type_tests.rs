@@ -224,7 +224,7 @@ fn a_pointer_naming_nothing_is_rejected_and_names_itself() {
 
     assert_eq!(
         err.to_string(),
-        "validation failed: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
+        "InvalidSpec: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
          declares partition key `/data/no_such_member`, which names no declared member \
          `no_such_member`"
     );
@@ -241,7 +241,7 @@ fn a_value_that_is_not_a_pointer_is_rejected() {
 
     assert_eq!(
         err.to_string(),
-        "validation failed: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
+        "InvalidSpec: gts.cf.core.events.event.v1~fabrikam.shop.orders.order_placed.v1~ \
          declares partition key `tenant_id`, which is not a JSON Pointer into the event"
     );
 }

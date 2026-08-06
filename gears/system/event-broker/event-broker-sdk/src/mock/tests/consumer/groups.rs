@@ -30,7 +30,7 @@ async fn s1_01_positive_create_anonymous_group() {
     assert_eq!(group.kind, ConsumerGroupKind::Anonymous);
     // tenant_id and owner_principal_id come from the caller's SecurityContext, not the body.
     assert_eq!(group.tenant_id, c.subject_tenant_id());
-    assert_eq!(group.owner_principal_id, c.subject_id().to_string());
+    assert_eq!(group.owner_principal_id, c.subject_id());
 
     // Side effect: a subsequent GET returns the same record.
     let fetched = broker.get_consumer_group(&c, &group.id).await.unwrap();
@@ -50,7 +50,7 @@ async fn s1_02_positive_get_group_by_id() {
     assert_eq!(fetched.id, gid);
     assert_eq!(fetched.kind, ConsumerGroupKind::Anonymous);
     assert_eq!(fetched.tenant_id, c.subject_tenant_id());
-    assert_eq!(fetched.owner_principal_id, c.subject_id().to_string());
+    assert_eq!(fetched.owner_principal_id, c.subject_id());
 }
 
 /// Scenario: consumer/groups/1.03-positive-list-groups.md
@@ -135,23 +135,49 @@ async fn s1_07_negative_get_unknown_group() {
 async fn s1_06_negative_invalid_client_agent() {
     let broker = crate::mock::MockBroker::new();
     let c = ctx();
-    // Non-ASCII client_agent is rejected (must be ASCII, 1-256 bytes).
+
+    // A non-ASCII `client_agent` breaks the encoding rule. The rejection names
+    // the field and states the requirement, and carries no part of the value.
     let err = broker
         .create_consumer_group(
             &c,
             CreateConsumerGroupRequest {
-                client_agent: "consumer/✓1.0".to_owned(),
+                client_agent: "consumer/\u{2713}1.0".to_owned(),
                 description: None,
             },
         )
         .await
         .expect_err("non-ASCII client_agent must be rejected");
     assert!(
-        matches!(err, EventBrokerError::InvalidEventField { field, .. } if field == "client_agent"),
-        "expected InvalidEventField(client_agent), got {err:?}"
+        matches!(
+            &err,
+            EventBrokerError::InvalidTextField { field, detail, reason, instance }
+                if *field == "client_agent"
+                    && detail == "must contain only printable ASCII (0x20-0x7E)"
+                    && *reason == "ascii_only"
+                    && instance == "/v1/consumer-groups"
+        ),
+        "expected InvalidTextField(client_agent, ascii_only), got {err:?}"
     );
 
-    // An oversized (>256 byte) client_agent is also rejected.
+    // A `DEL` is rejected too, which `str::is_ascii` used to admit.
+    let err = broker
+        .create_consumer_group(
+            &c,
+            CreateConsumerGroupRequest {
+                client_agent: "consumer\u{7f}".to_owned(),
+                description: None,
+            },
+        )
+        .await
+        .expect_err("a DEL byte in client_agent must be rejected");
+    assert!(
+        matches!(&err, EventBrokerError::InvalidTextField { reason, .. } if *reason == "ascii_only"),
+        "expected ascii_only, got {err:?}"
+    );
+
+    // One byte past the bound breaks the length rule, which reports its own
+    // reason so a caller knows to shorten rather than re-encode.
     let err = broker
         .create_consumer_group(
             &c,
@@ -163,8 +189,49 @@ async fn s1_06_negative_invalid_client_agent() {
         .await
         .expect_err("oversized client_agent must be rejected");
     assert!(
-        matches!(err, EventBrokerError::InvalidEventField { field, .. } if field == "client_agent")
+        matches!(
+            &err,
+            EventBrokerError::InvalidTextField { field, detail, reason, .. }
+                if *field == "client_agent"
+                    && detail == "must be 1-256 bytes, got 257"
+                    && *reason == "field_too_long"
+        ),
+        "expected InvalidTextField(client_agent, field_too_long), got {err:?}"
     );
+
+    // `description` is bounded by the same rule - the case the scenario sends,
+    // a multibyte character next to a control byte.
+    let err = broker
+        .create_consumer_group(
+            &c,
+            CreateConsumerGroupRequest {
+                client_agent: "consumer/1.0".to_owned(),
+                description: Some("caf\u{e9}\u{2} orders".to_owned()),
+            },
+        )
+        .await
+        .expect_err("non-ASCII description must be rejected");
+    assert!(
+        matches!(
+            &err,
+            EventBrokerError::InvalidTextField { field, reason, .. }
+                if *field == "description" && *reason == "ascii_only"
+        ),
+        "expected InvalidTextField(description, ascii_only), got {err:?}"
+    );
+
+    // An empty description is accepted: the field is optional, so "" and an
+    // absent field agree.
+    broker
+        .create_consumer_group(
+            &c,
+            CreateConsumerGroupRequest {
+                client_agent: "consumer/1.0".to_owned(),
+                description: Some(String::new()),
+            },
+        )
+        .await
+        .expect("an empty description is within the rule");
 }
 
 /// Scenario: consumer/groups/1.08-positive-named-group-join.md

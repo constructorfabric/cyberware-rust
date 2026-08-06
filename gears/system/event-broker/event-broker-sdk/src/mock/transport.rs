@@ -7,19 +7,21 @@ use gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::ResolvedPosition;
+use crate::Position;
 use crate::api::{
     AssignedPartition, EventBrokerApi, IngestOutcome, JoinRequest, PartitionCursor,
     ProducerCursors, ProducerMode, SeekResult, SubscriptionAssignment, TopicCursors,
 };
 use crate::api::{FrameStream, SeekPosition};
 use crate::error::EventBrokerError;
+use crate::error::{OutOfRange, PositionViolation, StorageBackendError};
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use crate::models::Event;
 use crate::models::{
     ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, EventType,
     Page, PartitionRange, ResetScope, Subscription, Topic, TopicSegment,
 };
+use crate::sequence::Sequence;
 
 use super::core::{Core, GroupReg, GroupState, MockBroker, SubState};
 use super::ingest::{ingest_batch, ingest_one};
@@ -28,8 +30,8 @@ use super::stream::open_stream;
 
 // --- Helper --------------------------------------------------------------------
 
-fn principal(ctx: &SecurityContext) -> String {
-    ctx.subject_id().to_string()
+fn principal(ctx: &SecurityContext) -> Uuid {
+    ctx.subject_id()
 }
 
 fn tenant(ctx: &SecurityContext) -> Uuid {
@@ -84,57 +86,85 @@ fn check_batch_size(events: &[Event]) -> Result<(), EventBrokerError> {
 /// the mock's append-only log). Returns the offset of the first event whose
 /// `occurred_at >= ts`. A timestamp at/before the retention floor resolves to
 /// the floor offset; a timestamp beyond the high-water mark resolves to the HWM.
-fn resolve_at_timestamp(core: &Core, topic: &str, partition: u32, ts: &str) -> i64 {
-    let topic_state = match core.topics.get(topic) {
-        Some(t) => t,
-        None => return 0,
-    };
-    // High-water mark = last assigned offset (next_offset - 1), floored at 0.
-    let hwm = topic_state
-        .next_offset
-        .get(&partition)
-        .copied()
-        .unwrap_or(0)
-        .saturating_sub(1)
-        .max(0);
-    let log = match topic_state.log.get(&partition) {
-        Some(l) if !l.is_empty() => l,
-        _ => return hwm,
-    };
+/// The cursor to read after so delivery begins at `position`.
+///
+/// Storage-side: this adapter owns the integer space, and the position it
+/// returns is not claimed to exist - it is frequently the one retention removed.
+fn cursor_delivering(position: Sequence) -> Sequence {
+    Sequence::assigned(position.as_i64().saturating_sub(1))
+}
 
-    // Parse the requested timestamp; an unparseable timestamp falls back to the
-    // retention floor (the earliest stored offset).
-    let target = match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt.with_timezone(&chrono::Utc),
-        Err(_) => {
-            return log
-                .first()
-                .and_then(|e| e.event.offset)
-                .map(|o| o - 1)
-                .unwrap_or(0);
+/// The mock's high-water mark as a cursor: the last offset it assigned.
+///
+/// `next_offset` is the mock's own integer counter, so the step happens before
+/// the value becomes a `Sequence` - this is a storage adapter, and the counter
+/// is not itself a position.
+///
+/// **Unclamped on purpose.** A partition that has never been written yields
+/// `-1`, which the mock uses as its "nothing assigned yet" sentinel and which
+/// `last_examined` reports verbatim. A caller that needs the cursor floor
+/// instead clamps at its own site, because the two readings differ: a scan
+/// frontier can legitimately sit below the first position, a cursor cannot.
+pub(super) fn hwm_cursor(core: &Core, topic: &str, partition: u32) -> Sequence {
+    Sequence::assigned(
+        core.topics
+            .get(topic)
+            .and_then(|t| t.next_offset.get(&partition).copied())
+            .unwrap_or(0)
+            .saturating_sub(1)
+            .max(0),
+    )
+}
+
+/// Resolves a requested position against what this mock holds.
+///
+/// The one place the mock answers "which position should a cursor take?", so
+/// the four forms cannot drift apart.
+pub(super) fn resolve_position(
+    core: &Core,
+    topic: &str,
+    partition: u32,
+    position: Position,
+) -> Result<Sequence, StorageBackendError> {
+    let ceiling = hwm_cursor(core, topic, partition);
+    let oldest = core
+        .topics
+        .get(topic)
+        .and_then(|t| t.log.get(&partition))
+        .and_then(|log| log.first())
+        .and_then(|stored| stored.event.sequence);
+    // Nothing retained leaves the ceiling as the only position a cursor can
+    // hold: no event remains for delivery to resume from.
+    let floor = oldest.map_or(ceiling, cursor_delivering);
+
+    match position {
+        Position::Earliest => Ok(floor),
+        Position::Latest => Ok(ceiling),
+        Position::At(at) => Ok(core
+            .topics
+            .get(topic)
+            .and_then(|t| t.log.get(&partition))
+            .and_then(|log| log.iter().find(|stored| stored.event.occurred_at >= at))
+            .and_then(|stored| stored.event.sequence)
+            .map_or(ceiling, cursor_delivering)),
+        Position::Exact(requested) => {
+            if (floor..=ceiling).contains(&requested) {
+                Ok(requested)
+            } else {
+                Err(StorageBackendError::OffsetOutOfRange {
+                    floor,
+                    ceiling,
+                    breached: if requested < floor {
+                        OutOfRange::BelowFloor
+                    } else {
+                        OutOfRange::AboveCeiling
+                    },
+                    detail: format!("valid positions are [{floor}, {ceiling}]"),
+                    instance: String::new(),
+                })
+            }
         }
-    };
-
-    // Cursor is last-processed (emit from cursor+1). To DELIVER the first event at
-    // or after `target`, the cursor is that event's offset minus 1.
-    // Timestamp at/before the retention floor → clamp to floor (deliver the first event).
-    let floor_offset = log.first().and_then(|e| e.event.offset).unwrap_or(1);
-    if let Some(first) = log.first()
-        && target <= first.event.occurred_at
-    {
-        return floor_offset - 1;
     }
-
-    // Linear scan for the first event with occurred_at >= target.
-    for stored in log {
-        if stored.event.occurred_at >= target {
-            return stored.event.offset.unwrap_or(floor_offset) - 1;
-        }
-    }
-
-    // Timestamp beyond the last stored event → high-water mark (equivalent to Latest:
-    // cursor = last existing offset, emit only future events).
-    hwm
 }
 
 impl MockBroker {
@@ -177,6 +207,16 @@ impl EventBrokerApi for MockBroker {
         mode: ProducerMode,
         client_agent: &str,
     ) -> Result<ProducerId, EventBrokerError> {
+        crate::validate::client_agent(client_agent)
+            .map_err(|err| EventBrokerError::invalid_text_field(&err, "/v1/producers"))?;
+        // Stateless producers are not registered (DESIGN §3.2); only chained and
+        // monotonic modes mint a producer id.
+        if mode == ProducerMode::Stateless {
+            return Err(EventBrokerError::InvalidProducerOptions {
+                detail: "a stateless producer is not registered".to_owned(),
+                instance: String::new(),
+            });
+        }
         let id = ProducerId(Uuid::new_v4());
         let mut core = self.core.lock().await;
         core.producers.insert(
@@ -230,7 +270,7 @@ impl EventBrokerApi for MockBroker {
         &self,
         _ctx: &SecurityContext,
         events: &[Event],
-    ) -> Result<Vec<IngestOutcome>, EventBrokerError> {
+    ) -> Result<IngestOutcome, EventBrokerError> {
         self.check_reject_persist().await?;
         check_batch_size(events)?;
         self.consume_publish_allowance(events.len() as u32).await?;
@@ -240,7 +280,15 @@ impl EventBrokerApi for MockBroker {
         if any_accepted {
             self.notify.notify_waiters();
         }
-        Ok(results.into_iter().map(|(o, _)| o).collect())
+        // A batch is all-or-nothing, so it reports one outcome: `Duplicate` only
+        // when every event was a duplicate, otherwise `Accepted`.
+        Ok(
+            if !results.is_empty() && results.iter().all(|(o, _)| *o == IngestOutcome::Duplicate) {
+                IngestOutcome::Duplicate
+            } else {
+                IngestOutcome::Accepted
+            },
+        )
     }
 
     async fn get_producer_cursors(
@@ -328,16 +376,12 @@ impl EventBrokerApi for MockBroker {
         ctx: &SecurityContext,
         req: CreateConsumerGroupRequest,
     ) -> Result<ConsumerGroup, EventBrokerError> {
-        // B3: client_agent must be ASCII, 1-256 bytes.
-        if req.client_agent.is_empty()
-            || req.client_agent.len() > 256
-            || !req.client_agent.is_ascii()
-        {
-            return Err(EventBrokerError::InvalidEventField {
-                field: "client_agent",
-                detail: "client_agent must be ASCII and 1-256 bytes".to_owned(),
-                instance: "/v1/consumer-groups".to_owned(),
-            });
+        // B3: `client_agent` follows the RFC 9110 User-Agent grammar.
+        crate::validate::client_agent(&req.client_agent)
+            .map_err(|err| EventBrokerError::invalid_text_field(&err, "/v1/consumer-groups"))?;
+        if let Some(description) = req.description.as_deref() {
+            crate::validate::description(description)
+                .map_err(|err| EventBrokerError::invalid_text_field(&err, "/v1/consumer-groups"))?;
         }
         let group_id = ConsumerGroupId::new(Uuid::new_v4());
         let mut core = self.core.lock().await;
@@ -398,7 +442,7 @@ impl EventBrokerApi for MockBroker {
             .map(|(id, reg)| ConsumerGroup {
                 id: *id,
                 tenant_id: reg.owner_tenant,
-                owner_principal_id: reg.owner_principal.clone(),
+                owner_principal_id: reg.owner_principal,
                 kind: reg.kind,
                 description: None,
                 created_at: Utc::now(),
@@ -455,17 +499,9 @@ impl EventBrokerApi for MockBroker {
         _ctx: &SecurityContext,
         req: JoinRequest,
     ) -> Result<SubscriptionAssignment, EventBrokerError> {
-        // B3: client_agent must be ASCII, 1-256 bytes (RFC 9110 User-Agent grammar).
-        if req.client_agent.is_empty()
-            || req.client_agent.len() > 256
-            || !req.client_agent.is_ascii()
-        {
-            return Err(EventBrokerError::InvalidEventField {
-                field: "client_agent",
-                detail: "client_agent must be ASCII and 1-256 bytes".to_owned(),
-                instance: "/v1/subscriptions".to_owned(),
-            });
-        }
+        // B3: `client_agent` follows the RFC 9110 User-Agent grammar.
+        crate::validate::client_agent(&req.client_agent)
+            .map_err(|err| EventBrokerError::invalid_text_field(&err, "/v1/subscriptions"))?;
         // B4: a subscription carries 1-64 interests.
         const MAX_INTERESTS: usize = 64;
         if req.interests.is_empty() || req.interests.len() > MAX_INTERESTS {
@@ -529,6 +565,7 @@ impl EventBrokerApi for MockBroker {
         // Build SubState.
         let sub = SubState {
             group: req.group,
+            client_agent: req.client_agent,
             interests: req.interests,
             topics,
             assigned: Vec::new(),
@@ -588,6 +625,8 @@ impl EventBrokerApi for MockBroker {
         Ok(Subscription {
             id,
             consumer_group: sub.group,
+            client_agent: sub.client_agent.clone(),
+            interests: sub.interests.clone(),
             assigned: sub
                 .assigned
                 .iter()
@@ -619,6 +658,8 @@ impl EventBrokerApi for MockBroker {
                 Subscription {
                     id: *id,
                     consumer_group: sub.group,
+                    client_agent: sub.client_agent.clone(),
+                    interests: sub.interests.clone(),
                     assigned: sub
                         .assigned
                         .iter()
@@ -756,46 +797,47 @@ impl EventBrokerApi for MockBroker {
                 });
             }
         }
+        // Resolve every entry before applying any, and report every offender:
+        // the request applies in full or not at all, and a caller correcting
+        // several positions does not need one round trip each.
         let mut results: Vec<SeekResult> = Vec::with_capacity(positions.len());
-        let mut internal: HashMap<(String, u32), i64> = HashMap::new();
-        for pos in positions {
-            let offset = match &pos.value {
-                ResolvedPosition::Exact(n) => *n,
-                ResolvedPosition::Earliest => 0,
-                ResolvedPosition::Latest => core
-                    .topics
-                    .get(&pos.topic)
-                    .and_then(|t| t.next_offset.get(&pos.partition).copied())
-                    .unwrap_or(0)
-                    .saturating_sub(1),
-                ResolvedPosition::AtTimestamp(ts) => {
-                    resolve_at_timestamp(&core, &pos.topic, pos.partition, ts)
+        let mut internal: HashMap<(String, u32), Sequence> = HashMap::new();
+        let mut violations: Vec<PositionViolation> = Vec::new();
+        for (index, pos) in positions.iter().enumerate() {
+            // One resolver for all four forms, shared with the backend
+            // surface, so the two cannot disagree.
+            match resolve_position(&core, &pos.topic, pos.partition, pos.value.clone()) {
+                Ok(offset) => {
+                    results.push(SeekResult {
+                        topic: pos.topic.clone(),
+                        partition: pos.partition,
+                        offset,
+                    });
+                    internal.insert((pos.topic.clone(), pos.partition), offset);
                 }
-            };
-            // A4: the resolved cursor must lie in [RF-1, HWM] = [0, next_offset].
-            // (RF=1 on a 1-based log, so RF-1=0; HWM = next offset to be admitted.)
-            let hwm = core
-                .topics
-                .get(&pos.topic)
-                .and_then(|t| t.next_offset.get(&pos.partition).copied())
-                .unwrap_or(1);
-            if offset < 0 || offset > hwm {
-                return Err(EventBrokerError::InvalidInitialPosition {
-                    topic: pos.topic.clone(),
-                    partition: pos.partition,
-                    requested: offset.to_string(),
-                    detail: format!(
-                        "resolved offset {offset} is outside the valid range [0, {hwm}]"
-                    ),
-                    instance: format!("/v1/subscriptions/{id:?}:seek"),
-                });
+                Err(StorageBackendError::OffsetOutOfRange {
+                    floor,
+                    ceiling,
+                    breached,
+                    ..
+                }) => violations.push(
+                    PositionViolation::builder(index)
+                        .floor(floor)
+                        .ceiling(ceiling)
+                        .breached(breached)
+                        .build(),
+                ),
+                Err(other) => {
+                    return Err(EventBrokerError::Internal(other.to_string()));
+                }
             }
-            results.push(SeekResult {
-                topic: pos.topic.clone(),
-                partition: pos.partition,
-                offset,
+        }
+        if !violations.is_empty() {
+            return Err(EventBrokerError::InvalidInitialPosition {
+                violations,
+                detail: "Request validation failed".to_owned(),
+                instance: format!("/v1/subscriptions/{id:?}:seek"),
             });
-            internal.insert((pos.topic.clone(), pos.partition), offset);
         }
         // Advance group cursor using MAX rule (forward-only, equivalent to old ack behaviour).
         let group_id = core.subscriptions.get(&id).map(|s| s.group);
@@ -831,7 +873,7 @@ impl EventBrokerApi for MockBroker {
         topic: &str,
         partition: u32,
         _range: PartitionRange,
-    ) -> Result<Vec<TopicSegment>, EventBrokerError> {
+    ) -> Result<TopicSegment, EventBrokerError> {
         let core = self.core.lock().await;
         let t = core
             .topics
@@ -841,35 +883,26 @@ impl EventBrokerApi for MockBroker {
                 detail: String::new(),
                 instance: String::new(),
             })?;
-        let log = t.log.get(&partition);
-        let segments = if let Some(events) = log {
-            if events.is_empty() {
-                vec![]
-            } else {
-                let start = events.first().and_then(|e| e.event.sequence).unwrap_or(0);
-                let end = events.last().and_then(|e| e.event.sequence).unwrap_or(0);
-                let ts = events
-                    .first()
-                    .and_then(|e| e.event.sequence_time)
-                    .unwrap_or_else(Utc::now);
-                let te = events
-                    .last()
-                    .and_then(|e| e.event.sequence_time)
-                    .unwrap_or_else(Utc::now);
-                vec![TopicSegment {
-                    topic: topic.to_owned(),
-                    partition,
-                    start_sequence: start,
-                    end_sequence: end,
-                    start_time: ts,
-                    end_time: te,
-                    segments: vec![],
-                }]
-            }
-        } else {
-            vec![]
-        };
-        Ok(segments)
+        // The wire returns one manifest per (topic, partition). An empty
+        // partition has no span, so its sequences are NONE and its times absent.
+        let events = t.log.get(&partition).filter(|events| !events.is_empty());
+        let start = events
+            .and_then(|e| e.first())
+            .and_then(|e| e.event.sequence)
+            .unwrap_or(Sequence::NONE);
+        let end = events
+            .and_then(|e| e.last())
+            .and_then(|e| e.event.sequence)
+            .unwrap_or(Sequence::NONE);
+        Ok(TopicSegment {
+            topic: topic.to_owned(),
+            partition,
+            start_sequence: start,
+            end_sequence: end,
+            start_time: events.and_then(|e| e.first()).and_then(|e| e.event.sequence_time),
+            end_time: events.and_then(|e| e.last()).and_then(|e| e.event.sequence_time),
+            segments: vec![],
+        })
     }
 
     async fn list_event_types(

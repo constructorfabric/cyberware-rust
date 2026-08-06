@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use toolkit_gts::gts_id;
@@ -38,8 +39,8 @@ fn raw_event(offset: i64) -> RawEvent {
         subject: format!("order-{offset}"),
         subject_type: "order".to_owned(),
         partition: 6,
-        sequence: offset,
-        offset,
+        sequence: Sequence::assigned(offset),
+        offset: Sequence::assigned(offset),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,

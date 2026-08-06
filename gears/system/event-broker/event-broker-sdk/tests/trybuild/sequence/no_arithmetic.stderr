@@ -1,0 +1,39 @@
+error[E0369]: cannot subtract `Sequence` from `Sequence`
+  --> tests/trybuild/sequence/no_arithmetic.rs:11:15
+   |
+11 |     let _ = a - b;
+   |             - ^ - Sequence
+   |             |
+   |             Sequence
+   |
+note: `Sequence` does not implement `Sub`
+  --> src/sequence.rs
+   |
+   | pub struct Sequence(i64);
+   | ^^^^^^^^^^^^^^^^^^^ `Sequence` is defined in another crate
+
+error[E0369]: cannot add `{integer}` to `Sequence`
+  --> tests/trybuild/sequence/no_arithmetic.rs:14:15
+   |
+14 |     let _ = a + 1;
+   |             - ^ - {integer}
+   |             |
+   |             Sequence
+   |
+note: `Sequence` does not implement `Add<{integer}>`
+  --> src/sequence.rs
+   |
+   | pub struct Sequence(i64);
+   | ^^^^^^^^^^^^^^^^^^^ `Sequence` is defined in another crate
+
+error[E0599]: no method named `next` found for struct `Sequence` in the current scope
+  --> tests/trybuild/sequence/no_arithmetic.rs:17:15
+   |
+17 |     let _ = a.next();
+   |               ^^^^
+   |
+help: there is a method `ne` with a similar name, but with different arguments
+  --> $RUST/core/src/cmp.rs
+   |
+   |     fn ne(&self, other: &Rhs) -> bool {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

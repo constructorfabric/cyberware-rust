@@ -1,3 +1,4 @@
+use event_broker_sdk::Sequence;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,8 +8,8 @@ use chrono::Utc;
 use event_broker_sdk::consumer::LOCAL_DB_OFFSET_STORE_MIGRATION_SQL;
 use event_broker_sdk::dlq::{ConsumerDlqOutbox, DeadLetterEnvelope, DeadLetterRecord};
 use event_broker_sdk::{
-    CommitOffsetInTx, ConsumerGroupId, Fallback, LocalDbOffsetManager, OffsetStore, RawEvent,
-    ResolvedPosition, TopicId,
+    CommitOffsetInTx, ConsumerGroupId, Fallback, LocalDbOffsetManager, OffsetStore, Position,
+    RawEvent, TopicId,
 };
 use sea_orm::{ConnectionTrait, Database, Statement};
 use toolkit_db::outbox::{
@@ -120,8 +121,8 @@ fn rejected_event(offset: i64) -> RawEvent {
         subject: format!("dlq-order-{offset}"),
         subject_type: "order".to_owned(),
         partition: 0,
-        sequence: offset,
-        offset,
+        sequence: Sequence::assigned(offset),
+        offset: Sequence::assigned(offset),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -149,7 +150,7 @@ async fn load_position(
     group: &ConsumerGroupId,
     topic: &TopicId,
     partition: u32,
-) -> ResolvedPosition {
+) -> Position {
     manager
         .load_position(group, topic, partition)
         .await
@@ -224,7 +225,7 @@ async fn if_i_want_transactional_dlq_i_enqueue_and_commit_offset_in_the_same_tx(
     assert_eq!(envelope.offset, event.offset);
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Exact(event.offset)
+        Position::Exact(event.offset)
     );
 
     fixture.stop().await;
@@ -268,7 +269,7 @@ async fn if_the_dlq_transaction_rolls_back_neither_handoff_nor_offset_is_durable
     assert!(fixture.envelopes.lock().unwrap().is_empty());
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Earliest
+        Position::Earliest
     );
 
     fixture.stop().await;
@@ -322,7 +323,7 @@ async fn if_the_main_transaction_rolled_back_i_open_a_new_tx_for_dlq_and_offset_
     assert_eq!(envelope.offset, event.offset);
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Exact(event.offset)
+        Position::Exact(event.offset)
     );
 
     fixture.stop().await;
@@ -365,7 +366,7 @@ async fn if_dlq_handoff_fails_i_do_not_commit_the_source_offset() {
     assert!(fixture.envelopes.lock().unwrap().is_empty());
     assert_eq!(
         load_position(&manager, &group, &topic, event.partition).await,
-        ResolvedPosition::Earliest
+        Position::Earliest
     );
 
     fixture.stop().await;

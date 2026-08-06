@@ -865,8 +865,6 @@ fn chained_event_for_sequence(producer_id: ProducerId, sequence: i64, previous: 
         partition: None,
         sequence: None,
         sequence_time: None,
-        offset: None,
-        offset_time: None,
         meta: Some(ProducerMeta {
             version: 1,
             producer_id: Some(producer_id.0),

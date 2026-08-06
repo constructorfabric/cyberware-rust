@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use std::time::Duration;
 use toolkit_gts::{GTS_ID_PREFIX, gts_id};
 
@@ -78,8 +79,8 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
         subject: "order-1".to_owned(),
         subject_type: "order".to_owned(),
         partition: 3,
-        sequence: 42,
-        offset: 42,
+        sequence: Sequence::assigned(42),
+        offset: Sequence::assigned(42),
         occurred_at: chrono::Utc::now(),
         sequence_time: chrono::Utc::now(),
         trace_parent: Some("00-test".to_owned()),
@@ -96,7 +97,7 @@ fn dead_letter_record_exposes_context_fields_for_diagnosis_and_replay() {
     assert_eq!(record.topic_id, Some(topic_id));
     assert_eq!(record.topic, topic);
     assert_eq!(record.partition, 3);
-    assert_eq!(record.offset, 42);
+    assert_eq!(record.offset, Sequence::assigned(42));
     assert_eq!(record.payload, payload);
     assert_eq!(record.reason, "schema mismatch");
     assert_eq!(record.attempts, Some(2));

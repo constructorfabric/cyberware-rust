@@ -17,9 +17,9 @@ async fn s1_01_publish_batch() {
     let evs: Vec<_> = (0..2)
         .map(|_| wire_event(EVT, c.subject_tenant_id()))
         .collect();
-    let outcomes = broker.publish_batch(&c, &evs).await.unwrap();
-    assert_eq!(outcomes.len(), 2);
-    assert!(outcomes.iter().all(|o| *o == IngestOutcome::Accepted));
+    // A batch is all-or-nothing, so it reports one outcome for the whole batch.
+    let outcome = broker.publish_batch(&c, &evs).await.unwrap();
+    assert_eq!(outcome, IngestOutcome::Accepted);
     assert_eq!(h.stored(TOPIC, 0).await.len(), 2);
 }
 

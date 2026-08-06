@@ -1,5 +1,6 @@
 use crate::consumer::{BatchHandlerOutcome, RawEvent};
 use crate::error::EventBrokerError;
+use crate::sequence::Sequence;
 
 pub(crate) fn processed_count_from_outcome(
     outcome: &BatchHandlerOutcome,
@@ -15,7 +16,7 @@ pub(crate) fn processed_count_from_outcome(
 }
 
 pub(crate) fn processed_count_from_delivered_offset(
-    offset: i64,
+    offset: Sequence,
     batch_events: &[RawEvent],
 ) -> Result<usize, EventBrokerError> {
     batch_events
