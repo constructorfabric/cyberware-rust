@@ -46,7 +46,7 @@ make e2e-local             # E2E — local: run every shared-server suite agains
 make e2e-local-smoke       # E2E — smoke subset only
 make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
 make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (resource_group/e2e.yaml, profile: tr-authz)
-make e2e-usage-collector   # E2E — usage-collector lane (dedicated binary; needs Docker)
+make e2e-usage-collector   # E2E — usage-collector lane, TimescaleDB + ClickHouse backends (dedicated binary each; needs Docker)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
 make all                   # full pipeline (build + check + test-sqlite + e2e-local)

@@ -1,0 +1,220 @@
+# E2E configuration for the usage-collector gear, ClickHouse storage backend.
+#
+# Sibling of config.yaml (TimescaleDB), colocated in this suite directory:
+# same tenants,
+# tokens, tree and API surface, so the same test bodies run unchanged against
+# either backend. Only the storage plugin — and the cluster gear it needs —
+# differ. Used only by `make e2e-usage-collector`, which builds a dedicated
+# binary per backend and starts the matching container. NOT part of
+# config/e2e-features.txt or the shared `make e2e-local` run.
+#
+# The two authz surfaces reach the PDP differently. usage-collector's
+# `usage_type` resource is platform-global per ADR-0012 and so declares no
+# supported properties (`ResourceType::from_static(.., &[])`), which means
+# `static-authz-plugin` emits no `owner_tenant_id` clamp for the CATALOG routes
+# (create/get/list/delete) — a constraint naming an undeclared property is an
+# `AllConstraintsFailed` deny in the PEP compiler. Those routes run under
+# `require_constraints(false)`, so the empty set compiles to `allow_all` and the
+# catalog is tenant-agnostic. The usage-RECORD routes declare
+# `owner_tenant_id` and run under `require_constraints(true)`, so they carry the
+# usual row clamp and the tenant-scoping tests below have something to assert
+# against.
+#
+# `__E2E_CH_PORT__` is substituted with the container's mapped host port by
+# testing/e2e/suites/usage_collector/conftest.py before the server starts.
+#
+# usage-collector itself declares no `db` capability (all durable usage rows
+# live in the bound storage plugin's own ClickHouse, via `database_url`
+# below) and types-registry is in-memory. BUT a top-level `database:` section
+# IS required regardless: `credstore`, `resource-group`, `simple-user-settings`,
+# and `file-parser` are gears compiled unconditionally into
+# cf-gears-example-server (not gated by any cargo feature — see
+# apps/cf-gears-example-server/Cargo.toml) and the first three call
+# `ctx.db_required()` at init. A local SQLite server is used for these gears; it
+# is completely independent of the ClickHouse plugin's own connection.
+database:
+  servers:
+    sqlite_uc_e2e:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+      pool:
+        max_conns: 5
+
+server:
+  home_dir: "~/.cf-gears"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/cf-gears-e2e-usage-collector-clickhouse.log"
+    file_level: debug
+    max_age_days: 7
+    max_backups: 3
+    max_size_mb: 50
+  sqlx:
+    console_level: warn
+    file: "logs/sql-usage-collector-clickhouse.log"
+    file_level: debug
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8088"
+      enable_docs: true
+      cors_enabled: false
+      auth_disabled: false
+      require_auth_by_default: true
+      openapi:
+        title: "CF/Gears Usage Collector E2E (ClickHouse)"
+        version: "0.1.0"
+        description: "Usage Collector E2E server, ClickHouse backend"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/cf-gears-grpc-uc-ch-e2e"
+
+  types-registry:
+    config: {}
+
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # Single-root tree (static-tr-plugin enforces exactly one root). Tenants A
+  # and B are SIBLINGS, so neither is an ancestor of the other and the PDP's
+  # own-tenant clamp genuinely isolates them.
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      tenants:
+        - id: "a0000000-0000-4000-8000-000000000000"
+          name: "e2e-uc-root"
+          parent_id: null
+          status: active
+        - id: "a0000000-0000-4000-8000-00000000000a"
+          name: "e2e-uc-tenant-a"
+          parent_id: "a0000000-0000-4000-8000-000000000000"
+          status: active
+        - id: "a0000000-0000-4000-8000-00000000000b"
+          name: "e2e-uc-tenant-b"
+          parent_id: "a0000000-0000-4000-8000-000000000000"
+          status: active
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: static_tokens
+      tokens:
+        - token: "e2e-uc-token-tenant-a"
+          identity:
+            subject_id: "a0000000-0000-4000-8000-0000000000a1"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-uc-token-tenant-b"
+          identity:
+            subject_id: "a0000000-0000-4000-8000-0000000000b1"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000b"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # credstore, resource-group, and simple-user-settings are mandatory gears
+  # (not gated by any cargo feature) that require a database at init; see the
+  # top-of-file note. No credstore storage plugin is bound here since this
+  # e2e suite never exercises credstore's endpoints.
+  credstore:
+    database:
+      server: "sqlite_uc_e2e"
+      file: "credstore.db"
+    config:
+      vendor: "constructorfabric"
+
+  resource-group:
+    database:
+      server: "sqlite_uc_e2e"
+      file: "resource_group.db"
+    config: {}
+
+  simple-user-settings:
+    database:
+      server: "sqlite_uc_e2e"
+      file: "settings.db"
+    config: {}
+
+  # file-parser is also a mandatory gear; `allowed_local_base_dir` has no
+  # default.
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  # The ClickHouse plugin acquires a per-`gts_id` exclusive lock around both
+  # `create_usage_record(s)` and `delete_usage_type` (ClickHouse has no FKs, so
+  # referential integrity is application-emulated). It resolves that lock from
+  # the cluster gear under the fixed profile name `usage-collector`
+  # (`UsageCollectorProfile::NAME`), and every create/delete fails closed with a
+  # retryable `Transient` error if the profile is unbound — so this block is
+  # mandatory, not optional tuning. `lock:` is deliberately omitted: the cluster
+  # wiring then auto-wraps a linearizable CasBasedDistributedLockBackend over
+  # this profile's cache, which is what the plugin requires.
+  cluster:
+    config:
+      profiles:
+        usage-collector:
+          cache: { provider: standalone }
+
+  # `vendor` is written out explicitly on BOTH the gear and the plugin. They
+  # happen to share the same crate default today (`cyberfabric`); stating it
+  # means a future default change in either crate cannot silently leave the
+  # gear with no storage plugin bound — a failure that would otherwise surface
+  # only on the first dispatch, not at startup.
+  usage-collector:
+    config:
+      vendor: "cyberfabric"
+
+  clickhouse-usage-collector-plugin:
+    config:
+      vendor: "cyberfabric"
+      priority: 10
+      # allow_insecure_http is the deliberate opt-out ClickHousePluginConfig::
+      # validate honours: it rejects a plaintext http:// database_url at
+      # startup unless this is set, because the URL embeds credentials. The
+      # test container serves no TLS. MUST NOT be set in production.
+      database_url: "http://default:ch_test_pw@127.0.0.1:__E2E_CH_PORT__/default"
+      allow_insecure_http: true
+      request_timeout_secs: 30
+      lock_ttl_secs: 30
+      lock_timeout_secs: 5
+      # 10 years. Long enough that the usage_records TTL can never drop test
+      # rows mid-run, and — unlike a value near the ceiling — safely inside the
+      # range the TTL expression can represent.
+      #
+      # Do NOT raise this toward MAX_RETENTION_SECS (100 years). The migration
+      # emits `TTL toDateTime(created_at) + INTERVAL <n> SECOND`, and
+      # `toDateTime` is ClickHouse's 32-bit DateTime, which saturates in 2106 —
+      # `validate` bounds `n` against DateTime64 instead. At 100 years the sum
+      # wraps to a past instant, so every row is TTL-expired the moment it is
+      # written: inserts report success, `written_rows = 1`, and the table stays
+      # empty. Reads then 404 with nothing in the server log to explain it.
+      retention_period_secs: 315360000

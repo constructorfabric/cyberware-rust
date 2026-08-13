@@ -1,11 +1,18 @@
 """E2E fixtures for the usage-collector gear.
 
-This module owns its own server AND its own TimescaleDB container, because the
-gear's storage plugin connects and migrates a real TimescaleDB at init and
-fails hard when it cannot. It therefore gates on E2E_BINARY and skips when
-unset, exactly like mini_chat: `make e2e-local` builds a binary WITHOUT the
+This module owns its own server AND its own database container, because the
+gear's storage plugin connects and migrates a real database at init and fails
+hard when it cannot. It therefore gates on E2E_BINARY and skips when unset,
+exactly like mini_chat: `make e2e-local` builds a binary WITHOUT the
 usage-collector features, so running there would start a second server and a
 container for routes that binary does not serve.
+
+The suite runs against either storage backend, selected by `UC_E2E_BACKEND`
+(see BACKENDS below). Only this module knows which one is active: the test
+bodies talk HTTP and are backend-agnostic. Because a plugin compiled into the
+binary always initializes — and both plugins fail init without their own
+database — each backend needs its own binary, built from its own cargo feature
+set, and the two run sequentially rather than in one process.
 
 Run it with: make e2e-usage-collector
 """
@@ -21,20 +28,48 @@ import httpx
 import pytest
 
 from lib.orchestrator import GearTestEnv
-from lib.sidecars import TimescaleDbSidecar, skip_without_docker
+from lib.sidecars import ClickHouseSidecar, TimescaleDbSidecar, skip_without_docker
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
 HERE = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-CONFIG = HERE / "config.yaml"
-PORT_PLACEHOLDER = "__E2E_TS_PORT__"
+
+# Per-backend wiring: config file, sidecar class, the DSN port placeholder that
+# config carries, and the plugin crate to raise to debug logging.
+BACKENDS = {
+    "timescaledb": {
+        "config": "config.yaml",
+        "sidecar": TimescaleDbSidecar,
+        "placeholder": "__E2E_TS_PORT__",
+        "log_crate": "cf_gears_timescaledb_usage_collector_plugin",
+    },
+    "clickhouse": {
+        "config": "config-clickhouse.yaml",
+        "sidecar": ClickHouseSidecar,
+        "placeholder": "__E2E_CH_PORT__",
+        "log_crate": "cf_gears_clickhouse_usage_collector_plugin",
+    },
+}
+
+# Defaults to timescaledb so a bare `pytest testing/e2e/suites/usage_collector/`
+# behaves as it always has; the Makefile sets this explicitly for each run.
+BACKEND = os.environ.get("UC_E2E_BACKEND", "timescaledb")
+if BACKEND not in BACKENDS:
+    raise RuntimeError(
+        f"UC_E2E_BACKEND={BACKEND!r} is not one of {sorted(BACKENDS)}"
+    )
+
+_BACKEND_CFG = BACKENDS[BACKEND]
+CONFIG = HERE / _BACKEND_CFG["config"]
+SIDECAR = _BACKEND_CFG["sidecar"]
+PORT_PLACEHOLDER = _BACKEND_CFG["placeholder"]
 
 SERVER_PORT = 8088
 API_BASE = "/usage-collector/v1"
 REQUEST_TIMEOUT = 5.0
 
-# Must match this suite's config.yaml.
+# Must match both backend configs; they share one tenant/token set on purpose.
 TENANT_A = "a0000000-0000-4000-8000-00000000000a"
 TENANT_B = "a0000000-0000-4000-8000-00000000000b"
 TOKEN_A = "e2e-uc-token-tenant-a"
@@ -109,7 +144,7 @@ def pytest_collection_modifyitems(items):
     suites too.
 
     The problem: pytest-timeout charges FIXTURE SETUP against whichever test
-    triggers it. The session-scoped `test_env` starts a TimescaleDB container
+    triggers it. The session-scoped `test_env` starts a database container
     (image pull included) and waits up to 90s for the server to become
     healthy, so the first test to run would blow pytest.ini's 10s budget
     through no fault of its own.
@@ -155,9 +190,12 @@ def _patch_config(config_text: str, env) -> str:
     The orchestrator calls this AFTER sidecars start, so the port is known.
     """
     for sidecar in env.sidecars:
-        if sidecar.name == "timescaledb":
+        if sidecar.name == SIDECAR.name:
             return config_text.replace(PORT_PLACEHOLDER, sidecar.dsn_port)
-    raise RuntimeError("timescaledb sidecar missing from GearTestEnv.sidecars")
+    raise RuntimeError(
+        f"{SIDECAR.name} sidecar missing from GearTestEnv.sidecars "
+        f"(UC_E2E_BACKEND={BACKEND})"
+    )
 
 
 @pytest.fixture(scope="session")
@@ -171,10 +209,11 @@ def gear_test_env() -> GearTestEnv:
         env={"RUST_LOG": os.environ.get(
             "RUST_LOG",
             "info,cf_gears_usage_collector=debug,"
-            "cf_gears_timescaledb_usage_collector_plugin=debug",
+            f"{_BACKEND_CFG['log_crate']}=debug",
         )},
-        sidecars=[TimescaleDbSidecar()],
-        log_suffix="usage-collector",
+        sidecars=[SIDECAR()],
+        # Backend-suffixed so the two runs do not overwrite each other's log.
+        log_suffix=f"usage-collector-{BACKEND}",
     )
 
 

@@ -10,6 +10,9 @@ requirements.txt is minimal and Snyk-pinned, and testcontainers-rs 0.27 (used
 by the Rust plugin tests) ships no ryuk either, so the library would buy no
 cleanup guarantee the repo already relies on. Orphans are handled by the label
 reaper below.
+
+``_DockerSidecar`` owns the lifecycle every container shares; a subclass
+supplies its image, its environment, and its own readiness probe.
 """
 
 from __future__ import annotations
@@ -23,12 +26,12 @@ import time
 import pytest
 
 DOCKER_TIMEOUT = 120
-# Image pulls get their own, far more generous budget. See TimescaleDbSidecar.pull.
+# Image pulls get their own, far more generous budget. See _DockerSidecar.pull.
 PULL_TIMEOUT = 600
 READY_TIMEOUT = 60
 READY_POLL_INTERVAL = 0.5
 # Consecutive successful query probes required before a container is called
-# ready. See TimescaleDbSidecar._wait_ready for why one success is not enough.
+# ready. See _DockerSidecar._wait_ready for why one success is not enough.
 REQUIRED_CONSECUTIVE_OK = 3
 
 # The TimescaleDB pin, mirrored from libs/test-containers/src/lib.rs (TIMESCALEDB_IMAGE,
@@ -88,32 +91,29 @@ def skip_without_docker() -> None:
         pytest.skip(f"Docker required for this suite: {exc}", allow_module_level=True)
 
 
-class TimescaleDbSidecar:
-    """A throwaway TimescaleDB container with a dynamically mapped host port.
+class _DockerSidecar:
+    """A throwaway container with a dynamically mapped host port.
 
-    The image comes from the module-level pin (TIMESCALEDB_IMAGE) and
-    `timescaledb_tag()`, so GEARS_TEST_TIMESCALEDB_TAG moves this lane and the
-    Rust plugin tests together. Resolved once, at class-definition time: the
-    variable is set before pytest starts, and keeping IMAGE a plain attribute
-    spares every caller -- including test_sidecar_contract.py -- a method call.
+    Subclasses set `IMAGE`, `LABEL`, `CONTAINER_PORT` and `name`, then
+    implement `_env_args` (the container's environment) and `_probe` (one
+    readiness attempt). Everything else — reap, pull, run, port lookup, the
+    consecutive-OK readiness wait, and teardown — is shared.
     """
 
-    IMAGE = f"{TIMESCALEDB_IMAGE}:{timescaledb_tag()}"
-    LABEL = "cf-gears-e2e=usage-collector"
+    # Subclass contract.
+    IMAGE = ""
+    LABEL = ""
+    # The container-side port to map, in `docker port` syntax, e.g. "5432/tcp".
+    CONTAINER_PORT = ""
+    name = ""
 
-    DB_USER = "uc"
-    DB_PASSWORD = "uc"
-    DB_NAME = "uc"
-
-    name = "timescaledb"
-
-    def __init__(self, label: str = LABEL) -> None:
+    def __init__(self, label: str | None = None) -> None:
         # Per-instance label (defaulting to the class constant) so a caller
         # that needs an isolated Docker namespace — e.g. the sidecar
         # self-tests in test_sidecar_contract.py, which plant and reap
         # orphans of their own — cannot collide with (and reap!) the label
         # a real session's container is running under.
-        self.label = label
+        self.label = label or self.LABEL
         self.port: int | None = None
         self.container_id: str | None = None
 
@@ -121,11 +121,11 @@ class TimescaleDbSidecar:
     def dsn_port(self) -> str:
         """Mapped host port as a string, for config substitution."""
         if self.port is None:
-            raise RuntimeError("TimescaleDbSidecar.start() has not run")
+            raise RuntimeError(f"{type(self).__name__}.start() has not run")
         return str(self.port)
 
     @classmethod
-    def reap_orphans(cls, label: str = LABEL) -> None:
+    def reap_orphans(cls, label: str | None = None) -> None:
         """Remove containers left by an earlier interrupted run.
 
         atexit does not fire on SIGKILL or a hard crash, so a leaked container
@@ -137,6 +137,7 @@ class TimescaleDbSidecar:
         use. Callers MUST pass the label of the namespace they own; never
         reap a label whose container might be a live session under test.
         """
+        label = label or cls.LABEL
         ids = _run(["docker", "ps", "-aq", "--filter", f"label={label}"])
         for container_id in ids.splitlines():
             container_id = container_id.strip()
@@ -171,9 +172,7 @@ class TimescaleDbSidecar:
         self.container_id = _run([
             "docker", "run", "-d", "-P",
             "--label", self.label,
-            "-e", f"POSTGRES_USER={self.DB_USER}",
-            "-e", f"POSTGRES_PASSWORD={self.DB_PASSWORD}",
-            "-e", f"POSTGRES_DB={self.DB_NAME}",
+            *self._env_args(),
             self.IMAGE,
         ])
         atexit.register(self.stop)
@@ -185,7 +184,7 @@ class TimescaleDbSidecar:
         # runs. BaseException, not Exception, so a Ctrl-C during the readiness
         # wait cleans up too.
         try:
-            mapping = _run(["docker", "port", self.container_id, "5432/tcp"])
+            mapping = _run(["docker", "port", self.container_id, self.CONTAINER_PORT])
             # e.g. "0.0.0.0:32768" or two lines (IPv4 + IPv6). Take the first.
             self.port = int(mapping.splitlines()[0].rsplit(":", 1)[1])
 
@@ -194,55 +193,45 @@ class TimescaleDbSidecar:
             self.stop()
             raise
 
-        print(f"[sidecar] timescaledb ready on 127.0.0.1:{self.port} "
+        print(f"[sidecar] {self.name} ready on 127.0.0.1:{self.port} "
               f"({self.container_id[:12]})")
 
+    def _env_args(self) -> list[str]:
+        """The `-e KEY=VALUE` pairs to pass to `docker run`."""
+        raise NotImplementedError
+
+    def _probe(self) -> tuple[bool, str]:
+        """Run one readiness attempt: `(succeeded, error text when it did not)`.
+
+        Called repeatedly by `_wait_ready`; must be cheap and must never raise.
+        """
+        raise NotImplementedError
+
     def _wait_ready(self) -> None:
-        """Block until the container serves real queries over its mapped port.
+        """Block until `_probe` succeeds `REQUIRED_CONSECUTIVE_OK` times running.
 
-        `pg_isready` alone is NOT sufficient, and using it alone caused
-        intermittent "connection reset by peer" / "expected to read 5 bytes,
-        got 0 bytes at EOF" failures in the gear under test. Two reasons:
-
-        * Run over `docker exec`, it talks to the container's Unix socket. The
-          official Postgres entrypoint starts a *temporary* local-only server
-          to run initdb and any init scripts, then shuts it down and starts the
-          real one. During that window `pg_isready` succeeds while nothing is
-          listening on TCP yet.
-        * Even once TCP is up, the restart boundary can accept a connection and
-          immediately drop it.
-
-        So readiness here means: a real query, executed via `docker exec` against
-        the container's OWN loopback (`-h 127.0.0.1 -p 5432`, i.e. the container's
-        internal TCP listener, not the host-mapped port), succeeding
-        `REQUIRED_CONSECUTIVE_OK` times in a row. `-h 127.0.0.1` forces psql onto
-        TCP rather than the Unix socket, and the repetition is what makes the
-        init->restart boundary observable instead of a coin flip. Host-side
-        reachability through the mapped port is a separate concern, covered by
-        `test_sidecar_contract.py`'s plain `socket.create_connection` probe.
+        A single success is not enough. A database container typically starts
+        a temporary server to initialise itself, then shuts it down and starts
+        the real one; a probe landing in that window succeeds against a server
+        that is about to disappear, and the restart boundary can also accept a
+        connection and immediately drop it. Requiring consecutive successes is
+        what makes that boundary observable instead of a coin flip — hence the
+        reset (not decrement) below: the boundary must be crossed cleanly, not
+        merely survived on balance.
         """
         deadline = time.monotonic() + READY_TIMEOUT
         consecutive_ok = 0
         last_err = ""
 
         while time.monotonic() < deadline:
-            probe = subprocess.run(
-                ["docker", "exec", "-e", f"PGPASSWORD={self.DB_PASSWORD}",
-                 self.container_id,
-                 "psql", "-h", "127.0.0.1", "-p", "5432",
-                 "-U", self.DB_USER, "-d", self.DB_NAME,
-                 "-tAc", "select 1"],
-                capture_output=True, text=True, timeout=30, check=False,
-            )
-            if probe.returncode == 0 and probe.stdout.strip() == "1":
+            ok, err = self._probe()
+            if ok:
                 consecutive_ok += 1
                 if consecutive_ok >= REQUIRED_CONSECUTIVE_OK:
                     return
             else:
-                # Reset, not decrement: the restart boundary must be crossed
-                # cleanly, not merely survived on balance.
                 consecutive_ok = 0
-                last_err = (probe.stderr or probe.stdout).strip()
+                last_err = err
             time.sleep(READY_POLL_INTERVAL)
 
         logs = subprocess.run(
@@ -250,7 +239,7 @@ class TimescaleDbSidecar:
             capture_output=True, text=True, timeout=30, check=False,
         )
         raise RuntimeError(
-            f"TimescaleDB not ready within {READY_TIMEOUT}s "
+            f"{self.name} not ready within {READY_TIMEOUT}s "
             f"(container {self.container_id}). Last probe error: {last_err}\n"
             f"--- docker logs ---\n{logs.stdout}\n{logs.stderr}"
         )
@@ -264,3 +253,130 @@ class TimescaleDbSidecar:
         )
         self.container_id = None
         self.port = None
+
+
+class TimescaleDbSidecar(_DockerSidecar):
+    """A throwaway TimescaleDB container with a dynamically mapped host port.
+
+    The image comes from the module-level pin (TIMESCALEDB_IMAGE) and
+    `timescaledb_tag()`, so GEARS_TEST_TIMESCALEDB_TAG moves this lane and the
+    Rust plugin tests together. Resolved once, at class-definition time: the
+    variable is set before pytest starts, and keeping IMAGE a plain attribute
+    spares every caller -- including test_sidecar_contract.py -- a method call.
+    """
+
+    IMAGE = f"{TIMESCALEDB_IMAGE}:{timescaledb_tag()}"
+    LABEL = "cf-gears-e2e=usage-collector"
+    CONTAINER_PORT = "5432/tcp"
+
+    DB_USER = "uc"
+    DB_PASSWORD = "uc"
+    DB_NAME = "uc"
+
+    name = "timescaledb"
+
+    def _env_args(self) -> list[str]:
+        return [
+            "-e", f"POSTGRES_USER={self.DB_USER}",
+            "-e", f"POSTGRES_PASSWORD={self.DB_PASSWORD}",
+            "-e", f"POSTGRES_DB={self.DB_NAME}",
+        ]
+
+    def _probe(self) -> tuple[bool, str]:
+        """Run a real query against the container's OWN TCP listener.
+
+        `pg_isready` alone is NOT sufficient, and using it alone caused
+        intermittent "connection reset by peer" / "expected to read 5 bytes,
+        got 0 bytes at EOF" failures in the gear under test. Run over
+        `docker exec`, it talks to the container's Unix socket, and the
+        official Postgres entrypoint starts a *temporary* local-only server to
+        run initdb and any init scripts before starting the real one — during
+        that window `pg_isready` succeeds while nothing is listening on TCP
+        yet.
+
+        So readiness here means a real query, executed via `docker exec`
+        against the container's own loopback (`-h 127.0.0.1 -p 5432`, i.e. the
+        container's internal TCP listener, not the host-mapped port). The
+        `-h 127.0.0.1` forces psql onto TCP rather than the Unix socket.
+        Host-side reachability through the mapped port is a separate concern,
+        covered by `test_sidecar_contract.py`'s plain `socket.create_connection`
+        probe.
+        """
+        probe = subprocess.run(
+            ["docker", "exec", "-e", f"PGPASSWORD={self.DB_PASSWORD}",
+             self.container_id,
+             "psql", "-h", "127.0.0.1", "-p", "5432",
+             "-U", self.DB_USER, "-d", self.DB_NAME,
+             "-tAc", "select 1"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if probe.returncode == 0 and probe.stdout.strip() == "1":
+            return True, ""
+        return False, (probe.stderr or probe.stdout).strip()
+
+
+class ClickHouseSidecar(_DockerSidecar):
+    """A throwaway ClickHouse container with a dynamically mapped host port.
+
+    Keep IMAGE in sync with the Rust plugin integration tests:
+    gears/system/usage-collector/plugins/clickhouse-usage-collector-plugin/tests/common/mod.rs
+    A skew between the two means the plugin's schema DDL is validated against
+    a different ClickHouse version than E2E runs.
+    """
+
+    IMAGE = "clickhouse/clickhouse-server:24.3"
+    LABEL = "cf-gears-e2e=usage-collector-ch"
+    # The HTTP interface: the `clickhouse` crate the plugin uses is
+    # HTTP-based, so 8123 — not the native protocol's 9000 — is the port
+    # `database_url` points at.
+    CONTAINER_PORT = "8123/tcp"
+
+    DB_USER = "default"
+    # MUST be non-empty. The official image's entrypoint only provisions
+    # `default` with `<networks><ip>::/0</ip></networks>` when CLICKHOUSE_USER
+    # is non-default **or** CLICKHOUSE_PASSWORD is non-empty; otherwise it
+    # writes a `users.d` override restricting `default` to 127.0.0.1/::1,
+    # which rejects every connection arriving through the mapped host port.
+    # Mirrors CH_TEST_PASSWORD in the Rust harness.
+    DB_PASSWORD = "ch_test_pw"
+    DB_NAME = "default"
+
+    name = "clickhouse"
+
+    def _env_args(self) -> list[str]:
+        return [
+            "-e", f"CLICKHOUSE_USER={self.DB_USER}",
+            "-e", f"CLICKHOUSE_PASSWORD={self.DB_PASSWORD}",
+            "-e", f"CLICKHOUSE_DB={self.DB_NAME}",
+        ]
+
+    def _probe(self) -> tuple[bool, str]:
+        """Run `SELECT 1` over the mapped HTTP port, as the plugin itself will.
+
+        Probing the host-mapped HTTP interface rather than exec'ing a client
+        inside the container is deliberate: it is the exact transport, port
+        and credentials the plugin's `build_client` uses, so a success here
+        means the plugin can connect. That matters more than for TimescaleDB
+        because the plugin's `apply_migrations` runs at gear `init` with no
+        retry loop of its own (only the Rust *test* harness retries) — a
+        false-ready therefore fails server startup outright rather than
+        costing one reconnect.
+
+        This image also logs to files under /var/log/clickhouse-server rather
+        than stdout, so a log-based wait strategy cannot work at all; the Rust
+        harness polls `SELECT 1` for the same reason.
+        """
+        import httpx
+
+        try:
+            resp = httpx.get(
+                f"http://127.0.0.1:{self.port}/",
+                params={"query": "SELECT 1"},
+                auth=(self.DB_USER, self.DB_PASSWORD),
+                timeout=5,
+            )
+        except httpx.HTTPError as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        if resp.status_code == 200 and resp.text.strip() == "1":
+            return True, ""
+        return False, f"HTTP {resp.status_code}: {resp.text.strip()[:200]}"

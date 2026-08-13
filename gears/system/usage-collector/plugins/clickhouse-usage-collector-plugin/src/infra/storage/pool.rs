@@ -1,0 +1,325 @@
+//! `ClickHouse` connection-pool bootstrap and schema migration.
+//!
+//! Exposes two public entry points:
+//! - [`build_client`] — constructs and configures the `clickhouse::Client`.
+//! - [`apply_migrations`] — runs the embedded DDL against the connected
+//!   `ClickHouse` instance.
+
+use anyhow::Context as _;
+use url::Url;
+
+use crate::config::{ClickHousePluginConfig, is_plaintext_url};
+
+/// Endpoint components split out of a `database_url` for the `clickhouse`
+/// crate's connection-configuration methods.
+///
+/// The `clickhouse` 0.15.x crate's `Client::with_url` stores the given string
+/// verbatim as the base request URL — every query/insert does
+/// `Url::parse(&client.url)` and only clears/rewrites the *query string*
+/// (`query_pairs_mut().clear()`); the URL's **path** and **userinfo** pass
+/// straight through unchanged (see `clickhouse::query::do_execute` /
+/// `insert_formatted`). So a `database_url` like
+/// `http://user:pass@host:8123/mydb` sent as-is to `with_url` would request
+/// the literal HTTP path `/mydb` on every call — which `ClickHouse`'s HTTP
+/// interface rejects with "There is no handle /mydb..." (only `/`, `/ping`,
+/// etc. are implemented) — while silently discarding the credentials, since
+/// `with_url` never touches `Client::authentication` / `Client::database`.
+/// Those must instead be extracted here and applied via
+/// `with_user`/`with_password`/`with_database`, matching this plugin's own
+/// documented config contract (README: `database_url = "https://user:pass@host:8443/db"`).
+struct ParsedEndpoint {
+    /// Bare scheme + host + port, no userinfo/path/query — safe to pass to
+    /// `Client::with_url`.
+    base_url: String,
+    user: Option<String>,
+    password: Option<String>,
+    database: Option<String>,
+}
+
+/// Split a `database_url` into a bare HTTP endpoint plus optional
+/// user/password/database.
+///
+/// Username and password are taken from the URL's userinfo as-is (not
+/// percent-decoded): callers embedding `${VAR}`-expanded secrets containing
+/// URL-reserved characters must percent-encode them in `database_url` first.
+/// The database name is the URL path with leading/trailing slashes trimmed;
+/// an empty path yields `None` (`ClickHouse` then uses the server's default
+/// database for the resolved user).
+///
+/// # Errors
+///
+/// Returns [`url::ParseError`] if `database_url` is not a valid absolute URL.
+fn parse_endpoint(database_url: &str) -> Result<ParsedEndpoint, url::ParseError> {
+    let mut url = Url::parse(database_url)?;
+
+    let user = (!url.username().is_empty()).then(|| url.username().to_owned());
+    let password = url.password().map(str::to_owned);
+    let database = {
+        let path = url.path().trim_matches('/');
+        (!path.is_empty()).then(|| path.to_owned())
+    };
+
+    // Strip userinfo/path/query so the remaining string is a bare endpoint
+    // safe to hand to `Client::with_url` (see struct-level doc comment).
+    // `set_username`/`set_password` only fail for schemes that cannot carry
+    // credentials (e.g. `file:`); an http(s) URL that parsed successfully
+    // above always accepts them, so the `Result` is deliberately ignored.
+    url.set_username("").ok();
+    url.set_password(None).ok();
+    url.set_path("");
+    url.set_query(None);
+
+    Ok(ParsedEndpoint {
+        base_url: url.to_string(),
+        user,
+        password,
+        database,
+    })
+}
+
+/// Embedded schema migration SQL.
+///
+/// Relative path from this file (`src/infra/storage/pool.rs`) three levels
+/// up to the crate root, then into `migrations/`.
+pub(crate) const MIGRATION_SQL: &str = include_str!("../../../migrations/0001_init.sql");
+
+/// Placeholder token in the migration SQL that is replaced by the startup-time
+/// retention window before the DDL is executed.
+pub(crate) const RETENTION_PLACEHOLDER: &str = "{retention_period_secs}";
+
+/// Replace the `{retention_period_secs}` placeholder in a migration SQL string.
+///
+/// Called by [`apply_migrations`] at init time and by unit tests in
+/// `pool_tests.rs` to verify substitution correctness without a live
+/// `ClickHouse` connection.
+fn substitute_retention(sql: &str, retention_period_secs: u64) -> String {
+    sql.replace(RETENTION_PLACEHOLDER, &retention_period_secs.to_string())
+}
+
+/// Build a configured `clickhouse::Client` from the plugin config.
+///
+/// The DSN (embedding credentials) is unwrapped from [`SecretFromEnv`] only
+/// here at the connection boundary — it is never logged or stored past this
+/// call. `ClickHouse` credentials and usage data are always sent in
+/// cleartext when the URL scheme is `http://`; [`ClickHousePluginConfig::validate`]
+/// (called by `Gear::init` before this function) already fails closed on a
+/// plaintext `database_url` unless `allow_insecure_http` is explicitly set,
+/// so a call reaching here with a `http://` URL has already had that
+/// override deliberately enabled. This function still emits a
+/// [`tracing::warn!`] in that case — defense-in-depth observability for any
+/// call path that does not route through `validate()` first, and a durable
+/// operator-visible signal every time an insecure connection is actually
+/// made.
+///
+/// Timeout configuration is forwarded via `ClickHouse` session settings
+/// `send_timeout` and `receive_timeout` (both bound to
+/// `cfg.request_timeout_secs`).  The `clickhouse` 0.15.x `Client` is a
+/// lightweight handle over an internal `hyper` connection pool.
+pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
+    let url = cfg.database_url.expose();
+
+    // TLS posture check — mirrors the reference plugin's sslmode-warn pattern.
+    // Reaching this branch means `allow_insecure_http` was explicitly set
+    // (validate() already rejected an unqualified `http://` database_url);
+    // `https://` (the production default) requires no warning.
+    if is_plaintext_url(url) {
+        tracing::warn!(
+            "connecting to `ClickHouse` with http:// scheme: credentials and usage \
+             data are sent in cleartext. Use https:// for encrypted transport \
+             in production."
+        );
+    }
+
+    // On the production path this branch is unreachable: `Gear::init` always
+    // calls `ClickHousePluginConfig::validate` before `build_client`, and
+    // `validate` rejects a `database_url` that `Url::parse` cannot handle. It
+    // only defends call sites that construct a client without validating first
+    // (direct unit/integration use of `build_client`), where returning an inert
+    // client is preferable to panicking.
+    //
+    // The resulting client cannot connect anywhere: the `clickhouse` crate
+    // re-parses `Client::url` on every request, so the same parse failure
+    // surfaces as `Error::InvalidParams` before any socket is opened — no
+    // request is sent and no credentials leave the process.
+    let endpoint = parse_endpoint(url).unwrap_or_else(|err| {
+        tracing::warn!(
+            error = %err,
+            "database_url failed to parse as a URL; every ClickHouse request will fail with \
+             an invalid-params error before any connection is attempted"
+        );
+        ParsedEndpoint {
+            base_url: url.to_owned(),
+            user: None,
+            password: None,
+            database: None,
+        }
+    });
+
+    // `send_timeout` and `receive_timeout` are standard `ClickHouse` HTTP API
+    // settings accepted as URL query parameters or per-request headers.
+    // The `clickhouse` crate passes them as request headers on every query.
+    // Both are set to `request_timeout_secs` — the crate exposes a single
+    // combined timeout knob rather than separate send/receive splits.
+    let timeout_str = cfg.request_timeout_secs.to_string();
+
+    let mut client = clickhouse::Client::default()
+        .with_url(endpoint.base_url)
+        .with_setting("send_timeout", &timeout_str)
+        .with_setting("receive_timeout", &timeout_str);
+
+    if let Some(user) = endpoint.user {
+        client = client.with_user(user);
+    }
+    if let Some(password) = endpoint.password {
+        client = client.with_password(password);
+    }
+    if let Some(database) = endpoint.database {
+        client = client.with_database(database);
+    }
+
+    client
+}
+
+/// Strip `--` SQL comments, returning only the executable source.
+///
+/// Comments must be removed *before* splitting on `;`: this migration file's
+/// prose comments use semicolons as ordinary punctuation (e.g. "...has no
+/// `pg_advisory_lock` equivalent; unlike the reference plugin..."), and a
+/// naive `sql.split(';')` treats that mid-sentence semicolon as a statement
+/// boundary. The resulting fragment starts mid-comment *without* its `--`
+/// prefix (which was left behind in the previous split chunk), so a
+/// per-statement "is this comment-only?" check can't catch it — `ClickHouse`
+/// then rejects the fragment as a syntax error. Stripping every `--` comment
+/// first removes the semicolon from the executable text entirely, so it can
+/// never become a false statement boundary.
+///
+/// A `--` is also stripped when it trails executable text on the same line
+/// (`DDL -- trailing comment`), so a comment added that way to the migration
+/// file cannot smuggle a semicolon into the executable source. Quote state is
+/// tracked while scanning — `''` escapes included, matching
+/// [`split_sql_statements`] — so a `--` inside a `COMMENT '...'` column
+/// annotation is left untouched.
+fn strip_line_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut in_string = false;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if in_string && chars.peek() == Some(&'\'') => {
+                out.push('\'');
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            }
+            '\'' => {
+                in_string = !in_string;
+                out.push(c);
+            }
+            '-' if !in_string && chars.peek() == Some(&'-') => {
+                // Drop the comment body but keep the newline, so the remaining
+                // executable text stays on its original line.
+                while chars.peek().is_some_and(|&next| next != '\n') {
+                    chars.next();
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+
+    out
+}
+
+/// Split (already comment-stripped) SQL into individual statements on `;`,
+/// ignoring semicolons inside single-quoted string literals.
+///
+/// This migration's `COMMENT '...'` column annotations are prose that itself
+/// uses semicolons as punctuation (e.g. `COMMENT 'Usage type; application-\
+/// enforced reference to usage_type_catalog (no FK in ClickHouse)'`) --  a
+/// plain `sql.split(';')` would cut statements apart mid-string-literal.
+/// A doubled `''` inside a string is treated as an escaped literal quote
+/// (standard SQL / `ClickHouse` string-escaping) rather than a string
+/// terminator, though this file does not currently use that form.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if in_string && chars.peek() == Some(&'\'') => {
+                // Escaped `''` inside a string literal -- consume both quotes
+                // as literal content, stay inside the string.
+                current.push('\'');
+                if let Some(escaped) = chars.next() {
+                    current.push(escaped);
+                }
+            }
+            '\'' => {
+                in_string = !in_string;
+                current.push(c);
+            }
+            ';' if !in_string => {
+                let stmt = current.trim().to_owned();
+                if !stmt.is_empty() {
+                    statements.push(stmt);
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+
+    let stmt = current.trim().to_owned();
+    if !stmt.is_empty() {
+        statements.push(stmt);
+    }
+
+    statements
+}
+
+/// Apply the embedded initial schema migration against the live `ClickHouse` instance.
+///
+/// Reads the embedded SQL from `migrations/0001_init.sql`, replaces the
+/// `{retention_period_secs}` placeholder with the configured value (baking the
+/// startup-time retention window as a DDL literal), strips `--` comment lines
+/// (see [`strip_line_comments`]), splits the result into statements on `';'`
+/// while respecting single-quoted string literals (see
+/// [`split_sql_statements`]), and executes each one via the `clickhouse`
+/// crate's raw query path.
+///
+/// Every statement uses `CREATE TABLE IF NOT EXISTS`, making the migration
+/// idempotent and safe to re-run on concurrent replica startup. `ClickHouse`
+/// has no `pg_advisory_lock` equivalent; idempotent DDL alone is sufficient
+/// because `CREATE TABLE IF NOT EXISTS` is internally atomic in `ClickHouse`.
+///
+/// # Errors
+///
+/// Returns an error if any DDL statement fails.  The context message includes
+/// the failing statement text.
+pub async fn apply_migrations(
+    client: &clickhouse::Client,
+    retention_period_secs: u64,
+) -> anyhow::Result<()> {
+    // Replace the runtime-substituted TTL placeholder before execution.
+    // The SQL file uses {retention_period_secs} as a plain token (not a SQL
+    // bind parameter — ClickHouse DDL does not support parameterised DDL).
+    let sql = substitute_retention(MIGRATION_SQL, retention_period_secs);
+    let sql = strip_line_comments(&sql);
+
+    for stmt in split_sql_statements(&sql) {
+        client
+            .query(&stmt)
+            .execute()
+            .await
+            .with_context(|| format!("migration DDL statement failed:\n{stmt}"))?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "pool_tests.rs"]
+mod pool_tests;

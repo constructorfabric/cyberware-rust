@@ -1,9 +1,15 @@
 """Integration-seam E2E tests for the usage-collector gear.
 
 Each test targets exactly one seam that only manifests over real HTTP against
-real TimescaleDB. Storage SQL, aggregation internals, domain validation and
-DTO conversion are covered by unit tests and by
+a real storage backend. Storage SQL, aggregation internals, domain validation
+and DTO conversion are covered by unit tests and by
 `make test-usage-collector-pg` — not here.
+
+Backend-agnostic by construction: these bodies talk HTTP only, and
+`make e2e-usage-collector` runs the whole module against both the TimescaleDB
+and the ClickHouse storage plugin. Anything asserted here is therefore a
+contract of the gear's API, not of one plugin — which is exactly what makes
+the two plugins substitutable.
 """
 
 from datetime import datetime
@@ -13,10 +19,18 @@ from .conftest import accepted_records, record_payload, window_filter
 
 
 async def test_ingest_and_read_record_roundtrip(api, make_usage_type):
-    """Seam: handler <-> JSON wire format <-> PostgreSQL round-trip.
+    """Seam: handler <-> JSON wire format <-> storage round-trip.
 
-    A Decimal `value` crosses as a string and comes back byte-identical, and
-    an RFC3339 `created_at` survives the timestamptz round-trip.
+    A Decimal `value` crosses as a string and comes back with its numeric value
+    intact, and an RFC3339 `created_at` survives the backend's timestamp
+    round-trip (PostgreSQL `timestamptz` / ClickHouse `DateTime64(6)`).
+
+    `value` is compared as a Decimal, not as a string: the trailing-zero scale
+    is the storage column's, not the gear's. PostgreSQL `NUMERIC` keeps the
+    scale it was given ("42.5"); ClickHouse `Decimal128(9)` is fixed-scale and
+    returns "42.500000000". Both carry the same number, which is the contract
+    the gear offers — asserting the digits would assert one plugin's column
+    type.
     """
     gts_id, _ = await make_usage_type()
     payload = record_payload(gts_id, value="42.5")
@@ -33,7 +47,7 @@ async def test_ingest_and_read_record_roundtrip(api, make_usage_type):
     assert fetched.status_code == 200, fetched.text
     body = fetched.json()
     assert body["id"] == record_id
-    assert body["value"] == "42.5"
+    assert Decimal(str(body["value"])) == Decimal("42.5")
     assert body["gts_id"] == gts_id
     assert body["tenant_id"] == payload["tenant_id"]
     assert body["status"] == "active"
@@ -173,11 +187,14 @@ async def test_get_usage_type(api, make_usage_type):
 
 
 async def test_delete_usage_type_referenced_by_record_is_rejected(api, make_usage_type):
-    """Seam: real PostgreSQL FK ON DELETE RESTRICT surfaced as HTTP 409.
+    """Seam: referential integrity surfaced as HTTP 409.
 
-    This is the canonical PostgreSQL-only seam: SQLite's default FK behaviour
-    differs, and no unit test can observe the constraint. An unreferenced type
-    deletes cleanly (204), a referenced one is refused (409).
+    No unit test can observe this: the constraint lives in the storage
+    backend, and each plugin enforces it differently — TimescaleDB with a real
+    FK `ON DELETE RESTRICT` (SQLite's default FK behaviour differs), ClickHouse
+    with a lock-protected verify-then-delete, since it has no FKs at all. The
+    gear's contract is identical either way, which is what this asserts: an
+    unreferenced type deletes cleanly (204), a referenced one is refused (409).
     """
     referenced_id, _ = await make_usage_type()
     unreferenced_id, _ = await make_usage_type()

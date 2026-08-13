@@ -470,7 +470,7 @@ async def test_my_endpoint(base_url, auth_headers):
 | `make e2e-local SUITE=file-parser`   | Local  | Run **one** suite: build its server + run its tests |
 | `make e2e-local-smoke`               | Local  | Smoke tests only (add `SUITE=<name>` to focus on one suite)  |
 | `make e2e-mini-chat`                 | Local  | Alias for `make e2e-local SUITE=mini-chat` (self-managed, offline) |
-| `make e2e-usage-collector`           | Local  | Alias for `make e2e-local SUITE=usage-collector` (self-managed; **requires Docker** for TimescaleDB) |
+| `make e2e-usage-collector`           | Local  | Usage-collector suite, run against both storage backends: a dedicated binary + container per backend, TimescaleDB then ClickHouse (**requires Docker**) |
 | `make e2e-tr-authz`                  | Local  | resource-group suite, `tr-authz` profile  |
 
 ## Troubleshooting

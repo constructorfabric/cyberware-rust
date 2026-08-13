@@ -1,0 +1,75 @@
+[package]
+name = "cf-gears-clickhouse-usage-collector-plugin"
+description = "ClickHouse Usage Collector storage backend plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+keywords = ["constructorfabric", "cf-gears"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "clickhouse_usage_collector_plugin"
+
+[lints]
+workspace = true
+
+[features]
+# Gates the ClickHouse-backed real-DB integration tests (Docker required).
+clickhouse = []
+
+[dependencies]
+usage-collector-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+cluster-sdk = { workspace = true }
+# Linked so `#[toolkit::gear(deps = [..., cluster])]` can resolve the gear crate;
+# also provides CasBasedDistributedLockBackend for tests via the same path dep.
+cluster = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true }
+
+async-trait = { workspace = true }
+# `join_all` for the concurrent per-`gts_id` partition phase of create_batch.
+futures = { workspace = true }
+
+clickhouse = { workspace = true }
+url = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_repr = { workspace = true }
+
+time = { workspace = true }
+rust_decimal = { workspace = true }
+bigdecimal = { workspace = true }
+chrono = { workspace = true }
+
+opentelemetry = { workspace = true }
+tracing = { workspace = true }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+xxhash-rust = { workspace = true }
+
+# Required by the toolkit::gear macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+uuid = { workspace = true }
+# Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="clickhouse")]-gated.
+testcontainers = { workspace = true }
+# In-memory metric reader for the metrics-recording unit tests; the `testing`
+# feature gates `InMemoryMetricExporter`.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# CasBasedDistributedLockBackend + StandaloneCache for lock-manager unit / integration tests.
+cf-gears-standalone-cluster-plugin = { path = "../../../cluster/plugins/standalone-cluster-plugin" }
+# Non-human-readable serde for `ch_uuid` / `ch_decimal128_9` binary-path unit tests.
+postcard = { workspace = true }

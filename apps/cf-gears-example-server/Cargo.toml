@@ -50,6 +50,7 @@ bss-rate-provider = [
 bss-ledger = ["dep:bss_ledger"]
 usage-collector = ["dep:usage_collector"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
+clickhouse-usage-collector = ["dep:clickhouse_usage_collector_plugin"]
 # Content-based file type detection in file-parser (see that crate's `magika`
 # feature doc comment for what it pulls in).
 magika = ["file_parser/magika"]
@@ -118,9 +119,11 @@ bss_rate_provider = { package = "cf-gears-bss-rate-provider", path = "../../gear
 bss_rate_provider_ecb_plugin = { package = "cf-gears-bss-rate-provider-ecb-plugin", path = "../../gears/bss/rate-provider/plugins/ecb-plugin", optional = true }
 bss_rate_provider_http_json_plugin = { package = "cf-gears-bss-rate-provider-http-json-plugin", path = "../../gears/bss/rate-provider/plugins/http-json-plugin", optional = true }
 
-# Optional Usage Collector gear + its TimescaleDB storage plugin
+# Optional Usage Collector gear + its TimescaleDB / ClickHouse storage plugins
 usage_collector = { package = "cf-gears-usage-collector", path = "../../gears/system/usage-collector/usage-collector", optional = true }
 timescaledb_usage_collector_plugin = { package = "cf-gears-timescaledb-usage-collector-plugin", path = "../../gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin", optional = true }
+clickhouse_usage_collector_plugin = { package = "cf-gears-clickhouse-usage-collector-plugin", path = "../../gears/system/usage-collector/plugins/clickhouse-usage-collector-plugin", optional = true }
+
 # Optional BSS Plan & Price Modeling gear
 bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricing/pricing", optional = true }
 

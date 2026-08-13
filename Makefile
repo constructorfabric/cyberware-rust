@@ -1026,10 +1026,21 @@ e2e-mini-chat:
 	$(call print_target_banner)
 	$(MAKE) e2e-local SUITE=mini-chat
 
-## Run usage-collector E2E tests (alias for focused local E2E; Docker required)
-e2e-usage-collector:
+# Shared by both backends; each build appends its own storage-plugin feature.
+# The plugins cannot share a binary: every linked gear is initialized, and both
+# fail init without their own live database. Hence two builds, two runs.
+UC_E2E_FEATURES = usage-collector,static-tenants,static-authn,static-authz
+
+## Run usage-collector E2E tests against both storage backends
+## (dedicated binary per backend + TimescaleDB / ClickHouse container; Docker required)
+e2e-usage-collector: py-env
 	$(call print_target_banner)
-	$(MAKE) e2e-local SUITE=usage-collector
+	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),timescaledb-usage-collector
+	E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=timescaledb \
+		$(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv
+	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),clickhouse-usage-collector
+	E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=clickhouse \
+		$(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv
 
 # -------- Code coverage --------
 
