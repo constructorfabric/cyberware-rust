@@ -401,7 +401,7 @@ mod live {
     use crate::domain::ports::CatalogStore;
     use crate::infra::metrics::Metrics;
     use crate::infra::storage::catalog_store::ChCatalogStore;
-    use crate::infra::storage::pool::apply_migrations;
+    use crate::infra::storage::pool::{apply_migrations, ensure_retention_ttl};
 
     use super::{AlwaysGrantLock, GrantThenLoseSession};
 
@@ -413,7 +413,7 @@ mod live {
         clickhouse::Client,
         ContainerAsync<GenericImage>,
     ) {
-        let image = GenericImage::new("clickhouse/clickhouse-server", "24.3")
+        let image = GenericImage::new("clickhouse/clickhouse-server", "25.6")
             .with_wait_for(WaitFor::Nothing)
             .with_env_var("CLICKHOUSE_USER", "default")
             .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)
@@ -441,9 +441,12 @@ mod live {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        apply_migrations(&client, 365 * 24 * 3600)
+        apply_migrations(&client)
             .await
             .expect("schema migrations must succeed on the live test container");
+        ensure_retention_ttl(&client, 365 * 24 * 3600)
+            .await
+            .expect("retention TTL reconcile must succeed on the live test container");
 
         let store = ChCatalogStore::new(
             client.clone(),

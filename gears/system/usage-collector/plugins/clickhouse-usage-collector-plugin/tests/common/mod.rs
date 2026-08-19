@@ -37,7 +37,9 @@ use clickhouse_usage_collector_plugin::infra::metrics::Metrics;
 use clickhouse_usage_collector_plugin::infra::storage::catalog_store::{
     CatalogLockPort, ChCatalogStore,
 };
-use clickhouse_usage_collector_plugin::infra::storage::pool::{apply_migrations, build_client};
+use clickhouse_usage_collector_plugin::infra::storage::pool::{
+    apply_migrations, build_client, ensure_retention_ttl,
+};
 use clickhouse_usage_collector_plugin::infra::storage::record_store::ChRecordStore;
 
 /// Live testcontainer harness holding a `ClickHouse` container and a shared
@@ -70,7 +72,7 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
     // inside the container, so it never appears on stdout/stderr and a
     // `message_on_stdout` wait can only ever time out. Readiness is polled
     // over HTTP below instead.
-    let ch_image = GenericImage::new("clickhouse/clickhouse-server", "24.3")
+    let ch_image = GenericImage::new("clickhouse/clickhouse-server", "25.6")
         .with_wait_for(WaitFor::Nothing)
         .with_env_var("CLICKHOUSE_USER", "default")
         .with_env_var("CLICKHOUSE_PASSWORD", CH_TEST_PASSWORD)
@@ -93,7 +95,7 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
 
     let mut last_err = None;
     for _ in 0..20u8 {
-        match apply_migrations(&client, cfg.retention_period_secs).await {
+        match apply_migrations(&client).await {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -107,6 +109,8 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
     if let Some(e) = last_err {
         return Err(e);
     }
+
+    ensure_retention_ttl(&client, cfg.retention_period_secs).await?;
 
     let hub = Arc::new(ClientHub::default());
     let cache = StandaloneCache::new();
@@ -257,13 +261,13 @@ pub fn unreachable_client() -> clickhouse::Client {
 /// Process-wide base instant (unix seconds) for fixture `created_at` values.
 ///
 /// Anchored to the current clock, **not** a hardcoded epoch: `usage_records`
-/// carries `TTL toDateTime(created_at) + INTERVAL retention_period_secs SECOND
-/// DELETE` (365 days by default), so a fixture timestamp older than the
-/// retention window makes every inserted row immediately TTL-expired — a
-/// background merge (or a `FINAL` read that triggers one) then drops it
-/// mid-test, and any reference/aggregation assertion fails depending on
-/// timing. A hardcoded epoch works until it ages past the window and then
-/// rots the whole suite.
+/// carries `TTL created_at + INTERVAL retention_period_secs SECOND DELETE`
+/// (365 days by default), so a fixture timestamp older than the retention
+/// window makes every inserted row immediately TTL-expired — a background
+/// merge (or a `FINAL` read that triggers one) then drops it mid-test, and
+/// any reference/aggregation assertion fails depending on timing. A
+/// hardcoded epoch works until it ages past the window and then rots the
+/// whole suite.
 ///
 /// Resolved once per process so it stays deterministic within a run: the dedup
 /// tests build two fixtures independently and rely on them sharing the same

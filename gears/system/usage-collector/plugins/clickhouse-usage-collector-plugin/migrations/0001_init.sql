@@ -6,20 +6,13 @@
 -- serialises concurrent init runs here — idempotent DDL alone is sufficient
 -- because CREATE TABLE IF NOT EXISTS is internally atomic in ClickHouse.
 --
--- The {retention_period_secs} placeholder in the TTL clause is NOT a SQL
--- parameter.  The apply_migrations function in pool.rs performs a plain
--- string replacement before executing the DDL so the startup-time retention
--- window is baked into the initial CREATE TABLE as a literal integer.
--- Runtime TTL updates after config changes are owned by the Data Retention
--- feature (DECOMPOSITION.md §2.5) via ALTER TABLE … MODIFY TTL.
+-- The usage_records TTL clause below uses a fixed 1-year default
+-- (INTERVAL 31536000 SECOND).  Config-driven retention is applied after
+-- migration by ensure_retention_ttl in pool.rs, which compares the live
+-- table TTL to retention_period_secs and issues ALTER TABLE … MODIFY TTL
+-- when they differ (DECOMPOSITION.md §2.5).
 --
--- DO NOT paste this file as-is into clickhouse-client / DBeaver / play.html
--- to run it manually: ClickHouse's own SQL parser reserves bare `{name}`
--- syntax for query parameters (which require a `{name:Type}` form) and will
--- reject the unsubstituted placeholder with "Expected one of: colon between
--- name and type, end of query". Replace {retention_period_secs} with a
--- literal integer (seconds) first, e.g.:
---   sed 's/{retention_period_secs}/31536000/' 0001_init.sql | clickhouse-client --multiquery
+-- This file is pasteable as-is into clickhouse-client / DBeaver / play.html.
 
 -- Table: usage_type_catalog
 --
@@ -93,10 +86,13 @@ ORDER BY (gts_id);
 -- pre-existing parts), which is a follow-up migration rather than something
 -- the startup path should run.
 --
--- TTL: toDateTime(created_at) converts from DateTime64(6) to DateTime
--- (second precision) as required for TTL expressions.  The
--- {retention_period_secs} placeholder is replaced by apply_migrations with
--- the startup-time config value as a literal integer before execution.
+-- TTL: `created_at` is DateTime64(6); the clause uses the column directly
+-- (`created_at + INTERVAL <n> SECOND DELETE`) so expiry stays in the
+-- DateTime64 range. Do not wrap with toDateTime — that casts to 32-bit
+-- DateTime (saturates in 2106) and can expire rows the moment they are
+-- written. The default window is 1 year (31536000 seconds);
+-- ensure_retention_ttl in pool.rs reconciles this with
+-- retention_period_secs after migration.
 CREATE TABLE IF NOT EXISTS usage_records
 (
     id              UUID                        COMMENT 'Deterministic gateway-derived record id (UUIDv5 of the 4-tuple dedup key); ADR-0013 / ADR-0014',
@@ -121,4 +117,4 @@ CREATE TABLE IF NOT EXISTS usage_records
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY (tenant_id, gts_id, created_at, id)
-TTL toDateTime(created_at) + INTERVAL {retention_period_secs} SECOND DELETE;
+TTL created_at + INTERVAL 31536000 SECOND DELETE;

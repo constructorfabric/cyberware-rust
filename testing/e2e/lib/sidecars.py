@@ -324,7 +324,7 @@ class ClickHouseSidecar(_DockerSidecar):
     a different ClickHouse version than E2E runs.
     """
 
-    IMAGE = "clickhouse/clickhouse-server:24.3"
+    IMAGE = "clickhouse/clickhouse-server:25.6"
     LABEL = "cf-gears-e2e=usage-collector-ch"
     # The HTTP interface: the `clickhouse` crate the plugin uses is
     # HTTP-based, so 8123 — not the native protocol's 9000 — is the port

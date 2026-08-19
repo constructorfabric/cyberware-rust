@@ -105,7 +105,16 @@ pub(crate) mod ch_decimal128_9 {
             d.to_string().serialize(s)
         } else {
             let mut rescaled = *d;
+            // `rescale` may stop short of `SCALE` when multiplying the mantissa
+            // by 10 would overflow the 96-bit Decimal capacity — serializing
+            // that mantissa would encode the wrong ClickHouse Decimal128(9).
             rescaled.rescale(SCALE);
+            if rescaled.scale() != SCALE {
+                return Err(serde::ser::Error::custom(format!(
+                    "Decimal128(9) value cannot be represented at scale {SCALE} (got scale {})",
+                    rescaled.scale()
+                )));
+            }
             rescaled.mantissa().serialize(s)
         }
     }

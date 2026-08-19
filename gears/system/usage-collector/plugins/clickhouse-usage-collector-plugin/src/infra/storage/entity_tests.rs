@@ -93,6 +93,22 @@ fn ch_decimal128_9_binary_rejects_overflow_mantissa() {
 }
 
 #[test]
+fn ch_decimal128_9_binary_rejects_rescale_that_cannot_reach_scale_9() {
+    // Near-max mantissa at scale 0 cannot be multiplied by 10^9 without
+    // overflowing rust_decimal's 96-bit capacity, so `rescale(9)` stops short.
+    // Binary serialize must fail closed rather than emit a wrong-scale mantissa.
+    let too_large = Decimal::from_parts(u32::MAX, u32::MAX, u32::MAX, false, 0);
+    // Human-readable path is unchanged and must still succeed for the same value.
+    assert!(serde_json::to_string(&DecimalWrap(too_large)).is_ok());
+    // postcard erases the serde custom message to `SerdeSerCustom`; asserting
+    // failure is enough — successful binary round-trips are covered above.
+    assert!(
+        postcard::to_allocvec(&DecimalWrap(too_large)).is_err(),
+        "mantissa that cannot reach scale 9 must fail Decimal128(9) encode"
+    );
+}
+
+#[test]
 fn ch_uuid_json_rejects_malformed() {
     let err = serde_json::from_str::<UuidWrap>("\"not-a-uuid\"").unwrap_err();
     assert!(!err.to_string().is_empty());

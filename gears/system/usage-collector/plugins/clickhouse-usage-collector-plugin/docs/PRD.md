@@ -118,7 +118,7 @@ This plugin operates within the standard Gears ToolKit lifecycle. At startup it 
 - Append-only compensation entries and a depth-1 deactivation cascade applied as a single atomic write, since ClickHouse has no in-place `UPDATE` suitable for the request path.
 - Application-level referential-integrity emulation between usage records and the usage-type catalog, using a per-`gts_id` coordination lock (DESIGN.md §3.5/§3.6) that closes the concurrent-reference window entirely rather than merely bounding it, since ClickHouse has no native foreign key.
 - Server-side aggregation (SUM / COUNT / MIN / MAX / AVG with grouping) and keyset pagination pushed into ClickHouse's vectorized execution engine, with the SPI's `MAX_AGGREGATION_BUCKETS` cap enforced server-side.
-- A native ClickHouse expiry mechanism providing time-based retention for usage records, configured from operator config and baked into the table's DDL at first schema provisioning.
+- A native ClickHouse expiry mechanism providing time-based retention for usage records: a fixed one-year TTL default in the initial DDL, reconciled on every startup to the operator-configured `retention_period_secs`.
 - Injection-safe translation of the host-supplied filter, aggregation, and pagination into parameterized ClickHouse queries.
 - Push-based OpenTelemetry metrics for the plugin's backend-internal operation, under a distinct `uc_clickhouse_*` sub-namespace, including a detection-backstop signal for the residual referential-integrity race ([§5](#5-functional-requirements)).
 - Typed classification of every backend error into the SDK's `UsageCollectorPluginError` vocabulary (Transient vs. Internal, plus the typed domain variants).
@@ -180,9 +180,9 @@ Because the lock makes (a) and (b) mutually exclusive for the same `gts_id`, the
 
 - [x] `p2` - **ID**: `cpt-cf-uc-ch-plugin-fr-retention`
 
-The plugin **MUST** bound `usage_records` storage growth via a native ClickHouse expiry mechanism (concrete mechanism: DESIGN.md §3.7, a `TTL` clause on `usage_records`) configured from the operator-supplied `retention_period_secs` value, which is baked directly into the `CREATE TABLE IF NOT EXISTS` DDL at plugin startup via `{retention_period_secs}` placeholder substitution in the embedded migration SQL. There is no separate `ALTER TABLE ... MODIFY TTL` step; the effective retention window is the value configured at table-creation time. The usage-type catalog **MUST NOT** be retention-bounded.
+The plugin **MUST** bound `usage_records` storage growth via a native ClickHouse expiry mechanism (concrete mechanism: DESIGN.md §3.7, a `TTL` clause on `usage_records`). Schema provisioning bakes a fixed one-year TTL default into the `CREATE TABLE IF NOT EXISTS` DDL; on every `init`, `ensure_retention_ttl` compares the live TTL interval to the operator-supplied `retention_period_secs` and issues `ALTER TABLE … MODIFY TTL` when they differ (or when TTL is missing). The usage-type catalog **MUST NOT** be retention-bounded.
 
-- **Rationale**: A native, backend-provided expiry mechanism is the direct analog of the reference plugin's declarative TimescaleDB retention policy. The TTL is baked at creation time in v1 for simplicity; changing it requires a manual `ALTER TABLE ... MODIFY TTL` or table recreate (see [§13](#13-open-questions) for the open schema-evolution question).
+- **Rationale**: A native, backend-provided expiry mechanism is the direct analog of the reference plugin's declarative TimescaleDB retention policy. The fixed DDL default keeps first provisioning simple and idempotent; startup reconciliation applies config changes across restarts without a manual operator `ALTER` or table recreate (non-TTL schema evolution remains an open question — see [§13](#13-open-questions)).
 - **Actors**: `cpt-cf-uc-ch-plugin-actor-plugin-host`, `cpt-cf-usage-collector-actor-platform-operator`
 
 #### Self-Provisioned Initial Schema (No External Migration Framework)
@@ -384,12 +384,12 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 
 **Actor**: `cpt-cf-uc-ch-plugin-actor-plugin-host`
 
-**Preconditions**: Valid plugin configuration (connection, request timeout, retention, coordination-lock TTL/timeout, vendor/priority) is provided; ClickHouse and the coordination-lock backend (cluster distributed lock) are both reachable.
+**Preconditions**: Valid plugin configuration (connection, request timeout, retention, coordination-lock TTL/timeout, vendor/priority) is provided; ClickHouse is reachable. The cluster `usage-collector` lock profile is expected to be provisioned for later use, but is **not** probed during `init` (cluster backends register in `start`, after this plugin's `init`).
 
 **Main Flow**:
 
-1. The plugin loads and validates config, creates its ClickHouse client, and creates its Coordination Lock Manager's Keeper client.
-2. The plugin provisions its initial schema idempotently, baking the configured retention window into the `usage_records` `TTL` clause when that table is created (a no-op if it already exists).
+1. The plugin loads and validates config, creates its ClickHouse client, and constructs its Coordination Lock Manager (`LockManager`) for lazy `DistributedLockV1` resolution on first acquire — no Keeper client and no lock-backend probe at startup.
+2. The plugin provisions its initial schema idempotently (`CREATE TABLE IF NOT EXISTS` with a fixed one-year TTL default on `usage_records`), then reconciles the live TTL to `retention_period_secs` via `ensure_retention_ttl` (`ALTER TABLE … MODIFY TTL` when the interval differs or TTL is missing).
 3. The plugin registers itself as a scoped SPI client under a GTS instance identifier, carrying vendor/priority.
 4. The host discovers and binds the backend by vendor/priority.
 
@@ -397,7 +397,8 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 
 **Alternative Flows**:
 
-- **Invalid config / unreachable ClickHouse or Keeper / missing required engine features**: startup fails fast; the plugin does not register and the host does not bind it.
+- **Invalid config / unreachable ClickHouse / schema provisioning failure**: startup fails fast; the plugin does not register and the host does not bind it.
+- **Unbound or unavailable `usage-collector` lock profile**: does not fail startup; the first create/delete lock acquire fails closed with `Transient`.
 
 ## 9. Acceptance Criteria
 

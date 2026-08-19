@@ -39,6 +39,9 @@ futures = { workspace = true }
 
 clickhouse = { workspace = true }
 url = { workspace = true }
+# Decode percent-encoded userinfo from `database_url` before `with_user` /
+# `with_password` (Url::username/password return the encoded form).
+percent-encoding = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

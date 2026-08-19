@@ -4,7 +4,6 @@ use super::{
     agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
 };
 use crate::infra::storage::query::bind::SqlBind;
-use crate::infra::storage::query::translate::SqlCtx;
 
 // ── corrects_id_partition_clause ─────────────────────────────────────────────
 
@@ -78,10 +77,9 @@ fn min_and_max_exprs_aggregate_value() {
 
 #[test]
 fn tenant_id_dimension_uses_to_string() {
-    let mut ctx = SqlCtx::new();
-    let expr = dimension_select_expr(&AggregationDimension::TenantId, &mut ctx);
+    let (expr, bind) = dimension_select_expr(&AggregationDimension::TenantId);
     assert_eq!(expr, "toString(tenant_id)");
-    assert!(ctx.binds.is_empty());
+    assert!(bind.is_none());
 }
 
 /// The identity columns are emitted verbatim and bind nothing — they come from
@@ -94,20 +92,17 @@ fn identity_dimensions_are_emitted_verbatim_without_binds() {
         (AggregationDimension::SubjectId, "subject_id"),
         (AggregationDimension::SubjectType, "subject_type"),
     ] {
-        let mut ctx = SqlCtx::new();
-        let expr = dimension_select_expr(&dim, &mut ctx);
+        let (expr, bind) = dimension_select_expr(&dim);
         assert_eq!(expr, expected, "dim = {dim:?}");
-        assert!(ctx.binds.is_empty(), "dim = {dim:?} binds nothing");
+        assert!(bind.is_none(), "dim = {dim:?} binds nothing");
     }
 }
 
 #[test]
-fn metadata_dimension_binds_key_and_uses_map_subscript() {
+fn metadata_dimension_returns_key_bind_and_map_subscript() {
     use usage_collector_sdk::MetadataKey;
     let key = MetadataKey::new("region").unwrap();
-    let mut ctx = SqlCtx::new();
-    let expr = dimension_select_expr(&AggregationDimension::Metadata(key), &mut ctx);
+    let (expr, bind) = dimension_select_expr(&AggregationDimension::Metadata(key));
     assert_eq!(expr, "metadata[?]");
-    assert_eq!(ctx.binds.len(), 1);
-    assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "region"));
+    assert!(matches!(bind, Some(SqlBind::Str(s)) if s == "region"));
 }

@@ -13,7 +13,7 @@ Config maps to `ClickHousePluginConfig` (`src/config.rs`). Durations are whole s
 | `request_timeout_secs` | `30` | HTTP request timeout in seconds (applies to both reads and writes). |
 | `lock_ttl_secs` | `30` | Cluster lock lease TTL. Must exceed worst-case create/delete critical-section latency (ClickHouse I/O while the lock is held). Renewed immediately before the mutating write. |
 | `lock_timeout_secs` | `5` | Maximum wait when acquiring the per-`gts_id` exclusive cluster lock. On timeout the operation fails closed with `Transient`. |
-| `retention_period_secs` | `31536000` (365d) | `usage_records` retention window; rows older than this are dropped via ClickHouse TTL. Must be in `(0, 100 years]`. Baked into the `CREATE TABLE` DDL at **first** schema provisioning only — see [Retention window management](#retention-window-management). |
+| `retention_period_secs` | `31536000` (365d) | `usage_records` retention window; rows older than this are dropped via ClickHouse TTL. Must be in `(0, 100 years]`. Migration DDL defaults to 1 year; on every startup `ensure_retention_ttl` issues `ALTER TABLE … MODIFY TTL` when the live interval differs from this value — see [Retention window management](#retention-window-management). |
 | `vendor` | `cyberfabric` | Vendor name for GTS instance registration. Must not be empty or blank; an empty value fails startup validation. |
 | `priority` | `10` | Plugin priority (lower = higher precedence when multiple plugins are registered). |
 
@@ -56,20 +56,19 @@ For the full lock-model rationale and critical-section sequences, see DESIGN.md 
 
 ### Retention window management
 
-- `retention_period_secs` takes effect **only at first table creation**. `apply_migrations` substitutes it into the `{retention_period_secs}` placeholder of `migrations/0001_init.sql` and executes `CREATE TABLE IF NOT EXISTS usage_records ... TTL toDateTime(created_at) + INTERVAL <n> SECOND DELETE`. There is **no** runtime `ALTER TABLE ... MODIFY TTL` reapply step.
-- Consequence: on an existing deployment, changing `retention_period_secs` in config and restarting is a **silent no-op** — the DDL re-runs as a no-op because the table already exists, and the TTL clause keeps the value it was created with. The plugin does not detect or report the divergence.
-- To change the retention window on an existing deployment, an operator must apply it to ClickHouse directly:
+- `migrations/0001_init.sql` creates `usage_records` with a fixed 1-year TTL default (`INTERVAL 31536000 SECOND`).
+- On every plugin `init`, after `apply_migrations`, `ensure_retention_ttl` reads the live TTL from `system.tables.create_table_query` and compares it to `retention_period_secs`. When missing or different, it runs:
 
-      ALTER TABLE usage_records MODIFY TTL toDateTime(created_at) + INTERVAL <new_secs> SECOND DELETE
+      ALTER TABLE usage_records MODIFY TTL created_at + INTERVAL <n> SECOND DELETE
 
-  Then update `retention_period_secs` in config to the same value so a future fresh deployment provisions the intended window. Verify the effective clause with `SHOW CREATE TABLE usage_records`.
-- The alternative — dropping and recreating `usage_records` so provisioning re-bakes the TTL — **destroys all stored usage records** and is not a routine procedure.
+- Changing `retention_period_secs` in config and restarting therefore updates the table TTL automatically; no manual operator `ALTER` is required for retention changes.
+- Verify the effective clause with `SHOW CREATE TABLE usage_records` (ClickHouse may rewrite `INTERVAL <n> SECOND` as `toIntervalSecond(<n>)`).
 - `usage_type_catalog` carries no TTL clause and is never retention-bounded.
 - ClickHouse applies TTL eviction asynchronously during background merges, so rows can outlive the threshold for a while; expiry is not a synchronous delete.
 
 ### Data-skipping index management
 
-Same class of gotcha as the TTL above: everything in `CREATE TABLE IF NOT EXISTS` applies **only at first provisioning**.
+Same class of gotcha for indexes (not TTL): everything in `CREATE TABLE IF NOT EXISTS` other than what `ensure_retention_ttl` reconciles applies **only at first provisioning**.
 
 - `migrations/0001_init.sql` declares two `bloom_filter` data-skipping indexes on `usage_records` — `idx_records_id` on `id` and `idx_records_corrects_id` on `corrects_id` — so that `get_usage_record` (`WHERE id = ?`) and the deactivation cascade (`WHERE id = ? OR corrects_id = ?`) prune granules instead of scanning the table. The `ORDER BY` key is deliberately unchanged, since it is the dedup identity `ReplacingMergeTree` collapses on.
 - A deployment provisioned **before** these indexes existed does not get them from a restart: the DDL re-runs as a no-op. Add them manually, then materialize them over the existing parts:
@@ -100,9 +99,9 @@ Same class of gotcha as the TTL above: everything in `CREATE TABLE IF NOT EXISTS
   For strict cross-replica read-your-writes, configure ClickHouse's native `insert_quorum` write-quorum setting on the server; this plugin does not enable it by default and enabling it incurs a proportional write-latency cost — see DESIGN.md §3.8.
 - **Workload isolation** — the ClickHouse client/pool is shared by both the ingestion and query paths (v1 design), so query bursts can degrade ingestion throughput; see [Workload isolation and pool contention](#workload-isolation-and-pool-contention).
 - **Referential integrity** — the per-`gts_id` exclusive cluster lock serializes every `create_usage_record` call against every `delete_usage_type` call for the same `gts_id`. Deleting a referenced type returns `UsageTypeReferenced`; deleting an unreferenced type removes the row; inserting against an absent/deleted type returns `UsageTypeNotFound`.
-- **Retention** — ClickHouse TTL clause on `usage_records`, baked into the `CREATE TABLE` DDL from `retention_period_secs` at first schema provisioning. There is no runtime reapply step, so changing the value later does not move the window on an existing table — see [Retention window management](#retention-window-management).
+- **Retention** — ClickHouse TTL clause on `usage_records`: fixed 1-year default in `CREATE TABLE`, then reconciled to `retention_period_secs` on every startup via `ensure_retention_ttl` (`ALTER TABLE … MODIFY TTL` when needed) — see [Retention window management](#retention-window-management).
 - **Deactivation** — applied as a single multi-row `INSERT` of versioned marker rows (depth-1 only); no `UPDATE` or `ALTER TABLE … DELETE` is issued on the request path.
-- **Schema** — provisioned idempotently at startup via `CREATE TABLE IF NOT EXISTS`; re-running on an existing deployment is a no-op, so changing DDL parameters (TTL, indexes) requires manual operator intervention — see [Retention window management](#retention-window-management) and [Data-skipping index management](#data-skipping-index-management).
+- **Schema** — provisioned idempotently at startup via `CREATE TABLE IF NOT EXISTS`; indexes still apply only at first provisioning (see [Data-skipping index management](#data-skipping-index-management)), while TTL is updated on startup when config differs.
 
 ## SPI conformance
 

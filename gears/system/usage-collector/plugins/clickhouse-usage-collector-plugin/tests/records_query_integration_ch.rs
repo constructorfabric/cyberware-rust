@@ -6,6 +6,7 @@
 //! - `$filter` by `tenant_id`,
 //! - metadata side-channel filtering,
 //! - SUM nets compensation, COUNT active-only, GROUP BY `resource_id`,
+//! - GROUP BY metadata key combined with `$filter` (SELECT/WHERE bind order),
 //! - `MAX_AGGREGATION_BUCKETS + 1` cap enforcement.
 //!
 //! All reads use `FINAL` (enforced by the store); tests insert with distinct
@@ -397,6 +398,76 @@ async fn ch_aggregate_group_by_resource_id() {
             ("res-b".to_owned(), Some(BigDecimal::from(5_i64))),
         ],
         "each resource_id bucket carries its summed value"
+    );
+}
+
+/// GROUP BY metadata key with a concurrent `$filter` — exercises SELECT-list
+/// bind ordering: the metadata key `?` appears before `gts_id` and the filter
+/// binds in the assembled SQL. Wrong order would mis-assign the filter UUID
+/// (or gts_id) into `metadata[?]` and yield empty/wrong buckets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_aggregate_group_by_metadata_with_filter() {
+    let Some((_h, store)) = setup_with_type(VCPU_GTS, &["region"]).await else {
+        return;
+    };
+    let tenant_a = Uuid::from_u128(0x3005);
+    let tenant_b = Uuid::from_u128(0x3006);
+
+    // tenant_a: us-east-1 → 2+3=5, eu-west-1 → 7; tenant_b must be filtered out.
+    let rows = [
+        (tenant_a, "us-east-1", 2_i64, 0_i64),
+        (tenant_a, "us-east-1", 3, 1),
+        (tenant_a, "eu-west-1", 7, 2),
+        (tenant_b, "us-east-1", 100, 3),
+    ];
+    for (i, (tenant, region, value, ts)) in rows.iter().enumerate() {
+        let seq = 0x3005_0000 + u128::try_from(i).unwrap();
+        let mut rec = record_at(VCPU_GTS, *tenant, seq, *ts);
+        rec.value = Decimal::new(*value, 0);
+        let mut meta = BTreeMap::new();
+        meta.insert(
+            MetadataKey::new("region").expect("valid metadata key"),
+            (*region).to_owned(),
+        );
+        rec.metadata = meta;
+        store.create(rec).await.expect("create record");
+    }
+
+    let filter = Expr::Compare(
+        Box::new(Expr::Identifier("tenant_id".to_owned())),
+        CompareOperator::Eq,
+        Box::new(Expr::Value(Value::Uuid(tenant_a))),
+    );
+    let query = ODataQuery::new().with_filter(filter);
+    let spec = AggregationSpec {
+        op: AggregationOp::Sum,
+        group_by: vec![AggregationDimension::Metadata(
+            MetadataKey::new("region").expect("valid metadata key"),
+        )],
+    };
+    let result = store
+        .aggregate(common::fixture_gts_id(VCPU_GTS), &query, &[], spec)
+        .await
+        .expect("aggregate group by metadata with filter");
+
+    assert_eq!(result.buckets.len(), 2, "one bucket per distinct region in tenant_a");
+    let mut got: Vec<(String, Option<BigDecimal>)> = result
+        .buckets
+        .iter()
+        .map(|b| {
+            assert_eq!(b.key.len(), 1, "single grouped dimension -> one key entry");
+            (b.key[0].clone(), b.value.clone())
+        })
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("eu-west-1".to_owned(), Some(BigDecimal::from(7_i64))),
+            ("us-east-1".to_owned(), Some(BigDecimal::from(5_i64))),
+        ],
+        "tenant_a regions only; tenant_b's us-east-1=100 must not leak in"
     );
 }
 

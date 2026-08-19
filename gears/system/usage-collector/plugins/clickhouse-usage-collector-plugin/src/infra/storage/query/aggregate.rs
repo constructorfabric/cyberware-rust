@@ -13,12 +13,14 @@
 //!   server-side `LIMIT` when `dim_count > 0`.
 //!
 //! All identifiers come from closed enum allowlists; the only caller-derived
-//! value (a [`AggregationDimension::Metadata`] key) is bound via `ctx` (`?`).
+//! value (a [`AggregationDimension::Metadata`] key) is returned as a bind so
+//! the caller can apply it **before** `gts_id` and every WHERE `?` — `ClickHouse`
+//! placeholders are strictly left-to-right in the assembled SQL, and the
+//! SELECT list precedes the WHERE clause.
 
 use usage_collector_sdk::{AggregationDimension, AggregationOp, MAX_AGGREGATION_BUCKETS};
 
 use super::bind::SqlBind;
-use super::translate::SqlCtx;
 
 /// SQL aggregate expression for an [`AggregationOp`].
 ///
@@ -55,20 +57,24 @@ pub fn corrects_id_partition_clause(op: AggregationOp) -> Option<&'static str> {
 
 /// SQL `String`-returning expression for a group [`AggregationDimension`].
 ///
+/// Returns `(select_expr, select_bind)`:
 /// - `TenantId`: `toString(tenant_id)` (UUID → String in `ClickHouse`).
-/// - `Metadata(key)`: `metadata[?]` (map subscript; key is bound via `ctx`).
-/// - All other identity columns are emitted directly.
-pub fn dimension_select_expr(dim: &AggregationDimension, ctx: &mut SqlCtx) -> String {
+/// - `Metadata(key)`: `metadata[?]` plus the key bind — the caller **must**
+///   apply this bind before `gts_id` and all WHERE binds (SELECT precedes
+///   WHERE in the query text; `ClickHouse` `?` is positional left-to-right).
+/// - All other identity columns are emitted directly with no bind.
+#[must_use]
+pub fn dimension_select_expr(dim: &AggregationDimension) -> (String, Option<SqlBind>) {
     match dim {
-        AggregationDimension::TenantId => "toString(tenant_id)".to_owned(),
-        AggregationDimension::ResourceId => "resource_id".to_owned(),
-        AggregationDimension::ResourceType => "resource_type".to_owned(),
-        AggregationDimension::SubjectId => "subject_id".to_owned(),
-        AggregationDimension::SubjectType => "subject_type".to_owned(),
-        AggregationDimension::Metadata(key) => {
-            ctx.push(SqlBind::Str(key.as_str().to_owned()));
-            "metadata[?]".to_owned()
-        }
+        AggregationDimension::TenantId => ("toString(tenant_id)".to_owned(), None),
+        AggregationDimension::ResourceId => ("resource_id".to_owned(), None),
+        AggregationDimension::ResourceType => ("resource_type".to_owned(), None),
+        AggregationDimension::SubjectId => ("subject_id".to_owned(), None),
+        AggregationDimension::SubjectType => ("subject_type".to_owned(), None),
+        AggregationDimension::Metadata(key) => (
+            "metadata[?]".to_owned(),
+            Some(SqlBind::Str(key.as_str().to_owned())),
+        ),
     }
 }
 

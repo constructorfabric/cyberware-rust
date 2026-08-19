@@ -1,11 +1,13 @@
 //! `ClickHouse` connection-pool bootstrap and schema migration.
 //!
-//! Exposes two public entry points:
+//! Exposes three public entry points:
 //! - [`build_client`] — constructs and configures the `clickhouse::Client`.
 //! - [`apply_migrations`] — runs the embedded DDL against the connected
 //!   `ClickHouse` instance.
+//! - [`ensure_retention_ttl`] — reconciles `usage_records` TTL with config.
 
 use anyhow::Context as _;
+use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::config::{ClickHousePluginConfig, is_plaintext_url};
@@ -39,12 +41,15 @@ struct ParsedEndpoint {
 /// Split a `database_url` into a bare HTTP endpoint plus optional
 /// user/password/database.
 ///
-/// Username and password are taken from the URL's userinfo as-is (not
-/// percent-decoded): callers embedding `${VAR}`-expanded secrets containing
-/// URL-reserved characters must percent-encode them in `database_url` first.
-/// The database name is the URL path with leading/trailing slashes trimmed;
-/// an empty path yields `None` (`ClickHouse` then uses the server's default
-/// database for the resolved user).
+/// Username and password come from the URL's userinfo and are
+/// percent-decoded before being returned: `Url::username` / `Url::password`
+/// yield the encoded form, but `Client::with_user` / `with_password` need the
+/// literal credentials. Callers embedding `${VAR}`-expanded secrets that
+/// contain URL-reserved characters must still percent-encode them in
+/// `database_url` so the URL parses. The database name is the URL path with
+/// leading/trailing slashes trimmed; an empty path yields `None`
+/// (`ClickHouse` then uses the server's default database for the resolved
+/// user).
 ///
 /// # Errors
 ///
@@ -52,8 +57,8 @@ struct ParsedEndpoint {
 fn parse_endpoint(database_url: &str) -> Result<ParsedEndpoint, url::ParseError> {
     let mut url = Url::parse(database_url)?;
 
-    let user = (!url.username().is_empty()).then(|| url.username().to_owned());
-    let password = url.password().map(str::to_owned);
+    let user = (!url.username().is_empty()).then(|| decode_userinfo(url.username()));
+    let password = url.password().map(decode_userinfo);
     let database = {
         let path = url.path().trim_matches('/');
         (!path.is_empty()).then(|| path.to_owned())
@@ -77,24 +82,22 @@ fn parse_endpoint(database_url: &str) -> Result<ParsedEndpoint, url::ParseError>
     })
 }
 
+/// Percent-decode a URL userinfo component for `with_user` / `with_password`.
+///
+/// Invalid UTF-8 after decoding is lossily replaced — credentials are opaque
+/// bytes at the wire level, but the `clickhouse` client takes `&str`.
+fn decode_userinfo(encoded: &str) -> String {
+    percent_decode_str(encoded).decode_utf8_lossy().into_owned()
+}
+
 /// Embedded schema migration SQL.
 ///
 /// Relative path from this file (`src/infra/storage/pool.rs`) three levels
 /// up to the crate root, then into `migrations/`.
 pub(crate) const MIGRATION_SQL: &str = include_str!("../../../migrations/0001_init.sql");
 
-/// Placeholder token in the migration SQL that is replaced by the startup-time
-/// retention window before the DDL is executed.
-pub(crate) const RETENTION_PLACEHOLDER: &str = "{retention_period_secs}";
-
-/// Replace the `{retention_period_secs}` placeholder in a migration SQL string.
-///
-/// Called by [`apply_migrations`] at init time and by unit tests in
-/// `pool_tests.rs` to verify substitution correctness without a live
-/// `ClickHouse` connection.
-fn substitute_retention(sql: &str, retention_period_secs: u64) -> String {
-    sql.replace(RETENTION_PLACEHOLDER, &retention_period_secs.to_string())
-}
+/// Default `usage_records` TTL baked into [`MIGRATION_SQL`] (1 year in seconds).
+pub(crate) const DEFAULT_RETENTION_SECS: u64 = 365 * 86_400;
 
 /// Build a configured `clickhouse::Client` from the plugin config.
 ///
@@ -281,32 +284,25 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
 
 /// Apply the embedded initial schema migration against the live `ClickHouse` instance.
 ///
-/// Reads the embedded SQL from `migrations/0001_init.sql`, replaces the
-/// `{retention_period_secs}` placeholder with the configured value (baking the
-/// startup-time retention window as a DDL literal), strips `--` comment lines
-/// (see [`strip_line_comments`]), splits the result into statements on `';'`
-/// while respecting single-quoted string literals (see
-/// [`split_sql_statements`]), and executes each one via the `clickhouse`
-/// crate's raw query path.
+/// Reads the embedded SQL from `migrations/0001_init.sql` (which bakes a fixed
+/// 1-year TTL default into `usage_records`), strips `--` comment lines (see
+/// [`strip_line_comments`]), splits the result into statements on `';'` while
+/// respecting single-quoted string literals (see [`split_sql_statements`]), and
+/// executes each one via the `clickhouse` crate's raw query path.
 ///
 /// Every statement uses `CREATE TABLE IF NOT EXISTS`, making the migration
 /// idempotent and safe to re-run on concurrent replica startup. `ClickHouse`
 /// has no `pg_advisory_lock` equivalent; idempotent DDL alone is sufficient
 /// because `CREATE TABLE IF NOT EXISTS` is internally atomic in `ClickHouse`.
 ///
+/// Config-driven retention is applied separately by [`ensure_retention_ttl`].
+///
 /// # Errors
 ///
 /// Returns an error if any DDL statement fails.  The context message includes
 /// the failing statement text.
-pub async fn apply_migrations(
-    client: &clickhouse::Client,
-    retention_period_secs: u64,
-) -> anyhow::Result<()> {
-    // Replace the runtime-substituted TTL placeholder before execution.
-    // The SQL file uses {retention_period_secs} as a plain token (not a SQL
-    // bind parameter — ClickHouse DDL does not support parameterised DDL).
-    let sql = substitute_retention(MIGRATION_SQL, retention_period_secs);
-    let sql = strip_line_comments(&sql);
+pub async fn apply_migrations(client: &clickhouse::Client) -> anyhow::Result<()> {
+    let sql = strip_line_comments(MIGRATION_SQL);
 
     for stmt in split_sql_statements(&sql) {
         client
@@ -315,6 +311,111 @@ pub async fn apply_migrations(
             .await
             .with_context(|| format!("migration DDL statement failed:\n{stmt}"))?;
     }
+
+    Ok(())
+}
+
+/// Parse retention seconds from a `CREATE TABLE` / `create_table_query` string.
+///
+/// Accepts both the literal form we emit (`INTERVAL <n> SECOND`) and
+/// ClickHouse's rewritten form (`toIntervalSecond(<n>)`). Returns `None` when
+/// no recognisable TTL interval is present.
+pub(crate) fn parse_ttl_seconds(create_table_query: &str) -> Option<u64> {
+    // Prefer the rewritten form ClickHouse often stores in system.tables.
+    if let Some(secs) = extract_u64_after(create_table_query, "toIntervalSecond(") {
+        return Some(secs);
+    }
+    // Literal INTERVAL form from our DDL / ALTER.
+    let upper = create_table_query.to_ascii_uppercase();
+    let Some(interval_idx) = upper.find("INTERVAL") else {
+        return None;
+    };
+    let after_interval = &create_table_query[interval_idx + "INTERVAL".len()..];
+    let trimmed = after_interval.trim_start();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if digits_end == 0 {
+        return None;
+    }
+    let secs: u64 = trimmed[..digits_end].parse().ok()?;
+    let rest = trimmed[digits_end..].trim_start();
+    if rest.to_ascii_uppercase().starts_with("SECOND") {
+        Some(secs)
+    } else {
+        None
+    }
+}
+
+fn extract_u64_after(haystack: &str, needle: &str) -> Option<u64> {
+    let idx = haystack.find(needle)?;
+    let after = &haystack[idx + needle.len()..];
+    let digits_end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    if digits_end == 0 {
+        return None;
+    }
+    after[..digits_end].parse().ok()
+}
+
+/// True when the live TTL still casts `created_at` through 32-bit `toDateTime`.
+///
+/// Matching interval seconds alone is not enough to skip `MODIFY TTL`: a
+/// table provisioned with the old wrapping clause would otherwise keep
+/// saturating at 2106 until `retention_period_secs` changed.
+fn ttl_uses_todatetime_cast(create_table_query: &str) -> bool {
+    create_table_query.contains("toDateTime(created_at)")
+}
+
+/// Reconcile `usage_records` TTL with the configured retention window.
+///
+/// Reads the live `create_table_query` from `system.tables`. When the table
+/// has no TTL, the parsed interval seconds differ from
+/// `retention_period_secs`, or the live clause still wraps `created_at` in
+/// `toDateTime`, issues
+/// `ALTER TABLE usage_records MODIFY TTL created_at + INTERVAL <n> SECOND DELETE`.
+///
+/// # Errors
+///
+/// Returns an error if the table is missing, the query fails, or the alter fails.
+pub async fn ensure_retention_ttl(
+    client: &clickhouse::Client,
+    retention_period_secs: u64,
+) -> anyhow::Result<()> {
+    let create_sql: String = client
+        .query(
+            "SELECT create_table_query \
+             FROM system.tables \
+             WHERE database = currentDatabase() AND name = 'usage_records'",
+        )
+        .fetch_one::<String>()
+        .await
+        .context("failed to read usage_records create_table_query from system.tables")?;
+
+    let current = parse_ttl_seconds(&create_sql);
+    if current == Some(retention_period_secs) && !ttl_uses_todatetime_cast(&create_sql) {
+        tracing::debug!(
+            retention_period_secs,
+            "usage_records TTL already matches configured retention"
+        );
+        return Ok(());
+    }
+
+    let alter = format!(
+        "ALTER TABLE usage_records MODIFY TTL \
+         created_at + INTERVAL {retention_period_secs} SECOND DELETE"
+    );
+    tracing::info!(
+        previous = ?current,
+        retention_period_secs,
+        "updating usage_records TTL to match configured retention"
+    );
+    client
+        .query(&alter)
+        .execute()
+        .await
+        .with_context(|| format!("failed to apply retention TTL:\n{alter}"))?;
 
     Ok(())
 }

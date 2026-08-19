@@ -1,6 +1,6 @@
 use super::{
-    MIGRATION_SQL, RETENTION_PLACEHOLDER, parse_endpoint, split_sql_statements,
-    strip_line_comments, substitute_retention,
+    DEFAULT_RETENTION_SECS, MIGRATION_SQL, parse_endpoint, parse_ttl_seconds, split_sql_statements,
+    strip_line_comments,
 };
 use crate::config::is_plaintext_url;
 
@@ -65,9 +65,8 @@ fn strip_line_comments_keeps_double_dash_inside_string_literal() {
 }
 
 #[test]
-fn migration_sql_after_comment_strip_and_substitution_yields_exactly_two_statements() {
-    let substituted = substitute_retention(MIGRATION_SQL, 31_536_000);
-    let stripped = strip_line_comments(&substituted);
+fn migration_sql_after_comment_strip_yields_exactly_two_statements() {
+    let stripped = strip_line_comments(MIGRATION_SQL);
     let statements = split_sql_statements(&stripped);
     assert_eq!(
         statements.len(),
@@ -205,6 +204,16 @@ fn parse_endpoint_user_without_password_has_no_password() {
 }
 
 #[test]
+fn parse_endpoint_percent_decodes_userinfo_with_reserved_chars() {
+    // `@` and `/` must be percent-encoded in the URL; after parse they must
+    // be restored to literal credentials for `with_user` / `with_password`.
+    let endpoint = parse_endpoint("http://u%3Aser:p%40ss%2Fword@ch:8123/usage").unwrap();
+    assert_eq!(endpoint.user.as_deref(), Some("u:ser"));
+    assert_eq!(endpoint.password.as_deref(), Some("p@ss/word"));
+    assert_eq!(endpoint.database.as_deref(), Some("usage"));
+}
+
+#[test]
 fn parse_endpoint_rejects_malformed_url() {
     assert!(parse_endpoint("not a url").is_err());
 }
@@ -255,36 +264,39 @@ fn timeout_string_for_large_value() {
 }
 
 // ---------------------------------------------------------------------------
-// SQL placeholder substitution
+// TTL parsing and default retention in migration SQL
 // ---------------------------------------------------------------------------
 
 #[test]
-fn retention_placeholder_is_replaced() {
-    let template = "TTL toDateTime(created_at) + INTERVAL {retention_period_secs} SECOND DELETE";
-    let result = substitute_retention(template, 86_400);
-    assert_eq!(
-        result,
-        "TTL toDateTime(created_at) + INTERVAL 86400 SECOND DELETE"
-    );
+fn parse_ttl_seconds_from_interval_form() {
+    let sql = "CREATE TABLE usage_records (...) TTL created_at + INTERVAL 86400 SECOND DELETE";
+    assert_eq!(parse_ttl_seconds(sql), Some(86_400));
 }
 
 #[test]
-fn substituted_sql_contains_no_placeholder_token() {
-    let result = substitute_retention(MIGRATION_SQL, 31_536_000);
-    assert!(
-        !result.contains(RETENTION_PLACEHOLDER),
-        "substituted SQL must not contain any literal {{retention_period_secs}} token"
-    );
+fn parse_ttl_seconds_from_legacy_todatetime_interval_form() {
+    let sql =
+        "CREATE TABLE usage_records (...) TTL toDateTime(created_at) + INTERVAL 86400 SECOND DELETE";
+    assert_eq!(parse_ttl_seconds(sql), Some(86_400));
 }
 
 #[test]
-fn substituted_sql_contains_the_literal_value() {
-    let retention = 7_776_000_u64; // 90 days
-    let result = substitute_retention(MIGRATION_SQL, retention);
-    assert!(
-        result.contains("7776000"),
-        "substituted SQL must contain the retention value as a literal integer"
-    );
+fn parse_ttl_seconds_from_to_interval_second_form() {
+    let sql = "CREATE TABLE usage_records (...) TTL created_at + toIntervalSecond(31536000)";
+    assert_eq!(parse_ttl_seconds(sql), Some(31_536_000));
+}
+
+#[test]
+fn parse_ttl_seconds_from_legacy_todatetime_to_interval_second_form() {
+    let sql =
+        "CREATE TABLE usage_records (...) TTL toDateTime(created_at) + toIntervalSecond(31536000)";
+    assert_eq!(parse_ttl_seconds(sql), Some(31_536_000));
+}
+
+#[test]
+fn parse_ttl_seconds_returns_none_when_missing() {
+    let sql = "CREATE TABLE usage_records (...) ENGINE = ReplacingMergeTree(version) ORDER BY (id)";
+    assert_eq!(parse_ttl_seconds(sql), None);
 }
 
 #[test]
@@ -322,11 +334,24 @@ fn migration_sql_uses_create_table_if_not_exists() {
 }
 
 #[test]
-fn migration_sql_has_usage_records_ttl_placeholder() {
+fn migration_sql_has_default_one_year_ttl() {
     assert!(
-        MIGRATION_SQL.contains(RETENTION_PLACEHOLDER),
-        "migration SQL must contain the retention_period_secs placeholder for runtime substitution"
+        !MIGRATION_SQL.contains("{retention_period_secs}"),
+        "migration SQL must not contain a retention placeholder"
     );
+    assert!(
+        MIGRATION_SQL.contains(&format!("INTERVAL {DEFAULT_RETENTION_SECS} SECOND")),
+        "migration SQL must bake the 1-year default TTL ({DEFAULT_RETENTION_SECS}s)"
+    );
+    assert!(
+        MIGRATION_SQL.contains("TTL created_at + INTERVAL"),
+        "migration TTL must use DateTime64 created_at directly, not toDateTime"
+    );
+    assert!(
+        !MIGRATION_SQL.contains("TTL toDateTime(created_at)"),
+        "migration TTL must not cast created_at through 32-bit toDateTime"
+    );
+    assert_eq!(DEFAULT_RETENTION_SECS, 31_536_000);
 }
 
 #[test]
@@ -426,7 +451,10 @@ mod integration {
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{GenericImage, ImageExt};
 
-    use super::super::{apply_migrations, build_client, parse_endpoint};
+    use super::super::{
+        DEFAULT_RETENTION_SECS, apply_migrations, build_client, ensure_retention_ttl,
+        parse_endpoint, parse_ttl_seconds,
+    };
     use crate::config::ClickHousePluginConfig;
 
     const CH_PASSWORD: &str = "pool_test_pw";
@@ -434,7 +462,7 @@ mod integration {
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn apply_migrations_creates_tables() {
-        let image = GenericImage::new("clickhouse/clickhouse-server", "24.3")
+        let image = GenericImage::new("clickhouse/clickhouse-server", "25.6")
             .with_wait_for(WaitFor::Nothing)
             .with_env_var("CLICKHOUSE_USER", "default")
             .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)
@@ -486,8 +514,107 @@ mod integration {
         }
 
         let client = build_client(&cfg);
-        apply_migrations(&client, cfg.retention_period_secs)
+        apply_migrations(&client)
             .await
             .expect("migration must succeed against a live ClickHouse instance");
+
+        async fn live_create_sql(client: &clickhouse::Client) -> String {
+            client
+                .query(
+                    "SELECT create_table_query \
+                     FROM system.tables \
+                     WHERE database = currentDatabase() AND name = 'usage_records'",
+                )
+                .fetch_one::<String>()
+                .await
+                .expect("create_table_query must be readable")
+        }
+
+        // Matching seconds must still rewrite a legacy toDateTime TTL.
+        client
+            .query(&format!(
+                "ALTER TABLE usage_records MODIFY TTL \
+                 toDateTime(created_at) + INTERVAL {DEFAULT_RETENTION_SECS} SECOND DELETE"
+            ))
+            .execute()
+            .await
+            .expect("forcing the legacy toDateTime TTL must succeed");
+        let legacy_sql = live_create_sql(&client).await;
+        assert!(
+            legacy_sql.contains("toDateTime(created_at)"),
+            "precondition: live TTL must still wrap created_at: {legacy_sql}"
+        );
+        ensure_retention_ttl(&client, DEFAULT_RETENTION_SECS)
+            .await
+            .expect("ensure_retention_ttl must rewrite a toDateTime TTL even when seconds match");
+        let rewritten = live_create_sql(&client).await;
+        assert!(
+            !rewritten.contains("toDateTime(created_at)"),
+            "legacy toDateTime TTL must be rewritten to DateTime64: {rewritten}"
+        );
+        assert_eq!(
+            parse_ttl_seconds(&rewritten),
+            Some(DEFAULT_RETENTION_SECS),
+            "rewritten TTL must keep the matching interval: {rewritten}"
+        );
+
+        // Default DDL TTL is 1 year; ensure with a different window must alter.
+        let ten_years = 10 * 365 * 86_400;
+        ensure_retention_ttl(&client, ten_years)
+            .await
+            .expect("ensure_retention_ttl must alter when config differs from default");
+
+        let create_sql = live_create_sql(&client).await;
+        assert_eq!(
+            parse_ttl_seconds(&create_sql),
+            Some(ten_years),
+            "live TTL must match the configured retention after ensure: {create_sql}"
+        );
+        assert!(
+            !create_sql.contains("toDateTime(created_at)"),
+            "configured TTL must keep DateTime64 created_at: {create_sql}"
+        );
+
+        // Idempotent when already matched.
+        ensure_retention_ttl(&client, ten_years)
+            .await
+            .expect("ensure_retention_ttl must no-op when TTL already matches");
+
+        // A created_at after DateTime's 2106 ceiling must not expire immediately.
+        const POST_2106_GTS: &str = "post-2106-ttl";
+        client
+            .query(
+                "INSERT INTO usage_records (id, tenant_id, gts_id, value, created_at, \
+                 resource_id, resource_type, subject_id, subject_type, idempotency_key, \
+                 corrects_id, status, metadata, ingested_at, version) VALUES \
+                 (generateUUIDv4(), generateUUIDv4(), ?, 1, \
+                  toDateTime64('2107-01-01 00:00:00', 6), \
+                  'res-1', 'vm', NULL, NULL, 'idem-post-2106', NULL, 'active', map(), \
+                  now64(6), 1)",
+            )
+            .bind(POST_2106_GTS)
+            .execute()
+            .await
+            .expect("inserting a post-2106 created_at must succeed");
+        client
+            .query("ALTER TABLE usage_records MATERIALIZE TTL")
+            .execute()
+            .await
+            .expect("MATERIALIZE TTL must succeed");
+        client
+            .query("OPTIMIZE TABLE usage_records FINAL")
+            .execute()
+            .await
+            .expect("OPTIMIZE FINAL must apply TTL during merge");
+        let remaining: u64 = client
+            .query("SELECT count() FROM usage_records FINAL WHERE gts_id = ?")
+            .bind(POST_2106_GTS)
+            .fetch_one()
+            .await
+            .expect("count of post-2106 row must be readable");
+        assert_eq!(
+            remaining, 1,
+            "post-2106 created_at plus a 10-year TTL must not expire on merge"
+        );
     }
 }

@@ -2140,6 +2140,7 @@ dependencies = [
  "inventory",
  "opentelemetry",
  "opentelemetry_sdk",
+ "percent-encoding",
  "postcard",
  "rust_decimal",
  "serde",

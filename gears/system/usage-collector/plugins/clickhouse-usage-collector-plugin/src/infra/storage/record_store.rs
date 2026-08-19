@@ -894,7 +894,11 @@ impl RecordStore for ChRecordStore {
         Self::push_metadata_filters(metadata_filter, &mut ctx, &mut clauses);
 
         // Dimension SELECT exprs + subject-not-null guards.
+        // SELECT-list binds (metadata keys) are collected separately from the
+        // WHERE `ctx`: they appear first in the SQL text and must be applied
+        // before `gts_id` and every WHERE `?`.
         let mut select_dims: Vec<String> = Vec::with_capacity(spec.group_by.len());
+        let mut select_binds: Vec<SqlBind> = Vec::new();
         for dim in &spec.group_by {
             match dim {
                 AggregationDimension::SubjectId => {
@@ -905,7 +909,11 @@ impl RecordStore for ChRecordStore {
                 }
                 _ => {}
             }
-            select_dims.push(dimension_select_expr(dim, &mut ctx));
+            let (expr, bind) = dimension_select_expr(dim);
+            select_dims.push(expr);
+            if let Some(b) = bind {
+                select_binds.push(b);
+            }
         }
 
         let dim_count = select_dims.len();
@@ -945,7 +953,13 @@ impl RecordStore for ChRecordStore {
             clauses.join(" AND "),
         );
 
-        let mut q = self.client.query(&sql).bind(gts_id.as_ref());
+        // Bind order matches left-to-right `?` in `sql`: SELECT metadata keys,
+        // then `gts_id`, then filter / metadata-filter WHERE binds.
+        let mut q = self.client.query(&sql);
+        for b in &select_binds {
+            q = bind_one(q, b);
+        }
+        q = q.bind(gts_id.as_ref());
         for b in &ctx.binds {
             q = bind_one(q, b);
         }
@@ -983,6 +997,9 @@ impl RecordStore for ChRecordStore {
         // a deactivation is in flight (plugin-spi.md Method 5 caller-side rule).
 
         // Step 1: Read the target + active depth-1 compensations.
+        // Enable skip indexes under FINAL so `idx_records_id` /
+        // `idx_records_corrects_id` can prune granules; keep exact-mode on so
+        // FINAL resolution stays correct when a skip index drops a granule.
         let sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
              WHERE id = ? OR (corrects_id = ? AND status = 'active')"
@@ -990,6 +1007,8 @@ impl RecordStore for ChRecordStore {
         let rows: Vec<UsageRecordRow> = self
             .client
             .query(&sql)
+            .with_setting("use_skip_indexes_if_final", "1")
+            .with_setting("use_skip_indexes_if_final_exact_mode", "1")
             .bind(id.to_string())
             .bind(id.to_string())
             .fetch_all()

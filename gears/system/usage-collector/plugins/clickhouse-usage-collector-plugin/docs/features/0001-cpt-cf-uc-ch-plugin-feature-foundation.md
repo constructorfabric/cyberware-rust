@@ -43,7 +43,7 @@ Establish the plugin's runtime substrate and its single public surface — the s
 
 ### 1.2 Purpose
 
-Foundation owns the cross-cutting plumbing every other feature builds on: the Plugin Module lifecycle, the Coordination Lock Manager (`LockManager` + `CatalogLockPort`/`LockGuardPort` testability-seam traits), the SPI Storage Adapter (the host's only entry point and the owner of backend-error classification and keyset cursor encoding), the idempotent Schema Migrations (with `{retention_period_secs}` placeholder substitution for the `TTL` clause), and the pure-persistence / SPI-conformance / TLS-credential-non-disclosure / vendor-isolation guarantees. It performs no record, query, catalog, retention, or metric behavior itself — it exposes the shape those features realize.
+Foundation owns the cross-cutting plumbing every other feature builds on: the Plugin Module lifecycle, the Coordination Lock Manager (`LockManager` + `CatalogLockPort`/`LockGuardPort` testability-seam traits), the SPI Storage Adapter (the host's only entry point and the owner of backend-error classification and keyset cursor encoding), the idempotent Schema Migrations (fixed 1-year TTL default in DDL plus `ensure_retention_ttl` reconcile), and the pure-persistence / SPI-conformance / TLS-credential-non-disclosure / vendor-isolation guarantees. It performs no record, query, catalog, retention, or metric behavior itself — it exposes the shape those features realize.
 
 **Requirements**: `cpt-cf-uc-ch-plugin-fr-schema-provisioning`, `cpt-cf-uc-ch-plugin-fr-error-classification`, `cpt-cf-uc-ch-plugin-nfr-spi-stability`, `cpt-cf-uc-ch-plugin-nfr-transport-security`, `cpt-cf-uc-ch-plugin-nfr-consistency-profile`
 
@@ -72,7 +72,7 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 - Record insert, dedup, compensation, and deactivation semantics — Feature 2 (`cpt-cf-uc-ch-plugin-feature-record-persistence`).
 - Aggregation and keyset raw-list execution and injection-safe translation — Feature 3 (`cpt-cf-uc-ch-plugin-feature-query-aggregation`).
 - Usage-type CRUD and the lock-protected verify-then-delete protocol — Feature 4 (`cpt-cf-uc-ch-plugin-feature-usage-type-catalog`).
-- `TTL` clause ownership, config, and retention semantics — Feature 5 (`cpt-cf-uc-ch-plugin-feature-retention`); Foundation provides only the DDL placeholder substitution call site.
+- `TTL` clause ownership, config, and retention semantics — Feature 5 (`cpt-cf-uc-ch-plugin-feature-retention`); Foundation provides the `apply_migrations` / `ensure_retention_ttl` call sites.
 - The `uc_clickhouse_*` metric inventory — Feature 6 (`cpt-cf-uc-ch-plugin-feature-observability`).
 - ClickHouse cluster topology, sizing, HA — operator deployment guide.
 
@@ -91,7 +91,7 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 **Error Scenarios**:
 
 - Invalid config (e.g. plaintext `http://` URL without `allow_insecure_http = true`), unreachable ClickHouse, or schema DDL failure — `init` fails fast; the plugin does not register and the host does not bind it.
-- Lock manager cannot resolve the cluster `usage-collector` profile — `init` fails fast.
+- Unbound or unavailable cluster `usage-collector` profile is **not** an `init` failure: `LockManager` resolves `DistributedLockV1` lazily on first acquire (cluster backends register in `start`, after this plugin's `init`); an unbound profile fails closed with retryable `Transient` on that acquire (create/delete), not at startup.
 
 **Steps**:
 
@@ -100,8 +100,8 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 3. [ ] - `p1` - **IF** `database_url` is plaintext `http://` AND `allow_insecure_http == false` - `inst-ch-boot-3`
    1. [ ] - `p1` - **RETURN** gear initialization failure: TLS enforcement violation - `inst-ch-boot-3a`
 4. [ ] - `p1` - Build the `clickhouse::Client` via `build_client` / `ParsedEndpoint` — parse URL into bare base URL + user/password/database, emit `tracing::warn!` if plaintext - `inst-ch-boot-4`
-5. [ ] - `p1` - Run `apply_migrations` with `retention_period_secs` substituted into the `{retention_period_secs}` placeholder in the embedded `migrations/0001_init.sql` DDL (schema migrations first — fail fast on schema errors) - `inst-ch-boot-5`
-6. [ ] - `p1` - Initialise the `LockManager` with the cluster `DistributedLockV1` handle (lazy `OnceLock` resolve deferred to first acquire; fail-fast: if the `usage-collector` profile is unbound at acquire-time the error is `Transient`) - `inst-ch-boot-6`
+5. [ ] - `p1` - Run `apply_migrations` (idempotent `CREATE TABLE IF NOT EXISTS` with fixed 1-year TTL default), then `ensure_retention_ttl` to reconcile `retention_period_secs` (schema migrations first — fail fast on schema errors) - `inst-ch-boot-5`
+6. [ ] - `p1` - Construct the `LockManager` with the cluster hub handle (lazy `OnceLock` `DistributedLockV1` resolve deferred to first acquire; unbound `usage-collector` profile → `Transient` at acquire-time, not at `init`) - `inst-ch-boot-6`
 7. [ ] - `p1` - **IF** provisioning fails - `inst-ch-boot-7`
    1. [ ] - `p1` - **RETURN** gear initialization failure without registering - `inst-ch-boot-7a`
 8. [ ] - `p1` - Build the `PluginV1<UsageCollectorPluginSpecV1>` registration and publish to `types-registry` - `inst-ch-boot-8`
@@ -114,17 +114,17 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 
 - [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-foundation-schema-provisioning`
 
-**Input**: A `clickhouse::Client` handle; configured `retention_period_secs`.
+**Input**: A `clickhouse::Client` handle; configured `retention_period_secs` (for post-DDL TTL reconcile).
 
-**Output**: A provisioned schema (`cpt-cf-uc-ch-plugin-db-schema`), re-runnable as a no-op on restart.
+**Output**: A provisioned schema (`cpt-cf-uc-ch-plugin-db-schema`) with TTL reconciled to config, re-runnable on restart.
 
 **Steps**:
 
-1. [ ] - `p1` - Substitute the `{retention_period_secs}` placeholder in the embedded `migrations/0001_init.sql` text - `inst-ch-prov-1`
-2. [ ] - `p1` - Strip `--` comment lines from the SQL text to prevent false statement splits on semicolons inside comments - `inst-ch-prov-2`
-3. [ ] - `p1` - Split the remaining text into individual statements, respecting single-quoted string literals - `inst-ch-prov-3`
-4. [ ] - `p1` - For each statement: execute via the ClickHouse client; a `CREATE TABLE IF NOT EXISTS` re-runs as a no-op when the table already exists - `inst-ch-prov-4`
-5. [ ] - `p1` - **IF** any statement returns an error - `inst-ch-prov-5`
+1. [ ] - `p1` - Strip `--` comment lines from the embedded `migrations/0001_init.sql` text to prevent false statement splits on semicolons inside comments - `inst-ch-prov-1`
+2. [ ] - `p1` - Split the remaining text into individual statements, respecting single-quoted string literals - `inst-ch-prov-2`
+3. [ ] - `p1` - For each statement: execute via the ClickHouse client; a `CREATE TABLE IF NOT EXISTS` re-runs as a no-op when the table already exists (DDL bakes a fixed 1-year TTL default) - `inst-ch-prov-3`
+4. [ ] - `p1` - Call `ensure_retention_ttl` to reconcile the live `usage_records` TTL with `retention_period_secs` - `inst-ch-prov-4`
+5. [ ] - `p1` - **IF** any statement or TTL reconcile returns an error - `inst-ch-prov-5`
    1. [ ] - `p1` - **RETURN** provisioning failure; caller fails `init` - `inst-ch-prov-5a`
 6. [ ] - `p1` - **RETURN** provisioning complete - `inst-ch-prov-6`
 
@@ -173,7 +173,7 @@ Not applicable — Foundation establishes the schema, adapter, and registration 
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-module`
 
-The system **MUST** implement the `#[toolkit::gear]` `init` that loads and validates `ClickHousePluginConfig`, builds the ClickHouse client via `build_client` / `ParsedEndpoint`, initialises `LockManager`, invokes `apply_migrations` with `{retention_period_secs}` substitution, and performs GTS publication plus ClientHub scoped registration. The module **MUST NOT** decide whether it is the active backend and **MUST NOT** implement SPI methods directly.
+The system **MUST** implement the `#[toolkit::gear]` `init` that loads and validates `ClickHousePluginConfig`, builds the ClickHouse client via `build_client` / `ParsedEndpoint`, initialises `LockManager`, invokes `apply_migrations` then `ensure_retention_ttl`, and performs GTS publication plus ClientHub scoped registration. The module **MUST NOT** decide whether it is the active backend and **MUST NOT** implement SPI methods directly.
 
 **Implements**: `cpt-cf-uc-ch-plugin-flow-foundation-bind-startup`, `cpt-cf-uc-ch-plugin-algo-foundation-schema-provisioning`
 
@@ -213,7 +213,7 @@ The system **MUST** implement the single `UsageCollectorPluginV1` `StorageAdapte
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-migrations`
 
-The system **MUST** run `apply_migrations` at `init`, substituting `{retention_period_secs}` into the embedded `migrations/0001_init.sql` and executing each `CREATE TABLE IF NOT EXISTS` statement idempotently. The DDL runner **MUST** strip `--` comment lines before splitting statements, split while respecting single-quoted string literals, and execute each statement as a no-op when the object already exists. No external migration-tracking table or framework is used.
+The system **MUST** run `apply_migrations` at `init`, executing each `CREATE TABLE IF NOT EXISTS` statement idempotently (with a fixed 1-year TTL default on `usage_records`), then run `ensure_retention_ttl` to reconcile `retention_period_secs`. The DDL runner **MUST** strip `--` comment lines before splitting statements, split while respecting single-quoted string literals, and execute each statement as a no-op when the object already exists. No external migration-tracking table or framework is used.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-foundation-schema-provisioning`
 
@@ -266,7 +266,7 @@ The system **MUST** keep all ClickHouse-specific SQL, schema, and client depende
 ## 6. Acceptance Criteria
 
 - [x] The crate implements the full `UsageCollectorPluginV1` SPI at build time (compile-time SPI conformance), with no dependency on the host `usage-collector` crate.
-- [x] `init` loads config, builds the ClickHouse client via `ParsedEndpoint`, provisions the schema with the correct `retention_period_secs` substituted, initialises `LockManager`, and registers under a GTS instance identifier carrying the configured vendor and priority; the plugin does not self-select as the active backend.
+- [x] `init` loads config, builds the ClickHouse client via `ParsedEndpoint`, provisions the schema, reconciles `retention_period_secs` via `ensure_retention_ttl`, initialises `LockManager`, and registers under a GTS instance identifier carrying the configured vendor and priority; the plugin does not self-select as the active backend.
 - [x] Re-running `init` on restart re-provisions the schema as a no-op (idempotent), with no error and no duplicate objects.
 - [x] A plaintext `http://` URL is refused at config validation time unless `allow_insecure_http = true` is set; the DSN and its embedded credentials never appear in logs, error messages, or `Debug` output.
 - [x] `build_client` emits `tracing::warn!` on every startup when `allow_insecure_http == true` and the URL is `http://`.

@@ -16,7 +16,7 @@ use crate::domain::ports::{CatalogStore, RecordStore};
 use crate::infra::coordination::lock_manager::LockManager;
 use crate::infra::metrics::Metrics;
 use crate::infra::storage::catalog_store::{CatalogLockPort, ChCatalogStore};
-use crate::infra::storage::pool::{apply_migrations, build_client};
+use crate::infra::storage::pool::{apply_migrations, build_client, ensure_retention_ttl};
 use crate::infra::storage::record_store::ChRecordStore;
 
 /// `ClickHouse` Usage Collector storage backend plugin module.
@@ -58,8 +58,12 @@ impl Gear for ClickHouseUsageCollectorPlugin {
         // Step A: Build the ClickHouse HTTP client and configure timeouts / pool.
         let client = build_client(&cfg);
 
-        // Step B: Run the embedded idempotent schema migration (CREATE TABLE IF NOT EXISTS).
-        apply_migrations(&client, cfg.retention_period_secs)
+        // Step B: Run the embedded idempotent schema migration, then reconcile
+        // usage_records TTL with the configured retention window.
+        apply_migrations(&client)
+            .await
+            .inspect_err(|_| metrics.inc_migration_failure())?;
+        ensure_retention_ttl(&client, cfg.retention_period_secs)
             .await
             .inspect_err(|_| metrics.inc_migration_failure())?;
 
