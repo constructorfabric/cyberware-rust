@@ -172,7 +172,7 @@ impl LockManager {
     /// Returns [`UsageCollectorPluginError::Transient`] if the lock cannot be
     /// acquired within `lock_timeout_secs`, or if the cluster profile is unbound
     /// (fail-closed — DESIGN.md §3.6 step 7).
-    #[instrument(skip(self), fields(gts_id, ?mode))]
+    #[instrument(skip(self), fields(gts_id = %gts_id, ?mode))]
     pub async fn acquire(
         &self,
         gts_id: &str,
@@ -371,26 +371,35 @@ impl Drop for ClusterLockGuard {
         if self.released {
             return;
         }
-        if let Some(inner) = self.inner.take()
-            // Cluster LockGuard drop is a no-op; spawn best-effort release so a
-            // forgotten explicit release still frees the name before TTL.
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            let mode = self.mode;
-            handle.spawn(async move {
-                // Best effort: if the release fails the lease still lapses on
-                // its own TTL, and there is no caller left to inform — but the
-                // cluster degradation that caused it must stay visible.
-                if let Err(e) = inner.release().await {
-                    tracing::warn!(
-                        error = %e,
-                        ?mode,
-                        "cluster lock release on guard drop failed; the lock name stays held \
-                         until its TTL expires"
-                    );
-                }
-            });
-        }
+        let Some(inner) = self.inner.take() else {
+            return;
+        };
+        let mode = self.mode;
+        // Cluster LockGuard drop is a no-op; spawn best-effort release so a
+        // forgotten explicit release still frees the name before TTL. Without a
+        // runtime there is nothing to spawn onto, so the release cannot be
+        // attempted at all — say so rather than dropping the guard silently.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                ?mode,
+                "cluster lock guard dropped outside a Tokio runtime; no release could be \
+                 attempted and the lock name stays held until its TTL expires"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            // Best effort: if the release fails the lease still lapses on
+            // its own TTL, and there is no caller left to inform — but the
+            // cluster degradation that caused it must stay visible.
+            if let Err(e) = inner.release().await {
+                tracing::warn!(
+                    error = %e,
+                    ?mode,
+                    "cluster lock release on guard drop failed; the lock name stays held \
+                     until its TTL expires"
+                );
+            }
+        });
     }
 }
 

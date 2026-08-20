@@ -207,14 +207,9 @@ gears:
       lock_ttl_secs: 30
       lock_timeout_secs: 5
       # 10 years. Long enough that the usage_records TTL can never drop test
-      # rows mid-run, and — unlike a value near the ceiling — safely inside the
-      # range the TTL expression can represent.
-      #
-      # Do NOT raise this toward MAX_RETENTION_SECS (100 years). The migration
-      # emits `TTL toDateTime(created_at) + INTERVAL <n> SECOND`, and
-      # `toDateTime` is ClickHouse's 32-bit DateTime, which saturates in 2106 —
-      # `validate` bounds `n` against DateTime64 instead. At 100 years the sum
-      # wraps to a past instant, so every row is TTL-expired the moment it is
-      # written: inserts report success, `written_rows = 1`, and the table stays
-      # empty. Reads then 404 with nothing in the server log to explain it.
+      # rows mid-run. A convenience, not a DateTime ceiling: the clause is
+      # `created_at + INTERVAL <n> SECOND` on DateTime64(6), so a 100-year
+      # window would also be representable. Keep this well below
+      # MAX_RETENTION_SECS only so the suite does not depend on the
+      # configured maximum.
       retention_period_secs: 315360000

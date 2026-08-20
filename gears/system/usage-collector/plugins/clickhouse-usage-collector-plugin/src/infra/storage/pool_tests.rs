@@ -228,10 +228,19 @@ fn plaintext_url_detected_for_http_scheme() {
     assert!(is_plaintext_url("http://ch:8123/usage"));
 }
 
+/// The scheme is matched on the parsed URL, whose scheme the `url` crate
+/// lowercases, so case variants of the same cleartext connection are all caught.
+#[test]
+fn plaintext_url_detected_regardless_of_scheme_case() {
+    assert!(is_plaintext_url("HTTP://user:pass@ch:8123/db"));
+    assert!(is_plaintext_url("Http://ch:8123/usage"));
+}
+
 #[test]
 fn tls_url_not_flagged_for_https_scheme() {
     assert!(!is_plaintext_url("https://user:pass@ch:8443/db"));
     assert!(!is_plaintext_url("https://ch:8443/usage"));
+    assert!(!is_plaintext_url("HTTPS://ch:8443/usage"));
 }
 
 #[test]
@@ -240,27 +249,14 @@ fn tls_url_not_flagged_for_non_http_schemes() {
     assert!(!is_plaintext_url("tcp://ch:9000"));
 }
 
-// ---------------------------------------------------------------------------
-// Timeout conversion -- config seconds to string for ClickHouse setting
-// ---------------------------------------------------------------------------
-
+/// A DSN that does not parse cannot be shown to be encrypted, so it counts as
+/// plaintext. `validate` rejects it before `build_client`, so this only decides
+/// whether the defense-in-depth cleartext warning fires on a path that skipped
+/// validation — and a spurious warning is the safe direction there.
 #[test]
-fn timeout_string_matches_config_seconds() {
-    let secs: u64 = 42;
-    let s = secs.to_string();
-    assert_eq!(s, "42");
-}
-
-#[test]
-fn timeout_string_for_zero_is_zero() {
-    let s: u64 = 0;
-    assert_eq!(s.to_string(), "0");
-}
-
-#[test]
-fn timeout_string_for_large_value() {
-    let secs: u64 = 3600;
-    assert_eq!(secs.to_string(), "3600");
+fn unparseable_url_treated_as_plaintext() {
+    assert!(is_plaintext_url("not-a-url"));
+    assert!(is_plaintext_url(""));
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +271,7 @@ fn parse_ttl_seconds_from_interval_form() {
 
 #[test]
 fn parse_ttl_seconds_from_legacy_todatetime_interval_form() {
-    let sql =
-        "CREATE TABLE usage_records (...) TTL toDateTime(created_at) + INTERVAL 86400 SECOND DELETE";
+    let sql = "CREATE TABLE usage_records (...) TTL toDateTime(created_at) + INTERVAL 86400 SECOND DELETE";
     assert_eq!(parse_ttl_seconds(sql), Some(86_400));
 }
 
@@ -459,6 +454,23 @@ mod integration {
 
     const CH_PASSWORD: &str = "pool_test_pw";
 
+    /// `gts_id` for the row whose `created_at` sits past `DateTime`'s 2106
+    /// ceiling, proving a `DateTime64` TTL does not expire it on write.
+    const POST_2106_GTS: &str = "post-2106-ttl";
+
+    /// Read the live `usage_records` DDL back from `system.tables`.
+    async fn live_create_sql(client: &clickhouse::Client) -> String {
+        client
+            .query(
+                "SELECT create_table_query \
+                 FROM system.tables \
+                 WHERE database = currentDatabase() AND name = 'usage_records'",
+            )
+            .fetch_one::<String>()
+            .await
+            .expect("create_table_query must be readable")
+    }
+
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn apply_migrations_creates_tables() {
@@ -514,21 +526,9 @@ mod integration {
         }
 
         let client = build_client(&cfg);
-        apply_migrations(&client)
+        apply_migrations(&client, cfg.client_deadline())
             .await
             .expect("migration must succeed against a live ClickHouse instance");
-
-        async fn live_create_sql(client: &clickhouse::Client) -> String {
-            client
-                .query(
-                    "SELECT create_table_query \
-                     FROM system.tables \
-                     WHERE database = currentDatabase() AND name = 'usage_records'",
-                )
-                .fetch_one::<String>()
-                .await
-                .expect("create_table_query must be readable")
-        }
 
         // Matching seconds must still rewrite a legacy toDateTime TTL.
         client
@@ -544,7 +544,7 @@ mod integration {
             legacy_sql.contains("toDateTime(created_at)"),
             "precondition: live TTL must still wrap created_at: {legacy_sql}"
         );
-        ensure_retention_ttl(&client, DEFAULT_RETENTION_SECS)
+        ensure_retention_ttl(&client, DEFAULT_RETENTION_SECS, cfg.client_deadline())
             .await
             .expect("ensure_retention_ttl must rewrite a toDateTime TTL even when seconds match");
         let rewritten = live_create_sql(&client).await;
@@ -560,7 +560,7 @@ mod integration {
 
         // Default DDL TTL is 1 year; ensure with a different window must alter.
         let ten_years = 10 * 365 * 86_400;
-        ensure_retention_ttl(&client, ten_years)
+        ensure_retention_ttl(&client, ten_years, cfg.client_deadline())
             .await
             .expect("ensure_retention_ttl must alter when config differs from default");
 
@@ -576,12 +576,11 @@ mod integration {
         );
 
         // Idempotent when already matched.
-        ensure_retention_ttl(&client, ten_years)
+        ensure_retention_ttl(&client, ten_years, cfg.client_deadline())
             .await
             .expect("ensure_retention_ttl must no-op when TTL already matches");
 
         // A created_at after DateTime's 2106 ceiling must not expire immediately.
-        const POST_2106_GTS: &str = "post-2106-ttl";
         client
             .query(
                 "INSERT INTO usage_records (id, tenant_id, gts_id, value, created_at, \

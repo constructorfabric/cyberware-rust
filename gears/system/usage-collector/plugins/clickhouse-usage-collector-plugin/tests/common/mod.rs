@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use usage_collector_sdk::{
     IdempotencyKey, MetadataKey, ResourceRef, SubjectRef, UsageKind, UsageRecord, UsageType,
-    UsageTypeGtsId,
+    UsageTypeGtsId, derive_usage_record_id,
 };
 
 use clickhouse_usage_collector_plugin::infra::coordination::lock_manager::{
@@ -95,7 +95,7 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
 
     let mut last_err = None;
     for _ in 0..20u8 {
-        match apply_migrations(&client).await {
+        match apply_migrations(&client, TEST_REQUEST_TIMEOUT).await {
             Ok(()) => {
                 last_err = None;
                 break;
@@ -110,7 +110,7 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
         return Err(e);
     }
 
-    ensure_retention_ttl(&client, cfg.retention_period_secs).await?;
+    ensure_retention_ttl(&client, cfg.retention_period_secs, TEST_REQUEST_TIMEOUT).await?;
 
     let hub = Arc::new(ClientHub::default());
     let cache = StandaloneCache::new();
@@ -176,6 +176,12 @@ pub fn metrics() -> Arc<Metrics> {
     Arc::new(Metrics::new())
 }
 
+/// Client-side per-request deadline for stores built by these helpers.
+///
+/// Generous relative to anything the live suites do, so it stays a backstop
+/// against a hang rather than something an assertion can trip over.
+pub const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Build a [`LockManager`] against the harness hub.
 #[must_use]
 pub fn lock_manager(hub: &Arc<ClientHub>) -> Arc<LockManager> {
@@ -204,7 +210,12 @@ pub fn record_store(h: &ChHarness) -> ChRecordStore {
 /// so a call reaches its SQL instead of failing at lock acquisition.
 #[must_use]
 pub fn record_store_over(h: &ChHarness, client: clickhouse::Client) -> ChRecordStore {
-    ChRecordStore::new(client, lock_manager(&h.hub), metrics())
+    ChRecordStore::new(
+        client,
+        lock_manager(&h.hub),
+        metrics(),
+        TEST_REQUEST_TIMEOUT,
+    )
 }
 
 /// Same as [`record_store`], but with a caller-supplied cluster lock backend
@@ -222,7 +233,12 @@ pub fn record_store_with_lock_backend(
     let hub = Arc::new(ClientHub::default());
     register_lock_backend(&hub, UsageCollectorProfile::NAME, backend)
         .expect("register the caller-supplied lock backend");
-    ChRecordStore::new(h.client.clone(), lock_manager(&hub), metrics())
+    ChRecordStore::new(
+        h.client.clone(),
+        lock_manager(&hub),
+        metrics(),
+        TEST_REQUEST_TIMEOUT,
+    )
 }
 
 /// Build a [`ChCatalogStore`] with its own [`LockManager`] and metric handle.
@@ -236,7 +252,13 @@ pub fn catalog_store(h: &ChHarness) -> ChCatalogStore {
 #[must_use]
 pub fn catalog_store_over(h: &ChHarness, client: clickhouse::Client) -> ChCatalogStore {
     let lock_port: Arc<dyn CatalogLockPort> = lock_manager(&h.hub);
-    ChCatalogStore::new(client, lock_port, h.cancel.clone(), metrics())
+    ChCatalogStore::new(
+        client,
+        lock_port,
+        h.cancel.clone(),
+        metrics(),
+        TEST_REQUEST_TIMEOUT,
+    )
 }
 
 /// Same as [`catalog_store`], but with a caller-supplied lock port, for driving
@@ -247,7 +269,13 @@ pub fn catalog_store_with_lock(
     h: &ChHarness,
     lock_port: Arc<dyn CatalogLockPort>,
 ) -> ChCatalogStore {
-    ChCatalogStore::new(h.client.clone(), lock_port, h.cancel.clone(), metrics())
+    ChCatalogStore::new(
+        h.client.clone(),
+        lock_port,
+        h.cancel.clone(),
+        metrics(),
+        TEST_REQUEST_TIMEOUT,
+    )
 }
 
 /// A client pointed at a port with nothing listening, so every statement fails
@@ -271,7 +299,7 @@ pub fn unreachable_client() -> clickhouse::Client {
 ///
 /// Resolved once per process so it stays deterministic within a run: the dedup
 /// tests build two fixtures independently and rely on them sharing the same
-/// `(tenant_id, gts_id, created_at, id)` key. Offset well into the past so
+/// `(tenant_id, gts_id, created_at, idempotency_key)` key. Offset well into the past so
 /// callers adding per-record offsets (`base + i`) stay in the past too.
 #[must_use]
 pub fn fixture_base_ts() -> i64 {
@@ -304,43 +332,88 @@ pub fn fixture_usage_type(gts: &str, kind: &str, fields: &[&str]) -> UsageType {
     }
 }
 
-/// Build a minimal [`UsageRecord`] fixture referencing `gts_id`.
+/// The default fixture event instant, [`fixture_base_ts`] as an
+/// [`OffsetDateTime`].
+///
+/// Pass this to [`fixture_usage_record`] when the test does not care about the
+/// timestamp, and [`fixture_created_at_offset`] when it needs distinct instants.
 #[must_use]
-pub fn fixture_usage_record(
+pub fn fixture_created_at() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(fixture_base_ts())
+        .expect("fixture created_at must be a valid unix timestamp")
+}
+
+/// [`fixture_created_at`] shifted by `offset_secs`, for tests that need several
+/// records at distinct instants.
+#[must_use]
+pub fn fixture_created_at_offset(offset_secs: i64) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(fixture_base_ts() + offset_secs)
+        .expect("fixture created_at must be a valid unix timestamp")
+}
+
+/// Build a minimal [`UsageRecord`] fixture at the default [`fixture_created_at`]
+/// instant.
+///
+/// Use [`fixture_usage_record_at`] when the test needs a specific event time —
+/// never set `created_at` on the returned record, see that function.
+#[must_use]
+pub fn fixture_usage_record(gts: &str, tenant_id: Uuid, idem: &str, value: Decimal) -> UsageRecord {
+    fixture_usage_record_at(gts, tenant_id, idem, value, fixture_created_at())
+}
+
+/// Build a minimal [`UsageRecord`] fixture referencing `gts_id` at `created_at`.
+///
+/// `id` is derived with [`derive_usage_record_id`], exactly as the gateway
+/// stamps it on every dispatch (ADR-0013 / ADR-0014) — `CreateUsageRecordRequest`
+/// carries no identity field, so a derived id is the only shape this plugin can
+/// ever receive. A synthetic id would let a test pass while the real dedup
+/// identity is broken: the dedup lookup keys on the canonical tuple and then
+/// compares the stored `id` against the incoming one, so a hand-forged id would
+/// read as a corrupted stored row rather than as an exact retry.
+///
+/// `created_at` is a parameter rather than a default the caller overwrites
+/// afterwards, because it is one of the four derivation inputs: mutating it on
+/// the returned record would leave a stale `id` behind. The fields tests do
+/// mutate (`value`, `metadata`, `corrects_id`, `resource_ref`, `subject_ref`)
+/// are not derivation inputs, so they stay safe to set post-construction.
+#[must_use]
+pub fn fixture_usage_record_at(
     gts: &str,
     tenant_id: Uuid,
     idem: &str,
     value: Decimal,
-    seq: u128,
+    created_at: OffsetDateTime,
 ) -> UsageRecord {
+    let gts_id = fixture_gts_id(gts);
+    let idempotency_key = IdempotencyKey::new(idem).expect("fixture idempotency_key must be valid");
     UsageRecord {
-        id: Uuid::from_u128(seq),
-        gts_id: fixture_gts_id(gts),
+        id: derive_usage_record_id(tenant_id, &gts_id, &idempotency_key, created_at),
+        gts_id,
         tenant_id,
         resource_ref: ResourceRef::new("res-1", "compute.vm")
             .expect("fixture resource_ref must be valid"),
         subject_ref: None,
         metadata: std::collections::BTreeMap::new(),
         value,
-        idempotency_key: IdempotencyKey::new(idem).expect("fixture idempotency_key must be valid"),
+        idempotency_key,
         corrects_id: None,
         status: usage_collector_sdk::UsageRecordStatus::Active,
-        created_at: OffsetDateTime::from_unix_timestamp(fixture_base_ts())
-            .expect("fixture created_at must be a valid unix timestamp"),
+        created_at,
     }
 }
 
-/// Build a [`UsageRecord`] fixture with a caller-chosen `resource_id`.
+/// Build a [`UsageRecord`] fixture with a caller-chosen `resource_id` at
+/// `created_at`.
 #[must_use]
-pub fn fixture_usage_record_with_resource(
+pub fn fixture_usage_record_with_resource_at(
     gts: &str,
     tenant_id: Uuid,
     idem: &str,
     value: Decimal,
-    seq: u128,
+    created_at: OffsetDateTime,
     resource_id: &str,
 ) -> UsageRecord {
-    let mut rec = fixture_usage_record(gts, tenant_id, idem, value, seq);
+    let mut rec = fixture_usage_record_at(gts, tenant_id, idem, value, created_at);
     rec.resource_ref =
         ResourceRef::new(resource_id, "compute.vm").expect("fixture resource_ref must be valid");
     rec
@@ -353,11 +426,10 @@ pub fn fixture_usage_record_with_subject(
     tenant_id: Uuid,
     idem: &str,
     value: Decimal,
-    seq: u128,
     subject_id: &str,
     subject_type: Option<&str>,
 ) -> UsageRecord {
-    let mut rec = fixture_usage_record(gts, tenant_id, idem, value, seq);
+    let mut rec = fixture_usage_record(gts, tenant_id, idem, value);
     rec.subject_ref =
         Some(SubjectRef::new(subject_id, subject_type).expect("fixture subject_ref must be valid"));
     rec

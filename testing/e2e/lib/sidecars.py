@@ -9,7 +9,16 @@ Deliberately hand-rolled rather than using testcontainers-python: this suite's
 requirements.txt is minimal and Snyk-pinned, and testcontainers-rs 0.27 (used
 by the Rust plugin tests) ships no ryuk either, so the library would buy no
 cleanup guarantee the repo already relies on. Orphans are handled by the label
-reaper below.
+reapers below.
+
+Labels are two-part, and the split matters. Every container carries the same
+KEY (``LABEL_KEY``) so a sweep can find sidecars from any run, while the VALUE
+ends in ``RUN_ID`` so it names one pytest process. Cleanup is what forces this:
+removal is by label and ``docker ps -aq`` lists running containers, so a single
+fixed label per class would make one session's startup delete a concurrent
+session's live database. ``reap_orphans`` therefore addresses one exact label
+(this run's, or a test's own), and cross-run cleanup goes through the age-gated
+``reap_stale``.
 
 ``_DockerSidecar`` owns the lifecycle every container shares; a subclass
 supplies its image, its environment, and its own readiness probe.
@@ -22,6 +31,8 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -54,6 +65,28 @@ def timescaledb_tag() -> str:
     against another, with nothing in the diff to show it.
     """
     return os.environ.get(ENV_TIMESCALEDB_TAG, "").strip() or TIMESCALEDB_TAG
+
+
+# Docker label KEY every sidecar here shares. The VALUE identifies the run that
+# owns the container: a class constant prefix plus RUN_ID. Splitting the two
+# lets `reap_stale` find every sidecar container ever started (filter on the
+# key) while `reap_orphans` still addresses one exact namespace.
+LABEL_KEY = "cf-gears-e2e"
+
+# One identity per pytest process, so two sessions on the same host never share
+# a label value. Overridable so CI can pin a run identity across processes (or
+# reuse one deliberately, e.g. to let a retry reap its own leftovers).
+RUN_ID = (
+    os.environ.get("CF_GEARS_E2E_RUN_ID")
+    or f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+)
+
+# How old a foreign container must be before `reap_stale` treats it as leaked.
+# There is no way to ask Docker whether the process that started a container is
+# still alive, so age is the proxy: this MUST exceed the longest plausible
+# session (cold image pull plus a full suite) or a new run would delete a live
+# concurrent one — the very bug the per-run label exists to prevent.
+REAP_MIN_AGE_SECS = int(os.environ.get("CF_GEARS_E2E_REAP_MIN_AGE_SECS", "3600"))
 
 
 class DockerUnavailable(RuntimeError):
@@ -102,18 +135,22 @@ class _DockerSidecar:
 
     # Subclass contract.
     IMAGE = ""
+    # `key=value` prefix, NOT the label a container ends up with: the instance
+    # appends RUN_ID (see __init__). Every subclass MUST use LABEL_KEY as the
+    # key, since that is what `reap_stale` sweeps on.
     LABEL = ""
     # The container-side port to map, in `docker port` syntax, e.g. "5432/tcp".
     CONTAINER_PORT = ""
     name = ""
 
     def __init__(self, label: str | None = None) -> None:
-        # Per-instance label (defaulting to the class constant) so a caller
-        # that needs an isolated Docker namespace — e.g. the sidecar
-        # self-tests in test_sidecar_contract.py, which plant and reap
-        # orphans of their own — cannot collide with (and reap!) the label
-        # a real session's container is running under.
-        self.label = label or self.LABEL
+        # Default to a per-RUN label, not the bare class constant: `start()`
+        # reaps before it runs, and the reap filter matches RUNNING containers,
+        # so two sessions sharing one label value delete each other's live
+        # database mid-run. An explicit `label` is taken verbatim, which is how
+        # the self-tests in test_sidecar_contract.py get a deterministic
+        # namespace they can plant and reap orphans in.
+        self.label = label or f"{self.LABEL}-{RUN_ID}"
         self.port: int | None = None
         self.container_id: str | None = None
 
@@ -124,9 +161,81 @@ class _DockerSidecar:
             raise RuntimeError(f"{type(self).__name__}.start() has not run")
         return str(self.port)
 
+    @staticmethod
+    def _ids_labelled(label_filter: str) -> list[str]:
+        """Container ids matching a `docker ps` label filter.
+
+        `label_filter` is either `key=value` (one exact namespace) or a bare
+        `key`, which Docker matches against any value.
+        """
+        ids = _run(["docker", "ps", "-aq", "--filter", f"label={label_filter}"])
+        return [line.strip() for line in ids.splitlines() if line.strip()]
+
+    @staticmethod
+    def _label_value(label: str) -> str:
+        """The VALUE half of a `key=value` label.
+
+        Callers hold the full form (that is what `--filter label=` wants),
+        while `docker inspect` reports bare values. Comparing the two directly
+        never matches, which would silently defeat `reap_stale`'s own-run
+        guard, so ownership checks go through here.
+        """
+        prefix = f"{LABEL_KEY}="
+        return label[len(prefix):] if label.startswith(prefix) else label
+
+    @staticmethod
+    def _rm(container_ids: list[str]) -> None:
+        for container_id in container_ids:
+            subprocess.run(
+                ["docker", "rm", "-f", container_id],
+                capture_output=True, timeout=DOCKER_TIMEOUT, check=False,
+            )
+
+    @staticmethod
+    def _owners(container_ids: list[str]) -> list[tuple[str, float, str]]:
+        """`(id, age_seconds, label value)` for each id Docker still knows.
+
+        `check=False` and the per-line skips are deliberate: a container can
+        vanish between the `docker ps` that listed it and this call — a
+        concurrent run reaping its own leftovers is exactly the situation this
+        module now handles — and one unreadable entry must not abort the sweep.
+
+        Anything unparseable is dropped, which means it is NOT reaped. That is
+        the safe direction: a container whose age cannot be established might
+        belong to a live session.
+        """
+        if not container_ids:
+            return []
+        proc = subprocess.run(
+            ["docker", "inspect", "-f",
+             '{{.Id}} {{.Created}} {{index .Config.Labels "' + LABEL_KEY + '"}}',
+             *container_ids],
+            capture_output=True, text=True, timeout=DOCKER_TIMEOUT, check=False,
+        )
+        now = datetime.now(timezone.utc)
+        owners: list[tuple[str, float, str]] = []
+        for line in proc.stdout.splitlines():
+            parts = line.split(maxsplit=2)
+            if len(parts) < 2:
+                continue
+            container_id, created = parts[0], parts[1]
+            label = parts[2].strip() if len(parts) > 2 else ""
+            # Docker stamps `Created` as RFC3339 with NANOSECOND precision,
+            # which `datetime.fromisoformat` rejects. Second resolution is
+            # ample against an hour-scale threshold, so parse the leading
+            # `YYYY-MM-DDTHH:MM:SS` (always UTC) and discard the rest.
+            try:
+                created_at = datetime.strptime(
+                    created[:19], "%Y-%m-%dT%H:%M:%S",
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            owners.append((container_id, (now - created_at).total_seconds(), label))
+        return owners
+
     @classmethod
-    def reap_orphans(cls, label: str | None = None) -> None:
-        """Remove containers left by an earlier interrupted run.
+    def reap_orphans(cls, label: str, *, min_age_secs: int = 0) -> None:
+        """Remove containers carrying exactly `label`.
 
         atexit does not fire on SIGKILL or a hard crash, so a leaked container
         is possible; this clears it on the next run. Same exposure as the Rust
@@ -134,18 +243,69 @@ class _DockerSidecar:
 
         `docker ps -aq` matches running containers too, so this removes ANY
         container carrying `label` — including one that is still in active
-        use. Callers MUST pass the label of the namespace they own; never
-        reap a label whose container might be a live session under test.
+        use. Callers MUST pass the label of a namespace they own, which is why
+        `label` is required rather than defaulting to `cls.LABEL`: that
+        constant is now only a prefix, so defaulting to it would silently match
+        nothing. The default instance label is owned by construction (it
+        carries RUN_ID, naming this process alone); cross-run cleanup belongs
+        to `reap_stale`, which is age-gated for exactly this reason.
+
+        `min_age_secs` spares containers younger than the given age. It
+        defaults to 0 (remove every match) because an exactly-matching label is
+        already proof of ownership.
         """
-        label = label or cls.LABEL
-        ids = _run(["docker", "ps", "-aq", "--filter", f"label={label}"])
-        for container_id in ids.splitlines():
-            container_id = container_id.strip()
-            if container_id:
-                subprocess.run(
-                    ["docker", "rm", "-f", container_id],
-                    capture_output=True, timeout=DOCKER_TIMEOUT, check=False,
-                )
+        ids = cls._ids_labelled(label)
+        if min_age_secs <= 0:
+            cls._rm(ids)
+            return
+        cls._rm([cid for cid, age, _ in cls._owners(ids) if age >= min_age_secs])
+
+    @classmethod
+    def stale_ids(
+        cls,
+        *,
+        min_age_secs: int = REAP_MIN_AGE_SECS,
+        own_label: str | None = None,
+    ) -> list[str]:
+        """Ids `reap_stale` would remove, without removing them.
+
+        Split out so the self-tests can assert the age decision — including at
+        `min_age_secs=0` — without running a host-wide removal that would
+        delete a live session's container, which is the very failure the age
+        gate exists to prevent.
+        """
+        own = cls._label_value(own_label) if own_label is not None else None
+        return [
+            cid for cid, age, label in cls._owners(cls._ids_labelled(LABEL_KEY))
+            if label != own and age >= min_age_secs
+        ]
+
+    @classmethod
+    def reap_stale(
+        cls,
+        *,
+        min_age_secs: int = REAP_MIN_AGE_SECS,
+        own_label: str | None = None,
+    ) -> None:
+        """Remove sidecar containers leaked by an earlier run of ANY session.
+
+        Per-run label values stop sessions from reaping each other, but they
+        also mean a crashed run's container no longer shares a label with
+        anything that follows it, so nothing would ever clean it up. This sweep
+        restores that: it matches the shared label KEY (every value) and then
+        decides ownership by age.
+
+        Age is a proxy, and it has to be: Docker cannot say whether the process
+        that started a container is still alive, and a PID would be meaningless
+        across hosts and containers. `min_age_secs` must therefore stay well
+        above the longest plausible session — see REAP_MIN_AGE_SECS. A live
+        concurrent run is younger than the threshold and survives; a container
+        that has outlived any plausible session is leaked and goes.
+
+        `own_label` is skipped outright, so "never reap your own session" holds
+        even if a skewed daemon clock made our own container look old.
+        """
+        cls._rm(cls.stale_ids(min_age_secs=min_age_secs, own_label=own_label))
 
     @classmethod
     def pull(cls) -> None:
@@ -166,7 +326,11 @@ class _DockerSidecar:
 
     def start(self) -> None:
         require_docker()
+        # Own namespace first (a re-run under a pinned CF_GEARS_E2E_RUN_ID, or a
+        # test passing an explicit label, can have leftovers of its own), then
+        # the age-gated sweep for containers leaked by other runs.
         self.reap_orphans(self.label)
+        self.reap_stale(own_label=self.label)
         self.pull()
 
         self.container_id = _run([
@@ -266,7 +430,7 @@ class TimescaleDbSidecar(_DockerSidecar):
     """
 
     IMAGE = f"{TIMESCALEDB_IMAGE}:{timescaledb_tag()}"
-    LABEL = "cf-gears-e2e=usage-collector"
+    LABEL = f"{LABEL_KEY}=usage-collector"
     CONTAINER_PORT = "5432/tcp"
 
     DB_USER = "uc"
@@ -325,7 +489,7 @@ class ClickHouseSidecar(_DockerSidecar):
     """
 
     IMAGE = "clickhouse/clickhouse-server:25.6"
-    LABEL = "cf-gears-e2e=usage-collector-ch"
+    LABEL = f"{LABEL_KEY}=usage-collector-ch"
     # The HTTP interface: the `clickhouse` crate the plugin uses is
     # HTTP-based, so 8123 — not the native protocol's 9000 — is the port
     # `database_url` points at.

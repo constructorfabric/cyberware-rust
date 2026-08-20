@@ -45,8 +45,15 @@ make e2e-docker-smoke      # E2E — Docker environment (smoke subset only)
 make e2e-local             # E2E — local: run every shared-server suite against one shared server
 make e2e-local-smoke       # E2E — smoke subset only
 make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
+<<<<<<< HEAD
 make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (resource_group/e2e.yaml, profile: tr-authz)
 make e2e-usage-collector   # E2E — usage-collector lane, TimescaleDB + ClickHouse backends (dedicated binary each; needs Docker)
+=======
+make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (local mode, e2e-tr-authz.yaml)
+make e2e-usage-collector   # E2E — usage-collector lane, both backends (aggregate of the two targets below)
+make e2e-usage-collector-timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
+make e2e-usage-collector-clickhouse   # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
+>>>>>>> 9f906fad (Resolve coderabbit comments)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
 make all                   # full pipeline (build + check + test-sqlite + e2e-local)
@@ -281,10 +288,18 @@ e2e-launcher`) and therefore **skips these** — run them via their dedicated
 SUITE=<suite>`), which CI invokes as separate steps.
 
 The usage-collector lane additionally needs a reachable Docker daemon — its storage
-plugin connects and migrates a real TimescaleDB at gear init, which `lib/sidecars.py`
-supplies as a throwaway container on a dynamically mapped port. When Docker is
-unreachable the suite skips rather than fails, so verify the skip count before reading
-a green run as coverage.
+plugin connects and migrates a real TimescaleDB (or ClickHouse) at gear init, which
+`lib/sidecars.py` supplies as a throwaway container on a dynamically mapped port. When
+Docker is unreachable the suite skips rather than fails, so verify the skip count before
+reading a green run as coverage.
+
+Those containers are labelled per run, so two sessions can share one host without
+reaping each other's database: the label value ends in a per-process `RUN_ID`, and
+containers left behind by a crashed run (where `atexit` never fired) are swept on the
+next start by age rather than by label alone. Set `CF_GEARS_E2E_RUN_ID` to pin the run
+identity, and `CF_GEARS_E2E_REAP_MIN_AGE_SECS` (default 3600) to change how old a
+foreign container must be before it counts as leaked — lowering it below the length of
+a full session reintroduces the cross-session reap it exists to prevent.
 
 Other quality-related GitHub Actions under `.github/workflows` complement the E2E
 workflow:

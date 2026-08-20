@@ -6,9 +6,11 @@
 //! copy) is what every read observes. Deletion is a real row removal via a
 //! lightweight `DELETE FROM usage_type_catalog WHERE gts_id = ?` — never
 //! `ALTER TABLE … DELETE`, which is an asynchronous background mutation
-//! unsuitable for the request path — so a deleted row is immediately absent
-//! from every subsequent query with no tombstone flag or versioned marker
-//! required to represent "deleted".
+//! unsuitable for the request path. The statement sets
+//! `lightweight_deletes_sync = 2` itself rather than inheriting the server
+//! default, which is what makes a deleted row absent from every subsequent
+//! query, with no tombstone flag or versioned marker required to represent
+//! "deleted".
 //!
 //! `delete` acquires an exclusive per-`gts_id` coordination lock via
 //! [`CatalogLockPort`], runs an authoritative bounded reference-count probe
@@ -33,6 +35,7 @@
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Notify;
@@ -48,15 +51,15 @@ use crate::domain::ports::CatalogStore;
 use crate::infra::coordination::lock_manager::LockGuardPort;
 use crate::infra::metrics::{LockMode, Metrics};
 use crate::infra::storage::entity::{UsageTypeKindCode, UsageTypeRow};
-use crate::infra::storage::error::tracked_ch_err;
+use crate::infra::storage::error::{tracked_ch_err, with_deadline};
 use crate::infra::storage::mapper::current_merge_version;
-use crate::infra::storage::query::effective_page_size;
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate,
 };
 use crate::infra::storage::query::translate::{
     SqlCtx, bind_one, translate_usage_type_filter, usage_type_column,
 };
+use crate::infra::storage::query::{DEFAULT_PAGE_SIZE, effective_page_size};
 
 // ── Static column list ────────────────────────────────────────────────────────
 
@@ -67,9 +70,6 @@ use crate::infra::storage::query::translate::{
 const TYPE_COLUMNS: &str = "gts_id, kind, metadata_fields, version";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-
-/// Default page size when the caller omits `$top`.
-const DEFAULT_PAGE_SIZE: u64 = 100;
 
 /// Upper bound on the reference probe inside `delete`.
 ///
@@ -116,6 +116,8 @@ pub struct ChCatalogStore {
     client: clickhouse::Client,
     lock_manager: Arc<dyn CatalogLockPort>,
     metrics: Arc<Metrics>,
+    /// Client-side deadline applied to every individual `ClickHouse` await.
+    request_timeout: Duration,
     /// Gear shutdown token; races the background catalog-size refresh so a
     /// shutdown drops the in-flight `count()` promptly.
     cancel: CancellationToken,
@@ -146,6 +148,12 @@ impl ChCatalogStore {
     /// races its `count()` against it so a shutdown drops the in-flight query,
     /// returns its connection promptly, and the worker exits.
     ///
+    /// `request_timeout` bounds every individual `ClickHouse` await; production
+    /// wiring passes `ClickHousePluginConfig::client_deadline()`. It is an
+    /// explicit parameter rather than a defaulted builder step so a future
+    /// wiring change cannot silently leave a store on a default that disagrees
+    /// with the configured budget.
+    ///
     /// Must be invoked within a Tokio runtime (the worker is spawned eagerly).
     #[must_use]
     pub fn new(
@@ -153,11 +161,13 @@ impl ChCatalogStore {
         lock_manager: Arc<dyn CatalogLockPort>,
         cancel: CancellationToken,
         metrics: Arc<Metrics>,
+        request_timeout: Duration,
     ) -> Self {
         let store = Self {
             client,
             lock_manager,
             metrics,
+            request_timeout,
             cancel,
             refresh_signal: Arc::new(Notify::new()),
             #[cfg(test)]
@@ -220,12 +230,26 @@ impl ChCatalogStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         let sql = "SELECT count() FROM usage_type_catalog FINAL";
-        match self.client.query(sql).fetch_one::<u64>().await {
-            Ok(n) => {
+        // Bounded with a bare `timeout` rather than `with_deadline`: a stalled
+        // gauge refresh is not a request-path backend error, so it stays out of
+        // the backend-error counter and is only logged.
+        match tokio::time::timeout(
+            self.request_timeout,
+            self.client.query(sql).fetch_one::<u64>(),
+        )
+        .await
+        {
+            Ok(Ok(n)) => {
                 self.metrics.set_catalog_size(n);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(error = %e, "failed to refresh usage_type_catalog size");
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    deadline_secs = self.request_timeout.as_secs(),
+                    "usage_type_catalog size refresh exceeded the client-side deadline"
+                );
             }
         }
     }
@@ -233,11 +257,14 @@ impl ChCatalogStore {
     /// INSERT a single `UsageTypeRow` into `usage_type_catalog`.
     async fn insert_type_row(&self, row: &UsageTypeRow) -> Result<(), UsageCollectorPluginError> {
         let pool_start = std::time::Instant::now();
-        let mut insert = self
-            .client
-            .insert::<UsageTypeRow>("usage_type_catalog")
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        // `with_timeouts` bounds the `write` / `end` awaits below natively.
+        let mut insert = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client.insert::<UsageTypeRow>("usage_type_catalog"),
+        )
+        .await?
+        .with_timeouts(Some(self.request_timeout), Some(self.request_timeout));
         self.metrics
             .record_pool_acquire(pool_start.elapsed().as_secs_f64());
         insert
@@ -285,13 +312,15 @@ impl CatalogStore for ChCatalogStore {
 
     async fn get(&self, gts_id: UsageTypeGtsId) -> Result<UsageType, UsageCollectorPluginError> {
         let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let row: Option<UsageTypeRow> = self
-            .client
-            .query(&sql)
-            .bind(gts_id.as_ref())
-            .fetch_optional::<UsageTypeRow>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let row: Option<UsageTypeRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .bind(gts_id.as_ref())
+                .fetch_optional::<UsageTypeRow>(),
+        )
+        .await?;
 
         match row {
             Some(row) => UsageType::try_from(row),
@@ -371,10 +400,8 @@ impl CatalogStore for ChCatalogStore {
         for b in &ctx.binds {
             q = bind_one(q, b);
         }
-        let mut rows: Vec<UsageTypeRow> = q
-            .fetch_all()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let mut rows: Vec<UsageTypeRow> =
+            with_deadline(&self.metrics, self.request_timeout, q.fetch_all()).await?;
 
         // Look-ahead row present → a next page exists; drop it before mapping.
         let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -455,13 +482,15 @@ impl ChCatalogStore {
 
         // 1. Pre-existence check: SELECT FINAL WHERE gts_id = ?.
         let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let existing: Option<UsageTypeRow> = self
-            .client
-            .query(&sql)
-            .bind(gts_id_raw.as_str())
-            .fetch_optional::<UsageTypeRow>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let existing: Option<UsageTypeRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .bind(gts_id_raw.as_str())
+                .fetch_optional::<UsageTypeRow>(),
+        )
+        .await?;
 
         if let Some(row) = existing {
             // 2-3. Compare kind and metadata_fields for idempotency absorb vs conflict.
@@ -522,13 +551,15 @@ impl ChCatalogStore {
         exclusive_guard: &dyn LockGuardPort,
     ) -> Result<(), UsageCollectorPluginError> {
         let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let existing: Option<UsageTypeRow> = self
-            .client
-            .query(&sql)
-            .bind(gts_id.as_ref())
-            .fetch_optional::<UsageTypeRow>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let existing: Option<UsageTypeRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .bind(gts_id.as_ref())
+                .fetch_optional::<UsageTypeRow>(),
+        )
+        .await?;
 
         if existing.is_none() {
             return Err(UsageCollectorPluginError::UsageTypeNotFound {
@@ -538,14 +569,16 @@ impl ChCatalogStore {
 
         let ref_sql = "SELECT count() FROM (SELECT 1 FROM usage_records FINAL WHERE gts_id = ? LIMIT ?) \
              AS sub_ref";
-        let ref_count: u64 = self
-            .client
-            .query(ref_sql)
-            .bind(gts_id.as_ref())
-            .bind(REF_COUNT_CAP)
-            .fetch_one::<u64>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let ref_count: u64 = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(ref_sql)
+                .bind(gts_id.as_ref())
+                .bind(REF_COUNT_CAP)
+                .fetch_one::<u64>(),
+        )
+        .await?;
 
         if ref_count > 0 {
             self.metrics.inc_usage_type_referenced();
@@ -560,13 +593,26 @@ impl ChCatalogStore {
             return Err(e);
         }
 
+        // `lightweight_deletes_sync = 2` is stated explicitly rather than
+        // inherited: the removal must be visible to the very next read, because
+        // a re-`create` for this `gts_id` decides absorb-vs-`UsageTypeAlreadyExists`
+        // from a `FINAL` pre-existence check (see `create_under_lock`), and
+        // `create_usage_record` decides `UsageTypeNotFound` the same way. The
+        // server-side default is not ours to rely on — ClickHouse Cloud ships
+        // `1` and a settings profile can ship `0`, which returns from `DELETE`
+        // before the row stops being visible. A query-level setting overrides
+        // both, at the cost of waiting for the mutation on every replica.
         let delete_sql = "DELETE FROM usage_type_catalog WHERE gts_id = ?";
-        self.client
-            .query(delete_sql)
-            .bind(gts_id.as_ref())
-            .execute()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(delete_sql)
+                .with_setting("lightweight_deletes_sync", "2")
+                .bind(gts_id.as_ref())
+                .execute(),
+        )
+        .await?;
 
         self.request_catalog_size_refresh();
         Ok(())

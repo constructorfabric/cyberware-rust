@@ -114,13 +114,13 @@ This plugin operates within the standard Gears ToolKit lifecycle. At startup it 
 
 - Full implementation of the Usage Collector storage SPI: single and batch record persistence, point read, keyset-paginated raw list, pushed-down aggregation (with the SPI's mandatory result-bucket cap enforced), event deactivation with a depth-1 cascade, and the full usage-type catalog lifecycle (create, get, list, delete).
 - Durable system-of-record storage for usage records, structured for efficient dedup point-lookups and time-range scans (DESIGN.md §3.7).
-- Application-level deduplication keyed on the deterministic record `id` (itself derived from the `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple, ADR-0014).
+- Application-level deduplication keyed on the SPI's canonical `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple, with the deterministic record `id` derived from that same tuple (ADR-0014) then verified as a canonical field.
 - Append-only compensation entries and a depth-1 deactivation cascade applied as a single atomic write, since ClickHouse has no in-place `UPDATE` suitable for the request path.
 - Application-level referential-integrity emulation between usage records and the usage-type catalog, using a per-`gts_id` coordination lock (DESIGN.md §3.5/§3.6) that closes the concurrent-reference window entirely rather than merely bounding it, since ClickHouse has no native foreign key.
 - Server-side aggregation (SUM / COUNT / MIN / MAX / AVG with grouping) and keyset pagination pushed into ClickHouse's vectorized execution engine, with the SPI's `MAX_AGGREGATION_BUCKETS` cap enforced server-side.
 - A native ClickHouse expiry mechanism providing time-based retention for usage records: a fixed one-year TTL default in the initial DDL, reconciled on every startup to the operator-configured `retention_period_secs`.
 - Injection-safe translation of the host-supplied filter, aggregation, and pagination into parameterized ClickHouse queries.
-- Push-based OpenTelemetry metrics for the plugin's backend-internal operation, under a distinct `uc_clickhouse_*` sub-namespace, including a detection-backstop signal for the residual referential-integrity race ([§5](#5-functional-requirements)).
+- Push-based OpenTelemetry metrics for the plugin's backend-internal operation, under a distinct `uc_clickhouse_*` sub-namespace: backend readiness, error classification, insert/query/lock instruments, and the catalog-size gauge ([§5](#5-functional-requirements)). The orphaned-reference detection-backstop counter is **deferred** and not registered — see [§9](#9-acceptance-criteria) and feature 0006 §5.
 - Typed classification of every backend error into the SDK's `UsageCollectorPluginError` vocabulary (Transient vs. Internal, plus the typed domain variants).
 - Runtime discovery/registration and operator configuration of the connection, request and lock timeouts, retention window, and GTS instance selection (vendor, priority). Connection-pool sizing is **not** configurable — see [§6.1](#61-gear-specific-nfrs).
 
@@ -142,7 +142,7 @@ This plugin operates within the standard Gears ToolKit lifecycle. At startup it 
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-fr-idempotent-dedup`
 
-The plugin **MUST** deduplicate records on the deterministic record `id` (derived from the `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple, ADR-0014) using an application-level mechanism appropriate for a backend without native uniqueness constraints (concrete mechanism: DESIGN.md §3.6 Ingest sequence). On an exact-equality retry the plugin **MUST** return the stored record (silent absorb); on a canonical-field mismatch under the same `id` it **MUST** return an idempotency-conflict error. Unlike the reference plugin, this backend **MUST NOT** claim *DB-enforced* atomic serialization of concurrent same-key submissions: the serialization comes from the per-`gts_id` exclusive coordination lock ([§5](#5-functional-requirements) referential-integrity FR, DESIGN.md §3.5/§3.6), not from ClickHouse. Because every `create_usage_record`/`create_usage_records` call for a `gts_id` acquires that one exclusive lock, two concurrent submissions sharing a dedup identity (which necessarily share a `gts_id`) **MUST** be ordered against each other, so the read-before-insert check is authoritative and a conflicting-field submission is caught as `IdempotencyConflict` rather than lost to a race. The only residual, theoretical exposure is a **hash collision** across *different* `gts_id`s — two callers whose distinct `gts_id`s derive the same record `id`, or whose hashed lock-name leaves collide — which the lock does not order; this narrow residual **MUST** be documented in the plugin's README rather than presented as equivalent to the reference plugin's DB-enforced guarantee.
+The plugin **MUST** deduplicate records on the SPI's canonical `(tenant_id, gts_id, idempotency_key, created_at)` 4-tuple (ADR-0014) using an application-level mechanism appropriate for a backend without native uniqueness constraints (concrete mechanism: DESIGN.md §3.6 Ingest sequence). It **MUST NOT** key the lookup on the derived record `id` alone: `id` is a projection of that same tuple, so a stored row whose `id` disagrees with its own tuple would be missed and re-inserted under an idempotency key already in use. On an exact-equality retry the plugin **MUST** return the stored record (silent absorb); on a canonical-field mismatch under the same dedup tuple — including a stored `id` that differs from the incoming record's derived `id` — it **MUST** return an idempotency-conflict error. Unlike the reference plugin, this backend **MUST NOT** claim *DB-enforced* atomic serialization of concurrent same-key submissions: the serialization comes from the per-`gts_id` exclusive coordination lock ([§5](#5-functional-requirements) referential-integrity FR, DESIGN.md §3.5/§3.6), not from ClickHouse. Because every `create_usage_record`/`create_usage_records` call for a `gts_id` acquires that one exclusive lock, two concurrent submissions sharing a dedup identity (which necessarily share a `gts_id`) **MUST** be ordered against each other, so the read-before-insert check is authoritative and a conflicting-field submission is caught as `IdempotencyConflict` rather than lost to a race. The only residual, theoretical exposure is a **hash collision** across *different* `gts_id`s — two callers whose distinct `gts_id`s derive the same record `id`, or whose hashed lock-name leaves collide — which the lock does not order; this narrow residual **MUST** be documented in the plugin's README rather than presented as equivalent to the reference plugin's DB-enforced guarantee.
 
 - **Rationale**: ClickHouse has no `INSERT ... ON CONFLICT` and no row-level locking, so mutual exclusion has to come from outside ClickHouse; the exclusive coordination lock supplies it, and `ReplacingMergeTree` convergence remains a defense-in-depth backstop. Chosen and reviewed in Phase 1's design gate and narrowed further when the coordination lock became a single exclusive mutex per `gts_id` (see DESIGN.md §2.2, §3.6).
 - **Actors**: `cpt-cf-uc-ch-plugin-actor-plugin-host`
@@ -344,7 +344,7 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 **Main Flow**:
 
 1. The core calls the SPI to persist a usage record.
-2. The plugin's referential-integrity check passes; the plugin's dedup point-lookup finds no existing row for the record's deterministic id.
+2. The plugin's referential-integrity check passes; the plugin's dedup lookup finds no existing row for the record's canonical dedup tuple.
 3. The record is stored and returned.
 
 **Postconditions**: The record is durably stored and visible to subsequent dedup checks within the retention window.
@@ -388,10 +388,11 @@ The plugin **MUST** emit push-based OpenTelemetry metrics for its backend-intern
 
 **Main Flow**:
 
-1. The plugin loads and validates config, creates its ClickHouse client, and constructs its Coordination Lock Manager (`LockManager`) for lazy `DistributedLockV1` resolution on first acquire — no Keeper client and no lock-backend probe at startup.
+1. The plugin loads and validates config and creates its ClickHouse client.
 2. The plugin provisions its initial schema idempotently (`CREATE TABLE IF NOT EXISTS` with a fixed one-year TTL default on `usage_records`), then reconciles the live TTL to `retention_period_secs` via `ensure_retention_ttl` (`ALTER TABLE … MODIFY TTL` when the interval differs or TTL is missing).
-3. The plugin registers itself as a scoped SPI client under a GTS instance identifier, carrying vendor/priority.
-4. The host discovers and binds the backend by vendor/priority.
+3. The plugin constructs its Coordination Lock Manager (`LockManager`) for lazy `DistributedLockV1` resolution on first acquire — no Keeper client and no lock-backend probe at startup. It follows schema provisioning because it performs no I/O of its own and nothing earlier in the sequence needs a lock.
+4. The plugin registers itself as a scoped SPI client under a GTS instance identifier, carrying vendor/priority.
+5. The host discovers and binds the backend by vendor/priority.
 
 **Postconditions**: The backend is bound and ready; the backend-readiness signal is set.
 

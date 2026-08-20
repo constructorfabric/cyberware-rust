@@ -19,7 +19,6 @@ use std::collections::BTreeMap;
 
 use bigdecimal::BigDecimal;
 use rust_decimal::Decimal;
-use time::OffsetDateTime;
 use uuid::Uuid;
 
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
@@ -33,14 +32,6 @@ use usage_collector_sdk::{
 use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
 
 const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
-
-/// Base instant so each record's `created_at = base + i` is distinct.
-///
-/// Taken from [`common::fixture_base_ts`] rather than a hardcoded epoch so the
-/// rows stay inside the `usage_records` TTL window (see that function).
-fn base_ts() -> i64 {
-    common::fixture_base_ts()
-}
 
 /// Bring up containers and register `VCPU_GTS`.
 ///
@@ -61,17 +52,16 @@ async fn setup_with_type(
     Some((h, store))
 }
 
+/// A record `i` seconds after the fixture base instant, keyed by `seq` so each
+/// seeded row has its own idempotency key (and therefore its own derived id).
 fn record_at(gts: &str, tenant: Uuid, seq: u128, i: i64) -> UsageRecord {
-    let mut rec = common::fixture_usage_record(
+    common::fixture_usage_record_at(
         gts,
         tenant,
         &format!("idem-{seq}"),
         Decimal::new(i + 1, 0),
-        seq,
-    );
-    rec.created_at =
-        OffsetDateTime::from_unix_timestamp(base_ts() + i).expect("valid created_at instant");
-    rec
+        common::fixture_created_at_offset(i),
+    )
 }
 
 fn created_at_id_asc() -> ODataOrderBy {
@@ -303,14 +293,16 @@ async fn ch_aggregate_count_active_only() {
     let tenant = Uuid::from_u128(0x3002);
 
     // Insert three active rows, then deactivate one.
+    let mut first_id = None;
     for i in 0..3 {
         let seq = 0x3002_0000 + u128::try_from(i).unwrap();
-        store
+        let stored = store
             .create(record_at(VCPU_GTS, tenant, seq, i))
             .await
             .expect("create record");
+        first_id = first_id.or(Some(stored.id));
     }
-    let first_id = Uuid::from_u128(0x3002_0000);
+    let first_id = first_id.expect("three rows were seeded");
     store.deactivate(first_id).await.expect("deactivate first");
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -346,20 +338,19 @@ async fn ch_aggregate_group_by_resource_id() {
     let tenant = Uuid::from_u128(0x3003);
 
     let rows = [
-        ("idem-3003-1", 4_i64, 0x3003_0001_u128, "res-a", 0_i64),
-        ("idem-3003-2", 6, 0x3003_0002, "res-a", 1),
-        ("idem-3003-3", 5, 0x3003_0003, "res-b", 2),
+        ("idem-3003-1", 4_i64, "res-a", 0_i64),
+        ("idem-3003-2", 6, "res-a", 1),
+        ("idem-3003-3", 5, "res-b", 2),
     ];
-    for (idem, value, seq, resource_id, ts) in rows {
-        let mut rec = common::fixture_usage_record_with_resource(
+    for (idem, value, resource_id, ts) in rows {
+        let rec = common::fixture_usage_record_with_resource_at(
             VCPU_GTS,
             tenant,
             idem,
             Decimal::new(value, 0),
-            seq,
+            common::fixture_created_at_offset(ts),
             resource_id,
         );
-        rec.created_at = OffsetDateTime::from_unix_timestamp(base_ts() + ts).unwrap();
         store.create(rec).await.expect("create record");
     }
 
@@ -404,7 +395,7 @@ async fn ch_aggregate_group_by_resource_id() {
 /// GROUP BY metadata key with a concurrent `$filter` — exercises SELECT-list
 /// bind ordering: the metadata key `?` appears before `gts_id` and the filter
 /// binds in the assembled SQL. Wrong order would mis-assign the filter UUID
-/// (or gts_id) into `metadata[?]` and yield empty/wrong buckets.
+/// (or `gts_id`) into `metadata[?]` and yield empty/wrong buckets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ch_aggregate_group_by_metadata_with_filter() {
@@ -451,7 +442,11 @@ async fn ch_aggregate_group_by_metadata_with_filter() {
         .await
         .expect("aggregate group by metadata with filter");
 
-    assert_eq!(result.buckets.len(), 2, "one bucket per distinct region in tenant_a");
+    assert_eq!(
+        result.buckets.len(),
+        2,
+        "one bucket per distinct region in tenant_a"
+    );
     let mut got: Vec<(String, Option<BigDecimal>)> = result
         .buckets
         .iter()
@@ -487,20 +482,17 @@ async fn ch_aggregate_cap_at_max_aggregation_buckets() {
     let n = MAX_AGGREGATION_BUCKETS + 2;
     let mut batch: Vec<_> = (0..n)
         .map(|i| {
-            let seq = 0x3010_0000 + u128::try_from(i).unwrap();
             let ts = i64::try_from(i).unwrap();
             let resource_id = format!("res-{i}");
             let idem = format!("idem-cap-{i}");
-            let mut rec = common::fixture_usage_record_with_resource(
+            common::fixture_usage_record_with_resource_at(
                 VCPU_GTS,
                 tenant,
                 &idem,
                 Decimal::ONE,
-                seq,
+                common::fixture_created_at_offset(ts),
                 &resource_id,
-            );
-            rec.created_at = OffsetDateTime::from_unix_timestamp(base_ts() + ts).expect("valid ts");
-            rec
+            )
         })
         .collect();
 

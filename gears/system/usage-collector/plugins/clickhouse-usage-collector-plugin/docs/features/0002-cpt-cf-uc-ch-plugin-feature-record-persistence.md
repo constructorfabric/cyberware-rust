@@ -124,7 +124,7 @@ Record Persistence owns the full lifecycle write path: locking, referential-inte
 
 1. [ ] - `p1` - Partition the input batch by `gts_id`, then sort the partition keys so every caller acquires multi-`gts_id` locks in one global order (two concurrent mixed batches cannot deadlock on opposite acquisition orders) - `inst-ch-rec-batch-1`
 2. [ ] - `p1` - Acquire every partition's exclusive `gts_id` lock up front, sequentially in the sorted order; on failure for a partition mark every record in it with the appropriate error and continue with the rest - `inst-ch-rec-batch-2`
-3. [ ] - `p1` - For each locked partition, concurrently (every partition already holds its own lock): run the catalog existence check and a single batched dedup pre-check `SELECT ... FINAL WHERE (tenant_id, gts_id, created_at, id) IN (...)` for that partition's records - `inst-ch-rec-batch-3`
+3. [ ] - `p1` - For each locked partition, concurrently (every partition already holds its own lock): run the catalog existence check and a single batched dedup pre-check `SELECT ... FINAL WHERE (tenant_id, gts_id, created_at, idempotency_key) IN (...)` for that partition's records - `inst-ch-rec-batch-3`
 4. [ ] - `p1` - Compute per-record dedup outcome (new / absorb / conflict) sequentially, partition by partition, in input order from the pre-check results, so `version` offsets and within-batch dedup stay deterministic - `inst-ch-rec-batch-4`
 5. [ ] - `p1` - Renew every surviving partition's lease (`ensure_still_held`) and drop an expired partition's composed rows, then pool all remaining non-duplicate `INSERT`-ready rows into one multi-row `INSERT` and execute it - `inst-ch-rec-batch-5`
 6. [ ] - `p1` - Release all held partition locks, including on the insert-failure path - `inst-ch-rec-batch-6`
@@ -205,7 +205,7 @@ Every `usage_records` status transition is a new versioned row — never an `UPD
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-record-persistence-create-single`
 
-The system **MUST** implement `create_usage_record` as: acquire the exclusive `gts_id` coordination lock, run the catalog-existence check, run the dedup point-lookup against the `usage_records` `ORDER BY` sort key, and on a new record **MUST** call `ClusterLockGuard::ensure_still_held()` (lease renew) immediately before the INSERT (on `ClusterError::LockExpired` → release the lock, return `Transient`), then issue one `INSERT` with `status='active'` and a monotonic `version`. On absorb, return the stored record without inserting. On conflict, return `IdempotencyConflict`. On lock-manager unavailability or timeout, return `Transient`. Lock **MUST** be released on every exit path.
+The system **MUST** implement `create_usage_record` as: acquire the exclusive `gts_id` coordination lock, run the catalog-existence check, run the dedup lookup on the canonical `(tenant_id, gts_id, created_at, idempotency_key)` tuple against `usage_records`, and on a new record **MUST** call `ClusterLockGuard::ensure_still_held()` (lease renew) immediately before the INSERT (on `ClusterError::LockExpired` → release the lock, return `Transient`), then issue one `INSERT` with `status='active'` and a monotonic `version`. On absorb, return the stored record without inserting. On conflict, return `IdempotencyConflict`. On lock-manager unavailability or timeout, return `Transient`. Lock **MUST** be released on every exit path.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-record-persistence-ingest-dedup`, `cpt-cf-uc-ch-plugin-flow-record-persistence-create-single`
 
@@ -256,7 +256,7 @@ The system **MUST** implement `deactivate_usage_record` as: one `FINAL`-qualifie
 
 - [x] `create_usage_record` acquires the exclusive `gts_id` coordination lock before the catalog check; lock-manager unavailability returns `Transient`.
 - [x] The catalog-existence check runs while holding the exclusive lock; an absent or previously-deleted type returns `UsageTypeNotFound` with the lock released.
-- [x] The dedup point-lookup uses the full `(tenant_id, gts_id, created_at, id)` sort-key prefix and is `FINAL`-qualified.
+- [x] The dedup lookup keys on the canonical `(tenant_id, gts_id, created_at, idempotency_key)` tuple — leading with the three-column sort-key prefix, never on `id` — and is `FINAL`-qualified.
 - [x] An identical re-submission (same canonical fields) is absorbed silently; a re-submission with differing canonical fields returns `IdempotencyConflict`.
 - [x] `create_usage_record` calls `ClusterLockGuard::ensure_still_held()` (lease renew) immediately before the INSERT; on `ClusterError::LockExpired` the lock is released and `Transient` is returned without inserting.
 - [x] `create_usage_records` partitions the batch by `gts_id` and acquires the partition locks in sorted key order; each distinct `gts_id` partition performs its own lock + catalog-check + dedup-pre-check; only one multi-row `INSERT` is issued across all passing partitions; per-record outcomes are in input order.

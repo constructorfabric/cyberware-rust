@@ -12,7 +12,7 @@ use usage_collector_sdk::{UsageCollectorPluginError, UsageRecord, UsageTypeGtsId
 
 use super::{
     AggregateNdjsonParser, ChRecordStore, err_for_partition, parse_aggregate_response,
-    record_dedup_key, row_dedup_key,
+    prefer_dedup_row, record_dedup_key, row_dedup_key,
 };
 use crate::domain::ports::RecordStore;
 use crate::infra::coordination::lock_manager::LockGuardPort;
@@ -176,7 +176,8 @@ fn row_with_invalid_gts_id_maps_to_internal() {
 #[test]
 fn two_distinct_rows_produce_distinct_dedup_keys() {
     let row1 = make_row(Uuid::from_u128(1), Uuid::from_u128(10), 1_000_000, 1);
-    let row2 = make_row(Uuid::from_u128(2), Uuid::from_u128(10), 1_000_000, 1);
+    let mut row2 = make_row(Uuid::from_u128(2), Uuid::from_u128(10), 1_000_000, 1);
+    row2.idempotency_key = "idem-2".to_owned();
     assert_ne!(row_dedup_key(&row1), row_dedup_key(&row2));
 }
 
@@ -185,6 +186,92 @@ fn same_tuple_produces_same_dedup_key() {
     let row1 = make_row(Uuid::from_u128(5), Uuid::from_u128(10), 2_000_000, 1);
     let row2 = make_row(Uuid::from_u128(5), Uuid::from_u128(10), 2_000_000, 2); // version differs
     assert_eq!(row_dedup_key(&row1), row_dedup_key(&row2));
+}
+
+/// The dedup key is the SPI's canonical tuple, not the record `id`. Keying on
+/// `id` is what let a row whose `id` disagreed with its own canonical tuple slip
+/// past the lookup and be re-inserted under an idempotency key already in use.
+#[test]
+fn dedup_key_excludes_id_and_includes_idempotency_key() {
+    let tenant_id = Uuid::from_u128(10);
+    let created_at_micros = 3_000_000_i64;
+
+    let row = make_row(Uuid::from_u128(1), tenant_id, created_at_micros, 1);
+
+    let mut mismatched_id = make_row(Uuid::from_u128(2), tenant_id, created_at_micros, 1);
+    assert_eq!(
+        row_dedup_key(&row),
+        row_dedup_key(&mismatched_id),
+        "a differing `id` must not move the dedup key, or the lookup misses the stored row"
+    );
+
+    mismatched_id.idempotency_key = "idem-2".to_owned();
+    assert_ne!(
+        row_dedup_key(&row),
+        row_dedup_key(&mismatched_id),
+        "a differing `idempotency_key` is a different dedup identity"
+    );
+
+    // The incoming-record projection agrees with the stored-row one.
+    let record = make_record(Uuid::from_u128(3), tenant_id, created_at_micros);
+    assert_eq!(
+        row_dedup_key(&row),
+        record_dedup_key(&record),
+        "`record_dedup_key` must project the same tuple, independent of `id`"
+    );
+}
+
+// ── prefer_dedup_row ──────────────────────────────────────────────────────────
+//
+// `ClickHouse` has no UNIQUE constraint, so rows written while the lookup was
+// keyed on `id` can leave two rows sharing a dedup key with different `id`s.
+// Both survive `FINAL`, so the lookup must choose between them deterministically
+// and in favour of the caller's own record.
+
+#[test]
+fn prefer_dedup_row_takes_the_only_candidate() {
+    let row = make_row(Uuid::from_u128(9), Uuid::from_u128(10), 1_000_000, 1);
+    let chosen = prefer_dedup_row(None, row, Uuid::from_u128(9));
+    assert_eq!(chosen.id, Uuid::from_u128(9));
+}
+
+#[test]
+fn prefer_dedup_row_prefers_the_expected_id_over_a_lower_id() {
+    let tenant_id = Uuid::from_u128(10);
+    let expected = Uuid::from_u128(5);
+    let twin = make_row(Uuid::from_u128(1), tenant_id, 1_000_000, 1);
+    let honest = make_row(expected, tenant_id, 1_000_000, 1);
+
+    // Whichever order the rows arrive in, the expected `id` wins — even though
+    // the twin sorts lower.
+    assert_eq!(
+        prefer_dedup_row(Some(twin.clone()), honest.clone(), expected).id,
+        expected
+    );
+    assert_eq!(
+        prefer_dedup_row(Some(honest), twin, expected).id,
+        expected,
+        "an already-chosen exact match must not be displaced by a lower-`id` twin"
+    );
+}
+
+#[test]
+fn prefer_dedup_row_falls_back_to_the_lowest_id() {
+    let tenant_id = Uuid::from_u128(10);
+    let absent = Uuid::from_u128(99);
+    let low = make_row(Uuid::from_u128(1), tenant_id, 1_000_000, 1);
+    let high = make_row(Uuid::from_u128(2), tenant_id, 1_000_000, 1);
+
+    // Order-independent when neither candidate is the expected `id`, so the
+    // outcome never depends on which part ClickHouse read first.
+    assert_eq!(
+        prefer_dedup_row(Some(low.clone()), high.clone(), absent).id,
+        Uuid::from_u128(1)
+    );
+    assert_eq!(
+        prefer_dedup_row(Some(high), low, absent).id,
+        Uuid::from_u128(1)
+    );
 }
 
 // ── err_for_partition ─────────────────────────────────────────────────────────
@@ -310,6 +397,16 @@ impl CatalogLockPort for AlwaysGrantLock {
     ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
         Ok(Box::new(GrantedGuard))
     }
+
+    // Overridden explicitly rather than inherited from the trait default, so a
+    // create-path test asserts against this stub and not the default's
+    // delegation to `acquire_exclusive_for_delete`.
+    async fn acquire_exclusive_for_create(
+        &self,
+        _gts_id: &str,
+    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
+        Ok(Box::new(GrantedGuard))
+    }
 }
 
 /// Lock stub that never grants the lock — the cluster lock manager being
@@ -326,17 +423,34 @@ impl CatalogLockPort for AlwaysTransientLock {
             "cluster lock unavailable (test stub)",
         ))
     }
+
+    // See `AlwaysGrantLock`: overridden explicitly so the create path is
+    // exercised against this stub rather than the trait default.
+    async fn acquire_exclusive_for_create(
+        &self,
+        _gts_id: &str,
+    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
+        Err(UsageCollectorPluginError::transient(
+            "cluster lock unavailable (test stub)",
+        ))
+    }
 }
 
 /// Build a store over an offline client and a caller-chosen lock stub.
 ///
-/// The client points at the default `ClickHouse` address, so any query that is
-/// actually issued fails fast (connection refused) instead of blocking.
+/// Port 1 is reserved and never bound, so any query that is actually issued
+/// fails fast (connection refused) instead of blocking. The `clickhouse` crate's
+/// default address (`http://localhost:8123`) would let a real local server
+/// answer these "offline" tests.
 fn store_with_lock(lock: Arc<dyn CatalogLockPort>) -> ChRecordStore {
     ChRecordStore::new(
-        clickhouse::Client::default(),
+        clickhouse::Client::default().with_url("http://127.0.0.1:1"),
         lock,
         Arc::new(Metrics::new()),
+        // Generous: every assertion here either short-circuits before I/O or
+        // fails fast on connection refused, so the deadline is never what a
+        // test observes.
+        std::time::Duration::from_secs(30),
     )
 }
 
@@ -413,6 +527,46 @@ fn dedup_hit_on_an_inactive_stored_row_is_an_idempotency_conflict() {
     match offline_store().resolve_dedup_hit(&row, &record) {
         Err(UsageCollectorPluginError::IdempotencyConflict { existing_id, .. }) => {
             assert_eq!(existing_id, id);
+        }
+        other => panic!("expected IdempotencyConflict, got {other:?}"),
+    }
+}
+
+/// A stored row sharing the canonical dedup tuple but carrying a different `id`
+/// is a corrupted identity: the key is already bound to a record the caller
+/// cannot address, so it must fail closed rather than absorb.
+///
+/// This test is only meaningful because the lookup keys on the canonical tuple
+/// ([`super::DedupKey`]) rather than on `id` — an `id`-keyed lookup would never
+/// surface this row at all, and the create would silently insert a duplicate.
+#[test]
+fn dedup_hit_on_a_mismatched_id_row_is_an_idempotency_conflict() {
+    let stored_id = Uuid::from_u128(7);
+    let incoming_id = Uuid::from_u128(8);
+    let tenant_id = Uuid::from_u128(9);
+    let created_at_micros = 1_700_000_000_000_000_i64;
+
+    let row = make_row(stored_id, tenant_id, created_at_micros, 1);
+    let record = make_record(incoming_id, tenant_id, created_at_micros);
+
+    assert_eq!(
+        row_dedup_key(&row),
+        record_dedup_key(&record),
+        "the rows must share a dedup key, so only the mismatched `id` can drive the rejection"
+    );
+    assert_eq!(
+        row.status,
+        UsageRecordStatusCode::Active,
+        "the stored row must be active, so `status` cannot drive the rejection either"
+    );
+
+    match offline_store().resolve_dedup_hit(&row, &record) {
+        Err(UsageCollectorPluginError::IdempotencyConflict {
+            existing_id,
+            idempotency_key,
+        }) => {
+            assert_eq!(existing_id, stored_id, "the conflict names the stored row");
+            assert_eq!(idempotency_key, "idem-1");
         }
         other => panic!("expected IdempotencyConflict, got {other:?}"),
     }

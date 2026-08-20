@@ -28,18 +28,35 @@ use crate::infra::metrics::Metrics;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Endpoint for clients that must never reach a server.
+///
+/// Port 1 is reserved and never bound, so a query fails fast with connection
+/// refused. The `clickhouse` crate's default address (`http://localhost:8123`)
+/// is deliberately avoided: a developer running a real `ClickHouse` locally
+/// would have these "offline" tests silently talk to it.
+const UNREACHABLE_URL: &str = "http://127.0.0.1:1";
+
+/// Client-side request deadline for stores built in this file.
+///
+/// Generous relative to every assertion here: these tests are about lock and
+/// worker behaviour, and their clients either fail fast (connection refused) or
+/// are expected to hang, so the deadline must never be what a test observes —
+/// except in the one test that sets its own short deadline deliberately.
+const TEST_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Build a catalog store over an offline `ClickHouse` client with a
 /// caller-chosen cancellation token.
 ///
-/// The client is pointed at the default `ClickHouse` address
-/// (`http://localhost:8123/`). Any query issued against it fails quickly
-/// (connection refused) rather than blocking, keeping test duration low.
+/// The client is pointed at [`UNREACHABLE_URL`], so any query issued against it
+/// fails quickly (connection refused) rather than blocking, keeping test
+/// duration low.
 pub(super) fn offline_store(cancel: CancellationToken) -> ChCatalogStore {
     ChCatalogStore::new(
-        clickhouse::Client::default(),
+        clickhouse::Client::default().with_url(UNREACHABLE_URL),
         Arc::new(AlwaysGrantLock),
         cancel,
         Arc::new(Metrics::new()),
+        TEST_DEADLINE,
     )
 }
 
@@ -214,6 +231,7 @@ async fn worker_exits_when_cancelled_during_an_in_flight_count() {
         Arc::new(AlwaysGrantLock),
         cancel.clone(),
         Arc::new(Metrics::new()),
+        TEST_DEADLINE,
     );
 
     store.request_catalog_size_refresh();
@@ -237,6 +255,62 @@ async fn worker_exits_when_cancelled_during_an_in_flight_count() {
     );
 }
 
+// ── Test 3c: a black-holed socket is cut off by the client-side deadline ──────
+
+/// A connection that is accepted and then never answered is bounded by the
+/// client-side deadline, and reported as `Transient`.
+///
+/// This is the failure the `send_timeout` / `receive_timeout` settings
+/// `build_client` configures cannot catch: they are *server* settings, and a
+/// black-holed socket never reaches a server that could apply them. Without a
+/// client-side deadline this call hangs for as long as the caller waits.
+#[tokio::test]
+async fn a_black_holed_socket_is_cut_off_by_the_client_side_deadline() {
+    use usage_collector_sdk::UsageTypeGtsId;
+
+    use crate::domain::ports::CatalogStore;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a local socket");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let mut accepted = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.push(stream);
+        }
+    });
+
+    let deadline = Duration::from_millis(300);
+    let store = ChCatalogStore::new(
+        clickhouse::Client::default().with_url(format!("http://{addr}")),
+        Arc::new(AlwaysGrantLock),
+        CancellationToken::new(),
+        Arc::new(Metrics::new()),
+        deadline,
+    );
+
+    let gts_id =
+        UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~cf.compute._.black_holed_test.v1")
+            .expect("valid gts_id");
+
+    let started = std::time::Instant::now();
+    let err = store
+        .get(gts_id)
+        .await
+        .expect_err("a request to a socket that never answers must not succeed");
+    let elapsed = started.elapsed();
+
+    match err {
+        UsageCollectorPluginError::Transient { .. } => {}
+        other => panic!("expected Transient, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the call must return at roughly the deadline rather than hang, took {elapsed:?}"
+    );
+}
+
 // ── Test 4: delete returns Transient when lock manager is unavailable ─────────
 
 #[tokio::test]
@@ -247,10 +321,11 @@ async fn delete_returns_transient_on_lock_manager_unavailable() {
 
     let cancel = CancellationToken::new();
     let store = ChCatalogStore::new(
-        clickhouse::Client::default(),
+        clickhouse::Client::default().with_url(UNREACHABLE_URL),
         Arc::new(AlwaysTransientLock), // always denies the lock at acquisition
         cancel,
         Arc::new(Metrics::new()),
+        TEST_DEADLINE,
     );
 
     let gts_id =
@@ -290,10 +365,11 @@ async fn delete_fails_closed_when_the_lease_cannot_be_confirmed() {
 
     let cancel = CancellationToken::new();
     let store = ChCatalogStore::new(
-        clickhouse::Client::default(),
+        clickhouse::Client::default().with_url(UNREACHABLE_URL),
         Arc::new(GrantThenLoseSession), // grants lock but guard.ensure_still_held() → Err
         cancel,
         Arc::new(Metrics::new()),
+        TEST_DEADLINE,
     );
 
     let gts_id =
@@ -327,10 +403,11 @@ async fn create_returns_transient_on_lock_manager_unavailable() {
 
     let cancel = CancellationToken::new();
     let store = ChCatalogStore::new(
-        clickhouse::Client::default(),
+        clickhouse::Client::default().with_url(UNREACHABLE_URL),
         Arc::new(AlwaysTransientLock),
         cancel,
         Arc::new(Metrics::new()),
+        TEST_DEADLINE,
     );
 
     let usage_type = UsageType {
@@ -441,10 +518,10 @@ mod live {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        apply_migrations(&client)
+        apply_migrations(&client, super::TEST_DEADLINE)
             .await
             .expect("schema migrations must succeed on the live test container");
-        ensure_retention_ttl(&client, 365 * 24 * 3600)
+        ensure_retention_ttl(&client, 365 * 24 * 3600, super::TEST_DEADLINE)
             .await
             .expect("retention TTL reconcile must succeed on the live test container");
 
@@ -453,6 +530,7 @@ mod live {
             Arc::new(AlwaysGrantLock),
             CancellationToken::new(),
             Arc::new(Metrics::new()),
+            super::TEST_DEADLINE,
         );
         (store, client, container)
     }
@@ -564,6 +642,7 @@ mod live {
             Arc::new(GrantThenLoseSession),
             CancellationToken::new(),
             Arc::new(Metrics::new()),
+            super::TEST_DEADLINE,
         );
 
         let err = store

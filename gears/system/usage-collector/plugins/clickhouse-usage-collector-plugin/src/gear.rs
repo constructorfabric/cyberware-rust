@@ -59,11 +59,14 @@ impl Gear for ClickHouseUsageCollectorPlugin {
         let client = build_client(&cfg);
 
         // Step B: Run the embedded idempotent schema migration, then reconcile
-        // usage_records TTL with the configured retention window.
-        apply_migrations(&client)
+        // usage_records TTL with the configured retention window. Both are
+        // bounded by the same client-side deadline the request path uses: a
+        // hung init is worse than a failed one, since it never surfaces.
+        let client_deadline = cfg.client_deadline();
+        apply_migrations(&client, client_deadline)
             .await
             .inspect_err(|_| metrics.inc_migration_failure())?;
-        ensure_retention_ttl(&client, cfg.retention_period_secs)
+        ensure_retention_ttl(&client, cfg.retention_period_secs, client_deadline)
             .await
             .inspect_err(|_| metrics.inc_migration_failure())?;
 
@@ -93,6 +96,7 @@ impl Gear for ClickHouseUsageCollectorPlugin {
             client.clone(),
             Arc::clone(&lock_port),
             Arc::clone(&metrics),
+            client_deadline,
         ));
 
         let catalog_store: Arc<dyn CatalogStore> = Arc::new(ChCatalogStore::new(
@@ -100,6 +104,7 @@ impl Gear for ClickHouseUsageCollectorPlugin {
             lock_port,
             cancel,
             Arc::clone(&metrics),
+            client_deadline,
         ));
 
         // Construct the SPI adapter over the real stores.

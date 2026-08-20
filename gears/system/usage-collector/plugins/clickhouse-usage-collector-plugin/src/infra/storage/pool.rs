@@ -6,6 +6,8 @@
 //!   `ClickHouse` instance.
 //! - [`ensure_retention_ttl`] — reconciles `usage_records` TTL with config.
 
+use std::time::Duration;
+
 use anyhow::Context as _;
 use percent_encoding::percent_decode_str;
 use url::Url;
@@ -202,6 +204,19 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
 /// tracked while scanning — `''` escapes included, matching
 /// [`split_sql_statements`] — so a `--` inside a `COMMENT '...'` column
 /// annotation is left untouched.
+///
+/// # Limitations
+///
+/// This is a deliberately minimal scanner for one known input
+/// (`migrations/0001_init.sql`), not a general SQL lexer. Only `--` line
+/// comments and single-quoted strings are recognized; `/* … */` block comments
+/// and backtick- or double-quoted identifiers are not. A semicolon inside
+/// either construct is therefore treated as executable text and can become a
+/// false statement boundary in [`split_sql_statements`]. Migration files must
+/// consequently stay within `--` comments and single-quoted strings; if a
+/// future migration needs block comments or quoted identifiers containing
+/// semicolons, move the statements into per-statement consts or files instead
+/// of extending this scanner.
 fn strip_line_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut in_string = false;
@@ -243,6 +258,10 @@ fn strip_line_comments(sql: &str) -> String {
 /// A doubled `''` inside a string is treated as an escaped literal quote
 /// (standard SQL / `ClickHouse` string-escaping) rather than a string
 /// terminator, though this file does not currently use that form.
+///
+/// Shares the quote-tracking limits documented on [`strip_line_comments`]:
+/// `/* … */` block comments and backtick- or double-quoted identifiers are not
+/// recognized, so a semicolon inside one would split a statement.
 fn split_sql_statements(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
@@ -297,18 +316,30 @@ fn split_sql_statements(sql: &str) -> Vec<String> {
 ///
 /// Config-driven retention is applied separately by [`ensure_retention_ttl`].
 ///
+/// Each statement is bounded by `deadline` (the same client-side budget the
+/// request path uses, `ClickHousePluginConfig::client_deadline`). A hung `init`
+/// is worse than a failed one: it never surfaces as an error, and the gear's
+/// readiness gauge is already published as 0 by then.
+///
 /// # Errors
 ///
-/// Returns an error if any DDL statement fails.  The context message includes
-/// the failing statement text.
-pub async fn apply_migrations(client: &clickhouse::Client) -> anyhow::Result<()> {
+/// Returns an error if any DDL statement fails or exceeds `deadline`. The
+/// context message includes the failing statement text.
+pub async fn apply_migrations(
+    client: &clickhouse::Client,
+    deadline: Duration,
+) -> anyhow::Result<()> {
     let sql = strip_line_comments(MIGRATION_SQL);
 
     for stmt in split_sql_statements(&sql) {
-        client
-            .query(&stmt)
-            .execute()
+        tokio::time::timeout(deadline, client.query(&stmt).execute())
             .await
+            .map_err(|_elapsed| {
+                anyhow::anyhow!(
+                    "migration DDL statement exceeded the {}s client-side deadline:\n{stmt}",
+                    deadline.as_secs()
+                )
+            })?
             .with_context(|| format!("migration DDL statement failed:\n{stmt}"))?;
     }
 
@@ -318,7 +349,7 @@ pub async fn apply_migrations(client: &clickhouse::Client) -> anyhow::Result<()>
 /// Parse retention seconds from a `CREATE TABLE` / `create_table_query` string.
 ///
 /// Accepts both the literal form we emit (`INTERVAL <n> SECOND`) and
-/// ClickHouse's rewritten form (`toIntervalSecond(<n>)`). Returns `None` when
+/// `ClickHouse`'s rewritten form (`toIntervalSecond(<n>)`). Returns `None` when
 /// no recognisable TTL interval is present.
 pub(crate) fn parse_ttl_seconds(create_table_query: &str) -> Option<u64> {
     // Prefer the rewritten form ClickHouse often stores in system.tables.
@@ -327,9 +358,7 @@ pub(crate) fn parse_ttl_seconds(create_table_query: &str) -> Option<u64> {
     }
     // Literal INTERVAL form from our DDL / ALTER.
     let upper = create_table_query.to_ascii_uppercase();
-    let Some(interval_idx) = upper.find("INTERVAL") else {
-        return None;
-    };
+    let interval_idx = upper.find("INTERVAL")?;
     let after_interval = &create_table_query[interval_idx + "INTERVAL".len()..];
     let trimmed = after_interval.trim_start();
     let digits_end = trimmed
@@ -376,22 +405,36 @@ fn ttl_uses_todatetime_cast(create_table_query: &str) -> bool {
 /// `toDateTime`, issues
 /// `ALTER TABLE usage_records MODIFY TTL created_at + INTERVAL <n> SECOND DELETE`.
 ///
+/// Both statements are bounded by `deadline`, for the same reason as
+/// [`apply_migrations`].
+///
 /// # Errors
 ///
-/// Returns an error if the table is missing, the query fails, or the alter fails.
+/// Returns an error if the table is missing, either statement fails, or either
+/// exceeds `deadline`.
 pub async fn ensure_retention_ttl(
     client: &clickhouse::Client,
     retention_period_secs: u64,
+    deadline: Duration,
 ) -> anyhow::Result<()> {
-    let create_sql: String = client
-        .query(
-            "SELECT create_table_query \
-             FROM system.tables \
-             WHERE database = currentDatabase() AND name = 'usage_records'",
+    let create_sql: String = tokio::time::timeout(
+        deadline,
+        client
+            .query(
+                "SELECT create_table_query \
+                 FROM system.tables \
+                 WHERE database = currentDatabase() AND name = 'usage_records'",
+            )
+            .fetch_one::<String>(),
+    )
+    .await
+    .map_err(|_elapsed| {
+        anyhow::anyhow!(
+            "reading usage_records create_table_query exceeded the {}s client-side deadline",
+            deadline.as_secs()
         )
-        .fetch_one::<String>()
-        .await
-        .context("failed to read usage_records create_table_query from system.tables")?;
+    })?
+    .context("failed to read usage_records create_table_query from system.tables")?;
 
     let current = parse_ttl_seconds(&create_sql);
     if current == Some(retention_period_secs) && !ttl_uses_todatetime_cast(&create_sql) {
@@ -411,10 +454,14 @@ pub async fn ensure_retention_ttl(
         retention_period_secs,
         "updating usage_records TTL to match configured retention"
     );
-    client
-        .query(&alter)
-        .execute()
+    tokio::time::timeout(deadline, client.query(&alter).execute())
         .await
+        .map_err(|_elapsed| {
+            anyhow::anyhow!(
+                "retention TTL alter exceeded the {}s client-side deadline:\n{alter}",
+                deadline.as_secs()
+            )
+        })?
         .with_context(|| format!("failed to apply retention TTL:\n{alter}"))?;
 
     Ok(())

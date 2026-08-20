@@ -131,7 +131,7 @@ Query & Aggregation owns: OData `$filter`/`$orderby`/cursor → parameterized Cl
 
 1. [ ] - `p2` - For each `$filter` expression: bind caller-supplied values as parameters; validate column names against a closed allowlist of schema columns — reject any unlisted identifier - `inst-ch-trans-1`
 2. [ ] - `p2` - For each `$orderby` clause: validate column names against the same allowlist - `inst-ch-trans-2`
-3. [ ] - `p2` - For a keyset cursor: decode the cursor bytes, generate `WHERE (col1, col2, ...) > (?, ?, ...)` or `>=` predicate with bound parameters matching the decoded position - `inst-ch-trans-3`
+3. [ ] - `p2` - For a keyset cursor: decode the cursor bytes, generate a **strict** row-value predicate — `WHERE (col1, col2, ...) > (?, ?, ...)` (or `<` for a descending sort) — with bound parameters matching the decoded position; the cursor names the last row already returned, so `>=` would re-emit it - `inst-ch-trans-3`
 4. [ ] - `p2` - For an `AggregationSpec`: generate `GROUP BY <dims> SELECT <agg_exprs>` honoring the `SUM`-nets-compensations / other-ops-exclude-compensations rule - `inst-ch-trans-4`
 5. [ ] - `p2` - Adapt to the `clickhouse` crate's bind API (named `?` parameter slots or positional, per crate convention) - `inst-ch-trans-5`
 6. [ ] - `p2` - **RETURN** the parameterized SQL fragment and parameter bindings - `inst-ch-trans-6`
@@ -216,7 +216,7 @@ The system **MUST** document in the plugin README that v1 uses one `clickhouse::
 - [x] The aggregation-latency NFR budget is verified with `FINAL` included (not measured around it).
 - [x] `list_usage_records` is `FINAL`-qualified, uses the `n+1` look-ahead cursor pattern, and enforces forward-only cursor — a backward cursor returns `InvalidCursor`.
 - [x] The Query Translator uses bound parameters for all caller-derived values; no caller-controlled identifier is interpolated into query text; only allowlisted column names are accepted.
-- [x] Aggregation and list results contain only rows with `status='active'` (deactivated records are excluded from active aggregation).
+- [x] Aggregation results contain only rows with `status='active'` (deactivated records are excluded from active aggregation). Raw `list_usage_records` results are deliberately **status-agnostic**: `plugin-spi.md` Method 5 directs callers to enumerate a deactivation cascade through a follow-up list filtered on `status` / `corrects_id`, so the list path applies no `status` predicate of its own (matching the reference plugin).
 - [x] The plugin README documents the shared-client workload-isolation posture and the two-instance operational mitigation.
 
 ## 7. Non-Applicable Concerns

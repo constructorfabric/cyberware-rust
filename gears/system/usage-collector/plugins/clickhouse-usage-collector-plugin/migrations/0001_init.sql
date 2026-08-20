@@ -25,12 +25,13 @@
 --
 -- Deletion is a real row removal via ClickHouse's lightweight `DELETE FROM
 -- ... WHERE gts_id = ?` — never `ALTER TABLE ... DELETE`, which is an
--- asynchronous background mutation unsuitable for the request path. A
--- lightweight `DELETE` masks the matching row from every subsequent query
--- synchronously with the statement's return, so `delete_usage_type` can
--- rely on the row being immediately absent; no tombstone flag or
--- FINAL-resolved versioned marker is needed to represent "deleted" for this
--- table (DESIGN.md §3.6).
+-- asynchronous background mutation unsuitable for the request path.
+-- `delete_usage_type` issues that `DELETE` with `lightweight_deletes_sync = 2`
+-- on the statement, so it returns only once the row is masked from every
+-- subsequent query and can be relied on as absent; the server-side default is
+-- not relied on, because it is `2` only on self-managed deployments. No
+-- tombstone flag or FINAL-resolved versioned marker is needed to represent
+-- "deleted" for this table (DESIGN.md §3.6).
 --
 -- ORDER BY (gts_id): single-column sort key for point lookups on gts_id.
 -- There is no native PRIMARY KEY / UNIQUE constraint in ClickHouse; uniqueness
@@ -53,13 +54,22 @@ ORDER BY (gts_id);
 -- A new versioned row with `status = inactive` and a higher version emulates
 -- deactivation (no in-place UPDATE; DESIGN.md §3.6 Deactivation Cascade).
 --
--- ORDER BY (tenant_id, gts_id, created_at, id): the 4-tuple that is also
--- the deterministic dedup key (ADR-0013 / ADR-0014).  This sort key is
--- chosen so that:
+-- ORDER BY (tenant_id, gts_id, created_at, id): `id` is the deterministic
+-- UUIDv5 projection of the canonical dedup tuple (ADR-0013 / ADR-0014), so
+-- this sort key is one-to-one with that tuple.  It is chosen so that:
 --   (a) the dominant read pattern (tenant + type + time-range scans for
 --       aggregation / list) is a sort-key-aligned range scan, and
---   (b) the dedup point-lookup (always supplies all four columns) is a
---       genuine primary-key point lookup rather than a filtered scan.
+--   (b) the dedup lookup resolves against the leading three columns as a
+--       primary-key point rather than a full scan.
+--
+-- The dedup lookup itself keys on the canonical tuple
+-- (tenant_id, gts_id, created_at, idempotency_key), NOT on id — see
+-- record_store.rs `DedupKey`.  idempotency_key is deliberately absent from
+-- the sort key: adding it would change what ReplacingMergeTree collapses on,
+-- and the three-column prefix already prunes to a handful of rows, over which
+-- idempotency_key applies as a cheap residual filter.  Keying the lookup on
+-- id instead would miss a stored row whose id disagrees with its own tuple
+-- and re-insert it under an idempotency key already in use.
 --
 -- No FOREIGN KEY on gts_id — ClickHouse has no FK support; referential
 -- integrity is enforced in application code via the cluster exclusive per-gts_id

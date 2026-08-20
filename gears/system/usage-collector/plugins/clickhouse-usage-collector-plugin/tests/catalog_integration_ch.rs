@@ -24,7 +24,6 @@
 //!   an exclusive delete lock blocks a concurrent exclusive create; once
 //!   the row is deleted and the exclusive lock released, the create
 //!   returns `UsageTypeNotFound`.
-//!   pure local-socket behaviour).
 //! - `ch_lock_manager_fails_closed_when_profile_unbound` — unbound cluster profile fails closed.
 //! - `ch_insert_against_deleted_type_is_not_found` — `create_usage_record`
 //!   against a deleted `gts_id` returns `UsageTypeNotFound`.
@@ -51,17 +50,6 @@ const RAM_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.ram_gb.v1";
 const MISSING_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.absent.v1";
 const DISK_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.disk_gb.v1";
 
-/// Build a [`ChCatalogStore`] with a `LockManager` holding a live session
-/// against the harness's real `cluster` container, using a short
-/// `keeper_timeout_secs`.
-///
-/// `LockManager::new` performs a real connect-and-provision round trip
-/// (see its docs), so it fails immediately against a permanently-unreachable
-/// address — it cannot be used to reach the runtime fail-closed path this
-/// helper serves. Callers instead pause the harness's container (see
-/// [`common::ChHarness::pause_keeper`]) *after* this returns, to simulate
-/// `Keeper` going away mid-flight while `create_usage_record` /
-/// `delete_usage_type` MUST still fail closed with `Transient` rather than
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ch_create_then_get_roundtrips() {
@@ -188,9 +176,8 @@ async fn ch_delete_unreferenced_succeeds() {
         .await
         .expect("delete unreferenced");
 
-    // Allow ClickHouse's lightweight DELETE to be visible to a fresh read.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
+    // No settling delay: the DELETE carries `lightweight_deletes_sync = 2`, so
+    // the row is gone by the time it returns.
     let err = store
         .get(common::fixture_gts_id(VCPU_GTS))
         .await
@@ -198,6 +185,87 @@ async fn ch_delete_unreferenced_succeeds() {
     assert!(
         matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
         "get after delete must be UsageTypeNotFound, got {err:?}"
+    );
+}
+
+/// Delete-then-recreate: `create` after `delete` must insert a fresh row, not
+/// collide with the removed one.
+///
+/// `create` decides absorb vs `UsageTypeAlreadyExists` from a `FINAL`
+/// pre-existence check, so a delete whose removal is not yet visible turns a
+/// legitimate re-registration into a conflict. The differing payload is
+/// deliberate: an identical one would be absorbed, which cannot distinguish "the
+/// row was recreated" from "the old row is still there".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_delete_then_recreate_same_gts_id_succeeds() {
+    let Some(h) = common::bring_up_or_skip().await else {
+        return;
+    };
+    let store = common::catalog_store(&h);
+
+    store
+        .create(common::fixture_usage_type(VCPU_GTS, "counter", &["region"]))
+        .await
+        .expect("create");
+    store
+        .delete(common::fixture_gts_id(VCPU_GTS))
+        .await
+        .expect("delete unreferenced");
+
+    let recreated = common::fixture_usage_type(VCPU_GTS, "gauge", &["tier"]);
+    let created = store
+        .create(recreated.clone())
+        .await
+        .expect("re-create after delete must not conflict with the removed row");
+    assert_eq!(created, recreated, "re-create returns the new payload");
+
+    let fetched = store
+        .get(common::fixture_gts_id(VCPU_GTS))
+        .await
+        .expect("get after re-create");
+    assert_eq!(
+        fetched, recreated,
+        "the stored row is the re-created one, not the deleted original"
+    );
+}
+
+/// The `DELETE` must be synchronous even when the connection asks for async.
+///
+/// This is the test that actually pins `with_setting("lightweight_deletes_sync",
+/// "2")` in `delete_under_lock`. Every other delete-visibility assertion in this
+/// file passes with or without it, because the test container's own default is
+/// already `2` — so they prove the server's behaviour, not the plugin's. Here the
+/// client asks for `0` (return before the removal is visible), which the
+/// statement-level setting must override.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_delete_is_synchronous_even_when_the_connection_default_is_async() {
+    let Some(h) = common::bring_up_or_skip().await else {
+        return;
+    };
+    let async_delete_client = h
+        .client
+        .clone()
+        .with_setting("lightweight_deletes_sync", "0");
+    let store = common::catalog_store_over(&h, async_delete_client);
+
+    store
+        .create(common::fixture_usage_type(DISK_GTS, "counter", &[]))
+        .await
+        .expect("create");
+    store
+        .delete(common::fixture_gts_id(DISK_GTS))
+        .await
+        .expect("delete unreferenced");
+
+    let err = store
+        .get(common::fixture_gts_id(DISK_GTS))
+        .await
+        .expect_err("the statement-level setting must override the connection default");
+    assert!(
+        matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+        "get immediately after delete must be UsageTypeNotFound, got {err:?}"
     );
 }
 
@@ -240,7 +308,6 @@ async fn ch_delete_referenced_is_usage_type_referenced() {
             Uuid::from_u128(0xABCD),
             "idem-ref",
             Decimal::ONE,
-            0xABCD_0001,
         ))
         .await
         .expect("insert usage record to create reference");
@@ -356,7 +423,6 @@ async fn ch_concurrent_create_blocks_delete_and_delete_sees_reference() {
             Uuid::from_u128(0xCC01),
             "idem-lock-cc1",
             Decimal::ONE,
-            0xCC01,
         ))
         .await
         .expect("insert usage record to create reference");
@@ -377,22 +443,12 @@ async fn ch_concurrent_create_blocks_delete_and_delete_sees_reference() {
     let delete_task =
         tokio::spawn(async move { cs_del.delete(common::fixture_gts_id(VCPU_GTS)).await });
 
-    // 5. The delete must NOT complete while the create lock is held.
-    //    Timeout after 300 ms: if delete completes here it opened the race window.
-    let timed_out = tokio::time::timeout(
-        Duration::from_millis(300),
-        &mut std::pin::pin!(tokio::time::sleep(Duration::from_millis(250))),
-    )
-    .await
-    .is_ok();
-    // The delete task is still pending (not joined), confirming it is blocked.
+    // 5. The delete must NOT complete while the create lock is held. Give it
+    //    250 ms of head start; if it finished in that window it opened the race.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(
         !delete_task.is_finished(),
         "delete MUST be blocked by the held create lock; if it completed, the lock did not block it"
-    );
-    assert!(
-        timed_out,
-        "sleep completed \u{2014} blocking window was held as expected"
     );
 
     // 6. Release the exclusive create lock. The delete task's lock acquisition
@@ -450,7 +506,6 @@ async fn ch_concurrent_delete_removes_row_before_create_create_sees_not_found() 
         .delete(common::fixture_gts_id(VCPU_GTS))
         .await
         .expect("delete unreferenced usage type (removes the row)");
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 3. Acquire an exclusive lock directly, simulating a second delete in flight
     //    (or just the deletion already committed state). The record_store's
@@ -472,7 +527,6 @@ async fn ch_concurrent_delete_removes_row_before_create_create_sees_not_found() 
                 Uuid::from_u128(0xCD01),
                 "idem-del-before-create",
                 Decimal::ONE,
-                0xCD01,
             ))
             .await
     });
@@ -584,10 +638,8 @@ async fn ch_batch_second_record_gts_id_lock_blocks_delete_of_that_type() {
     // 5. A batch whose SECOND record targets the now-deleted RAM_GTS must
     //    reject only that record — the first (VCPU_GTS) record is untouched.
     let tenant = Uuid::from_u128(0xB2B2);
-    let row_a =
-        common::fixture_usage_record(VCPU_GTS, tenant, "batch-lock-a", Decimal::ONE, 0xB2B21);
-    let row_b =
-        common::fixture_usage_record(RAM_GTS, tenant, "batch-lock-b", Decimal::ONE, 0xB2B22);
+    let row_a = common::fixture_usage_record(VCPU_GTS, tenant, "batch-lock-a", Decimal::ONE);
+    let row_b = common::fixture_usage_record(RAM_GTS, tenant, "batch-lock-b", Decimal::ONE);
 
     let results = record_store
         .create_batch(vec![row_a.clone(), row_b.clone()])
@@ -626,8 +678,11 @@ async fn ch_batch_second_record_gts_id_lock_blocks_delete_of_that_type() {
 
 /// Acquire fails closed when the `usage-collector` cluster profile has no
 /// lock backend registered.
+///
+/// Needs no container: the empty [`ClientHub`](toolkit::client_hub::ClientHub)
+/// makes the profile unresolvable, so `acquire_for_create` fails before any
+/// I/O.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker (testcontainers)"]
 async fn ch_lock_manager_fails_closed_when_profile_unbound() {
     let hub = std::sync::Arc::new(toolkit::client_hub::ClientHub::default());
     let mgr = common::lock_manager_with_timeout(&hub, std::time::Duration::from_millis(200));
@@ -665,17 +720,14 @@ async fn ch_insert_against_deleted_type_is_not_found() {
         .await
         .expect("delete unreferenced (removes the row)");
 
-    // Allow the lightweight DELETE to be visible to a fresh read.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Attempt to create a usage record against the now-deleted type.
+    // Attempt to create a usage record against the now-deleted type. No
+    // settling delay: the DELETE waits for the removal to be visible.
     let err = record_store
         .create(common::fixture_usage_record(
             VCPU_GTS,
             Uuid::from_u128(0xEB01),
             "idem-deleted-type",
             Decimal::ONE,
-            0xEB01,
         ))
         .await
         .expect_err("insert against deleted type must fail");
@@ -965,7 +1017,6 @@ async fn ch_delete_surfaces_release_failure_after_removing_the_row() {
     );
 
     // The row is gone: the DELETE ran before the release failed.
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let err = common::catalog_store(&h)
         .get(common::fixture_gts_id(DISK_GTS))
         .await

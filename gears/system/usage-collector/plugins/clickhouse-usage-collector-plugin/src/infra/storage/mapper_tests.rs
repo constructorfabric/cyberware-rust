@@ -230,29 +230,50 @@ fn type_row_invalid_metadata_field_is_internal() {
 
 // ── canonical_equal ──────────────────────────────────────────────────────────
 
-#[test]
-fn canonical_equal_returns_true_for_identical_fields() {
-    use usage_collector_sdk::{IdempotencyKey, ResourceRef, UsageRecord, UsageRecordStatus};
+/// Build the record that `row` would have been stored from, leaving
+/// `subject_ref` to the caller so subject mismatch can be exercised.
+fn record_from_row(
+    row: &UsageRecordRow,
+    subject_ref: Option<usage_collector_sdk::SubjectRef>,
+) -> UsageRecord {
+    use usage_collector_sdk::{IdempotencyKey, ResourceRef, UsageRecordStatus};
 
-    let row = valid_record_row();
     let created_at =
         OffsetDateTime::try_from(EpochMicros(row.created_at)).expect("in-range timestamp");
     let mut metadata = BTreeMap::new();
     metadata.insert(MetadataKey::new("region").unwrap(), "eu-west".to_owned());
-    let record = UsageRecord {
+    UsageRecord {
         id: row.id,
         gts_id: UsageTypeGtsId::new(VALID_GTS_ID).unwrap(),
         tenant_id: row.tenant_id,
         resource_ref: ResourceRef::new(row.resource_id.clone(), row.resource_type.clone()).unwrap(),
-        subject_ref: None,
+        subject_ref,
         metadata,
         value: row.value,
         idempotency_key: IdempotencyKey::new(row.idempotency_key.clone()).unwrap(),
         corrects_id: row.corrects_id,
         status: UsageRecordStatus::Active,
         created_at,
-    };
-    // subject differs (row has subject, record has None) → not equal
+    }
+}
+
+#[test]
+fn canonical_equal_returns_true_for_identical_fields() {
+    use usage_collector_sdk::SubjectRef;
+
+    let row = valid_record_row();
+    let record = record_from_row(
+        &row,
+        Some(SubjectRef::new("subj-1", Some("user".to_owned())).unwrap()),
+    );
+    assert!(canonical_equal(&row, &record).unwrap());
+}
+
+#[test]
+fn canonical_equal_returns_false_when_subject_differs() {
+    let row = valid_record_row();
+    // Row carries subj-1/user; the incoming record carries no subject at all.
+    let record = record_from_row(&row, None);
     assert!(!canonical_equal(&row, &record).unwrap());
 }
 

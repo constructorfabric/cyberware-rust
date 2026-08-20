@@ -97,7 +97,8 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 
 1. [ ] - `p1` - Host process starts with the ClickHouse plugin enabled; ToolKit invokes the gear `init` - `inst-ch-boot-1`
 2. [ ] - `p1` - Load and validate `ClickHousePluginConfig` (database URL, `allow_insecure_http`, `request_timeout_secs`, `lock_ttl_secs`, `lock_timeout_secs`, `retention_period_secs`, vendor, priority) - `inst-ch-boot-2`
-3. [ ] - `p1` - **IF** `database_url` is plaintext `http://` AND `allow_insecure_http == false` - `inst-ch-boot-3`
+   1. [ ] - `p1` - **IF** the parsed `database_url` scheme is neither `http` nor `https` — **RETURN** gear initialization failure naming the unsupported scheme (the client speaks ClickHouse's HTTP interface only); independent of `allow_insecure_http` - `inst-ch-boot-2a`
+3. [ ] - `p1` - **IF** the parsed (lowercase-normalized) `database_url` scheme is plaintext `http` AND `allow_insecure_http == false` - `inst-ch-boot-3`
    1. [ ] - `p1` - **RETURN** gear initialization failure: TLS enforcement violation - `inst-ch-boot-3a`
 4. [ ] - `p1` - Build the `clickhouse::Client` via `build_client` / `ParsedEndpoint` — parse URL into bare base URL + user/password/database, emit `tracing::warn!` if plaintext - `inst-ch-boot-4`
 5. [ ] - `p1` - Run `apply_migrations` (idempotent `CREATE TABLE IF NOT EXISTS` with fixed 1-year TTL default), then `ensure_retention_ttl` to reconcile `retention_period_secs` (schema migrations first — fail fast on schema errors) - `inst-ch-boot-5`
@@ -141,8 +142,10 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 1. [ ] - `p1` - Inspect the error source - `inst-ch-err-1`
 2. [ ] - `p1` - **IF** the error encodes a typed domain condition (idempotency conflict, record not found, already inactive, usage-type not found / already exists / referenced) - `inst-ch-err-2`
    1. [ ] - `p1` - Map to the corresponding typed `UsageCollectorPluginError` variant - `inst-ch-err-2a`
-3. [ ] - `p1` - **IF** the error is retryable (ClickHouse connection loss, request timeout, cluster lock timeout / `ClusterError::LockExpired`) - `inst-ch-err-3`
+3. [ ] - `p1` - **IF** the error is retryable (ClickHouse connection loss, request timeout, client-side deadline expiry, cluster lock timeout / `ClusterError::LockExpired`) - `inst-ch-err-3`
    1. [ ] - `p1` - Classify as `Transient` (retryable) - `inst-ch-err-3a`
+   2. [ ] - `p1` - Treat a server-reported error code on the fixed overload/backpressure/replication allowlist as retryable too (`159`, `202`, `203`, `209`, `210`, `252`, `279`, `285`, `999`, plus HTTP `502`/`503`/`504` when the body is unreadable), read from the *start* of the response text so a nested exception from another node cannot reclassify a permanent outer error; `241` `MEMORY_LIMIT_EXCEEDED` and `319` `UNKNOWN_STATUS_OF_INSERT` are deliberately excluded - `inst-ch-err-3b`
+   3. [ ] - `p1` - Clear the backend-readiness gauge only for the unreachable-backend cases, never for a server-reported retryable code — a server that answered with backpressure is degraded, not down - `inst-ch-err-3c`
 4. [ ] - `p1` - **ELSE** - `inst-ch-err-4`
    1. [ ] - `p1` - Classify as `Internal` (non-retryable) - `inst-ch-err-4a`
 5. [ ] - `p1` - **RETURN** the classified error so the host applies retry/fail-closed behavior uniformly - `inst-ch-err-5`
@@ -159,7 +162,8 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 
 1. [ ] - `p2` - Parse `database_url` into a `ParsedEndpoint`: extract scheme, host, port as the base URL; extract user, password, and database separately (not via `url()` path/userinfo, which `clickhouse::Client` silently ignores) - `inst-ch-client-1`
 2. [ ] - `p2` - Build `clickhouse::Client::default().with_url(base_url).with_user(user).with_password(password).with_database(database)` - `inst-ch-client-2`
-3. [ ] - `p2` - Apply `request_timeout_secs` as the HTTP request timeout - `inst-ch-client-3`
+3. [ ] - `p2` - Apply `request_timeout_secs` as the ClickHouse server settings `send_timeout` / `receive_timeout`, which bound the server's own socket handling - `inst-ch-client-3`
+   1. [ ] - `p2` - Derive a client-side per-request deadline of `request_timeout_secs + 5s` and bound every individual ClickHouse await with it, so a connection that is accepted and then never answered — which the server settings cannot bound because they never reach a server — fails as `Transient` instead of hanging; the 5s margin keeps the server's own descriptive timeout first when the server is responsive - `inst-ch-client-3a`
 4. [ ] - `p2` - **IF** `allow_insecure_http == true` AND scheme is `http://` — emit `tracing::warn!` so operators have a per-startup signal that TLS is disabled - `inst-ch-client-4`
 5. [ ] - `p2` - **RETURN** the configured client handle - `inst-ch-client-5`
 
@@ -173,7 +177,7 @@ Not applicable — Foundation establishes the schema, adapter, and registration 
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-module`
 
-The system **MUST** implement the `#[toolkit::gear]` `init` that loads and validates `ClickHousePluginConfig`, builds the ClickHouse client via `build_client` / `ParsedEndpoint`, initialises `LockManager`, invokes `apply_migrations` then `ensure_retention_ttl`, and performs GTS publication plus ClientHub scoped registration. The module **MUST NOT** decide whether it is the active backend and **MUST NOT** implement SPI methods directly.
+The system **MUST** implement the `#[toolkit::gear]` `init` that loads and validates `ClickHousePluginConfig`, builds the ClickHouse client via `build_client` / `ParsedEndpoint`, invokes `apply_migrations` then `ensure_retention_ttl`, constructs `LockManager` (after schema provisioning — it performs no I/O and resolves its backend lazily on first acquire), and performs GTS publication plus ClientHub scoped registration. The module **MUST NOT** decide whether it is the active backend and **MUST NOT** implement SPI methods directly.
 
 **Implements**: `cpt-cf-uc-ch-plugin-flow-foundation-bind-startup`, `cpt-cf-uc-ch-plugin-algo-foundation-schema-provisioning`
 
@@ -237,7 +241,7 @@ The system **MUST** build the `PluginV1<UsageCollectorPluginSpecV1>` registratio
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-foundation-tls-dsn`
 
-The system **MUST** reject a plaintext `http://` `database_url` at config validation time unless `allow_insecure_http = true` is explicitly set. The DSN **MUST** be wrapped in `SecretFromEnv` with no `Display`, `Serialize`, or `PartialEq`, and a `Debug` that emits `<redacted>`; the raw URL is unwrapped only at the `build_client` boundary. When `allow_insecure_http == true` and the URL is `http://`, `build_client` **MUST** emit `tracing::warn!` on every startup.
+The system **MUST** reject a plaintext `http://` `database_url` at config validation time unless `allow_insecure_http = true` is explicitly set. The scheme **MUST** be read from the parsed URL (normalized to lowercase) rather than matched as a raw prefix, so that `HTTP://` is gated identically. A `database_url` whose scheme is neither `http` nor `https` **MUST** be rejected at the same point regardless of `allow_insecure_http`, and the rejection **MUST** name only the scheme, never the DSN. The DSN **MUST** be wrapped in `SecretFromEnv` with no `Display`, `Serialize`, or `PartialEq`, and a `Debug` that emits `<redacted>`; the raw URL is unwrapped only at the `build_client` boundary. When `allow_insecure_http == true` and the URL is `http://`, `build_client` **MUST** emit `tracing::warn!` on every startup.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-foundation-build-client`
 
@@ -269,6 +273,7 @@ The system **MUST** keep all ClickHouse-specific SQL, schema, and client depende
 - [x] `init` loads config, builds the ClickHouse client via `ParsedEndpoint`, provisions the schema, reconciles `retention_period_secs` via `ensure_retention_ttl`, initialises `LockManager`, and registers under a GTS instance identifier carrying the configured vendor and priority; the plugin does not self-select as the active backend.
 - [x] Re-running `init` on restart re-provisions the schema as a no-op (idempotent), with no error and no duplicate objects.
 - [x] A plaintext `http://` URL is refused at config validation time unless `allow_insecure_http = true` is set; the DSN and its embedded credentials never appear in logs, error messages, or `Debug` output.
+- [x] The TLS gate matches the parsed, lowercase-normalized scheme, so a mixed-case `HTTP://` URL is refused too; a `database_url` whose scheme is neither `http` nor `https` is refused at the same point even when `allow_insecure_http = true`.
 - [x] `build_client` emits `tracing::warn!` on every startup when `allow_insecure_http == true` and the URL is `http://`.
 - [x] Backend/ClickHouse errors and cluster lock errors are surfaced as `UsageCollectorPluginError` classified `Transient` vs `Internal` plus the typed domain variants; lock-manager unavailability returns `Transient`.
 - [x] Invalid config or an unreachable ClickHouse fails `init` fast; the plugin does not register.

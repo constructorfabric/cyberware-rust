@@ -952,7 +952,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1031,16 +1031,22 @@ e2e-mini-chat:
 # fail init without their own live database. Hence two builds, two runs.
 UC_E2E_FEATURES = usage-collector,static-tenants,static-authn,static-authz
 
-## Run usage-collector E2E tests against both storage backends
-## (dedicated binary per backend + TimescaleDB / ClickHouse container; Docker required)
-e2e-usage-collector: py-env
-	$(call print_target_banner)
+## Run usage-collector E2E tests against TimescaleDB
+## (dedicated binary + TimescaleDB container; Docker required)
+e2e-usage-collector-timescaledb:
 	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),timescaledb-usage-collector
 	E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=timescaledb \
 		$(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv
+
+## Run usage-collector E2E tests against ClickHouse
+## (dedicated binary + ClickHouse container; Docker required)
+e2e-usage-collector-clickhouse:
 	cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),clickhouse-usage-collector
 	E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=clickhouse \
 		$(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv
+
+## Run usage-collector E2E tests against both storage backends
+e2e-usage-collector: e2e-usage-collector-timescaledb e2e-usage-collector-clickhouse
 
 # -------- Code coverage --------
 

@@ -24,7 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
@@ -46,7 +46,7 @@ use crate::infra::coordination::lock_manager::LockGuardPort;
 use crate::infra::metrics::{InsertMode, LockMode, Metrics, OpDurationGuard, QueryKind, TimedOp};
 use crate::infra::storage::catalog_store::CatalogLockPort;
 use crate::infra::storage::entity::{EpochMicros, UsageRecordRow, UsageRecordStatusCode};
-use crate::infra::storage::error::tracked_ch_err;
+use crate::infra::storage::error::{tracked_ch_err, with_deadline};
 use crate::infra::storage::mapper::{
     canonical_equal, current_merge_version, make_inactive_marker, record_row_key,
     version_higher_than,
@@ -73,26 +73,35 @@ pub struct ChRecordStore {
     client: clickhouse::Client,
     lock_manager: Arc<dyn CatalogLockPort>,
     metrics: Arc<Metrics>,
+    request_timeout: Duration,
 }
 
 impl ChRecordStore {
     /// Build a store from an existing `ClickHouse` client, exclusive-lock port,
-    /// and metric inventory.
+    /// metric inventory, and per-request client-side deadline.
     ///
     /// The lock port is the erased [`CatalogLockPort`] the catalog store also
     /// depends on — both stores contend on the same exclusive per-`gts_id`
     /// cluster mutex — so create-path lock failures are exercisable offline
     /// with a stub implementation.
+    ///
+    /// `request_timeout` bounds every individual `ClickHouse` await; production
+    /// wiring passes `ClickHousePluginConfig::client_deadline()`. It is an
+    /// explicit parameter rather than a defaulted builder step so a future
+    /// wiring change cannot silently leave a store on a default that disagrees
+    /// with the configured budget.
     #[must_use]
     pub fn new(
         client: clickhouse::Client,
         lock_manager: Arc<dyn CatalogLockPort>,
         metrics: Arc<Metrics>,
+        request_timeout: Duration,
     ) -> Self {
         Self {
             client,
             lock_manager,
             metrics,
+            request_timeout,
         }
     }
 
@@ -117,13 +126,15 @@ impl ChRecordStore {
         gts_id: &UsageTypeGtsId,
     ) -> Result<(), UsageCollectorPluginError> {
         let sql = "SELECT gts_id FROM usage_type_catalog FINAL WHERE gts_id = ?";
-        let found: Option<String> = self
-            .client
-            .query(sql)
-            .bind(gts_id.as_ref())
-            .fetch_optional::<String>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let found: Option<String> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(sql)
+                .bind(gts_id.as_ref())
+                .fetch_optional::<String>(),
+        )
+        .await?;
         if found.is_none() {
             return Err(UsageCollectorPluginError::UsageTypeNotFound {
                 gts_id: gts_id.clone(),
@@ -132,10 +143,29 @@ impl ChRecordStore {
         Ok(())
     }
 
-    /// Dedup point-lookup using the full `ORDER BY` key prefix:
-    /// `WHERE tenant_id = ? AND gts_id = ? AND created_at = ? AND id = ?`
+    /// Dedup lookup on the canonical dedup tuple [`DedupKey`]:
+    /// `WHERE tenant_id = ? AND gts_id = ? AND created_at = ? AND
+    /// idempotency_key = ?`
+    ///
+    /// The three leading columns are the `ORDER BY` prefix, so this still
+    /// prunes down to a primary-key point; `idempotency_key` is a residual
+    /// filter over the handful of rows sharing that exact microsecond.
     ///
     /// Returns the stored row if found, `None` if no row exists for this key.
+    /// A well-formed table holds at most one matching row, but `ClickHouse`
+    /// cannot enforce that — see [`prefer_dedup_row`] for how a legacy
+    /// mismatched-`id` twin is resolved. `ORDER BY id` only makes the candidate
+    /// order stable; the choice itself is made by `prefer_dedup_row`.
+    ///
+    /// NOTE — filtering on `idempotency_key` (not a sort-key column) alongside
+    /// `FINAL` is safe even though `optimize_move_to_prewhere_if_final` may push
+    /// the predicate below the merge. `idempotency_key` is invariant across
+    /// every version of a given sort key: `id` is the `UUIDv5` of the canonical
+    /// tuple, and [`make_inactive_marker`] clones the source row wholesale, so a
+    /// deactivation marker carries the same key. Pre-merge and post-merge
+    /// filtering therefore select the same sort keys — which is what keeps the
+    /// "inactive stored row ⇒ conflict" path in [`Self::resolve_dedup_hit`]
+    /// working.
     ///
     /// # Errors
     ///
@@ -148,18 +178,25 @@ impl ChRecordStore {
         let sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
              WHERE tenant_id = ? AND gts_id = ? \
-             AND created_at = fromUnixTimestamp64Micro(?) AND id = ?"
+             AND created_at = fromUnixTimestamp64Micro(?) AND idempotency_key = ? \
+             ORDER BY id"
         );
         let created_at_micros = EpochMicros::from(record.created_at).0;
-        self.client
-            .query(&sql)
-            .bind(record.tenant_id.to_string())
-            .bind(record.gts_id.as_ref())
-            .bind(created_at_micros)
-            .bind(record.id.to_string())
-            .fetch_optional::<UsageRecordRow>()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))
+        let rows: Vec<UsageRecordRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .bind(record.tenant_id.to_string())
+                .bind(record.gts_id.as_ref())
+                .bind(created_at_micros)
+                .bind(record.idempotency_key.as_str())
+                .fetch_all(),
+        )
+        .await?;
+        Ok(rows.into_iter().fold(None, |current, candidate| {
+            Some(prefer_dedup_row(current, candidate, record.id))
+        }))
     }
 
     /// Insert a single row into `usage_records`.
@@ -178,11 +215,16 @@ impl ChRecordStore {
         op_start: Instant,
     ) -> Result<(), UsageCollectorPluginError> {
         let pool_start = Instant::now();
-        let mut insert: clickhouse::insert::Insert<UsageRecordRow> = self
-            .client
-            .insert("usage_records")
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        // `with_timeouts` bounds the subsequent `write` / `end` awaits natively
+        // (yielding `ChError::TimedOut`, already classified retryable), which
+        // the crate documents as far cheaper than wrapping each of them.
+        let mut insert: clickhouse::insert::Insert<UsageRecordRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client.insert("usage_records"),
+        )
+        .await?
+        .with_timeouts(Some(self.request_timeout), Some(self.request_timeout));
         self.metrics
             .record_pool_acquire(pool_start.elapsed().as_secs_f64());
 
@@ -220,11 +262,14 @@ impl ChRecordStore {
             return Ok(());
         }
         let pool_start = Instant::now();
-        let mut insert: clickhouse::insert::Insert<UsageRecordRow> = self
-            .client
-            .insert("usage_records")
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        // Native per-await timeouts on `write` / `end`, as in `insert_record`.
+        let mut insert: clickhouse::insert::Insert<UsageRecordRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client.insert("usage_records"),
+        )
+        .await?
+        .with_timeouts(Some(self.request_timeout), Some(self.request_timeout));
         self.metrics
             .record_pool_acquire(pool_start.elapsed().as_secs_f64());
         // Row counts up to the batch cap (≤1000) fit exactly in f64's 52-bit mantissa.
@@ -251,9 +296,13 @@ impl ChRecordStore {
     }
 
     /// Batch dedup pre-check: SELECT all rows whose `(tenant_id, gts_id,
-    /// created_at, id)` 4-tuple appears in the input list.
+    /// created_at, idempotency_key)` canonical dedup tuple appears in the input
+    /// list — the batch analogue of [`Self::dedup_point_lookup`], including its
+    /// `FINAL`/`PREWHERE` safety argument.
     ///
-    /// Returns a map from the 4-tuple key to the stored row.
+    /// Returns a map from the 4-tuple key to the stored row. Two stored rows can
+    /// share a key only through a legacy mismatched-`id` twin; the collision is
+    /// resolved by [`prefer_dedup_row`] against the incoming record's `id`.
     ///
     /// # Errors
     ///
@@ -266,33 +315,46 @@ impl ChRecordStore {
         if records.is_empty() {
             return Ok(HashMap::new());
         }
-        // Build `(t, g, c, i) IN ((?, ?, fromUnixTimestamp64Micro(?), ?), ...)`.
+        // Build `(t, g, c, k) IN ((?, ?, fromUnixTimestamp64Micro(?), ?), ...)`.
         // A bare epoch-microsecond integer in a tuple comparison is coerced
         // through Decimal arithmetic by ClickHouse and can raise
         // DECIMAL_OVERFLOW before the query starts.
         let mut ctx = SqlCtx::new();
         let mut tuples = Vec::with_capacity(records.len());
+        // The `id` each incoming record expects to find, so a collision between
+        // two stored rows sharing a dedup key is resolved toward the caller's
+        // own record rather than by part-read order.
+        let mut expected_ids: HashMap<DedupKey, Uuid> = HashMap::with_capacity(records.len());
         for r in records {
             ctx.push(SqlBind::Uuid(r.tenant_id));
             ctx.push(SqlBind::Str(r.gts_id.as_ref().to_owned()));
             ctx.push(SqlBind::DateTime64Micros(EpochMicros::from(r.created_at).0));
-            ctx.push(SqlBind::Uuid(r.id));
+            ctx.push(SqlBind::Str(r.idempotency_key.as_str().to_owned()));
             tuples.push("(?, ?, fromUnixTimestamp64Micro(?), ?)");
+            expected_ids.insert(record_dedup_key(r), r.id);
         }
         let in_clause = tuples.join(", ");
         let sql = format!(
             "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
-             WHERE (tenant_id, gts_id, created_at, id) IN ({in_clause})"
+             WHERE (tenant_id, gts_id, created_at, idempotency_key) IN ({in_clause})"
         );
         let mut q = self.client.query(&sql);
         for b in &ctx.binds {
             q = bind_one(q, b);
         }
-        let rows: Vec<UsageRecordRow> = q
-            .fetch_all()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
-        Ok(rows.into_iter().map(|r| (row_dedup_key(&r), r)).collect())
+        let rows: Vec<UsageRecordRow> =
+            with_deadline(&self.metrics, self.request_timeout, q.fetch_all()).await?;
+        let mut out: HashMap<DedupKey, UsageRecordRow> = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let key = row_dedup_key(&row);
+            // A row the batch did not ask for cannot come back from the `IN`
+            // filter; `Uuid::nil` is an unreachable fallback that simply makes
+            // the lowest-`id` rule the tie-break.
+            let expected_id = expected_ids.get(&key).copied().unwrap_or_else(Uuid::nil);
+            let chosen = prefer_dedup_row(out.remove(&key), row, expected_id);
+            out.insert(key, chosen);
+        }
+        Ok(out)
     }
 
     /// Append metadata side-channel filters as parameterised `WHERE` clauses.
@@ -323,23 +385,73 @@ impl ChRecordStore {
 }
 
 /// The 4-tuple dedup identity for `usage_records`: `(tenant_id, gts_id,
-/// created_at_micros, id)`.
+/// created_at_micros, idempotency_key)` — the SPI's canonical dedup tuple
+/// (plugin-spi.md §"Plugin-specific outputs"; ADR-0014).
+///
+/// The record `id` is deliberately **not** part of this key. `id` is a
+/// deterministic `UUIDv5` projection *of* this tuple, so for well-formed data
+/// keying on either is equivalent — but a stored row whose `id` disagrees with
+/// its own canonical tuple would be missed by an `id`-keyed lookup and inserted
+/// as new, silently binding an idempotency key that is already taken. Keying on
+/// the tuple instead lets [`canonical_equal`] compare stored vs incoming `id`
+/// and surface the disagreement as `IdempotencyConflict`.
 ///
 /// `created_at` is stored as `i64` epoch-microseconds, so the dedup key is
 /// already µs-normalised; no truncation is needed.
-type DedupKey = (Uuid, String, i64, Uuid);
+///
+/// NOTE — the field order differs from the `TimescaleDB` sibling plugin's
+/// `(tenant_id, gts_id, idempotency_key, created_at)`. That is deliberate:
+/// `ClickHouse` can only prune an `IN`-tuple against the primary key when the
+/// tuple's *leading* elements match the `ORDER BY` prefix, so `created_at` (a
+/// key column) must stay ahead of `idempotency_key` (which is not in the sort
+/// key). Postgres enforces its own order through a real `UNIQUE` index and has
+/// no such constraint.
+type DedupKey = (Uuid, String, i64, String);
 
 fn record_dedup_key(r: &UsageRecord) -> DedupKey {
     (
         r.tenant_id,
         r.gts_id.as_ref().to_owned(),
         EpochMicros::from(r.created_at).0,
-        r.id,
+        r.idempotency_key.as_str().to_owned(),
     )
 }
 
 fn row_dedup_key(r: &UsageRecordRow) -> DedupKey {
-    (r.tenant_id, r.gts_id.clone(), r.created_at, r.id)
+    (
+        r.tenant_id,
+        r.gts_id.clone(),
+        r.created_at,
+        r.idempotency_key.clone(),
+    )
+}
+
+/// Pick between two stored rows that share a [`DedupKey`], preferring the one
+/// whose `id` matches `expected_id`.
+///
+/// `ClickHouse` has no `UNIQUE` constraint, so rows written before the dedup
+/// lookup was keyed on the canonical tuple can leave two rows sharing a tuple
+/// with different `id`s. Both survive `FINAL` — distinct `id`s are distinct
+/// sort keys, so `ReplacingMergeTree` never collapses them together.
+///
+/// The exact-`id` match wins so an honest retry is still absorbed when a
+/// corrupt twin exists; otherwise the lowest `id` wins, which makes the choice
+/// deterministic rather than dependent on which part `ClickHouse` reads first.
+fn prefer_dedup_row(
+    current: Option<UsageRecordRow>,
+    candidate: UsageRecordRow,
+    expected_id: Uuid,
+) -> UsageRecordRow {
+    let Some(current) = current else {
+        return candidate;
+    };
+    if current.id == expected_id {
+        return current;
+    }
+    if candidate.id == expected_id || candidate.id < current.id {
+        return candidate;
+    }
+    current
 }
 
 /// Build an `Internal` error noting a dedup invariant break and log it at
@@ -414,6 +526,12 @@ impl ChRecordStore {
     /// the deactivated row as a silent absorb — the key is already bound to a
     /// record the caller cannot have back, which is exactly
     /// [`UsageCollectorPluginError::IdempotencyConflict`].
+    ///
+    /// The canonical fields include the record `id`. Because the lookup keys on
+    /// the canonical tuple and not on `id` ([`DedupKey`]), that comparison is a
+    /// load-bearing fail-closed guard rather than a tautology: a stored row
+    /// whose `id` disagrees with its own dedup tuple is reported as a conflict
+    /// instead of being missed and re-inserted under a key already in use.
     fn resolve_dedup_hit(
         &self,
         row: &UsageRecordRow,
@@ -622,7 +740,11 @@ impl RecordStore for ChRecordStore {
                     // A second row for the same dedup key inside this batch is
                     // only absorbed when it is canonically identical to the one
                     // already composed; otherwise it is a conflict just as it
-                    // would be against a stored row.
+                    // would be against a stored row. Since `DedupKey` is the
+                    // canonical tuple rather than the `id`, two in-batch records
+                    // sharing a tuple but carrying different `id`s now collide
+                    // here and the second is reported as a conflict, instead of
+                    // both being inserted under one idempotency key.
                     let resolved = self.resolve_dedup_hit(&to_insert[row_idx], record);
                     if resolved.is_ok() {
                         row_slots[row_idx].push(idx);
@@ -715,13 +837,15 @@ impl RecordStore for ChRecordStore {
     #[instrument(skip_all, fields(record_id = %id))]
     async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
         let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records FINAL WHERE id = ?");
-        let row: Option<UsageRecordRow> = self
-            .client
-            .query(&sql)
-            .bind(id.to_string())
-            .fetch_optional()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let row: Option<UsageRecordRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .bind(id.to_string())
+                .fetch_optional(),
+        )
+        .await?;
 
         match row {
             Some(row) => UsageRecord::try_from(row),
@@ -806,10 +930,8 @@ impl RecordStore for ChRecordStore {
         for b in &ctx.binds {
             q = bind_one(q, b);
         }
-        let mut rows: Vec<UsageRecordRow> = q
-            .fetch_all()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let mut rows: Vec<UsageRecordRow> =
+            with_deadline(&self.metrics, self.request_timeout, q.fetch_all()).await?;
 
         // Look-ahead row present → a next page exists.
         let has_next = rows.len() > usize::try_from(limit).unwrap_or(usize::MAX);
@@ -974,10 +1096,11 @@ impl RecordStore for ChRecordStore {
         let mut cursor = q
             .fetch_bytes("JSONEachRow")
             .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
-        while let Some(chunk) = cursor
-            .next()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?
+        // The deadline bounds each chunk read rather than the whole stream: a
+        // large aggregate legitimately takes longer than one request budget to
+        // drain, but a stall between chunks is the failure this guards.
+        while let Some(chunk) =
+            with_deadline(&self.metrics, self.request_timeout, cursor.next()).await?
         {
             parser.push_chunk(&chunk)?;
         }
@@ -1004,16 +1127,18 @@ impl RecordStore for ChRecordStore {
             "SELECT {RECORD_COLUMNS} FROM usage_records FINAL \
              WHERE id = ? OR (corrects_id = ? AND status = 'active')"
         );
-        let rows: Vec<UsageRecordRow> = self
-            .client
-            .query(&sql)
-            .with_setting("use_skip_indexes_if_final", "1")
-            .with_setting("use_skip_indexes_if_final_exact_mode", "1")
-            .bind(id.to_string())
-            .bind(id.to_string())
-            .fetch_all()
-            .await
-            .map_err(|e| tracked_ch_err(&self.metrics, &e))?;
+        let rows: Vec<UsageRecordRow> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .with_setting("use_skip_indexes_if_final", "1")
+                .with_setting("use_skip_indexes_if_final_exact_mode", "1")
+                .bind(id.to_string())
+                .bind(id.to_string())
+                .fetch_all(),
+        )
+        .await?;
 
         // Step 2: Identify target and compensation rows.
         let target_row = rows.iter().find(|r| r.id == id);

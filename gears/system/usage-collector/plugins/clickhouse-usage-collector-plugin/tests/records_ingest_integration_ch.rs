@@ -4,7 +4,8 @@
 //! single insert with idempotency dedup (insert / absorb / conflict),
 //! compensation persistence, batch per-row outcomes, deactivation cascade,
 //! cascade atomicity, the dedup-convergence race, and the lock-release failure
-//! that lands after a successful write. Requires Docker.
+//! that lands after a successful write. Requires Docker, except for the
+//! fixture-contract test at the bottom of the file.
 
 mod common;
 
@@ -12,7 +13,10 @@ use rust_decimal::Decimal;
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
-use usage_collector_sdk::{UsageCollectorPluginError, UsageRecordStatus};
+use usage_collector_sdk::{
+    UsageCollectorPluginError, UsageRecord, UsageRecordStatus, created_at_micros,
+    derive_usage_record_id,
+};
 
 use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
 
@@ -43,7 +47,7 @@ async fn ch_insert_new_record_returns_active() {
     };
     let tenant = Uuid::from_u128(0x1001);
 
-    let record = common::fixture_usage_record(VCPU_GTS, tenant, "idem-new", Decimal::new(5, 0), 1);
+    let record = common::fixture_usage_record(VCPU_GTS, tenant, "idem-new", Decimal::new(5, 0));
 
     let stored = store
         .create(record.clone())
@@ -76,8 +80,7 @@ async fn ch_exact_retry_is_absorbed() {
     };
     let tenant = Uuid::from_u128(0x1002);
 
-    let record =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-retry", Decimal::new(7, 0), 2);
+    let record = common::fixture_usage_record(VCPU_GTS, tenant, "idem-retry", Decimal::new(7, 0));
 
     let first = store.create(record.clone()).await.expect("first create");
     let second = store
@@ -103,13 +106,8 @@ async fn ch_insert_with_unregistered_gts_id_is_usage_type_not_found() {
     };
     let tenant = Uuid::from_u128(0x1009);
 
-    let record = common::fixture_usage_record(
-        UNREGISTERED_GTS,
-        tenant,
-        "idem-no-type",
-        Decimal::new(1, 0),
-        9,
-    );
+    let record =
+        common::fixture_usage_record(UNREGISTERED_GTS, tenant, "idem-no-type", Decimal::new(1, 0));
 
     let err = store
         .create(record)
@@ -136,15 +134,18 @@ async fn ch_same_key_conflicting_value_is_idempotency_conflict() {
     };
     let tenant = Uuid::from_u128(0x1003);
 
-    let first = common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(3, 0), 3);
+    let first = common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(3, 0));
     let stored = store.create(first.clone()).await.expect("first create");
 
-    // Same (tenant, gts_id, created_at, id) key but a different value — conflict.
-    let mut conflicting =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(999, 0), 4);
-    // Reuse the exact same (tenant, gts_id, created_at, id) 4-tuple.
-    conflicting.id = first.id;
-    conflicting.created_at = first.created_at;
+    // Same idempotency key and instant, different value. Both fixtures derive
+    // their id from that shared 4-tuple, so this is a genuine resubmission
+    // rather than a hand-forged key collision.
+    let conflicting =
+        common::fixture_usage_record(VCPU_GTS, tenant, "idem-dup", Decimal::new(999, 0));
+    assert_eq!(
+        conflicting.id, first.id,
+        "the same dedup key must derive the same id"
+    );
 
     let err = store
         .create(conflicting)
@@ -166,6 +167,214 @@ async fn ch_same_key_conflicting_value_is_idempotency_conflict() {
     }
 }
 
+// ── Mismatched stored identity ────────────────────────────────────────────────
+//
+// The dedup lookup keys on the canonical tuple `(tenant_id, gts_id, created_at,
+// idempotency_key)` rather than on `id`. That matters only for a stored row
+// whose `id` disagrees with its own canonical tuple — something the gateway
+// cannot produce (the id is a derived projection) but that data corruption, or a
+// row written before the lookup was fixed, can. `ClickHouse` has no UNIQUE
+// constraint to catch it, so these two tests seed such a row directly.
+
+/// Insert a `usage_records` row carrying `record`'s canonical dedup tuple but a
+/// caller-chosen `id`, bypassing the store so the identity can disagree with the
+/// tuple. `value` and the resource fields mirror the fixture, so the *only*
+/// canonical difference from `record` is the identity.
+async fn seed_row_with_id(client: &clickhouse::Client, id: Uuid, record: &UsageRecord) {
+    let sql = "INSERT INTO usage_records (id, tenant_id, gts_id, value, created_at, \
+               resource_id, resource_type, subject_id, subject_type, idempotency_key, \
+               corrects_id, status, metadata, ingested_at, version) VALUES \
+               (?, ?, ?, toDecimal128(?, 9), fromUnixTimestamp64Micro(?), ?, ?, NULL, NULL, \
+               ?, NULL, 'active', map(), now64(6), 1)";
+    let micros = i64::try_from(created_at_micros(record.created_at))
+        .expect("fixture created_at must fit in i64 microseconds");
+    client
+        .query(sql)
+        .bind(id.to_string())
+        .bind(record.tenant_id.to_string())
+        .bind(record.gts_id.as_ref())
+        .bind(record.value.to_string())
+        .bind(micros)
+        .bind(record.resource_ref.resource_id())
+        .bind(record.resource_ref.resource_type())
+        .bind(record.idempotency_key.as_str())
+        .execute()
+        .await
+        .expect("seeding a mismatched-id usage record must succeed");
+}
+
+/// How many rows share `record`'s canonical dedup tuple, post-`FINAL`.
+async fn count_rows_for_dedup_key(client: &clickhouse::Client, record: &UsageRecord) -> u64 {
+    let sql = "SELECT count() FROM usage_records FINAL \
+               WHERE tenant_id = ? AND gts_id = ? \
+               AND created_at = fromUnixTimestamp64Micro(?) AND idempotency_key = ?";
+    let micros = i64::try_from(created_at_micros(record.created_at))
+        .expect("fixture created_at must fit in i64 microseconds");
+    client
+        .query(sql)
+        .bind(record.tenant_id.to_string())
+        .bind(record.gts_id.as_ref())
+        .bind(micros)
+        .bind(record.idempotency_key.as_str())
+        .fetch_one::<u64>()
+        .await
+        .expect("counting rows for the dedup key must succeed")
+}
+
+/// A stored row whose `id` disagrees with its canonical tuple must fail closed:
+/// the idempotency key is already bound to a record the caller cannot address,
+/// so re-creating it is an `IdempotencyConflict`, not a second insert.
+///
+/// Against an `id`-keyed lookup this test fails — the seeded row is invisible to
+/// the lookup and the create silently inserts a duplicate under a key already in
+/// use. That is exactly the regression it exists to pin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_stored_row_with_mismatched_id_is_an_idempotency_conflict() {
+    let Some((h, store)) = setup().await else {
+        return;
+    };
+    let tenant = Uuid::from_u128(0x100D);
+
+    let record =
+        common::fixture_usage_record(VCPU_GTS, tenant, "idem-mismatched-id", Decimal::new(7, 0));
+    let wrong_id = Uuid::from_u128(0xDEAD_BEEF);
+    assert_ne!(
+        wrong_id, record.id,
+        "the seeded row must not accidentally carry the derived id"
+    );
+
+    seed_row_with_id(&h.client, wrong_id, &record).await;
+
+    let err = store
+        .create(record.clone())
+        .await
+        .expect_err("a stored row with a mismatched id must not be re-inserted");
+
+    match err {
+        UsageCollectorPluginError::IdempotencyConflict {
+            idempotency_key,
+            existing_id,
+        } => {
+            assert_eq!(idempotency_key, "idem-mismatched-id");
+            assert_eq!(
+                existing_id, wrong_id,
+                "the conflict names the corrupted stored row"
+            );
+        }
+        other => panic!("expected IdempotencyConflict, got {other:?}"),
+    }
+
+    assert_eq!(
+        count_rows_for_dedup_key(&h.client, &record).await,
+        1,
+        "the rejected create must not have inserted a second row under the same key"
+    );
+}
+
+/// When a mismatched-`id` twin sits alongside the correctly-derived row, the
+/// exact-`id` match still wins, so an honest retry is absorbed rather than
+/// spuriously rejected. The twin's `id` sorts below the derived one, so the
+/// lowest-`id` tie-break alone would pick the wrong row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_exact_retry_is_absorbed_despite_a_mismatched_id_twin() {
+    let Some((h, store)) = setup().await else {
+        return;
+    };
+    let tenant = Uuid::from_u128(0x100E);
+
+    let record = common::fixture_usage_record(VCPU_GTS, tenant, "idem-twin", Decimal::new(13, 0));
+    let stored = store.create(record.clone()).await.expect("first create");
+
+    let twin_id = Uuid::from_u128(1);
+    assert!(
+        twin_id < record.id,
+        "the twin must sort below the derived id, so the tie-break alone would pick it"
+    );
+    seed_row_with_id(&h.client, twin_id, &record).await;
+
+    let absorbed = store
+        .create(record.clone())
+        .await
+        .expect("an exact retry must still be absorbed alongside a mismatched-id twin");
+    assert_eq!(
+        absorbed.id, stored.id,
+        "absorption returns the caller's own row, not the twin"
+    );
+    assert_eq!(
+        absorbed.value,
+        Decimal::new(13, 0),
+        "the absorbed row keeps its value"
+    );
+}
+
+/// `created_at` is part of the derivation input and of the dedup key, so the
+/// same idempotency key submitted at two different instants is two rows, not a
+/// conflict — and each stays addressable under its own derived id.
+///
+/// This is the counterpart to `ch_same_key_conflicting_value_is_idempotency_conflict`:
+/// together they pin that the id moves with the whole 4-tuple rather than with
+/// the idempotency key alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_same_idem_different_created_at_are_distinct_and_addressable() {
+    let Some((_h, store)) = setup().await else {
+        return;
+    };
+    let tenant = Uuid::from_u128(0x100C);
+
+    let earlier = common::fixture_usage_record_at(
+        VCPU_GTS,
+        tenant,
+        "idem-two-instants",
+        Decimal::new(11, 0),
+        common::fixture_created_at_offset(0),
+    );
+    let later = common::fixture_usage_record_at(
+        VCPU_GTS,
+        tenant,
+        "idem-two-instants",
+        Decimal::new(22, 0),
+        common::fixture_created_at_offset(1),
+    );
+    assert_ne!(
+        earlier.id, later.id,
+        "a different created_at must derive a different id"
+    );
+
+    store
+        .create(earlier.clone())
+        .await
+        .expect("create the earlier row");
+    store
+        .create(later.clone())
+        .await
+        .expect("a different instant is a new row, not a conflict");
+
+    let fetched_earlier = store.get(earlier.id).await.expect("get the earlier row");
+    assert_eq!(
+        fetched_earlier.created_at, earlier.created_at,
+        "the earlier row keeps its own instant"
+    );
+    assert_eq!(
+        fetched_earlier.value,
+        Decimal::new(11, 0),
+        "the earlier row keeps its own value"
+    );
+
+    let fetched_later = store.get(later.id).await.expect("get the later row");
+    assert_eq!(
+        fetched_later.created_at, later.created_at,
+        "the later row keeps its own instant"
+    );
+    assert_eq!(
+        fetched_later.value,
+        Decimal::new(22, 0),
+        "the later row keeps its own value"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ch_compensation_persists_corrects_id() {
@@ -174,12 +383,11 @@ async fn ch_compensation_persists_corrects_id() {
     };
     let tenant = Uuid::from_u128(0x1004);
 
-    let original =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-orig", Decimal::new(10, 0), 5);
+    let original = common::fixture_usage_record(VCPU_GTS, tenant, "idem-orig", Decimal::new(10, 0));
     let original = store.create(original).await.expect("create original");
 
     let mut compensation =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-comp", Decimal::new(-10, 0), 6);
+        common::fixture_usage_record(VCPU_GTS, tenant, "idem-comp", Decimal::new(-10, 0));
     compensation.corrects_id = Some(original.id);
 
     let stored = store
@@ -214,17 +422,18 @@ async fn ch_batch_preserves_order_and_isolates_conflict() {
     let tenant = Uuid::from_u128(0x1005);
 
     // Pre-existing record whose key the batch's #1 will collide with.
-    let existing =
-        common::fixture_usage_record(VCPU_GTS, tenant, "batch-dup", Decimal::new(1, 0), 7);
+    let existing = common::fixture_usage_record(VCPU_GTS, tenant, "batch-dup", Decimal::new(1, 0));
     let existing = store.create(existing).await.expect("seed existing record");
 
-    let row0 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-0", Decimal::new(2, 0), 8);
-    // row1 reuses the same (id, created_at) 4-tuple as `existing` but a different value -> conflict.
-    let mut row1 =
-        common::fixture_usage_record(VCPU_GTS, tenant, "batch-dup", Decimal::new(42, 0), 9);
-    row1.id = existing.id;
-    row1.created_at = existing.created_at;
-    let row2 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-2", Decimal::new(3, 0), 10);
+    let row0 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-0", Decimal::new(2, 0));
+    // row1 resubmits `existing`'s dedup key with a different value, so it
+    // derives the same id and must come back as a conflict.
+    let row1 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-dup", Decimal::new(42, 0));
+    assert_eq!(
+        row1.id, existing.id,
+        "the same dedup key must derive the same id"
+    );
+    let row2 = common::fixture_usage_record(VCPU_GTS, tenant, "batch-2", Decimal::new(3, 0));
 
     let results = store
         .create_batch(vec![row0.clone(), row1, row2.clone()])
@@ -267,15 +476,9 @@ async fn ch_batch_mixed_gts_id_validates_each_partition_independently() {
     };
     let tenant = Uuid::from_u128(0x1010);
 
-    let row0 =
-        common::fixture_usage_record(VCPU_GTS, tenant, "mixed-0", Decimal::new(1, 0), 0x1011);
-    let row1 = common::fixture_usage_record(
-        UNREGISTERED_GTS,
-        tenant,
-        "mixed-1",
-        Decimal::new(2, 0),
-        0x1012,
-    );
+    let row0 = common::fixture_usage_record(VCPU_GTS, tenant, "mixed-0", Decimal::new(1, 0));
+    let row1 =
+        common::fixture_usage_record(UNREGISTERED_GTS, tenant, "mixed-1", Decimal::new(2, 0));
 
     let results = store
         .create_batch(vec![row0.clone(), row1.clone()])
@@ -339,11 +542,11 @@ async fn ch_deactivate_flips_target_and_active_compensations() {
     let tenant = Uuid::from_u128(0x1006);
 
     let target =
-        common::fixture_usage_record(VCPU_GTS, tenant, "deact-target", Decimal::new(20, 0), 11);
+        common::fixture_usage_record(VCPU_GTS, tenant, "deact-target", Decimal::new(20, 0));
     let target = store.create(target).await.expect("create target");
 
     let mut comp =
-        common::fixture_usage_record(VCPU_GTS, tenant, "deact-comp", Decimal::new(-20, 0), 12);
+        common::fixture_usage_record(VCPU_GTS, tenant, "deact-comp", Decimal::new(-20, 0));
     comp.corrects_id = Some(target.id);
     let comp = store.create(comp).await.expect("create compensation");
 
@@ -399,8 +602,7 @@ async fn ch_deactivate_already_inactive_is_already_inactive() {
     };
     let tenant = Uuid::from_u128(0x1007);
 
-    let record =
-        common::fixture_usage_record(VCPU_GTS, tenant, "deact-twice", Decimal::new(30, 0), 13);
+    let record = common::fixture_usage_record(VCPU_GTS, tenant, "deact-twice", Decimal::new(30, 0));
     let record = store.create(record).await.expect("create record");
 
     store
@@ -431,10 +633,10 @@ async fn ch_deactivate_leaves_unrelated_records_active() {
     };
     let tenant = Uuid::from_u128(0x1008);
 
-    let r1 = common::fixture_usage_record(VCPU_GTS, tenant, "deact-r1", Decimal::new(40, 0), 14);
+    let r1 = common::fixture_usage_record(VCPU_GTS, tenant, "deact-r1", Decimal::new(40, 0));
     let r1 = store.create(r1).await.expect("create r1");
 
-    let r2 = common::fixture_usage_record(VCPU_GTS, tenant, "deact-r2", Decimal::new(50, 0), 15);
+    let r2 = common::fixture_usage_record(VCPU_GTS, tenant, "deact-r2", Decimal::new(50, 0));
     let r2 = store.create(r2).await.expect("create r2");
 
     store.deactivate(r1.id).await.expect("deactivate r1");
@@ -458,16 +660,14 @@ async fn ch_deactivate_does_not_propagate_past_depth_one() {
 
     // Chain A <- B (corrects A) <- C (corrects B). Deactivating A flips A and
     // its depth-1 compensation B, but leaves the depth-2 row C active.
-    let a = common::fixture_usage_record(VCPU_GTS, tenant, "deact-d2-a", Decimal::new(20, 0), 16);
+    let a = common::fixture_usage_record(VCPU_GTS, tenant, "deact-d2-a", Decimal::new(20, 0));
     let a = store.create(a).await.expect("create A");
 
-    let mut b =
-        common::fixture_usage_record(VCPU_GTS, tenant, "deact-d2-b", Decimal::new(-20, 0), 17);
+    let mut b = common::fixture_usage_record(VCPU_GTS, tenant, "deact-d2-b", Decimal::new(-20, 0));
     b.corrects_id = Some(a.id);
     let b = store.create(b).await.expect("create B (corrects A)");
 
-    let mut c =
-        common::fixture_usage_record(VCPU_GTS, tenant, "deact-d2-c", Decimal::new(20, 0), 18);
+    let mut c = common::fixture_usage_record(VCPU_GTS, tenant, "deact-d2-c", Decimal::new(20, 0));
     c.corrects_id = Some(b.id);
     let c = store.create(c).await.expect("create C (corrects B)");
 
@@ -511,9 +711,10 @@ async fn ch_dedup_race_converges() {
 
     // Two identical records; both contend for the same exclusive per-gts_id
     // mutex, and whichever loses the race sees the winner's row.
-    let rec_a =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-race", Decimal::new(1, 0), 0xDED1);
+    let rec_a = common::fixture_usage_record(VCPU_GTS, tenant, "idem-race", Decimal::new(1, 0));
     let rec_b = rec_a.clone(); // exact duplicate — same 4-tuple key
+    // Captured before the records move into the spawned tasks.
+    let id = rec_a.id;
 
     // Barrier: both tasks rendezvous before calling create, so the two calls
     // are genuinely concurrent instead of serializing on scheduling luck — the
@@ -548,7 +749,6 @@ async fn ch_dedup_race_converges() {
     // highest-version row — at most one row visible, never two.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let id = Uuid::from_u128(0xDED1);
     let row = store.get(id).await.expect("get the raced record via FINAL");
     // FINAL means exactly one row is visible per dedup key; the get itself
     // proves at-most-one (get returns UsageRecordNotFound if no rows, or the
@@ -573,17 +773,12 @@ async fn ch_deactivation_cascade_is_atomic() {
     };
     let tenant = Uuid::from_u128(0xA70C);
 
-    let target = common::fixture_usage_record(
-        VCPU_GTS,
-        tenant,
-        "atom-target",
-        Decimal::new(100, 0),
-        0xA701,
-    );
+    let target =
+        common::fixture_usage_record(VCPU_GTS, tenant, "atom-target", Decimal::new(100, 0));
     let target = store.create(target).await.expect("create target");
 
     let mut comp =
-        common::fixture_usage_record(VCPU_GTS, tenant, "atom-comp", Decimal::new(-100, 0), 0xA702);
+        common::fixture_usage_record(VCPU_GTS, tenant, "atom-comp", Decimal::new(-100, 0));
     comp.corrects_id = Some(target.id);
     let comp = store.create(comp).await.expect("create compensation");
 
@@ -653,13 +848,8 @@ async fn ch_create_surfaces_release_failure_after_writing_the_row() {
     };
     let tenant = Uuid::from_u128(0x100B);
 
-    let record = common::fixture_usage_record(
-        VCPU_GTS,
-        tenant,
-        "idem-release-fails",
-        Decimal::new(19, 0),
-        0x100B_0001,
-    );
+    let record =
+        common::fixture_usage_record(VCPU_GTS, tenant, "idem-release-fails", Decimal::new(19, 0));
 
     let failing_store = common::record_store_with_lock_backend(
         &h,
@@ -722,8 +912,7 @@ async fn ch_record_backend_failure_is_surfaced_by_every_operation() {
     let gts_id = common::fixture_gts_id(VCPU_GTS);
     let tenant = Uuid::from_u128(0x9001);
 
-    let record =
-        common::fixture_usage_record(VCPU_GTS, tenant, "idem-dead-backend", Decimal::ONE, 0x9001);
+    let record = common::fixture_usage_record(VCPU_GTS, tenant, "idem-dead-backend", Decimal::ONE);
 
     store
         .create(record.clone())
@@ -824,4 +1013,55 @@ mod stubs {
             Ok(Self::grant(name))
         }
     }
+}
+
+/// Pins the fixture's identity contract: every test record above must carry the
+/// id the gateway would have derived, because that id *is* the dedup key this
+/// store looks rows up by. A fixture stamping a synthetic id (a counter, say)
+/// would make the dedup tests above assert nothing — the lookup would simply
+/// miss and every duplicate would insert cleanly.
+///
+/// Needs no Docker: it builds fixtures and compares ids, and so runs on the
+/// default (non-`--ignored`) pass as a guard on the rest of the file.
+#[test]
+fn fixture_record_id_is_derived_from_its_own_dedup_key() {
+    let tenant = Uuid::from_u128(0xF1AC);
+    let record = common::fixture_usage_record(VCPU_GTS, tenant, "idem-pin", Decimal::ONE);
+
+    assert_eq!(
+        record.id,
+        derive_usage_record_id(
+            record.tenant_id,
+            &record.gts_id,
+            &record.idempotency_key,
+            record.created_at
+        ),
+        "the fixture id must be derived from the record's own \
+         (tenant_id, gts_id, idempotency_key, created_at)"
+    );
+
+    // Each derivation input actually moves the id.
+    let other_tenant =
+        common::fixture_usage_record(VCPU_GTS, Uuid::from_u128(0xF1AD), "idem-pin", Decimal::ONE);
+    assert_ne!(record.id, other_tenant.id, "tenant_id feeds the id");
+
+    let other_idem = common::fixture_usage_record(VCPU_GTS, tenant, "idem-pin-2", Decimal::ONE);
+    assert_ne!(record.id, other_idem.id, "idempotency_key feeds the id");
+
+    let other_instant = common::fixture_usage_record_at(
+        VCPU_GTS,
+        tenant,
+        "idem-pin",
+        Decimal::ONE,
+        common::fixture_created_at_offset(1),
+    );
+    assert_ne!(record.id, other_instant.id, "created_at feeds the id");
+
+    // Value is not a derivation input, so it must not move the id.
+    let other_value =
+        common::fixture_usage_record(VCPU_GTS, tenant, "idem-pin", Decimal::new(7, 0));
+    assert_eq!(
+        record.id, other_value.id,
+        "value is not part of the dedup key"
+    );
 }

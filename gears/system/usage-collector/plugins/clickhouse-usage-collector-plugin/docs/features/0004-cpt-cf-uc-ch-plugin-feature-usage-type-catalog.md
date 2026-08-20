@@ -150,7 +150,7 @@ This feature owns the create-idempotency absorb, the catalog point-read and keys
 3. [ ] - `p1` - Bounded reference probe: `SELECT 1 FROM usage_records FINAL WHERE gts_id = ? LIMIT REF_COUNT_CAP` — because the exclusive lock excludes every concurrent create for this `gts_id`, any reference visible at this point is authoritative (not probabilistic) - `inst-ch-cat-del-3`
 4. [ ] - `p1` - **IF** references found → release lock, **RETURN** `UsageTypeReferenced { gts_id, sample_ref_count }` - `inst-ch-cat-del-4`
 5. [ ] - `p1` - **No references found**: call `LockGuardPort::ensure_still_held()` (lease renew) — **IF** lease expired → **RETURN** `Transient` (abort before issuing `DELETE`) - `inst-ch-cat-del-5`
-6. [ ] - `p1` - Issue `DELETE FROM usage_type_catalog WHERE gts_id = ?` (lightweight real row removal; row masked from every subsequent query synchronously with statement return) - `inst-ch-cat-del-6`
+6. [ ] - `p1` - Issue `DELETE FROM usage_type_catalog WHERE gts_id = ?` with `SETTINGS lightweight_deletes_sync = 2` (lightweight real row removal; the explicit setting is what masks the row from every subsequent query synchronously with statement return) - `inst-ch-cat-del-6`
 7. [ ] - `p1` - Release the lock via `LockGuardPort::release()` - `inst-ch-cat-del-7`
 8. [ ] - `p1` - **RETURN** success - `inst-ch-cat-del-8`
 
@@ -171,14 +171,14 @@ The exclusive-mutex coordination lock per `gts_id` — the same lock name as the
 - Once the exclusive lock is granted, no new `create_usage_record`/`create_usage_records` call for this `gts_id` can start (they all acquire the same exclusive mutex name).
 - The bounded reference probe (`LIMIT REF_COUNT_CAP` scan) is therefore authoritative: any reference that exists is visible; no new reference can be created while the lock is held.
 - `ensure_still_held()` (lease renew) guards against lock-lease expiry between the probe and the `DELETE FROM` (cluster ADR-002 deviation — holding a cluster lock across ClickHouse remote I/O); if the lease expired, the call aborts with `Transient` before the `DELETE` is issued.
-- The `DELETE FROM usage_type_catalog WHERE gts_id = ?` is a lightweight ClickHouse primitive (distinct from `ALTER TABLE ... DELETE`): the row is masked from every subsequent query synchronously with the statement's return; physical removal happens in background merges.
+- The `DELETE FROM usage_type_catalog WHERE gts_id = ?` is a lightweight ClickHouse primitive (distinct from `ALTER TABLE ... DELETE`): the statement carries `lightweight_deletes_sync = 2`, so it returns only once the row is masked on every replica and is therefore invisible to the next query; physical removal still happens in background merges. The setting is stated on the statement rather than inherited, because the server-side default is `2` only on self-managed deployments — ClickHouse Cloud defaults to `1` and a settings profile can set `0`, either of which lets the `DELETE` return while the row is still visible. Since the wait sits inside the lock's critical section, its latency is part of what `lock_ttl_secs` must cover.
 - No rollback step exists: the `DELETE` is issued only after the verify step has run to completion under the exclusive lock; there is no possibility of a reference landing after row removal is missed by the verify.
 
 ### Catalog Size Background Refresh
 
 - [ ] `p3` - **ID**: `cpt-cf-uc-ch-plugin-algo-catalog-size-refresh`
 
-`ChCatalogStore` spawns a single background `tokio` worker that coalesces mutation-triggered `COUNT(*)` refresh requests via a `tokio::sync::Notify` signal. The worker races each `count()` query against the gear cancellation token for prompt shutdown. The refreshed count is cached for the `uc_clickhouse_usage_type_catalog_size` gauge (Feature 6). Coalescing means that a burst of `create_usage_type` calls triggers at most one `COUNT(*)` round-trip per worker-wake, not one per create.
+`ChCatalogStore` spawns a single background `tokio` worker that coalesces mutation-triggered refresh requests via a `tokio::sync::Notify` signal. Each refresh issues `SELECT count() FROM usage_type_catalog FINAL` (`FINAL` collapses the `ReplacingMergeTree` duplicates, so the count reflects live rows rather than raw parts), raced against the gear cancellation token for prompt shutdown. The refreshed count is cached for the `uc_clickhouse_usage_type_catalog_size` gauge (Feature 6). Coalescing means that a burst of `create_usage_type` calls triggers at most one `count()` round-trip per worker-wake, not one per create.
 
 ## 4. States (CDSL)
 
@@ -234,7 +234,7 @@ The system **MUST** implement `list_usage_types` as a `FINAL`-qualified keyset-p
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-catalog-delete-type`
 
-The system **MUST** implement `delete_usage_type` as the lock-protected verify-then-delete protocol: acquire exclusive `gts_id` lock via `CatalogLockPort::acquire_exclusive_for_delete`, run existence check, run bounded reference probe (`LIMIT REF_COUNT_CAP`), call `LockGuardPort::ensure_still_held()` before the `DELETE FROM`, issue the lightweight `DELETE FROM`, release the lock. Lock **MUST** be released on every exit path (including lock-expired abort). Lock-manager unavailability **MUST** return `Transient`. `ChCatalogStore` **MUST** depend on `Arc<dyn CatalogLockPort>` to support offline unit testing of the critical section via stub implementations.
+The system **MUST** implement `delete_usage_type` as the lock-protected verify-then-delete protocol: acquire exclusive `gts_id` lock via `CatalogLockPort::acquire_exclusive_for_delete`, run existence check, run bounded reference probe (`LIMIT REF_COUNT_CAP`), call `LockGuardPort::ensure_still_held()` before the `DELETE FROM`, issue the lightweight `DELETE FROM`, release the lock. The `DELETE` **MUST** set `lightweight_deletes_sync = 2` on the statement rather than relying on the connection or server default, so the removal is visible to the next read (the create path's `FINAL` pre-existence check depends on it). Lock **MUST** be released on every exit path (including lock-expired abort). Lock-manager unavailability **MUST** return `Transient`. `ChCatalogStore` **MUST** depend on `Arc<dyn CatalogLockPort>` to support offline unit testing of the critical section via stub implementations.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-catalog-delete-fk`, `cpt-cf-uc-ch-plugin-flow-catalog-delete-type`
 
@@ -256,6 +256,8 @@ The system **MUST** implement `delete_usage_type` as the lock-protected verify-t
 - [x] The reference probe uses `LIMIT REF_COUNT_CAP`; with the exclusive lock held, the probe result is authoritative — no new reference can be created while the probe and `DELETE FROM` execute.
 - [x] `ensure_still_held()` is called immediately before the `DELETE FROM`; if the lease has expired, the call returns `Transient` without issuing the `DELETE`.
 - [x] `DELETE FROM usage_type_catalog WHERE gts_id = ?` is a lightweight real row removal — not a tombstone flag, not a higher-version marker row.
+- [x] The `DELETE` carries `lightweight_deletes_sync = 2` on the statement, so the removal is visible to the next read even when the connection or server default asks for asynchronous deletes.
+- [x] Deleting a `gts_id` and immediately re-creating it succeeds and stores the new payload — the removed row does not surface as `UsageTypeAlreadyExists` or absorb the re-create.
 - [x] Lock is released on every exit path (success, type-not-found, referenced, lease-expired, ClickHouse error).
 - [x] `ChCatalogStore` depends on `Arc<dyn CatalogLockPort>` and can be unit-tested with a stub without a live ClickHouse or cluster backend.
 - [x] A type deleted via `delete_usage_type` is subsequently invisible to `create_usage_record`'s catalog-existence check (returns `UsageTypeNotFound`).

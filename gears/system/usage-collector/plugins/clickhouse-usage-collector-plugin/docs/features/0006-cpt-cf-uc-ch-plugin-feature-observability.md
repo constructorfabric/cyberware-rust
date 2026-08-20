@@ -193,11 +193,11 @@ Why it is safe to defer: the referential-integrity race this would backstop is c
 
 - [x] `p3` - **ID**: `cpt-cf-uc-ch-plugin-dod-observability-write-path`
 
-The system **MUST** implement `uc_clickhouse_insert_duration_seconds` (Histogram, label `mode: single|batch`), `uc_clickhouse_batch_rows` (Histogram), the three dedup-outcome counters `uc_clickhouse_dedup_absorbed_total` / `uc_clickhouse_idempotency_conflicts_total` / `uc_clickhouse_compensations_total`, `uc_clickhouse_deactivate_duration_seconds` (Histogram), and `uc_clickhouse_pool_acquire_duration_seconds` (Histogram). Each instrument **MUST** be recorded at the appropriate call site in `ChRecordStore`. All histograms **MUST** declare explicit bucket boundaries.
+The system **MUST** implement `uc_clickhouse_insert_duration_seconds` (Histogram, label `mode: single|batch`), `uc_clickhouse_batch_rows` (Histogram), the three dedup-outcome counters `uc_clickhouse_dedup_absorbed_total` / `uc_clickhouse_idempotency_conflicts_total` / `uc_clickhouse_compensations_total`, `uc_clickhouse_deactivate_duration_seconds` (Histogram), and `uc_clickhouse_pool_acquire_duration_seconds` (Histogram). Each instrument **MUST** be recorded at the appropriate call site in `ChRecordStore`, **except** `uc_clickhouse_pool_acquire_duration_seconds`, which is not write-path-exclusive: the pool is shared, so it **MUST** additionally be recorded on the catalog path in `ChCatalogStore`, matching its inventory row in [§3](#3-processes--business-logic-cdsl) ("recorded on both write and catalog paths"). All histograms **MUST** declare explicit bucket boundaries.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-observability-inventory` (write-path instruments), `cpt-cf-uc-ch-plugin-flow-observability-request-path`
 
-**Touches**: `infra/metrics.rs`; `ChRecordStore` call sites
+**Touches**: `infra/metrics.rs`; `ChRecordStore` call sites; `ChCatalogStore` call sites (pool-acquire only)
 
 ### Implement read-path metric instruments
 
@@ -250,7 +250,7 @@ The system **MUST** implement `uc_clickhouse_orphaned_reference_detected_total` 
 - [x] `uc_clickhouse_dedup_absorbed_total`, `uc_clickhouse_idempotency_conflicts_total`, and `uc_clickhouse_compensations_total` are incremented for their respective outcomes on both the single and batch insert paths.
 - [x] `uc_clickhouse_lock_acquire_duration_seconds`, `uc_clickhouse_lock_contention_total`, and `uc_clickhouse_lock_manager_unavailable_total` are recorded by `LockManager` on every lock acquisition attempt, each labelled by `mode`; a failed `ensure_still_held` also increments the unavailable counter.
 - [ ] **Deferred, not asserted**: `uc_clickhouse_orphaned_reference_detected_total` and its reconciliation worker are not implemented, so no acceptance test asserts the instrument's existence or its value (see the DoD note in [§5](#5-definitions-of-done)).
-- [x] `uc_clickhouse_usage_type_catalog_size` is updated by the catalog-size background refresh worker after each `create_usage_type` insertion.
+- [x] `uc_clickhouse_usage_type_catalog_size` is refreshed **asynchronously and eventually**, not synchronously per mutation: a `create_usage_type` / `delete_usage_type` signals the background worker via `tokio::sync::Notify`, and the worker coalesces a burst into at most one `SELECT count() FROM usage_type_catalog FINAL` per wake (feature 0004 `cpt-cf-uc-ch-plugin-algo-catalog-size-refresh`). The gauge therefore lags a mutation briefly and a burst of *n* creates does not produce *n* gauge updates.
 - [x] All instruments use the `opentelemetry` SDK-agnostic API (global meter); the plugin does not hard-depend on a specific OTLP exporter.
 - [x] Unit tests use the `opentelemetry_sdk` `InMemoryMetricExporter` (gated behind the `testing` feature) to assert metric recordings without a live OTLP endpoint.
 
