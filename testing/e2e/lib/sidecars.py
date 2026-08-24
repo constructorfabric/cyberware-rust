@@ -266,6 +266,7 @@ class _DockerSidecar:
         *,
         min_age_secs: int = REAP_MIN_AGE_SECS,
         own_label: str | None = None,
+        run_id: str | None = RUN_ID,
     ) -> list[str]:
         """Ids `reap_stale` would remove, without removing them.
 
@@ -273,11 +274,27 @@ class _DockerSidecar:
         `min_age_secs=0` — without running a host-wide removal that would
         delete a live session's container, which is the very failure the age
         gate exists to prevent.
+
+        Two exclusions, not one, because a label VALUE carries both a class
+        prefix and a run identity. `own_label` spares that one exact value —
+        what an explicit self-test label needs, since it carries no RUN_ID.
+        `run_id` spares every value ending in `-{run_id}`, whatever its class
+        prefix: one run can hold containers under more than one prefix
+        (`usage-collector` and `usage-collector-ch`), and a second sidecar's
+        `start()` sweep would otherwise treat the first one as foreign and
+        reap it the moment age said so — a skewed daemon clock or a lowered
+        `CF_GEARS_E2E_REAP_MIN_AGE_SECS` is enough, and under a pinned
+        CF_GEARS_E2E_RUN_ID the two backend sessions are one run by
+        definition. It defaults to this process's RUN_ID so no caller can
+        forget it; pass `run_id=None` to sweep by age alone.
         """
         own = cls._label_value(own_label) if own_label is not None else None
+        mine = f"-{run_id}" if run_id else None
         return [
             cid for cid, age, label in cls._owners(cls._ids_labelled(LABEL_KEY))
-            if label != own and age >= min_age_secs
+            if label != own
+            and not (mine is not None and label.endswith(mine))
+            and age >= min_age_secs
         ]
 
     @classmethod
@@ -286,6 +303,7 @@ class _DockerSidecar:
         *,
         min_age_secs: int = REAP_MIN_AGE_SECS,
         own_label: str | None = None,
+        run_id: str | None = RUN_ID,
     ) -> None:
         """Remove sidecar containers leaked by an earlier run of ANY session.
 
@@ -302,10 +320,14 @@ class _DockerSidecar:
         concurrent run is younger than the threshold and survives; a container
         that has outlived any plausible session is leaked and goes.
 
-        `own_label` is skipped outright, so "never reap your own session" holds
-        even if a skewed daemon clock made our own container look old.
+        `own_label` and everything carrying `run_id` are skipped outright, so
+        "never reap your own session" holds even if a skewed daemon clock made
+        our own container look old — and holds for every backend the run
+        started, not just the one calling this. See `stale_ids`.
         """
-        cls._rm(cls.stale_ids(min_age_secs=min_age_secs, own_label=own_label))
+        cls._rm(cls.stale_ids(
+            min_age_secs=min_age_secs, own_label=own_label, run_id=run_id,
+        ))
 
     @classmethod
     def pull(cls) -> None:

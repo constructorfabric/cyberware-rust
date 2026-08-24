@@ -45,15 +45,10 @@ make e2e-docker-smoke      # E2E — Docker environment (smoke subset only)
 make e2e-local             # E2E — local: run every shared-server suite against one shared server
 make e2e-local-smoke       # E2E — smoke subset only
 make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
-<<<<<<< HEAD
 make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (resource_group/e2e.yaml, profile: tr-authz)
-make e2e-usage-collector   # E2E — usage-collector lane, TimescaleDB + ClickHouse backends (dedicated binary each; needs Docker)
-=======
-make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (local mode, e2e-tr-authz.yaml)
 make e2e-usage-collector   # E2E — usage-collector lane, both backends (aggregate of the two targets below)
 make e2e-usage-collector-timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
 make e2e-usage-collector-clickhouse   # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
->>>>>>> 9f906fad (Resolve coderabbit comments)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
 make all                   # full pipeline (build + check + test-sqlite + e2e-local)

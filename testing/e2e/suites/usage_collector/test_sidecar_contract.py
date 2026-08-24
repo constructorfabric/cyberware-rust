@@ -207,14 +207,26 @@ def test_reap_stale_never_removes_its_own_run(sidecar_cls, selftest_label):
          "--entrypoint", "sleep", sidecar_cls.IMAGE, "300"],
         capture_output=True, text=True, timeout=120, check=True,
     ).stdout.strip()
+    # A second backend of the SAME run: different class prefix, same RUN_ID
+    # suffix. `own_label` cannot spare it, so only the run identity can.
+    sibling_label = f"{selftest_label}-sibling-{RUN_ID}"
+    sibling = subprocess.run(
+        ["docker", "run", "-d", "--label", sibling_label,
+         "--entrypoint", "sleep", sidecar_cls.IMAGE, "300"],
+        capture_output=True, text=True, timeout=120, check=True,
+    ).stdout.strip()
     try:
         selected = sidecar_cls.stale_ids(min_age_secs=0, own_label=own_label)
         assert mine not in selected, "own run's container selected for reaping"
+        assert sibling not in selected, (
+            "a container from this run under another class prefix was selected "
+            "— a second sidecar's start() would have reaped it mid-session"
+        )
         # The full `key=value` form must work: callers hold labels in that
         # shape, while `docker inspect` reports bare values.
         assert own_label.startswith(f"{LABEL_KEY}=")
     finally:
-        subprocess.run(["docker", "rm", "-f", mine],
+        subprocess.run(["docker", "rm", "-f", mine, sibling],
                        capture_output=True, timeout=60, check=False)
 
 
