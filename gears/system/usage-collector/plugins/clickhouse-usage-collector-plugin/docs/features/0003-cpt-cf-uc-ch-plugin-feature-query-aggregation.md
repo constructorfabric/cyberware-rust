@@ -130,8 +130,8 @@ Query & Aggregation owns: OData `$filter`/`$orderby`/cursor → parameterized Cl
 **Steps**:
 
 1. [ ] - `p2` - For each `$filter` expression: bind caller-supplied values as parameters; validate column names against a closed allowlist of schema columns — reject any unlisted identifier - `inst-ch-trans-1`
-2. [ ] - `p2` - For each `$orderby` clause: validate column names against the same allowlist - `inst-ch-trans-2`
-3. [ ] - `p2` - For a keyset cursor: decode the cursor bytes, generate a **strict** row-value predicate — `WHERE (col1, col2, ...) > (?, ?, ...)` (or `<` for a descending sort) — with bound parameters matching the decoded position; the cursor names the last row already returned, so `>=` would re-emit it - `inst-ch-trans-3`
+2. [ ] - `p2` - For each `$orderby` clause: validate column names against the same allowlist. The effective keyset order **MUST** be a **total order** — it **MUST** end in a stable globally-unique tie-breaker (`id` for `usage_records`, `gts_id` for the type catalog). Per `plugin-spi.md` Method 4 the host guarantees this by normalizing every caller `$orderby` to end in the canonical `(created_at, id)` suffix (`ODataOrderBy::ensure_tiebreaker`, in the caller's sort direction); an order whose final key is not unique **MUST NOT** be executed as a keyset query, because rows sharing the boundary value that did not fit on the previous page are silently dropped at the page break - `inst-ch-trans-2`
+3. [ ] - `p2` - For a keyset cursor: decode the cursor bytes, generate a **strict** row-value predicate — `WHERE (col1, col2, ...) > (?, ?, ...)` (or `<` for a descending sort) — with bound parameters matching the decoded position; the cursor names the last row already returned, so `>=` would re-emit it. The predicate's column tuple and the cursor's key tuple **MUST** span the full total order of step 2, tie-breaker included — a cursor arity that does not match the effective order is rejected - `inst-ch-trans-3`
 4. [ ] - `p2` - For an `AggregationSpec`: generate `GROUP BY <dims> SELECT <agg_exprs>` honoring the `SUM`-nets-compensations / other-ops-exclude-compensations rule - `inst-ch-trans-4`
 5. [ ] - `p2` - Adapt to the `clickhouse` crate's bind API (named `?` parameter slots or positional, per crate convention) - `inst-ch-trans-5`
 6. [ ] - `p2` - **RETURN** the parameterized SQL fragment and parameter bindings - `inst-ch-trans-6`
@@ -146,7 +146,7 @@ Per `plugin-spi.md` Method 3's pushdown obligation, the plugin **MUST** add `LIM
 
 - [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-keyset-cursor`
 
-Cursors encode the sort-key values of the last row of the returned page, opaque to callers. Decoding yields a typed position that is injected into the `WHERE` clause as bound parameters. The forward-only cursor constraint (`ensure_forward_cursor`) is a v1 constraint: a cursor whose decoded position is prior to the current page's first row is rejected with `InvalidCursor` (backward paging is not supported in v1).
+Cursors encode the sort-key values of the last row of the returned page, opaque to callers. The encoded key tuple covers the **whole** effective order including its unique final tie-breaker (`id` for records, `gts_id` for the catalog), so the keyset sequence is a total order and no two distinct rows share a cursor position. Decoding yields a typed position that is injected into the `WHERE` clause as bound parameters. The forward-only cursor constraint (`ensure_forward_cursor`) is a v1 constraint: a cursor whose decoded position is prior to the current page's first row is rejected with `InvalidCursor` (backward paging is not supported in v1).
 
 ## 4. States (CDSL)
 

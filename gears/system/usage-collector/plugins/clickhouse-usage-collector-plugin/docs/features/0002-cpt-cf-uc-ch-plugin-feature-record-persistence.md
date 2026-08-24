@@ -98,7 +98,7 @@ Record Persistence owns the full lifecycle write path: locking, referential-inte
 1. [ ] - `p1` - Compute the deterministic record `id` (ADR-0013/ADR-0014 4-tuple: `tenant_id`, `gts_id`, `idempotency_key`, `created_at`) - `inst-ch-rec-create-1`
 2. [ ] - `p1` - Acquire the exclusive `gts_id` coordination lock via `LockManager::acquire_exclusive_for_create(gts_id)` — timeout → `Transient` - `inst-ch-rec-create-2`
 3. [ ] - `p1` - Plugin-owned referential-integrity check: `SELECT 1 FINAL FROM usage_type_catalog WHERE gts_id = ?` — absent → release lock, **RETURN** `UsageTypeNotFound` - `inst-ch-rec-create-3`
-4. [ ] - `p1` - Dedup point-lookup: `SELECT ... FINAL FROM usage_records WHERE tenant_id=? AND gts_id=? AND created_at=? AND id=?` - `inst-ch-rec-create-4`
+4. [ ] - `p1` - Dedup point-lookup: `SELECT ... FINAL FROM usage_records WHERE tenant_id=? AND gts_id=? AND created_at=? AND idempotency_key=?` - `inst-ch-rec-create-4`
 5. [ ] - `p1` - **IF** not found — proceed to insert - `inst-ch-rec-create-5`
    1. [ ] - `p1` - Call `ClusterLockGuard::ensure_still_held()` (lease renew) immediately before the INSERT; on `ClusterError::LockExpired` → release the lock, **RETURN** `Transient` (cluster ADR-002 deviation) - `inst-ch-rec-create-5a`
    2. [ ] - `p1` - `INSERT` one row with `status='active'`, `version=<monotonic epoch_μs>` - `inst-ch-rec-create-5b`
