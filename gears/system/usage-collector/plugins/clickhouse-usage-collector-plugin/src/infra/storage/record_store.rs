@@ -836,12 +836,18 @@ impl RecordStore for ChRecordStore {
     // @cpt-flow:cpt-cf-uc-ch-plugin-seq-get
     #[instrument(skip_all, fields(record_id = %id))]
     async fn get(&self, id: Uuid) -> Result<UsageRecord, UsageCollectorPluginError> {
+        // Enable skip indexes under FINAL so `idx_records_id` can prune granules
+        // for this non-sort-key-prefix `id` predicate; keep exact-mode on so
+        // FINAL resolution stays correct when a skip index drops a granule.
+        // Same pair the deactivation cascade's read applies.
         let sql = format!("SELECT {RECORD_COLUMNS} FROM usage_records FINAL WHERE id = ?");
         let row: Option<UsageRecordRow> = with_deadline(
             &self.metrics,
             self.request_timeout,
             self.client
                 .query(&sql)
+                .with_setting("use_skip_indexes_if_final", "1")
+                .with_setting("use_skip_indexes_if_final_exact_mode", "1")
                 .bind(id.to_string())
                 .fetch_optional(),
         )
