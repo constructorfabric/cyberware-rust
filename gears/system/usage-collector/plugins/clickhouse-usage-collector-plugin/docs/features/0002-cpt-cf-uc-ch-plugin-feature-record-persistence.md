@@ -114,7 +114,7 @@ Record Persistence owns the full lifecycle write path: locking, referential-inte
 
 **Success Scenarios**:
 
-- All records inserted/absorbed in a single multi-row `INSERT`; per-record outcomes returned in input order.
+- All records inserted/absorbed through one multi-row `INSERT` per distinct `gts_id` partition (exactly one for a single-`gts_id` batch); per-record outcomes returned in input order.
 
 **Error Scenarios**:
 
@@ -122,12 +122,12 @@ Record Persistence owns the full lifecycle write path: locking, referential-inte
 
 **Steps**:
 
-1. [ ] - `p1` - Partition the input batch by `gts_id`, then sort the partition keys so every caller acquires multi-`gts_id` locks in one global order (two concurrent mixed batches cannot deadlock on opposite acquisition orders) - `inst-ch-rec-batch-1`
-2. [ ] - `p1` - Acquire every partition's exclusive `gts_id` lock up front, sequentially in the sorted order; on failure for a partition mark every record in it with the appropriate error and continue with the rest - `inst-ch-rec-batch-2`
-3. [ ] - `p1` - For each locked partition, concurrently (every partition already holds its own lock): run the catalog existence check and a single batched dedup pre-check `SELECT ... FINAL WHERE (tenant_id, gts_id, created_at, idempotency_key) IN (...)` for that partition's records - `inst-ch-rec-batch-3`
-4. [ ] - `p1` - Compute per-record dedup outcome (new / absorb / conflict) sequentially, partition by partition, in input order from the pre-check results, so `version` offsets and within-batch dedup stay deterministic - `inst-ch-rec-batch-4`
-5. [ ] - `p1` - Renew every surviving partition's lease (`ensure_still_held`) and drop an expired partition's composed rows, then pool all remaining non-duplicate `INSERT`-ready rows into one multi-row `INSERT` and execute it - `inst-ch-rec-batch-5`
-6. [ ] - `p1` - Release all held partition locks, including on the insert-failure path - `inst-ch-rec-batch-6`
+1. [ ] - `p1` - Partition the input batch by `gts_id`, then sort the partition keys so each partition's `version` range (step 4) is assigned deterministically rather than in hash-map iteration order - `inst-ch-rec-batch-1`
+2. [ ] - `p1` - Start every partition's pipeline (steps 3-6) concurrently; each acquires only its own exclusive `gts_id` lock and holds it for its own critical section, so a partition waiting on a contended `gts_id` never delays another partition's read or write, and no pipeline ever holds two locks at once. On acquisition failure for a partition, mark every record in it with the appropriate error and leave the rest unaffected - `inst-ch-rec-batch-2`
+3. [ ] - `p1` - Per partition, under its own lock: run the catalog existence check and a single batched dedup pre-check `SELECT ... FINAL WHERE (tenant_id, gts_id, created_at, idempotency_key) IN (...)` for that partition's records - `inst-ch-rec-batch-3`
+4. [ ] - `p1` - Per partition, compute per-record dedup outcome (new / absorb / conflict) in input order from the pre-check results, minting `version`s from the range reserved for that partition before any lock was taken; within-batch dedup is partition-local because the canonical dedup tuple contains `gts_id` - `inst-ch-rec-batch-4`
+5. [ ] - `p1` - Per partition, renew its lease (`ensure_still_held`) immediately before its own write — skipped only when the partition composed no rows — then execute one multi-row `INSERT` of that partition's non-duplicate rows inside its lock - `inst-ch-rec-batch-5`
+6. [ ] - `p1` - Release each partition's lock as soon as its own `INSERT` completes, including on the insert-failure path - `inst-ch-rec-batch-6`
 7. [ ] - `p1` - **RETURN** per-record outcome vector aligned to input order (an insert failure is reported per affected slot, not as a top-level error) - `inst-ch-rec-batch-7`
 
 ### Get Usage Record
@@ -178,7 +178,7 @@ The create-side referential-integrity half of `cpt-cf-uc-ch-plugin-fr-referentia
 
 - [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-record-persistence-batch-partition`
 
-The batch MUST be partitioned by `gts_id` before any lock acquisition. Acquiring only `records[0].gts_id`'s lock for the whole batch would expose every non-first `gts_id` to a concurrent `delete_usage_type` referential-integrity race. Partition keys MUST be **sorted** before acquiring their locks: with unordered acquisition, two concurrent batches covering the same two `gts_id`s in opposite orders can hold one lock each and block on the other until both leases lapse, so one global order is what rules that deadlock out. Each distinct `gts_id` partition runs its own acquire → catalog-check → dedup-pre-check sequence; because the locks are all taken before any read, the per-partition read phases are independent and run concurrently, while outcome resolution stays sequential to keep `version` offsets and within-batch dedup deterministic. Only the physical write is batched: all non-duplicate rows from all passing partitions are collected into one multi-row `INSERT`. Each partition's lock is held until after the combined `INSERT` completes.
+The batch MUST be partitioned by `gts_id` before any lock acquisition. Acquiring only `records[0].gts_id`'s lock for the whole batch would expose every non-first `gts_id` to a concurrent `delete_usage_type` referential-integrity race. Each distinct `gts_id` partition MUST run its own acquire → catalog-check → dedup-pre-check → resolve → renew → `INSERT` → release pipeline, and the partitions MUST run concurrently. A partition's lock MUST cover its own critical section only: a partition queued behind a contended `gts_id` therefore delays nothing but itself. Because a pipeline holds at most one lock at any moment, hold-and-wait cannot arise, so two concurrent batches covering the same `gts_id`s in opposite orders can queue but never deadlock. Partition keys are still **sorted**, now to make the per-partition `version` ranges deterministic: each partition reserves its range (base merge version plus the record count of every preceding partition) before any lock is taken, so concurrently composing partitions mint disjoint, reproducible `version`s without a shared counter. Within-batch dedup is resolved per partition, which is exact because the canonical dedup tuple contains `gts_id`. The physical write is batched per partition: one multi-row `INSERT` of that partition's non-duplicate rows, issued inside its lock — `N` `INSERT`s for `N` distinct `gts_id`s, exactly one for the common single-`gts_id` batch. Whole-batch write atomicity is deliberately not claimed; the contract is per-record outcomes, and each `INSERT` remains one atomic part write over exactly the partition its lock protects.
 
 ### Versioned-Marker Deactivation Cascade
 
@@ -220,7 +220,7 @@ The system **MUST** implement `create_usage_record` as: acquire the exclusive `g
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-record-persistence-create-batch`
 
-The system **MUST** implement `create_usage_records` with `gts_id`-partitioned locking: one lock + catalog check per distinct `gts_id` partition, locks acquired in sorted partition-key order to preclude cross-batch deadlock, a single batched dedup pre-check `SELECT` per partition (partition read phases MAY run concurrently once all locks are held), and exactly one multi-row `INSERT` for all non-duplicate rows across passing partitions. Per-record outcomes **MUST** be returned in input order. A partition failure **MUST NOT** affect other partitions. All partition locks **MUST** be held until the combined `INSERT` completes and then released.
+The system **MUST** implement `create_usage_records` with `gts_id`-partitioned locking: one lock + catalog check per distinct `gts_id` partition, a single batched dedup pre-check `SELECT` per partition, and one multi-row `INSERT` of that partition's non-duplicate rows. Each partition's pipeline (acquire → catalog check → dedup pre-check → resolve → `ensure_still_held` → `INSERT` → release) **MUST** run concurrently with the other partitions', and its lock **MUST** be held for its own critical section only — acquired no earlier than that partition's own work and released as soon as its own `INSERT` completes, on every exit path. A partition **MUST NOT** hold more than one lock at a time (which is what precludes cross-batch deadlock). Per-record outcomes **MUST** be returned in input order. A partition failure **MUST NOT** affect other partitions.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-record-persistence-batch-partition`, `cpt-cf-uc-ch-plugin-flow-record-persistence-create-batch`
 
@@ -259,7 +259,7 @@ The system **MUST** implement `deactivate_usage_record` as: one `FINAL`-qualifie
 - [x] The dedup lookup keys on the canonical `(tenant_id, gts_id, created_at, idempotency_key)` tuple — leading with the three-column sort-key prefix, never on `id` — and is `FINAL`-qualified.
 - [x] An identical re-submission (same canonical fields) is absorbed silently; a re-submission with differing canonical fields returns `IdempotencyConflict`.
 - [x] `create_usage_record` calls `ClusterLockGuard::ensure_still_held()` (lease renew) immediately before the INSERT; on `ClusterError::LockExpired` the lock is released and `Transient` is returned without inserting.
-- [x] `create_usage_records` partitions the batch by `gts_id` and acquires the partition locks in sorted key order; each distinct `gts_id` partition performs its own lock + catalog-check + dedup-pre-check; only one multi-row `INSERT` is issued across all passing partitions; per-record outcomes are in input order.
+- [x] `create_usage_records` partitions the batch by `gts_id`; each distinct `gts_id` partition performs its own lock + catalog-check + dedup-pre-check + `INSERT` concurrently with the others, holding its lock for its own critical section only; one multi-row `INSERT` is issued per passing partition; per-record outcomes are in input order.
 - [x] A partition-level lock or catalog failure does not affect outcomes for records in other partitions.
 - [x] `deactivate_usage_record` flips the target and all depth-1 active compensations in a single multi-row `INSERT`; no partial cascade is observable by a `FINAL`-qualified reader.
 - [x] `deactivate_usage_record` returns `UsageRecordNotFound` when the target does not exist and `UsageRecordAlreadyInactive` when it is already inactive.

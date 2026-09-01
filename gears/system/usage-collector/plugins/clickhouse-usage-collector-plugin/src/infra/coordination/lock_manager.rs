@@ -46,6 +46,13 @@
 //! on [`ClusterError::LockExpired`]. Size `lock_ttl_secs` above worst-case
 //! critical-section latency.
 //!
+//! That renew only buys headroom if the lease outlasts the one round-trip it
+//! precedes, so `ClickHousePluginConfig::validate` refuses to start with a
+//! `lock_ttl_secs` at or below the client deadline
+//! (`request_timeout_secs + CLIENT_DEADLINE_GRACE_SECS`). Longer,
+//! multi-round-trip prefixes of the critical section are not covered by that
+//! floor — they are covered by the renew failing closed.
+//!
 //! # Fail-closed rule (DESIGN.md §3.6 step 7)
 //!
 //! If the cluster lock cannot be granted within `lock_timeout_secs`, both
@@ -127,16 +134,17 @@ impl LockManager {
 
     /// Resolve (or return cached) [`DistributedLockV1`] for
     /// [`UsageCollectorProfile`], requiring linearizable locks.
-    fn resolve_lock(&self) -> Result<&DistributedLockV1, UsageCollectorPluginError> {
+    async fn resolve_lock(&self) -> Result<&DistributedLockV1, UsageCollectorPluginError> {
         if let Some(lock) = self.lock.get() {
             return Ok(lock);
         }
-        // Sync resolve under a brief async gate — caller must hold resolve_gate
-        // when racing; see `ensure_resolved`.
+        // Resolve under the async gate — caller must hold resolve_gate when
+        // racing; see `ensure_resolved`.
         let facade = DistributedLockV1::resolver(&self.hub)
             .profile(UsageCollectorProfile)
             .require(LockCapability::Linearizable)
             .resolve()
+            .await
             .map_err(map_resolve_error)?
             .scoped(LOCK_SCOPE_PREFIX)
             .map_err(|e| {
@@ -159,7 +167,7 @@ impl LockManager {
             return Ok(lock);
         }
         let _gate = self.resolve_gate.lock().await;
-        self.resolve_lock()
+        self.resolve_lock().await
     }
 
     /// Acquire the exclusive per-`gts_id` coordination lock.

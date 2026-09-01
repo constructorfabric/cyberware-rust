@@ -84,7 +84,7 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
         serde_json::from_str(&format!(
             r#"{{ "database_url": "http://default:{CH_TEST_PASSWORD}@127.0.0.1:{ch_port}/default",
                   "allow_insecure_http": true,
-                  "lock_ttl_secs": 30,
+                  "lock_ttl_secs": 60,
                   "lock_timeout_secs": 5 }}"#
         ))
         .expect("valid test config json");

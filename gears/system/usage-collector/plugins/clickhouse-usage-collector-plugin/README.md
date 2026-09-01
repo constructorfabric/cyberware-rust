@@ -11,7 +11,7 @@ Config maps to `ClickHousePluginConfig` (`src/config.rs`). Durations are whole s
 | `database_url` | _(required)_ | ClickHouse HTTP endpoint URL including credentials, e.g. `https://user:${CH_PASSWORD}@host:8443/db`. Wrapped in `SecretFromEnv` (Debug-redacted, no Display/Serialize); `${VAR}` placeholders are expanded at startup. Only the `http` and `https` schemes are accepted; a plaintext `http://` URL is additionally rejected unless `allow_insecure_http = true` (see [TLS enforcement](#tls-enforcement) below). |
 | `allow_insecure_http` | `false` | Explicit development/test opt-out that permits a plaintext `http://` `database_url`. Has no effect on a `https://` URL, and does not admit a non-HTTP scheme. **MUST NOT** be set in production. |
 | `request_timeout_secs` | `30` | Per-request timeout budget in seconds (reads and writes). Drives two mechanisms: the ClickHouse *server* settings `send_timeout`/`receive_timeout`, and a *client-side* deadline 5s later on every individual ClickHouse await. The client-side one is the backstop for a connection that is accepted and then never answered (or held open by an intermediary), which the server settings cannot bound because they never reach a server. Sized 5s apart so a responsive server's own timeout fires first and callers get its descriptive error. |
-| `lock_ttl_secs` | `30` | Cluster lock lease TTL. Must exceed worst-case create/delete critical-section latency (ClickHouse I/O while the lock is held). Renewed immediately before the mutating write. |
+| `lock_ttl_secs` | `60` | Cluster lock lease TTL. Should exceed worst-case create/delete critical-section latency (ClickHouse I/O while the lock is held). Renewed immediately before the mutating write. Startup validation enforces the floor that makes that renew useful: `lock_ttl_secs` **must be strictly greater than** the client deadline (`request_timeout_secs + 5s`, so `35s` at the default), because a single ClickHouse round-trip may burn the whole deadline and must not outlive the lease it was just granted. Raising `request_timeout_secs` therefore requires raising `lock_ttl_secs` with it. |
 | `lock_timeout_secs` | `5` | Maximum wait when acquiring the per-`gts_id` exclusive cluster lock. On timeout the operation fails closed with `Transient`. |
 | `retention_period_secs` | `31536000` (365d) | `usage_records` retention window; rows older than this are dropped via ClickHouse TTL. Must be in `(0, 100 years]`. Migration DDL defaults to 1 year; on every startup `ensure_retention_ttl` issues `ALTER TABLE … MODIFY TTL` when the live interval differs from this value — see [Retention window management](#retention-window-management). |
 | `vendor` | `cyberfabric` | Vendor name for GTS instance registration. Must not be empty or blank; an empty value fails startup validation. |
@@ -28,7 +28,7 @@ gears:
     config:
       database_url: "https://user:${CH_PASSWORD}@host:8443/usage"
       request_timeout_secs: 30
-      lock_ttl_secs: 30
+      lock_ttl_secs: 60
       lock_timeout_secs: 5
       retention_period_secs: 31536000
       vendor: "cyberfabric"

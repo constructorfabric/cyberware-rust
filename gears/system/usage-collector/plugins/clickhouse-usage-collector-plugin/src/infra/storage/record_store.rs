@@ -22,7 +22,7 @@
 //! - **`?` placeholders**: `ClickHouse` uses positional `?` (not `$N`).
 //! - **`metadata['key']`**: map subscript (not `metadata ->> key`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -471,7 +471,7 @@ fn dedup_invariant_break(record: &UsageRecord, msg: &'static str) -> UsageCollec
 ///
 /// [`UsageCollectorPluginError`] is intentionally not `Clone` (it is a
 /// foundation-owned SPI contract type — `cpt-cf-usage-collector-dod-*
-/// -plugin-contract-stability`), so [`ChRecordStore::create_batch`]
+/// -plugin-contract-stability`), so [`ChRecordStore::create_partition`]
 /// reconstructs an equivalent value per variant instead of cloning a shared
 /// instance. Only [`CatalogLockPort::acquire_exclusive_for_create`],
 /// [`ChRecordStore::check_catalog_existence`], [`ChRecordStore::batch_dedup_lookup`],
@@ -582,26 +582,98 @@ impl ChRecordStore {
         UsageRecord::try_from(row)
     }
 
-    /// Critical section of one `gts_id` partition of [`Self::create_batch`],
-    /// run while its exclusive partition lock is held.
+    /// Whole lifecycle of one `gts_id` partition of [`Self::create_batch`]:
+    /// acquire that partition's exclusive lock, run its critical section,
+    /// release the lock.
     ///
-    /// Mirrors [`Self::create_under_lock`]'s read phase: catalog existence
-    /// check, batch dedup pre-read, then a lease renewal so the caller knows
-    /// the partition is still owned before any row is composed. Returns the
-    /// stored rows keyed by their dedup identity.
+    /// The lock covers this partition's work and nothing else, so a partition
+    /// queueing behind a contended `gts_id` never delays another partition's
+    /// reads or `INSERT` — the whole point of running these per-partition
+    /// futures concurrently. Each future also holds at most one lock at a time,
+    /// so two concurrent multi-type batches cannot hold-and-wait into a cycle
+    /// whatever order they reach their partitions in.
+    ///
+    /// Returns one outcome per entry of `idxs`, positionally aligned to it. A
+    /// whole-partition failure (lock, catalog, dedup read, lease) is reported
+    /// in every one of those slots rather than raised, so the rest of the batch
+    /// is unaffected.
+    ///
+    /// `version_base` is this partition's reserved version range start (see
+    /// [`Self::create_batch`]); `op_start` is the batch's entry instant,
+    /// forwarded to the insert-latency histogram.
+    async fn create_partition(
+        &self,
+        records: &[UsageRecord],
+        partition_gts_id: &str,
+        idxs: &[usize],
+        version_base: u64,
+        op_start: Instant,
+    ) -> Vec<Result<UsageRecord, UsageCollectorPluginError>> {
+        let guard = match self
+            .lock_manager
+            .acquire_exclusive_for_create(partition_gts_id)
+            .await
+        {
+            Ok(guard) => guard,
+            // Nothing was acquired, so there is nothing to release.
+            Err(e) => {
+                return (0..idxs.len())
+                    .map(|_| Err(err_for_partition(&e)))
+                    .collect();
+            }
+        };
+
+        let result = self
+            .create_partition_under_lock(records, idxs, guard.as_ref(), version_base, op_start)
+            .await;
+
+        // The cluster guard's `Drop` is a no-op, so the lock is released
+        // explicitly on every exit path — including the failure ones, which
+        // would otherwise hold this `gts_id` until its lease lapsed.
+        //
+        // Unlike the single-record path, a failed release does not turn a
+        // successful partition into an error: the rows are already durable and
+        // the other partitions' outcomes must not be disturbed by it.
+        if let Err(e) = guard.release().await {
+            tracing::warn!(error = %e, "failed to release create-batch cluster lock");
+        }
+
+        match result {
+            Ok(outcomes) => outcomes,
+            Err(e) => (0..idxs.len())
+                .map(|_| Err(err_for_partition(&e)))
+                .collect(),
+        }
+    }
+
+    /// Critical section of one `gts_id` partition, run while its exclusive
+    /// partition lock is held.
+    ///
+    /// Mirrors [`Self::create_under_lock`], batched: catalog existence check,
+    /// batch dedup pre-read, per-record outcome resolution, a lease renewal
+    /// immediately before the write, then this partition's own multi-row
+    /// `INSERT`.
+    ///
+    /// All composition state is partition-local. That is sound for within-batch
+    /// dedup because [`DedupKey`] contains `gts_id`, so two records sharing a
+    /// dedup key are necessarily in the same partition.
     ///
     /// # Errors
     ///
     /// Returns `UsageTypeNotFound` when the partition's usage type is absent,
     /// and `Transient` / `Internal` on `ClickHouse` or lease failures. Every
-    /// error is a whole-partition failure — the caller fans it out across that
-    /// partition's outcome slots.
+    /// error returned here is a whole-partition failure. A failed `INSERT` is
+    /// **not** one of them: it is reported per affected slot inside the
+    /// returned vector, so rows absorbed from storage keep their outcome.
     async fn create_partition_under_lock(
         &self,
         records: &[UsageRecord],
         idxs: &[usize],
         guard: &dyn LockGuardPort,
-    ) -> Result<HashMap<DedupKey, UsageRecordRow>, UsageCollectorPluginError> {
+        version_base: u64,
+        op_start: Instant,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>
+    {
         let first = *idxs.first().ok_or_else(|| {
             UsageCollectorPluginError::internal("empty gts_id partition (invariant break)")
         })?;
@@ -610,12 +682,83 @@ impl ChRecordStore {
         let record_refs: Vec<&UsageRecord> = idxs.iter().map(|&i| &records[i]).collect();
         let existing = self.batch_dedup_lookup(&record_refs).await?;
 
-        if let Err(e) = guard.ensure_still_held().await {
-            self.metrics.inc_lock_manager_unavailable(LockMode::Create);
-            return Err(e);
+        let mut next_offset: u64 = 0;
+        let mut to_insert: Vec<UsageRecordRow> = Vec::new();
+        // Row position in `to_insert` rather than a clone of the row itself.
+        let mut insert_map: HashMap<DedupKey, usize> = HashMap::new();
+        // Parallel to `to_insert`: the partition-local outcome positions whose
+        // success depends on that row landing.
+        let mut row_slots: Vec<Vec<usize>> = Vec::new();
+        let mut outcomes: Vec<Option<Result<UsageRecord, UsageCollectorPluginError>>> =
+            (0..idxs.len()).map(|_| None).collect();
+
+        for (pos, &idx) in idxs.iter().enumerate() {
+            let record = &records[idx];
+            let key = record_dedup_key(record);
+            let outcome = if let Some(stored_row) = existing.get(&key) {
+                self.resolve_dedup_hit(stored_row, record)
+            } else if let Some(&row_idx) = insert_map.get(&key) {
+                // A second row for the same dedup key inside this batch is
+                // only absorbed when it is canonically identical to the one
+                // already composed; otherwise it is a conflict just as it
+                // would be against a stored row. Since `DedupKey` is the
+                // canonical tuple rather than the `id`, two in-batch records
+                // sharing a tuple but carrying different `id`s now collide
+                // here and the second is reported as a conflict, instead of
+                // both being inserted under one idempotency key.
+                let resolved = self.resolve_dedup_hit(&to_insert[row_idx], record);
+                if resolved.is_ok() {
+                    row_slots[row_idx].push(pos);
+                }
+                resolved
+            } else {
+                let version = version_base.saturating_add(next_offset);
+                next_offset += 1;
+                let row = UsageRecordRow::from((record, version));
+                let row_idx = to_insert.len();
+                to_insert.push(row);
+                insert_map.insert(key, row_idx);
+                row_slots.push(vec![pos]);
+                if record.corrects_id.is_some() {
+                    self.metrics.inc_compensation();
+                }
+                UsageRecord::try_from(to_insert[row_idx].clone())
+            };
+            outcomes[pos] = Some(outcome);
         }
 
-        Ok(existing)
+        if !to_insert.is_empty() {
+            // Lease renewal immediately before the write, so a lease that
+            // lapsed during this partition's reads cannot let a concurrent
+            // `delete_usage_type` orphan these rows. A partition that composed
+            // nothing has no write to protect, and failing it here would
+            // discard absorb/conflict outcomes a retry could only re-derive.
+            if let Err(e) = guard.ensure_still_held().await {
+                self.metrics.inc_lock_manager_unavailable(LockMode::Create);
+                return Err(e);
+            }
+
+            // A failed write does not invalidate the outcomes already decided
+            // for absorbed rows, so it is reported per slot rather than as a
+            // partition-level error that would discard them too.
+            if let Err(e) = self.insert_records(&to_insert, op_start).await {
+                tracing::warn!(error = %e, "create-batch insert failed; reporting per-record outcomes");
+                apply_insert_failure(&e, &row_slots, &mut outcomes);
+            }
+        }
+
+        Ok(outcomes
+            .into_iter()
+            .enumerate()
+            .map(|(pos, outcome)| {
+                outcome.unwrap_or_else(|| {
+                    Err(dedup_invariant_break(
+                        &records[idxs[pos]],
+                        "batch index unresolved after partition processing (invariant break)",
+                    ))
+                })
+            })
+            .collect())
     }
 }
 
@@ -667,154 +810,48 @@ impl RecordStore for ChRecordStore {
             grouped.entry(record.gts_id.as_ref()).or_default().push(idx);
         }
 
-        // Acquiring per-`gts_id` locks in `HashMap` iteration order lets two
-        // concurrent multi-type batches take the same pair of locks in opposite
-        // orders and deadlock until both leases lapse. Sorting the partition
-        // keys gives every caller one global acquisition order.
+        // Sorting the partition keys is no longer a deadlock guard — each
+        // partition future below holds at most one lock at a time, so two
+        // concurrent multi-type batches cannot hold-and-wait into a cycle
+        // whatever order they reach their partitions in. It survives because it
+        // makes the version-range assignment right below (and the log order)
+        // deterministic rather than `HashMap`-iteration dependent.
         let mut partitions: Vec<(&str, Vec<usize>)> = grouped.into_iter().collect();
         partitions.sort_unstable_by(|a, b| a.0.cmp(b.0));
 
-        let mut outcomes: Vec<Option<Result<UsageRecord, UsageCollectorPluginError>>> =
-            (0..records.len()).map(|_| None).collect();
-
-        // Phase 1: take every partition lock up front, sequentially, in the
-        // sorted order above.
-        let mut locked: Vec<(usize, Box<dyn LockGuardPort>)> = Vec::with_capacity(partitions.len());
-        for (p_idx, (partition_gts_id, idxs)) in partitions.iter().enumerate() {
-            match self
-                .lock_manager
-                .acquire_exclusive_for_create(partition_gts_id)
-                .await
-            {
-                Ok(guard) => locked.push((p_idx, guard)),
-                Err(e) => {
-                    for &idx in idxs {
-                        outcomes[idx] = Some(Err(err_for_partition(&e)));
-                    }
-                }
-            }
+        // Each partition composes rows concurrently, so its version range is
+        // reserved up front — before any await — instead of being handed out by
+        // a shared running counter. Partition `p` starts one past every
+        // preceding partition's record count, which is an upper bound on the
+        // rows it can compose, so the ranges are disjoint and reproducible.
+        let base = current_merge_version();
+        let mut version_bases: Vec<u64> = Vec::with_capacity(partitions.len());
+        let mut reserved: u64 = 0;
+        for (_, idxs) in &partitions {
+            version_bases.push(base.saturating_add(reserved));
+            reserved = reserved.saturating_add(u64::try_from(idxs.len()).unwrap_or(u64::MAX));
         }
 
-        // Phase 2: every partition now holds its lock, so their read phases are
-        // independent and run concurrently.
-        let prepared = join_all(locked.iter().map(|(p_idx, guard)| {
-            self.create_partition_under_lock(&records, &partitions[*p_idx].1, guard.as_ref())
-        }))
+        // Every partition runs its own acquire → catalog check → dedup pre-read
+        // → resolve → renew → INSERT → release pipeline, and they are all
+        // joined at once: a partition queueing on a contended `gts_id` lock
+        // therefore never delays another partition's INSERT, and no lock is
+        // held across a partition it does not belong to.
+        let partition_outcomes = join_all(partitions.iter().zip(&version_bases).map(
+            |((partition_gts_id, idxs), &version_base)| {
+                self.create_partition(&records, partition_gts_id, idxs, version_base, op_start)
+            },
+        ))
         .await;
 
-        // Phase 3: compose rows sequentially so version offsets and
-        // within-batch dedup stay deterministic.
-        let version_base = current_merge_version();
-        let mut next_offset: u64 = 0;
-        let mut to_insert: Vec<UsageRecordRow> = Vec::new();
-        // Row position in `to_insert` rather than a clone of the row itself.
-        let mut insert_map: HashMap<DedupKey, usize> = HashMap::new();
-        // Parallel to `to_insert`: the `held` position that composed each row,
-        // and the outcome slots whose success depends on that row landing.
-        let mut row_partition: Vec<usize> = Vec::new();
-        let mut row_slots: Vec<Vec<usize>> = Vec::new();
-        let mut held: Vec<(usize, Box<dyn LockGuardPort>)> = Vec::with_capacity(locked.len());
-
-        for ((p_idx, guard), partition_result) in locked.into_iter().zip(prepared) {
-            let idxs = &partitions[p_idx].1;
-            let existing = match partition_result {
-                Ok(existing) => existing,
-                Err(e) => {
-                    for &idx in idxs {
-                        outcomes[idx] = Some(Err(err_for_partition(&e)));
-                    }
-                    if let Err(rel) = guard.release().await {
-                        tracing::warn!(error = %rel, "failed to release create-batch cluster lock");
-                    }
-                    continue;
-                }
-            };
-
-            let held_idx = held.len();
-            for &idx in idxs {
-                let record = &records[idx];
-                let key = record_dedup_key(record);
-                let outcome = if let Some(stored_row) = existing.get(&key) {
-                    self.resolve_dedup_hit(stored_row, record)
-                } else if let Some(&row_idx) = insert_map.get(&key) {
-                    // A second row for the same dedup key inside this batch is
-                    // only absorbed when it is canonically identical to the one
-                    // already composed; otherwise it is a conflict just as it
-                    // would be against a stored row. Since `DedupKey` is the
-                    // canonical tuple rather than the `id`, two in-batch records
-                    // sharing a tuple but carrying different `id`s now collide
-                    // here and the second is reported as a conflict, instead of
-                    // both being inserted under one idempotency key.
-                    let resolved = self.resolve_dedup_hit(&to_insert[row_idx], record);
-                    if resolved.is_ok() {
-                        row_slots[row_idx].push(idx);
-                    }
-                    resolved
-                } else {
-                    let version = version_base.saturating_add(next_offset);
-                    next_offset += 1;
-                    let row = UsageRecordRow::from((record, version));
-                    let row_idx = to_insert.len();
-                    to_insert.push(row);
-                    insert_map.insert(key, row_idx);
-                    row_partition.push(held_idx);
-                    row_slots.push(vec![idx]);
-                    if record.corrects_id.is_some() {
-                        self.metrics.inc_compensation();
-                    }
-                    UsageRecord::try_from(to_insert[row_idx].clone())
-                };
+        // Scatter each partition's positionally-aligned outcomes back to their
+        // input positions.
+        let mut outcomes: Vec<Option<Result<UsageRecord, UsageCollectorPluginError>>> =
+            (0..records.len()).map(|_| None).collect();
+        for ((_, idxs), resolved) in partitions.iter().zip(partition_outcomes) {
+            for (&idx, outcome) in idxs.iter().zip(resolved) {
                 outcomes[idx] = Some(outcome);
             }
-
-            held.push((p_idx, guard));
-        }
-
-        // Phase 4: renew every lease immediately before the combined write, so
-        // a lease that expired while the other partitions were being prepared
-        // cannot let a concurrent `delete_usage_type` orphan these rows.
-        let mut expired: HashSet<usize> = HashSet::new();
-        for (held_idx, (p_idx, guard)) in held.iter().enumerate() {
-            if let Err(e) = guard.ensure_still_held().await {
-                self.metrics.inc_lock_manager_unavailable(LockMode::Create);
-                for &idx in &partitions[*p_idx].1 {
-                    outcomes[idx] = Some(Err(err_for_partition(&e)));
-                }
-                expired.insert(held_idx);
-            }
-        }
-        if !expired.is_empty() {
-            let mut kept_rows = Vec::with_capacity(to_insert.len());
-            let mut kept_slots = Vec::with_capacity(row_slots.len());
-            for ((row, slots), partition) in
-                to_insert.into_iter().zip(row_slots).zip(&row_partition)
-            {
-                if !expired.contains(partition) {
-                    kept_rows.push(row);
-                    kept_slots.push(slots);
-                }
-            }
-            to_insert = kept_rows;
-            row_slots = kept_slots;
-        }
-
-        let insert_result = self.insert_records(&to_insert, op_start).await;
-
-        // The cluster guard's `Drop` is a no-op, so every guard is released
-        // explicitly — including on the insert-failure path, which would
-        // otherwise hold each `gts_id` until its lease lapsed.
-        for (_, guard) in held {
-            if let Err(e) = guard.release().await {
-                tracing::warn!(error = %e, "failed to release create-batch cluster lock");
-            }
-        }
-
-        // A failed write does not invalidate the outcomes already decided for
-        // absorbed rows, so it is reported per slot rather than as a top-level
-        // error that would discard the whole batch's per-record contract.
-        if let Err(e) = insert_result {
-            tracing::warn!(error = %e, "create-batch insert failed; reporting per-record outcomes");
-            apply_insert_failure(&e, &row_slots, &mut outcomes);
         }
 
         let results = outcomes

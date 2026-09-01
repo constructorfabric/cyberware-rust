@@ -204,7 +204,9 @@ gears:
       database_url: "http://default:ch_test_pw@127.0.0.1:__E2E_CH_PORT__/default"
       allow_insecure_http: true
       request_timeout_secs: 30
-      lock_ttl_secs: 30
+      # Must exceed the client deadline (request_timeout_secs + 5s = 35s), or
+      # ClickHousePluginConfig::validate rejects the config at startup.
+      lock_ttl_secs: 60
       lock_timeout_secs: 5
       # 10 years. Long enough that the usage_records TTL can never drop test
       # rows mid-run. A convenience, not a DateTime ceiling: the clause is

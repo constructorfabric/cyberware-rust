@@ -409,6 +409,71 @@ impl CatalogLockPort for AlwaysGrantLock {
     }
 }
 
+/// Ordered log of `(gts_id, "acquire" | "release")` events shared by the
+/// recording lock stub and its guards.
+type LockEventLog = Arc<std::sync::Mutex<Vec<(String, &'static str)>>>;
+
+/// Guard stub that reports its release into a shared event log, tagged with the
+/// `gts_id` whose partition holds it.
+struct RecordingGuard {
+    gts_id: String,
+    events: LockEventLog,
+}
+
+#[async_trait]
+impl LockGuardPort for RecordingGuard {
+    async fn ensure_still_held(&self) -> Result<(), UsageCollectorPluginError> {
+        Ok(())
+    }
+
+    async fn release(self: Box<Self>) -> Result<(), UsageCollectorPluginError> {
+        self.events
+            .lock()
+            .unwrap()
+            .push((self.gts_id.clone(), "release"));
+        Ok(())
+    }
+}
+
+/// Lock stub that grants every `gts_id` but makes exactly one of them wait,
+/// simulating a partition queued behind a concurrent create or
+/// `delete_usage_type` holding that `gts_id`'s mutex.
+///
+/// Every acquire (once granted) and every release is appended to `events`, so a
+/// test can assert *when* each partition's lock was taken and given back.
+struct SlowForOneGtsIdLock {
+    slow_gts_id: &'static str,
+    delay: std::time::Duration,
+    events: LockEventLog,
+}
+
+#[async_trait]
+impl CatalogLockPort for SlowForOneGtsIdLock {
+    async fn acquire_exclusive_for_delete(
+        &self,
+        gts_id: &str,
+    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
+        self.acquire_exclusive_for_create(gts_id).await
+    }
+
+    async fn acquire_exclusive_for_create(
+        &self,
+        gts_id: &str,
+    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
+        if gts_id == self.slow_gts_id {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.events
+            .lock()
+            .unwrap()
+            .push((gts_id.to_owned(), "acquire"));
+        Ok(Box::new(RecordingGuard {
+            gts_id: gts_id.to_owned(),
+            events: Arc::clone(&self.events),
+        }))
+    }
+}
+
 /// Lock stub that never grants the lock — the cluster lock manager being
 /// unavailable at acquisition time.
 struct AlwaysTransientLock;
@@ -480,6 +545,14 @@ fn make_record(id: Uuid, tenant_id: Uuid, created_at_micros: i64) -> UsageRecord
         corrects_id: None,
         status: UsageRecordStatus::Active,
         metadata: std::collections::BTreeMap::default(),
+    }
+}
+
+/// [`make_record`] under a caller-chosen usage type, for multi-`gts_id` batches.
+fn make_record_for(gts_id: &str, id: Uuid, tenant_id: Uuid, created_at_micros: i64) -> UsageRecord {
+    UsageRecord {
+        gts_id: UsageTypeGtsId::new(gts_id).unwrap(),
+        ..make_record(id, tenant_id, created_at_micros)
     }
 }
 
@@ -698,6 +771,68 @@ async fn create_batch_reports_backend_failures_per_record() {
         )) => {}
         other => panic!("expected a per-record backend failure, got {other:?}"),
     }
+}
+
+/// Each `gts_id` partition owns its own lock for the length of its own critical
+/// section only, so a partition queued behind a contended `gts_id` must not
+/// delay any other partition's work.
+///
+/// `RAM_GTS` sorts before `VCPU_GTS`, so it is the *first* partition — the one
+/// whose lock the batch used to acquire before any other partition could start.
+/// Its acquisition is stalled here; `VCPU_GTS` must still acquire, run, and
+/// release inside that window. Both partitions then fail against the offline
+/// client, which is exactly what makes each release observable.
+#[tokio::test]
+async fn create_batch_does_not_block_a_partition_behind_another_partitions_lock() {
+    const RAM_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.ram_gb.v1";
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = store_with_lock(Arc::new(SlowForOneGtsIdLock {
+        slow_gts_id: RAM_GTS,
+        delay: std::time::Duration::from_millis(200),
+        events: Arc::clone(&events),
+    }));
+    let tenant_id = Uuid::from_u128(2);
+    let records = vec![
+        make_record_for(
+            RAM_GTS,
+            Uuid::from_u128(1),
+            tenant_id,
+            1_700_000_000_000_000,
+        ),
+        make_record_for(
+            VCPU_GTS,
+            Uuid::from_u128(3),
+            tenant_id,
+            1_700_000_000_000_001,
+        ),
+    ];
+
+    let outcomes = store
+        .create_batch(records)
+        .await
+        .expect("a contended partition is a per-record outcome, not a batch-level failure");
+    assert_eq!(outcomes.len(), 2, "one outcome per input record");
+
+    let log = events.lock().unwrap().clone();
+    let position = |gts_id: &str, event: &str| {
+        log.iter()
+            .position(|(g, e)| g == gts_id && *e == event)
+            .unwrap_or_else(|| panic!("no {event} recorded for {gts_id} in {log:?}"))
+    };
+
+    assert!(
+        position(VCPU_GTS, "release") < position(RAM_GTS, "acquire"),
+        "the uncontended partition must acquire, run and release its own lock while the \
+         contended partition is still waiting for its lock, got {log:?}"
+    );
+    for gts_id in [RAM_GTS, VCPU_GTS] {
+        assert!(
+            position(gts_id, "acquire") < position(gts_id, "release"),
+            "every partition lock must be released after its own critical section, got {log:?}"
+        );
+    }
+    assert_eq!(log.len(), 4, "exactly one acquire + release per partition");
 }
 
 /// The batch INSERT runs after the dedup SELECTs have already decided every

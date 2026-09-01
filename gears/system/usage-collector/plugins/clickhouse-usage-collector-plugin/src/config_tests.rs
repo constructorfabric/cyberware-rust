@@ -6,7 +6,7 @@ fn config_defaults_are_applied() {
     assert_eq!(cfg.vendor, "cyberfabric");
     assert_eq!(cfg.priority, 10);
     assert_eq!(cfg.request_timeout_secs, 30);
-    assert_eq!(cfg.lock_ttl_secs, 30);
+    assert_eq!(cfg.lock_ttl_secs, 60);
     assert_eq!(cfg.lock_timeout_secs, 5);
     assert_eq!(cfg.retention_period_secs, 365 * 86_400);
     assert!(cfg.database_url.expose().is_empty());
@@ -82,6 +82,47 @@ fn validate_rejects_zero_lock_ttl() {
     let json = r#"{ "database_url": "http://u:p@h/db", "lock_ttl_secs": 0 }"#;
     let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
     assert!(cfg.validate().is_err());
+}
+
+/// The default pair must satisfy the invariant `validate` enforces — a stock
+/// config is not allowed to be a config the plugin refuses to start on.
+#[test]
+fn default_lock_ttl_exceeds_the_default_client_deadline() {
+    let default_cfg = ClickHousePluginConfig::default();
+    assert!(
+        default_cfg.lock_ttl_secs > default_cfg.client_deadline().as_secs(),
+        "default lock_ttl_secs ({}) must exceed the default client deadline ({}s)",
+        default_cfg.lock_ttl_secs,
+        default_cfg.client_deadline().as_secs()
+    );
+}
+
+/// A lock lease that a single `ClickHouse` round-trip can outlive makes the
+/// pre-write renew meaningless: the write it protects can expire the lease it
+/// was just handed. Rejected at config load rather than surfacing as sporadic
+/// `Transient` failures under load.
+#[test]
+fn validate_rejects_lock_ttl_at_or_below_the_client_deadline() {
+    // request_timeout 30 => client deadline 35; a 35s TTL is exactly the
+    // boundary case and must be rejected too (the relation is strict).
+    for ttl in [30_u64, 35] {
+        let json = format!(
+            r#"{{ "database_url": "https://u:p@h/db", "request_timeout_secs": 30, "lock_ttl_secs": {ttl} }}"#
+        );
+        let cfg: ClickHousePluginConfig = serde_json::from_str(&json).unwrap();
+        let err = cfg
+            .validate()
+            .expect_err("a lock TTL within one round-trip of the client deadline must be rejected");
+        assert!(
+            err.contains("lock_ttl_secs") && err.contains("client deadline"),
+            "the error must name both sides of the relation, got: {err}"
+        );
+    }
+
+    let json = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 30, "lock_ttl_secs": 36 }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    cfg.validate()
+        .expect("one second past the client deadline satisfies the relation");
 }
 
 #[test]

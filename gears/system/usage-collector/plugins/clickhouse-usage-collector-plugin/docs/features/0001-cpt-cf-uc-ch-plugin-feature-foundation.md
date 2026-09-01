@@ -98,6 +98,7 @@ Foundation owns the cross-cutting plumbing every other feature builds on: the Pl
 1. [ ] - `p1` - Host process starts with the ClickHouse plugin enabled; ToolKit invokes the gear `init` - `inst-ch-boot-1`
 2. [ ] - `p1` - Load and validate `ClickHousePluginConfig` (database URL, `allow_insecure_http`, `request_timeout_secs`, `lock_ttl_secs`, `lock_timeout_secs`, `retention_period_secs`, vendor, priority) - `inst-ch-boot-2`
    1. [ ] - `p1` - **IF** the parsed `database_url` scheme is neither `http` nor `https` — **RETURN** gear initialization failure naming the unsupported scheme (the client speaks ClickHouse's HTTP interface only); independent of `allow_insecure_http` - `inst-ch-boot-2a`
+   2. [ ] - `p1` - **IF** `lock_ttl_secs <= request_timeout_secs + 5` (the client deadline) — **RETURN** gear initialization failure stating both values: one ClickHouse round-trip inside the coordination lock may consume the whole deadline and must not outlive the lease renewed immediately before it - `inst-ch-boot-2b`
 3. [ ] - `p1` - **IF** the parsed (lowercase-normalized) `database_url` scheme is plaintext `http` AND `allow_insecure_http == false` - `inst-ch-boot-3`
    1. [ ] - `p1` - **RETURN** gear initialization failure: TLS enforcement violation - `inst-ch-boot-3a`
 4. [ ] - `p1` - Build the `clickhouse::Client` via `build_client` / `ParsedEndpoint` — parse URL into bare base URL + user/password/database, emit `tracing::warn!` if plaintext - `inst-ch-boot-4`

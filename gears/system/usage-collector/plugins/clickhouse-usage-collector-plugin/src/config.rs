@@ -109,6 +109,15 @@ pub struct ClickHousePluginConfig {
     /// Cluster distributed-lock lease TTL in seconds. Must exceed worst-case
     /// create/delete critical-section latency (`ClickHouse` round-trips while the
     /// lock is held). Renewed immediately before the mutating write.
+    ///
+    /// [`Self::validate`] enforces the floor that makes that renew meaningful:
+    /// `lock_ttl_secs` must be strictly greater than
+    /// [`Self::client_deadline`] (`request_timeout_secs` +
+    /// [`CLIENT_DEADLINE_GRACE_SECS`]), so the one `ClickHouse` round-trip
+    /// that follows the renew cannot outlive the lease it was just granted.
+    /// Multi-round-trip prefixes of the critical section are *not* covered by
+    /// that floor — they are covered by the renew itself, which fails closed
+    /// with `Transient` when the lease lapsed.
     pub lock_ttl_secs: u64,
     /// Maximum time to wait when acquiring the per-`gts_id` exclusive cluster
     /// lock. On timeout the operation fails closed with `Transient`.
@@ -128,7 +137,10 @@ impl Default for ClickHousePluginConfig {
             database_url: SecretFromEnv::default(),
             allow_insecure_http: false,
             request_timeout_secs: 30,
-            lock_ttl_secs: 30,
+            // Strictly above the default client deadline (30 + 5 = 35s) so a
+            // single ClickHouse round-trip taken right after a lease renew
+            // cannot outlive the lease; see `validate`.
+            lock_ttl_secs: 60,
             lock_timeout_secs: 5,
             // Same window the migration DDL bakes in, so a config-less start
             // needs no `MODIFY TTL` reconciliation at startup.
@@ -181,8 +193,9 @@ impl ClickHousePluginConfig {
     ///
     /// Returns an error string for an empty `database_url`, one whose scheme is
     /// neither `http` nor `https`, a plaintext `http` `database_url` without
-    /// [`Self::allow_insecure_http`], a zero timeout or lock TTL, a retention
-    /// window outside `(0, MAX_RETENTION_SECS]`, or a blank `vendor`.
+    /// [`Self::allow_insecure_http`], a zero timeout, a `lock_ttl_secs` that
+    /// does not exceed [`Self::client_deadline`], a retention window outside
+    /// `(0, MAX_RETENTION_SECS]`, or a blank `vendor`.
     pub fn validate(&self) -> Result<(), String> {
         if self.database_url.expose().trim().is_empty() {
             return Err("database_url must not be empty".to_owned());
@@ -206,8 +219,17 @@ impl ClickHousePluginConfig {
         if self.request_timeout_secs == 0 {
             return Err("request_timeout_secs must be > 0".to_owned());
         }
-        if self.lock_ttl_secs == 0 {
-            return Err("lock_ttl_secs must be > 0".to_owned());
+        // Subsumes a `> 0` check: the client deadline is at least
+        // `CLIENT_DEADLINE_GRACE_SECS`, so a zero TTL fails here too.
+        if self.lock_ttl_secs <= self.client_deadline().as_secs() {
+            return Err(format!(
+                "lock_ttl_secs ({}) must exceed the client deadline ({}s = request_timeout_secs \
+                 + {CLIENT_DEADLINE_GRACE_SECS}): a single ClickHouse round-trip inside the \
+                 coordination lock must not outlive its lease, otherwise the renew performed \
+                 immediately before a mutating write buys no headroom for that write",
+                self.lock_ttl_secs,
+                self.client_deadline().as_secs(),
+            ));
         }
         if self.lock_timeout_secs == 0 {
             return Err("lock_timeout_secs must be > 0".to_owned());
