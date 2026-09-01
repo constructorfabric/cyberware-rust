@@ -61,6 +61,7 @@ The normative decision (ledger-wide, stated in [`01-repository-foundation.md`](.
 * **Predicate (proposed):** book-owning **seller** = `platform` + `partner`; **buyer** = `organization` (+ a future `individual`).
 * **Recommended mechanism:** AMS adds an **`x-gts-traits.owns_billing_books: true`** trait to the `platform` and `partner` type schemas; the ledger's provisioning gate and the owner predicate read **that trait**, not a hardcoded type list.
 * ⏳ **Pending (AMS):** confirm platform + partner are the intended sellers (and whether an `organization`/reseller can ever sell), then add the trait to the catalogue. The predicate decision itself is ratified; this hardening item is the open remainder.
+* **Interim mechanism (ledger):** until that trait exists, the predicate is a configured set — `BssLedgerConfig::seller_tenant_types`, matched against the tenant type AM resolves. It is **required config with no default**: the gear ships no tenant-type ids, since a built-in list would name one deployment's catalogue and silently reject sellers on every other, which is the outcome this ADR set out to avoid ("the ledger stores no tenant taxonomy of its own"). Entries may be concrete chained ids or a family wildcard (`…tenant_type.v1~*`); shapes are validated at `init()`. When AMS adds `owns_billing_books`, this setting is what the trait replaces.
 
 ### Consequences
 

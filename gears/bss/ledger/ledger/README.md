@@ -77,9 +77,16 @@ recognition, dispute, and period-close contracts.
 
 ## Configuration
 
-The gear requires a database configuration. Its behavioral configuration is optional;
-defaults are provided for background-job cadences, seller tenant types, recognition,
-FX, reconciliation, and payment limits.
+The gear requires a database configuration and one behavioral setting:
+`seller_tenant_types`. Everything else has a default (background-job cadences,
+recognition, FX, reconciliation, payment limits).
+
+`seller_tenant_types` names the tenant types whose tenants own a billing ledger.
+There is deliberately **no default** — tenant-type identifiers come from the
+deployment's own catalogue, so any built-in list would name one product and
+silently reject every seller elsewhere. An empty or malformed list fails at
+`init()` with the offending field named, rather than turning every provisioning
+request into a "not a ledger owner" rejection.
 
 ```yaml
 gears:
@@ -87,8 +94,32 @@ gears:
     database:
       server: "postgres"
       dbname: "bss_ledger"
-    config: {}
+    config:
+      # Concrete chained type ids — the usual case, where only some tenant
+      # types own a ledger (a buyer/leaf type is simply left out).
+      seller_tenant_types:
+        - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        - "gts.cf.core.am.tenant_type.v1~cf.core.am.partner.v1~"
 ```
+
+Substitute the identifiers your Account Management catalogue actually registers
+(`GET /types-registry/v1/entities` lists them; the ids above are the shapes AM's
+own fixtures use). Entries are matched literally, so a typo means a rejected
+seller — hence the shape check at startup.
+
+A deployment where **every** registered tenant type owns a ledger configures one
+family wildcard instead of enumerating the catalogue:
+
+```yaml
+    config:
+      seller_tenant_types:
+        - "gts.cf.core.am.tenant_type.v1~*"
+```
+
+A wildcard matches by prefix with its separator retained, so
+`…v1~cf.core.am.partner.*` covers that family's versions without also matching
+`…partnership…`. The bare `gts.*` is rejected: "every type of every vendor owns
+a ledger" is never a deliberate predicate.
 
 Event publication is disabled by default until the Event Broker integration is enabled.
 

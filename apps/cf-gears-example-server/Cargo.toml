@@ -39,6 +39,10 @@ otel = ["toolkit/otel"]
 account-management = ["dep:account_management"]
 static-idp = ["dep:static-idp-plugin"]
 file-storage = ["dep:file_storage"]
+# The RBAC gear: role definitions, role assignments, permission evaluation and
+# built-in role seeding. Linking it is inert on its own — `init()` no-ops unless
+# the deployment's `gears:` config block carries an `rbac:` entry.
+rbac = ["dep:rbac"]
 # The FX rate-provider subsystem: the core gear + its source plugins. Independent
 # of bss-ledger — the ledger discovers the composite lazily at runtime via the
 # types-registry, so neither feature requires the other.
@@ -111,6 +115,9 @@ chat-engine = { package = "cf-chat-engine", path = "../../gears/chat-engine/chat
 # Optional Account Management gear
 account_management = { package = "cf-gears-account-management", path = "../../gears/system/account-management/account-management", optional = true }
 static-idp-plugin = { package = "cf-gears-static-idp-plugin", path = "../../gears/system/account-management/plugins/static-idp-plugin", optional = true }
+
+# Optional RBAC gear
+rbac = { package = "cf-gears-rbac", path = "../../gears/system/rbac/rbac", optional = true }
 
 # Optional BSS Billing Ledger gear
 bss_ledger = { package = "cf-gears-bss-ledger", path = "../../gears/bss/ledger/ledger", optional = true }

@@ -567,6 +567,19 @@ Group related durable resources into lifecycle-linked collections for bulk acces
 - TODO: API link
 - TODO: SDK link
 
+### RBAC
+#### Responsibility
+Own the management-plane role model — role definitions, role assignments, and the scoped permission semantics a policy decision point consumes — so domain gears enforce one authorization model instead of each inventing its own.
+#### High Level Scenarios
+- [ ] p1 - administer built-in and tenant-owned custom role definitions
+- [ ] p2 - assign roles to users, groups and service principals at global, tenant or resource-group scope
+- [ ] p3 - answer the in-process permission query the AuthZ Resolver Plugin makes on every authorization decision
+#### More details
+- [PRD](../gears/system/rbac/docs/PRD.md)
+- [Design](../gears/system/rbac/docs/DESIGN.md)
+- TODO: API link
+- TODO: SDK link
+
 ### Types Registry
 #### Responsibility
 GTS schema-storage service for tool definitions and contracts.

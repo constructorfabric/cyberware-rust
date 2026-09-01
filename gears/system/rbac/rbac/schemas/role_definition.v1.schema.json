@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.cf.core.rbac.role_definition.v1~",
+  "title": "RBAC Role Definition",
+  "description": "RBAC role definition with permission rules and assignable scopes",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "is_built_in": {
+      "type": "boolean"
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/permission_rule"
+      }
+    },
+    "not_permissions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/permission_rule"
+      }
+    },
+    "assignable_scopes": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 10,
+      "items": {
+        "$ref": "#/definitions/scope"
+      }
+    },
+    "owner_tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "assignment_count": {
+      "description": "Read-path decoration, not part of the persisted row: the number of role assignments referencing this definition that the requesting caller may see. Display-only — absent on write payloads, and absent on a read when no count was computed for the caller. Zero is a meaningful value; absence is not zero.",
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "definitions": {
+    "operation": {
+      "type": "string",
+      "pattern": "^(\\*|[a-z][a-z0-9_]*)$"
+    },
+    "gts_type_or_wildcard": {
+      "type": "string",
+      "description": "GTS type id (canonical, trailing '~', possibly chained) or a family wildcard 'prefix.*'. Coarse shape only: the canonical GTS grammar (segments, '_' placeholder, '~'-chaining, version tokens, segment caps) is enforced authoritatively by the gts parser in permission_matcher::is_valid_target_type_shape — a regex cannot express mid-string '~'.",
+      "pattern": "^gts\\.[a-z0-9_][a-z0-9_.~]*~$|^gts\\.[a-z0-9_][a-z0-9_.]*\\.\\*$"
+    },
+    "scope": {
+      "type": "string",
+      "oneOf": [
+        { "const": "/" },
+        {
+          "pattern": "^/tenants/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        {
+          "pattern": "^/tenants/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/resourceGroups/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        }
+      ]
+    },
+    "permission_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "$ref": "#/definitions/operation"
+        },
+        "target_type": {
+          "$ref": "#/definitions/gts_type_or_wildcard"
+        }
+      },
+      "required": ["operation", "target_type"]
+    }
+  },
+  "required": [
+    "id",
+    "name",
+    "is_built_in",
+    "permissions",
+    "not_permissions",
+    "assignable_scopes",
+    "created_at",
+    "updated_at",
+    "created_by"
+  ]
+}

@@ -342,7 +342,7 @@ clippy-deep:
 lychee: ensure-submodules
 	$(call print_target_banner)
 	$(call check_tool,lychee)
-	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs
+	lychee --exclude-path 'docs/web-docs' docs examples guidelines gears/system/event-broker/docs gears/system/rbac/docs gears/system/authz-resolver/plugins/authz-resolver-plugin/docs
 
 ## Validate internal links in web-docs.
 # The web-docs pages use Starlight route-relative links (e.g. ../foo/) that only
@@ -666,7 +666,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-rbac-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -807,6 +807,20 @@ test-pricing-pg: install-tools
 ## same reason: the gate is `#[ignore]` rather than a feature.
 test-coord-pg: install-tools
 	cargo nextest run -p cf-gears-bss-coord --run-ignored ignored-only -E 'binary(/^postgres_/)'
+
+## Run the RBAC gear's `#[ignore]`d Postgres tier (Docker required).
+##
+## `--run-ignored ignored-only` because the gate is `#[ignore]`, not a feature;
+## `--no-fail-fast` for the reason `test-pricing-pg` documents. One container
+## per test, so the tier is load-sensitive: if it turns flaky under CI load, see
+## bss-pricing's `tests/pg_support/mod.rs` (shared container, fresh database per
+## test) or add `--retries 1` as `test-cluster-pg` does.
+##
+## Colima exports no `/var/run/docker.sock`: without
+## `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock` every test fails in
+## ~10ms on the docker client, which reads as a real red.
+test-rbac-pg: install-tools
+	cargo nextest run -p cf-gears-rbac --run-ignored ignored-only -E 'binary(/^(postgres_|api_|e2e_)/)' --no-fail-fast
 
 ## Compile and run `bss-fixtures` on the surface a **gear** actually takes.
 ##

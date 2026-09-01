@@ -221,13 +221,81 @@ fn default_recon_tick_interval_is_five_minutes() {
 }
 
 #[test]
-fn default_config_carries_seller_types_and_events_off() {
+fn default_config_has_no_seller_types_and_events_off() {
     let cfg = BssLedgerConfig::default();
     assert!(!cfg.events_enabled, "events default OFF");
-    assert_eq!(cfg.seller_tenant_types.len(), 2, "partner + platform");
+    assert!(
+        cfg.seller_tenant_types.is_empty(),
+        "the gear MUST NOT ship tenant-type ids: they belong to the deployment's \
+         catalogue, and a built-in list would name one product"
+    );
     assert!(cfg.jobs.validate().is_ok());
     assert!(cfg.recognition.validate().is_ok());
     assert!(cfg.recon.validate().is_ok());
+}
+
+#[test]
+fn validate_rejects_a_config_without_seller_types() {
+    let err = BssLedgerConfig::default()
+        .validate()
+        .expect_err("an empty seller set must fail init, not degrade silently");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("seller_tenant_types") && msg.contains("must be set"),
+        "the error must name the missing field: {msg}"
+    );
+}
+
+#[test]
+fn validate_accepts_concrete_ids_and_family_wildcards() {
+    for entry in [
+        "gts.cf.core.am.tenant_type.v1~cf.core.am.partner.v1~",
+        "gts.cf.core.am.tenant_type.v1~*",
+        "gts.cf.core.am.tenant_type.v1~cf.core.am.partner.*",
+    ] {
+        let cfg = BssLedgerConfig {
+            seller_tenant_types: vec![entry.to_owned()],
+            ..BssLedgerConfig::default()
+        };
+        assert!(cfg.validate().is_ok(), "{entry} should be accepted");
+    }
+}
+
+#[test]
+fn validate_rejects_malformed_seller_entries() {
+    // Not a GTS id; a concrete id missing its trailing `~`; the bare wildcard
+    // ("every type of every vendor"); and a wildcard with no separator kept.
+    for entry in [
+        "cf.core.am.tenant_type.v1~cf.core.am.partner.v1~",
+        "gts.cf.core.am.tenant_type.v1~cf.core.am.partner.v1",
+        "gts.*",
+        "gts.cf.core.am.tenant_type.v1~cf.core.am.partner*",
+    ] {
+        let cfg = BssLedgerConfig {
+            seller_tenant_types: vec![entry.to_owned()],
+            ..BssLedgerConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("malformed entry must be rejected at init");
+        assert!(
+            err.to_string().contains("seller_tenant_types"),
+            "the error must name the field for {entry}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_a_blank_fx_provider_vendor() {
+    let mut cfg = BssLedgerConfig {
+        seller_tenant_types: vec!["gts.cf.core.am.tenant_type.v1~*".to_owned()],
+        ..BssLedgerConfig::default()
+    };
+    cfg.fx.provider_vendor = "   ".to_owned();
+    let err = cfg
+        .validate()
+        .expect_err("a blank vendor matches no plugin");
+    assert!(err.to_string().contains("fx.provider_vendor"), "{err}");
 }
 
 #[test]

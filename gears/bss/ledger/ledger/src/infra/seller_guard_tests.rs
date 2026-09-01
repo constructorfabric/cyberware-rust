@@ -6,8 +6,10 @@ use uuid::Uuid;
 
 use super::*;
 
-const SELLER: &str = gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.partner.v1~");
-const BUYER: &str = gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.organization.v1~");
+const SELLER: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.partner.v1~");
+const BUYER: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.organization.v1~");
+/// Family wildcard covering every registered tenant type.
+const ANY_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~*");
 
 /// Canned tenant-type reader (stands in for the AM `get_tenant` adapter).
 struct FakeReader(Option<String>);
@@ -96,5 +98,88 @@ async fn am_error_propagates_unchanged() {
     assert!(
         matches!(err, CanonicalError::ServiceUnavailable { .. }),
         "transient AM error must propagate, not collapse to FailedPrecondition; got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Family-wildcard entries (`prefix*`)
+// ---------------------------------------------------------------------------
+
+/// A guard configured with `seller_types`, reading back `tenant_type`.
+fn guard_with(seller_types: &[&str], tenant_type: Option<&str>) -> SellerGuard {
+    SellerGuard::new(
+        Arc::new(FakeReader(tenant_type.map(str::to_owned))),
+        seller_types.iter().map(|s| (*s).to_owned()),
+    )
+}
+
+#[tokio::test]
+async fn family_wildcard_admits_every_tenant_type() {
+    let ctx = SecurityContext::anonymous();
+    for tenant_type in [SELLER, BUYER] {
+        assert!(
+            guard_with(&[ANY_TYPE], Some(tenant_type))
+                .assert_owns_ledger(&ctx, Uuid::now_v7())
+                .await
+                .is_ok(),
+            "`…tenant_type.v1~*` must admit {tenant_type}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn family_wildcard_does_not_admit_another_envelope() {
+    let ctx = SecurityContext::anonymous();
+    let other_envelope = gts_id!("cf.core.am.tenant.v1~cf.core.am.partner.v1~");
+    assert!(
+        guard_with(&[ANY_TYPE], Some(other_envelope))
+            .assert_owns_ledger(&ctx, Uuid::now_v7())
+            .await
+            .is_err(),
+        "the wildcard is anchored on the tenant_type envelope, not on `gts.`"
+    );
+}
+
+/// The separator before `*` is retained when compiling, so a wildcard cannot
+/// bleed into a longer sibling segment.
+#[tokio::test]
+async fn family_wildcard_keeps_its_separator() {
+    let ctx = SecurityContext::anonymous();
+    let partner_family = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.partner.*");
+    let lookalike = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.partnership.v1~");
+    assert!(
+        guard_with(&[partner_family], Some(lookalike))
+            .assert_owns_ledger(&ctx, Uuid::now_v7())
+            .await
+            .is_err(),
+        "`partner.*` must not match `partnership…`"
+    );
+}
+
+#[tokio::test]
+async fn exact_and_wildcard_entries_compose() {
+    let ctx = SecurityContext::anonymous();
+    let recognized_family = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.*");
+    let platform = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~");
+    // Exact entry still admits its own type...
+    assert!(
+        guard_with(&[SELLER, recognized_family], Some(SELLER))
+            .assert_owns_ledger(&ctx, Uuid::now_v7())
+            .await
+            .is_ok()
+    );
+    // ...and the wildcard entry admits the family beside it.
+    assert!(
+        guard_with(&[SELLER, recognized_family], Some(platform))
+            .assert_owns_ledger(&ctx, Uuid::now_v7())
+            .await
+            .is_ok()
+    );
+    // Anything in neither is still rejected.
+    assert!(
+        guard_with(&[SELLER, recognized_family], Some(BUYER))
+            .assert_owns_ledger(&ctx, Uuid::now_v7())
+            .await
+            .is_err()
     );
 }

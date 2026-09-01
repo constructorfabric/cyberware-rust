@@ -1819,6 +1819,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-authz-resolver-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-plugin",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-rbac",
+ "cf-gears-rbac-sdk",
+ "cf-gears-resource-group",
+ "cf-gears-resource-group-sdk",
+ "cf-gears-tenant-resolver",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "lru 0.18.2",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "secrecy",
+ "serde",
+ "serde-saphyr 0.0.22",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-authz-resolver-sdk"
 version = "0.4.0"
 dependencies = [
@@ -2333,6 +2372,7 @@ dependencies = [
  "cf-gears-mini-chat",
  "cf-gears-nodes-registry",
  "cf-gears-oagw",
+ "cf-gears-rbac",
  "cf-gears-resource-group",
  "cf-gears-rg-tr-plugin",
  "cf-gears-simple-user-settings",
@@ -2959,6 +2999,72 @@ dependencies = [
  "tokio-retry",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-rbac"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "cf-gears-account-management-sdk",
+ "cf-gears-rbac",
+ "cf-gears-rbac-sdk",
+ "cf-gears-resource-group",
+ "cf-gears-resource-group-sdk",
+ "cf-gears-tenant-resolver",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "cf-gears-usage-collector-sdk",
+ "chrono",
+ "futures",
+ "gts",
+ "inventory",
+ "jsonschema",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "unicode-normalization",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-rbac-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-security",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "uuid",
 ]
 

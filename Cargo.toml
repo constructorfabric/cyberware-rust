@@ -135,6 +135,7 @@ members = [
     "gears/system/authz-resolver/authz-resolver",
     "gears/system/authz-resolver/plugins/static-authz-plugin",
     "gears/system/authz-resolver/plugins/tr-authz-plugin",
+    "gears/system/authz-resolver/plugins/authz-resolver-plugin",
     "gears/system/oagw/oagw",
     "gears/system/oagw/oagw-sdk",
     "gears/system/usage-collector/usage-collector-sdk",
@@ -163,6 +164,8 @@ members = [
     "gears/bss/fixtures/bss-fixtures-conformance",
     "gears/system/event-broker/event-broker-sdk",
     "gears/system/event-broker/event-broker",
+    "gears/system/rbac/rbac-sdk",
+    "gears/system/rbac/rbac",
     "gears/system/license-resolver/license-resolver-sdk",
     "gears/system/license-resolver/license-resolver",
     "gears/system/license-resolver/plugins/static-license-plugin",
@@ -354,6 +357,7 @@ oagw = { package = "cf-gears-oagw", version = "0.5.0", path = "gears/system/oagw
 account-management = { package = "cf-gears-account-management", version = "0.8.0", path = "gears/system/account-management/account-management" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.3.0", path = "gears/system/usage-collector/usage-collector" }
 cluster = { package = "cf-gears-cluster", version = "0.2.3", path = "gears/system/cluster/cluster" }
+rbac = { package = "cf-gears-rbac", version = "0.1.0", path = "gears/system/rbac/rbac" }
 
 cf-gears-cluster-sdk = { version = "0.2.3", path = "gears/system/cluster/cluster-sdk" }
 cf-gears-cluster-conformance = { version = "0.3.3", path = "gears/system/cluster/cluster-conformance" }
@@ -368,6 +372,7 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.4.0
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.1", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.11", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.9", path = "gears/system/usage-collector/usage-collector-sdk" }
+rbac-sdk = { package = "cf-gears-rbac-sdk", version = "0.1.0", path = "gears/system/rbac/rbac-sdk" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.1.4", path = "gears/bss/ledger/ledger-sdk" }
@@ -439,6 +444,10 @@ schemars = { version = "1.2", features = ["derive", "uuid1"] }
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+# NFKC normalisation ahead of the lookalike/confusable fold on role names
+# (`rbac`: domain/service/name_confusables.rs). Already in the tree as a
+# transitive dep of `stringprep`/`caseless`; this promotes it to a direct one.
+unicode-normalization = "0.1.25"
 
 # Async runtime
 tokio = { version = "1.47", features = ["full"] }
@@ -453,6 +462,9 @@ async-stream = { version = "0.3" }
 
 # High-performance data structures
 dashmap = "6.1"
+# Bounded LRU for the AuthZ resolver plugin's hierarchy-read cache. Pinned to
+# the version `types-registry` already depends on, to keep one copy in the tree.
+lru = "0.18.2"
 arc-swap = "1.7"
 
 # Security

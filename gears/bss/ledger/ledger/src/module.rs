@@ -908,24 +908,17 @@ impl Gear for BssLedgerGear {
         // `MissingConfigSection` arms both fall through here, so
         // `unwrap_or_default()` yields the parsed config or the all-defaults
         // config respectively (the `GearNotFound` / parse-error arms already
-        // returned). Abort init loudly on a present-but-invalid jobs cadence
-        // (a zero tick would panic `tokio::time::interval` in `serve`).
+        // returned). Abort init loudly on an invalid or incomplete config: a
+        // zero job cadence would panic `tokio::time::interval` in `serve`, and
+        // an absent `seller_tenant_types` would turn every provisioning request
+        // into a "not a ledger owner" rejection. Note this makes a gear entry
+        // with no `config:` block a startup error, not a defaults-only run.
         let cfg: BssLedgerConfig = ctx.config().unwrap_or_default();
-        cfg.jobs
-            .validate()
-            .map_err(|e| anyhow::anyhow!("bss-ledger: invalid jobs config: {e}"))?;
-        cfg.recognition
-            .validate()
-            .map_err(|e| anyhow::anyhow!("bss-ledger: invalid recognition config: {e}"))?;
-        cfg.fx
-            .validate()
-            .map_err(|e| anyhow::anyhow!("bss-ledger: invalid fx config: {e}"))?;
-        cfg.recon
-            .validate()
-            .map_err(|e| anyhow::anyhow!("bss-ledger: invalid recon config: {e}"))?;
-        cfg.payments
-            .validate()
-            .map_err(|e| anyhow::anyhow!("bss-ledger: invalid payments config: {e}"))?;
+        // One call: `BssLedgerConfig::validate` covers its own required fields
+        // (`seller_tenant_types`) and delegates to every sub-config, so a
+        // sub-config added later cannot be left unvalidated here by omission.
+        cfg.validate()
+            .map_err(|e| anyhow::anyhow!("bss-ledger: invalid config: {e}"))?;
 
         let db = ctx.db_required().context(
             "bss-ledger: ctx.db_required() failed; the `db` capability is declared \

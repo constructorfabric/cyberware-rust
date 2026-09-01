@@ -62,12 +62,53 @@ impl TenantTypeReader for AmTenantTypeReader {
     }
 }
 
+/// The configured seller predicate, compiled once at `init()`.
+///
+/// Two shapes, both taken verbatim from `BssLedgerConfig::seller_tenant_types`
+/// (validated there, so nothing here re-checks them):
+///
+/// * a concrete chained type id — exact match, `O(1)` via the set;
+/// * a family wildcard `prefix.*` / `prefix~*` — prefix match over the
+///   remaining entries. The separator before `*` is retained when compiling,
+///   so `…tenants.partner.*` cannot match `…tenants.partnership…`.
+///
+/// Deployments that grant every registered tenant type a ledger configure the
+/// single entry `gts.cf.core.am.tenant_type.v1~*` instead of enumerating the
+/// catalogue; deployments with a real seller/buyer split keep enumerating.
+#[derive(Debug, Default)]
+struct SellerPredicate {
+    exact: HashSet<String>,
+    prefixes: Vec<String>,
+}
+
+impl SellerPredicate {
+    fn compile(entries: impl IntoIterator<Item = String>) -> Self {
+        let mut out = Self::default();
+        for entry in entries {
+            if let Some(prefix) = entry.strip_suffix('*') {
+                out.prefixes.push(prefix.to_owned());
+            } else {
+                out.exact.insert(entry);
+            }
+        }
+        out
+    }
+
+    fn matches(&self, tenant_type: &str) -> bool {
+        self.exact.contains(tenant_type)
+            || self
+                .prefixes
+                .iter()
+                .any(|prefix| tenant_type.starts_with(prefix.as_str()))
+    }
+}
+
 /// Gate: assert the target tenant's TYPE is a configured seller (ledger owner)
 /// before its reference rows are seeded.
 pub(crate) struct SellerGuard {
     tenant_types: Arc<dyn TenantTypeReader>,
-    /// Chained GTS tenant-type ids that own a ledger (from `BssLedgerConfig`).
-    seller_types: HashSet<String>,
+    /// Compiled from `BssLedgerConfig::seller_tenant_types`.
+    seller_types: SellerPredicate,
 }
 
 impl SellerGuard {
@@ -77,7 +118,7 @@ impl SellerGuard {
     ) -> Self {
         Self {
             tenant_types,
-            seller_types: seller_types.into_iter().collect(),
+            seller_types: SellerPredicate::compile(seller_types),
         }
     }
 
@@ -106,7 +147,7 @@ impl SellerGuard {
                     )
                     .create()
             })?;
-        if self.seller_types.contains(&tenant_type) {
+        if self.seller_types.matches(&tenant_type) {
             Ok(())
         } else {
             Err(LedgerResource::failed_precondition()

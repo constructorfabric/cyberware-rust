@@ -393,6 +393,16 @@ jobs:
       - name: Test coord with Postgres (integration)
         run: make test-coord-pg
 
+      # The RBAC gear shipped with its entire Postgres tier `#[ignore]`d and no
+      # target or job invoking it: 141 tests across 16 binaries that compiled on
+      # every run and executed on none. They hold the SQLSTATE and constraint-name
+      # mappings, the partial-unique `uq_role_name_builtin`, the index set, the
+      # migrations on the dialect that ships, and the two-racing-writers and
+      # serialization-conflict proofs — none of which SQLite can express. This job
+      # already has Docker. See the Makefile target for the full inventory.
+      - name: Test rbac with Postgres (integration)
+        run: make test-rbac-pg
+
       - name: Test toolkit-db (sqlite integration)
         run: make test-sqlite
 
