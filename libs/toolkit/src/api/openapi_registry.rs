@@ -106,6 +106,58 @@ pub fn ensure_schema<T: utoipa::ToSchema + utoipa::PartialSchema + 'static>(
     registry.ensure_schema_raw(&root_name, collected)
 }
 
+/// Build the `x-*` vendor extensions for one operation.
+fn operation_vendor_extensions(
+    spec: &operation_builder::OperationSpec,
+) -> utoipa::openapi::extensions::Extensions {
+    let mut ext = utoipa::openapi::extensions::Extensions::default();
+
+    // Pagination
+    if let Some(pagination) = spec.vendor_extensions.x_odata_filter.as_ref()
+        && let Ok(value) = serde_json::to_value(pagination)
+    {
+        ext.insert("x-odata-filter".to_owned(), value);
+    }
+    if let Some(pagination) = spec.vendor_extensions.x_odata_orderby.as_ref()
+        && let Ok(value) = serde_json::to_value(pagination)
+    {
+        ext.insert("x-odata-orderby".to_owned(), value);
+    }
+
+    // Visibility axis (`OperationSpec.exposed`): mark routes that are
+    // registered in the gateway for external access. The `GatewayProvider`
+    // reads this vendor extension to select which routes to reverse-proxy.
+    // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
+    if spec.exposed {
+        ext.insert(
+            "x-toolkit-visibility".to_owned(),
+            serde_json::Value::String("exposed".to_owned()),
+        );
+    }
+
+    // Throttling zone bindings. The contract layer only knows zone
+    // *names*; the API gateway enriches these operations with the
+    // zones' numeric limits (`x-rate-limit-rps` / `x-rate-limit-burst`)
+    // when it builds the final document, using the zone name emitted
+    // here as the join key.
+    if let Some(throttling) = spec.throttling.as_ref() {
+        if let Some(zone) = throttling.rate_limit_zone.as_ref() {
+            ext.insert(
+                "x-throttling-rate-limit-zone".to_owned(),
+                serde_json::Value::String(zone.clone()),
+            );
+        }
+        if let Some(zone) = throttling.in_flight_limit_zone.as_ref() {
+            ext.insert(
+                "x-throttling-in-flight-limit-zone".to_owned(),
+                serde_json::Value::String(zone.clone()),
+            );
+        }
+    }
+
+    ext
+}
+
 /// Implementation of `OpenAPI` registry with lock-free data structures
 pub struct OpenApiRegistryImpl {
     /// Store operation specs keyed by "METHOD:path"
@@ -153,32 +205,7 @@ impl OpenApiRegistryImpl {
                 op = op.tag(tag.clone());
             }
 
-            // Vendor extensions
-            let mut ext = utoipa::openapi::extensions::Extensions::default();
-
-            // Pagination
-            if let Some(pagination) = spec.vendor_extensions.x_odata_filter.as_ref()
-                && let Ok(value) = serde_json::to_value(pagination)
-            {
-                ext.insert("x-odata-filter".to_owned(), value);
-            }
-            if let Some(pagination) = spec.vendor_extensions.x_odata_orderby.as_ref()
-                && let Ok(value) = serde_json::to_value(pagination)
-            {
-                ext.insert("x-odata-orderby".to_owned(), value);
-            }
-
-            // Visibility axis (`OperationSpec.exposed`): mark routes that are
-            // registered in the gateway for external access. The `GatewayProvider`
-            // reads this vendor extension to select which routes to reverse-proxy.
-            // The key is mirrored as a constant in `cf-gears-toolkit-gateway`.
-            if spec.exposed {
-                ext.insert(
-                    "x-toolkit-visibility".to_owned(),
-                    serde_json::Value::String("exposed".to_owned()),
-                );
-            }
-
+            let ext = operation_vendor_extensions(&spec);
             if !ext.is_empty() {
                 op = op.extensions(Some(ext));
             }
@@ -674,6 +701,40 @@ mod tests {
             description: None,
             servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn throttling_zone_names_are_emitted_as_vendor_extensions() {
+        use crate::api::operation_builder::ThrottlingSpec;
+
+        let registry = OpenApiRegistryImpl::new();
+        let mut spec = spec_with_response("/throttled", "throttled_op", None);
+        spec.throttling = Some(ThrottlingSpec {
+            rate_limit_zone: Some("rl_zone".to_owned()),
+            in_flight_limit_zone: Some("ifl_zone".to_owned()),
+            require_security_context: false,
+            dry_run: false,
+        });
+        registry.register_operation(&spec);
+        // An operation without throttling must not carry the extensions.
+        registry.register_operation(&spec_with_response("/plain", "plain_op", None));
+
+        let doc = registry.build_openapi(&test_info()).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+
+        let throttled = &json["paths"]["/throttled"]["get"];
+        assert_eq!(
+            throttled["x-throttling-rate-limit-zone"],
+            serde_json::json!("rl_zone")
+        );
+        assert_eq!(
+            throttled["x-throttling-in-flight-limit-zone"],
+            serde_json::json!("ifl_zone")
+        );
+
+        let plain = &json["paths"]["/plain"]["get"];
+        assert!(plain.get("x-throttling-rate-limit-zone").is_none());
+        assert!(plain.get("x-throttling-in-flight-limit-zone").is_none());
     }
 
     #[test]

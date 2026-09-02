@@ -680,10 +680,12 @@ impl ApiGateway {
         let info = toolkit::api::OpenApiInfo {
             title: config.openapi.title.clone(),
             version: config.openapi.version.clone(),
-            description: config.openapi.description,
+            description: config.openapi.description.clone(),
             servers: (!prefix.is_empty()).then_some(prefix).into_iter().collect(),
         };
-        self.openapi_registry.build_openapi(&info)
+        let mut openapi = self.openapi_registry.build_openapi(&info)?;
+        enrich_openapi_with_zone_limits(&mut openapi, &config);
+        Ok(openapi)
     }
 
     /// Parse bind address from configuration string.
@@ -1372,10 +1374,129 @@ async fn build_internal_authenticator(
     )
 }
 
+/// Enrich throttled operations with their rate-limit zone's numeric limits.
+///
+/// The toolkit registry emits only zone *names* (`x-throttling-rate-limit-zone`)
+/// because the contract layer does not know the gateway configuration. Here,
+/// where the zone definitions are in scope, every operation carrying that
+/// extension additionally gains `x-rate-limit-rps` / `x-rate-limit-burst`, so
+/// spec consumers keep seeing the numeric limits (as they did before the zone
+/// model, when the limits lived inline on the operation).
+fn enrich_openapi_with_zone_limits(
+    openapi: &mut utoipa::openapi::OpenApi,
+    config: &ApiGatewayConfig,
+) {
+    for item in openapi.paths.paths.values_mut() {
+        let operations = [
+            item.get.as_mut(),
+            item.put.as_mut(),
+            item.post.as_mut(),
+            item.delete.as_mut(),
+            item.options.as_mut(),
+            item.head.as_mut(),
+            item.patch.as_mut(),
+            item.trace.as_mut(),
+        ];
+        for op in operations.into_iter().flatten() {
+            let Some(zone_name) = op
+                .extensions
+                .as_ref()
+                .and_then(|ext| ext.get("x-throttling-rate-limit-zone"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let Some(zone) = config.rate_limit_zones.get(zone_name.as_str()) else {
+                continue;
+            };
+            let ext = op.extensions.get_or_insert_with(Default::default);
+            ext.insert(
+                "x-rate-limit-rps".to_owned(),
+                serde_json::json!(zone.rate_limit.rps),
+            );
+            ext.insert(
+                "x-rate-limit-burst".to_owned(),
+                serde_json::json!(zone.burst_limit),
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrich_openapi_adds_zone_limits_by_zone_name() {
+        use crate::config::{KeyConfig, KeyType, RateLimitZone, RateSpec, RetryAfter};
+        use utoipa::openapi::extensions::Extensions;
+        use utoipa::openapi::path::OperationBuilder;
+        use utoipa::openapi::{HttpMethod, OpenApiBuilder, PathItem, PathsBuilder};
+
+        let throttled = OperationBuilder::new()
+            .extensions(Some(Extensions::from_iter([(
+                "x-throttling-rate-limit-zone",
+                serde_json::json!("z1"),
+            )])))
+            .build();
+        let unknown_zone = OperationBuilder::new()
+            .extensions(Some(Extensions::from_iter([(
+                "x-throttling-rate-limit-zone",
+                serde_json::json!("missing"),
+            )])))
+            .build();
+        let plain = OperationBuilder::new().build();
+        let mut openapi = OpenApiBuilder::new()
+            .paths(
+                PathsBuilder::new()
+                    .path("/throttled", PathItem::new(HttpMethod::Get, throttled))
+                    .path("/unknown", PathItem::new(HttpMethod::Get, unknown_zone))
+                    .path("/plain", PathItem::new(HttpMethod::Get, plain))
+                    .build(),
+            )
+            .build();
+
+        let mut config = ApiGatewayConfig::default();
+        config.rate_limit_zones.insert(
+            "z1".to_owned(),
+            RateLimitZone {
+                rate_limit: RateSpec { rps: 50 },
+                burst_limit: 100,
+                response_status_code: 429,
+                response_retry_after: RetryAfter::Auto,
+                key: KeyConfig {
+                    key_type: KeyType::Ip,
+                },
+                max_keys: 1000,
+            },
+        );
+
+        enrich_openapi_with_zone_limits(&mut openapi, &config);
+        let json = serde_json::to_value(&openapi).unwrap();
+
+        let throttled = &json["paths"]["/throttled"]["get"];
+        assert_eq!(throttled["x-rate-limit-rps"], serde_json::json!(50));
+        assert_eq!(throttled["x-rate-limit-burst"], serde_json::json!(100));
+        // The zone-name binding emitted by the toolkit stays in place.
+        assert_eq!(
+            throttled["x-throttling-rate-limit-zone"],
+            serde_json::json!("z1")
+        );
+
+        // A binding to an unknown zone and an unthrottled operation gain nothing.
+        assert!(
+            json["paths"]["/unknown"]["get"]
+                .get("x-rate-limit-rps")
+                .is_none()
+        );
+        assert!(
+            json["paths"]["/plain"]["get"]
+                .get("x-rate-limit-rps")
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_openapi_generation() {
