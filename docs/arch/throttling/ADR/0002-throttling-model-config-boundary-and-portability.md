@@ -38,15 +38,15 @@ surfaced four concerns:
     closure — not serializable, not callable by an external gateway. Identity
     keying does not translate at all.
   * `IdentityKeyFn` pulls `axum::extract::Request` into the toolkit **contract**
-    type (`operation_builder.rs:261`), leaking the runtime into the contract
-    layer — a direct problem on `feature/toolkit_contracts`, where contracts are
-    meant to be portable.
+    type (the `IdentityKeyFn` alias, `operation_builder.rs:332`), leaking the
+    runtime into the contract layer — a direct problem on
+    `feature/toolkit_contracts`, where contracts are meant to be portable.
   * Zone definitions live in `ApiGatewayConfig`, not in the contract;
     `require_security_context` / `dry_run` are concepts of the local middleware
     pipeline only.
-* **Rust idioms (Go port)** — mostly idiomatic, but two Go-isms stand out: an
-  empty string used as a "no zone" sentinel (`if thr.rate_limit_zone.is_empty()`)
-  instead of `Option`, and `axum` appearing in a public contract type (above).
+* **Rust idioms (Go port)** — mostly idiomatic, with one Go-ism standing out:
+  `axum` appearing in a public contract type (above). Zone names are already
+  modelled as `Option<String>` rather than an empty-string "no zone" sentinel.
   Good/idiomatic elements: the `RateSpec` newtype with custom `Deserialize`, the
   `KeyType` / `RetryAfter` enums, the manual `Debug`, `governor` +
   `tokio::Semaphore`, and the `with_throttling(mut self) -> Self` builder that is
@@ -82,9 +82,8 @@ are expressible at the group level?
   `feature/toolkit_contracts`.
 * **Declarative identity keying** — the key must be data, not a Rust closure, so
   it can be serialized and translated to an external gateway's key language.
-* **Rust idiom** — replace sentinel values with `Option`; prefer the
-  `tower::Layer` / `.route_layer()` composition model over a bespoke central
-  resolver.
+* **Rust idiom** — prefer the `tower::Layer` / `.route_layer()` composition
+  model over a bespoke central resolver.
 * **Group-level ergonomics & explicit sharing semantics** — zone binding should
   be expressible for a route group, and the shared-vs-per-route bucket semantics
   must be an explicit, documented choice rather than an accident of `build_maps`.
@@ -128,8 +127,8 @@ decide:
    budget across the group" and "the same limit applied independently per route"
    must be expressible and explicitly named.
 
-Additionally, the empty-string "no zone" sentinel should become `Option`, and
-the `axum::extract::Request` dependency must be removed from the contract layer.
+Additionally, the `axum::extract::Request` dependency must be removed from the
+contract layer.
 
 Option B is rejected because it fixes only the portability leak and leaves the
 config/code boundary and grouping problems unsolved. Option C is rejected because
@@ -191,13 +190,13 @@ signatures — those belong to the toolkit DESIGN this ADR authorizes.
 
 * Good, because zero effort.
 * Bad, because it fails config-ergonomics, portability, and grouping drivers and
-  keeps non-idiomatic constructs (closure key, string sentinel).
+  keeps the non-idiomatic closure key.
 
 ## More Information
 
 * Current throttling metadata and builder: `libs/toolkit/src/api/operation_builder.rs`
-  (`ThrottlingSpec`, `IdentityKeyFn`, `with_throttling`; the `axum` leak at
-  `operation_builder.rs:261`).
+  (`ThrottlingSpec`, `IdentityKeyFn`, `with_throttling`; the `axum` leak in the
+  `IdentityKeyFn` alias, `operation_builder.rs:332`).
 * Current enforcement and zone resolution:
   `gears/system/api-gateway/src/middleware/throttling.rs` (`build_maps`,
   `RateZone`, `InFlightZone`) and `ApiGatewayConfig` zone definitions.
