@@ -23,7 +23,6 @@ credstore = ["dep:credstore"]
 # FIPS-140-3: use the AWS-LC FIPS-validated crypto module for all cryptographic operations
 fips = ["toolkit/fips", "oagw", "api_egress?/fips"]
 users-info-example = ["dep:users-info"]
-oop-example = ["dep:calculator-gateway", "dep:calculator"]
 single-tenant = ["dep:single-tenant-tr-plugin"]
 static-tenants = ["dep:static-tr-plugin"]
 static-authn = ["dep:static-authn-plugin"]
@@ -126,8 +125,6 @@ bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricin
 
 # Optional example module
 users-info = { path = "../../examples/toolkit/users-info/users-info", optional = true }
-calculator-gateway = { path = "../../examples/oop-gears/calculator-gateway/calculator-gateway", optional = true }
-calculator = { path = "../../examples/oop-gears/calculator/calculator", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -379,12 +379,12 @@ The default mode is in-process composition: gears share one runtime, communicate
 
 ### 9.2. Out-of-process execution
 
-Gears can also run as separate processes communicating via gRPC.
+Gears can also run as separate processes communicating via gRPC/REST.
 
 - [x] `HostRuntime` contains explicit OoP orchestration hooks.
 - [x] `toolkit-transport-grpc` exists as a transport library.
 - [x] `docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md` documents the pattern.
-- [x] `examples/oop-gears/` demonstrates the model with calculator examples.
+- [x] `examples/toolkit/hello/` and `examples/toolkit/api-contracts/` demonstrate the model.
 
 ## 10. Security architecture
 

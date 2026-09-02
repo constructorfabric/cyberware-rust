@@ -24,7 +24,7 @@ COMMA := ,
 EXAMPLE_SERVER_BIN ?= cf-gears-example-server
 EXAMPLE_SERVER_DEBUG_BINARY ?= target/debug/$(EXAMPLE_SERVER_BIN)
 EXAMPLE_SERVER_MANIFEST ?= apps/cf-gears-example-server/Cargo.toml
-EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel oop-example timescaledb-usage-collector
+EXAMPLE_SERVER_FEATURE_EXCLUDES ?= default fips k8s otel timescaledb-usage-collector
 EXAMPLE_SERVER_ALL_FEATURES := $(strip $(shell cargo gears ls features --manifest $(EXAMPLE_SERVER_MANIFEST) 2>/dev/null))
 EXAMPLE_SERVER_FEATURES ?= $(subst $(SPACE),$(COMMA),$(filter-out $(EXAMPLE_SERVER_FEATURE_EXCLUDES),$(EXAMPLE_SERVER_ALL_FEATURES)))
 EXAMPLE_SERVER_FEATURE_ARGS ?= $(if $(EXAMPLE_SERVER_FEATURES),--features $(EXAMPLE_SERVER_FEATURES),)
@@ -1279,12 +1279,6 @@ endif
 fips:
 	$(call print_target_banner)
 	cargo run --bin cf-gears-example-server --features fips,static-authn,static-authz,single-tenant,static-credstore,otel -- --config config/quickstart.yaml run
-
-## Run server with out-of-process example gear
-oop-example:
-	$(call print_target_banner)
-	cargo build -p calculator --features oop_gear
-	cargo run --bin cf-gears-example-server --features oop-example,users-info-example,static-authn,static-authz,static-tenants,static-credstore -- --config config/quickstart.yaml run
 
 # Run all quality checks
 check: fmt cfs-validate clippy lychee security dylint gts-docs test
