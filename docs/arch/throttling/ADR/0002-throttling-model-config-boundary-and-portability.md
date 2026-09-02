@@ -108,9 +108,12 @@ are expressible at the group level?
 ## Decision Outcome
 
 Chosen direction: **Option A**. This ADR records the *intent* and the specific
-questions the follow-up toolkit DESIGN must resolve; concrete types, config
-schema, and migration steps are deferred to that DESIGN. The follow-up must
-decide:
+questions the follow-up work must resolve; concrete types, config schema, and
+migration steps are deferred. The follow-up may be staged across several
+design documents: `docs/arch/throttling/DESIGN.md` covers the shipped-code
+defects (the contract's runtime dependency, the `max_keys` bound, the OpenAPI
+extensions) and explicitly defers the three decisions below to a later stage.
+Eventually the follow-ups must decide:
 
 1. **The config/code boundary** — specifically whether `dry_run` and the
    `operation -> zone` binding move into config. Route-policies already reserve

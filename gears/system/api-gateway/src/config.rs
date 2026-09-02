@@ -567,7 +567,9 @@ pub struct InFlightLimitZone {
     pub response_status_code: u16,
     /// Keying strategy.
     pub key: KeyConfig,
-    /// Maximum number of distinct keys tracked (LRU eviction beyond this).
+    /// Soft cap on distinct keys tracked: once reached, the periodic prune
+    /// drops gates not held by an in-flight request (a held gate is never
+    /// evicted, so real concurrency can exceed the cap).
     pub max_keys: u64,
     /// Keys that bypass this zone entirely (e.g. privileged identities).
     #[serde(default)]

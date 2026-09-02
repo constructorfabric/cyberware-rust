@@ -322,12 +322,18 @@ rather than unbounded in one.
 * Tests: admission refuses a new key beyond `max_keys` while admitted keys keep
   flowing, and admission reopens after the sweep resets the set (unit +
   end-to-end through the middleware).
-* The cap is documented as approximate: the check-then-insert is not atomic
-  (concurrent races can overshoot by a few entries), dry-run operations still
-  feed unadmitted keys to the limiter, and the sweep resets admission while the
-  limiter may retain recently-active keys. Bounding memory growth, not a
-  precise count, is the goal; making it exact would require locking the hot
-  path.
+* **The requirement is an approximate memory cap, not an exact count** (this
+  supersedes any reading of "never exceeds `max_keys`" as an exact invariant;
+  acceptance tests assert admission behavior and the dry-run bound, not an
+  exact count). Two tolerated deviations, both bounded and converging within
+  one prune interval: the unsynchronized check-then-insert can overshoot by at
+  most the number of concurrently-admitting requests, and the sweep's
+  admission reset while the limiter retains recently-active keys transiently
+  allows ~2x `max_keys` of combined state. Unadmitted keys never reach the
+  limiter in any mode — enforce rejects them, dry-run logs and serves without
+  consulting it — so neither mode grows the keyed store past the cap between
+  sweeps. Making the cap exact would require locking the hot path (or the
+  custom `StateStore` below); not worth it for a memory bound.
 
 **Alternative considered and rejected: remove the field.** Deleting `max_keys`
 from `RateLimitZone` and documenting recency pruning as the only bound is

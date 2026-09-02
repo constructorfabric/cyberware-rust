@@ -1410,14 +1410,15 @@ async fn build_internal_authenticator(
     )
 }
 
-/// Enrich throttled operations with their rate-limit zone's numeric limits.
+/// Enrich throttled operations with their zones' numeric limits.
 ///
-/// The toolkit registry emits only zone *names* (`x-throttling-rate-limit-zone`)
+/// The toolkit registry emits only zone *names* (`x-throttling-*-zone`)
 /// because the contract layer does not know the gateway configuration. Here,
-/// where the zone definitions are in scope, every operation carrying that
-/// extension additionally gains `x-rate-limit-rps` / `x-rate-limit-burst`, so
-/// spec consumers keep seeing the numeric limits (as they did before the zone
-/// model, when the limits lived inline on the operation).
+/// where the zone definitions are in scope, every operation carrying such an
+/// extension additionally gains `x-rate-limit-rps` / `x-rate-limit-burst` /
+/// `x-in-flight-limit`, so spec consumers keep seeing the numeric limits (as
+/// they did before the zone model, when the limits lived inline on the
+/// operation).
 fn enrich_openapi_with_zone_limits(
     openapi: &mut utoipa::openapi::OpenApi,
     config: &ApiGatewayConfig,
@@ -1434,27 +1435,37 @@ fn enrich_openapi_with_zone_limits(
             item.trace.as_mut(),
         ];
         for op in operations.into_iter().flatten() {
-            let Some(zone_name) = op
-                .extensions
-                .as_ref()
-                .and_then(|ext| ext.get("x-throttling-rate-limit-zone"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-            else {
-                continue;
+            let zone_name = |op: &utoipa::openapi::path::Operation, key: &str| {
+                op.extensions
+                    .as_ref()
+                    .and_then(|ext| ext.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
             };
-            let Some(zone) = config.rate_limit_zones.get(zone_name.as_str()) else {
-                continue;
-            };
-            let ext = op.extensions.get_or_insert_with(Default::default);
-            ext.insert(
-                "x-rate-limit-rps".to_owned(),
-                serde_json::json!(zone.rate_limit.rps),
-            );
-            ext.insert(
-                "x-rate-limit-burst".to_owned(),
-                serde_json::json!(zone.burst_limit),
-            );
+
+            if let Some(name) = zone_name(op, "x-throttling-rate-limit-zone")
+                && let Some(zone) = config.rate_limit_zones.get(name.as_str())
+            {
+                let ext = op.extensions.get_or_insert_with(Default::default);
+                ext.insert(
+                    "x-rate-limit-rps".to_owned(),
+                    serde_json::json!(zone.rate_limit.rps),
+                );
+                ext.insert(
+                    "x-rate-limit-burst".to_owned(),
+                    serde_json::json!(zone.burst_limit),
+                );
+            }
+
+            if let Some(name) = zone_name(op, "x-throttling-in-flight-limit-zone")
+                && let Some(zone) = config.in_flight_limit_zones.get(name.as_str())
+            {
+                let ext = op.extensions.get_or_insert_with(Default::default);
+                ext.insert(
+                    "x-in-flight-limit".to_owned(),
+                    serde_json::json!(zone.in_flight_limit),
+                );
+            }
         }
     }
 }
@@ -1484,12 +1495,19 @@ mod tests {
             )])))
             .build();
         let plain = OperationBuilder::new().build();
+        let inflight_only = OperationBuilder::new()
+            .extensions(Some(Extensions::from_iter([(
+                "x-throttling-in-flight-limit-zone",
+                serde_json::json!("ifl1"),
+            )])))
+            .build();
         let mut openapi = OpenApiBuilder::new()
             .paths(
                 PathsBuilder::new()
                     .path("/throttled", PathItem::new(HttpMethod::Get, throttled))
                     .path("/unknown", PathItem::new(HttpMethod::Get, unknown_zone))
                     .path("/plain", PathItem::new(HttpMethod::Get, plain))
+                    .path("/inflight", PathItem::new(HttpMethod::Get, inflight_only))
                     .build(),
             )
             .build();
@@ -1508,6 +1526,20 @@ mod tests {
                 max_keys: 1000,
             },
         );
+        config.in_flight_limit_zones.insert(
+            "ifl1".to_owned(),
+            crate::config::InFlightLimitZone {
+                in_flight_limit: 25,
+                backlog_limit: 0,
+                backlog_timeout: std::time::Duration::ZERO,
+                response_status_code: 429,
+                key: KeyConfig {
+                    key_type: KeyType::Ip,
+                },
+                max_keys: 1000,
+                excluded_keys: vec![],
+            },
+        );
 
         enrich_openapi_with_zone_limits(&mut openapi, &config);
         let json = serde_json::to_value(&openapi).unwrap();
@@ -1520,6 +1552,13 @@ mod tests {
             throttled["x-throttling-rate-limit-zone"],
             serde_json::json!("z1")
         );
+
+        // An in-flight-only operation gains the numeric in-flight limit and
+        // nothing rate-limit related; a rate-only operation the reverse.
+        let inflight = &json["paths"]["/inflight"]["get"];
+        assert_eq!(inflight["x-in-flight-limit"], serde_json::json!(25));
+        assert!(inflight.get("x-rate-limit-rps").is_none());
+        assert!(throttled.get("x-in-flight-limit").is_none());
 
         // A binding to an unknown zone and an unthrottled operation gain nothing.
         assert!(
