@@ -41730,7 +41730,12 @@
         "summary": "Create a new chat",
         "tags": [
           "Mini Chat Chats"
-        ]
+        ],
+        "x-in-flight-limit": 100,
+        "x-rate-limit-burst": 10,
+        "x-rate-limit-rps": 10,
+        "x-throttling-in-flight-limit-zone": "ifl_mini_chat_chat",
+        "x-throttling-rate-limit-zone": "rl_mini_chat_chat"
       }
     },
     "/mini-chat/v1/chats/{id}": {
