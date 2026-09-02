@@ -23,8 +23,8 @@ PRD/DESIGN", `PRD.md` is `required = true` at that scope, and `traceability` is
 ADR-0002 chose Option A — a declarative, config-owned throttling policy with a
 runtime-agnostic contract. That ADR deliberately records intent only and defers
 concrete types, config schema, and migration to a follow-up design. This is that
-follow-up, narrowed to the two items that are defects in the shipped code rather
-than shape improvements:
+follow-up, narrowed to the three items that are defects in the shipped code
+rather than shape improvements:
 
 1. **The contract layer must not depend on a runtime.** `ThrottlingSpec` stores
    `IdentityKeyFn = Arc<dyn Fn(&axum::extract::Request) -> String>`, which pulls
@@ -33,6 +33,9 @@ than shape improvements:
 2. **`max_keys` must bound something.** `RateLimitZone.max_keys` is parsed,
    validated (`> 0`) and documented as a key-count bound, but no code path reads
    it. Rate-zone memory is bounded only by a 10-second recency sweep.
+3. **The OpenAPI throttling extensions must survive the zone model.** The
+   throttling commit removed the `x-rate-limit-*` vendor-extension emission
+   together with its only test, silently breaking spec consumers (W3).
 
 The end state: a throttling zone is fully described by configuration. Code binds
 an operation to a zone by name and nothing else. The key strategy is data the
@@ -258,11 +261,22 @@ This is the reviewer's second suggested remedy ("a bounded keyed store").
 * When the set is full, an unknown key is rejected with the zone's configured
   status **without** reaching `check_key`, so `governor`'s internal map cannot
   grow past the admitted set.
+* Unadmitted keys never reach `check_key` in **any** mode: enforce mode rejects
+  them, dry-run mode logs the would-be rejection and serves the request without
+  consulting the limiter. Feeding unadmitted dry-run keys to the limiter would
+  create keyed-store state past the cap, unbounding memory exactly in the mode
+  operators use for tuning.
 * The background sweep clears the admission set in the same tick it calls
   `retain_recent()` / `shrink_to_fit()`, keeping the two views from drifting.
   Clearing rather than selectively pruning is deliberate: without a containment
   test on `governor`'s side there is no way to prune the two structures in
-  agreement, and a full clear is self-correcting within one interval.
+  agreement, and a full clear is self-correcting within one interval. The known
+  residual desynchronization: keys still active enough to survive
+  `retain_recent()` stay in the limiter while admission reopens, so combined
+  state is transiently bounded by ~2× `max_keys` immediately after a sweep,
+  converging within one interval. Eliminating that window requires the
+  custom-`StateStore` variant below, where admission and eviction live in one
+  structure by construction.
 
 Cost: one extra hash lookup on the throttling path, and a duplicated copy of the
 key string per tracked key. The duplication is the price of a bound that

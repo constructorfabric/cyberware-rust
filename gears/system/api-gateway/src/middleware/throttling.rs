@@ -85,11 +85,13 @@ impl RateZone {
     ///
     /// The cap is approximate rather than exact, deliberately: the
     /// check-then-insert is not atomic (a concurrent race can overshoot by a
-    /// few entries), a dry-run operation still feeds unadmitted keys to the
-    /// limiter, and the background prune resets the set while the limiter may
-    /// retain recently-active keys. Making it exact would require locking the
-    /// request hot path; the goal here is bounding memory growth, not a precise
-    /// count.
+    /// few entries), and the background prune resets the set while the limiter
+    /// may retain recently-active keys (so the combined state is transiently
+    /// bounded by ~2x the cap right after a sweep, converging within one
+    /// interval). Making it exact would require locking the request hot path;
+    /// the goal here is bounding memory growth, not a precise count. Unadmitted
+    /// keys never reach the limiter — in enforce mode they are rejected, in
+    /// dry-run mode logged and served without consulting it.
     fn admit(&self, key: &str) -> bool {
         if self.admitted.contains(key) {
             return true;
@@ -534,47 +536,49 @@ async fn enforce(inner: &ThrottlingInner, req: Request, next: Next) -> Response 
         let id = compute_key(zone.cfg.key.key_type, &req, inner.trusted_proxy_hops);
         // `max_keys` admission cap: a new key beyond the cap is rejected before
         // it can grow the limiter's keyed store (until the next prune frees
-        // capacity). Existing keys are unaffected.
-        if !zone.admit(&id) {
-            if entry.spec.dry_run {
-                log_dry_run_rate(&id);
-            } else {
-                record_rejection(inner, &key, &zone.name, "max_keys", &id);
-                return throttle_response(
-                    zone.cfg.response_status_code,
-                    Some(KEY_PRUNE_INTERVAL.as_secs()),
-                    Some((&zone.policy, zone.cfg.burst_limit)),
-                );
-            }
-        }
-        match zone.limiter.check_key(&id) {
-            Ok(snapshot) => {
-                rate_headers = Some(RateHeaders {
-                    policy: zone.policy.clone(),
-                    burst: HeaderValue::from(zone.cfg.burst_limit),
-                    remaining: HeaderValue::from(snapshot.remaining_burst_capacity()),
-                });
-            }
-            Err(not_until) => {
-                if entry.spec.dry_run {
-                    // Dry-run: observe but don't enforce. Log and fall through.
-                    log_dry_run_rate(&id);
-                } else {
-                    let wait = not_until
-                        .wait_time_from(zone.limiter.clock().now())
-                        .as_secs();
-                    let retry_after = match zone.cfg.response_retry_after {
-                        RetryAfter::Auto => Some(wait),
-                        RetryAfter::Seconds(n) => Some(n),
-                    };
-                    record_rejection(inner, &key, &zone.name, "rate_limit", &id);
-                    return throttle_response(
-                        zone.cfg.response_status_code,
-                        retry_after,
-                        Some((&zone.policy, zone.cfg.burst_limit)),
-                    );
+        // capacity). Existing keys are unaffected. In dry-run mode the
+        // would-be rejection is logged and the limiter is deliberately NOT
+        // consulted: feeding unadmitted keys to `check_key` would create
+        // keyed-store state past the cap, unbounding memory in observe mode.
+        if zone.admit(&id) {
+            match zone.limiter.check_key(&id) {
+                Ok(snapshot) => {
+                    rate_headers = Some(RateHeaders {
+                        policy: zone.policy.clone(),
+                        burst: HeaderValue::from(zone.cfg.burst_limit),
+                        remaining: HeaderValue::from(snapshot.remaining_burst_capacity()),
+                    });
+                }
+                Err(not_until) => {
+                    if entry.spec.dry_run {
+                        // Dry-run: observe but don't enforce. Log and fall through.
+                        log_dry_run_rate(&id);
+                    } else {
+                        let wait = not_until
+                            .wait_time_from(zone.limiter.clock().now())
+                            .as_secs();
+                        let retry_after = match zone.cfg.response_retry_after {
+                            RetryAfter::Auto => Some(wait),
+                            RetryAfter::Seconds(n) => Some(n),
+                        };
+                        record_rejection(inner, &key, &zone.name, "rate_limit", &id);
+                        return throttle_response(
+                            zone.cfg.response_status_code,
+                            retry_after,
+                            Some((&zone.policy, zone.cfg.burst_limit)),
+                        );
+                    }
                 }
             }
+        } else if entry.spec.dry_run {
+            log_dry_run_max_keys(&id);
+        } else {
+            record_rejection(inner, &key, &zone.name, "max_keys", &id);
+            return throttle_response(
+                zone.cfg.response_status_code,
+                Some(KEY_PRUNE_INTERVAL.as_secs()),
+                Some((&zone.policy, zone.cfg.burst_limit)),
+            );
         }
     }
 
@@ -754,6 +758,17 @@ fn record_rejection(inner: &ThrottlingInner, key: &ThrottleKey, zone: &str, kind
         zone,
         key = %id,
         "throttling limit exceeded"
+    );
+}
+
+/// Dry-run `max_keys` event: the key would have been refused admission but the
+/// request is served because the operation is in dry-run mode. The limiter is
+/// not consulted for such keys, so its keyed store stays capped even in
+/// observe mode.
+fn log_dry_run_max_keys(id: &str) {
+    tracing::warn!(
+        rate_limit_key = %id,
+        "too many tracked keys, serving will be continued because of dry run mode"
     );
 }
 
@@ -1257,6 +1272,49 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         // Bypassed requests carry no rejection hint.
         assert!(!second.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_grow_limiter_past_max_keys() {
+        // max_keys = 1: in dry-run every request is served, but unadmitted
+        // keys must not create limiter state — the keyed store stays capped
+        // even in observe mode.
+        let mut zone = rate_zone_cfg(1000, 1000, KeyType::Ip);
+        zone.max_keys = 1;
+        let cfg = cfg_with_rate("ip", zone);
+        let specs = vec![op(Method::GET, "/x", Some(thr_dry("ip", "")))];
+        let map = ThrottlingMapNoAuth::from_specs(&specs, &cfg).unwrap();
+        let rate_zone = Arc::clone(
+            map.inner
+                .routes
+                .values()
+                .next()
+                .unwrap()
+                .rate_zone
+                .as_ref()
+                .unwrap(),
+        );
+
+        let app =
+            Router::new()
+                .route("/x", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(
+                    move |req: Request, next: Next| {
+                        let map = map.clone();
+                        async move { throttling_no_auth_middleware(map, req, next).await }
+                    },
+                ));
+
+        for ip in ["10.0.0.1", "10.0.0.2", "10.0.0.3"] {
+            let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo(
+                format!("{ip}:1000").parse::<SocketAddr>().unwrap(),
+            ));
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        assert!(rate_zone.limiter.len() <= 1);
     }
 
     #[tokio::test]

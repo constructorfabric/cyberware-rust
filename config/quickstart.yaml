@@ -120,14 +120,17 @@ gears:
       # these zone names. That binding is already wired in the mini-chat gear at
       # gears/mini-chat/.../api/rest/routes/chats.rs (create_chat):
       #   ThrottlingSpec {
-      #     rate_limit_zone:        "rl_mini_chat_chat",
-      #     in_flight_limit_zone:   "ifl_mini_chat_chat",
-      #     key_type:               "ip",
-      #     identity_key_func:      None,
+      #     rate_limit_zone:          "rl_mini_chat_chat",
+      #     in_flight_limit_zone:     "ifl_mini_chat_chat",
       #     require_security_context: false,   // IP-keyed => enforced before auth
-      #   }
+      #     dry_run:                  true,    // observe-only: logs would-be
+      #   }                                    // rejections, never returns 429
       #
-      # `ip` keying is used so it works with auth_disabled (no identity available
+      # NOTE: because the binding sets `dry_run: true`, these zones only observe
+      # and log — nothing is actually rejected until the gear flips it to false.
+      #
+      # The key strategy (`ip` vs `identity`) lives in the zone `key:` block
+      # below; `ip` is used so it works with auth_disabled (no identity available
       # pre-auth). Switch both zones to `key: { type: identity }` and the spec to
       # `require_security_context: true` to throttle per authenticated subject.
       # ----------------------------------------------------------------------

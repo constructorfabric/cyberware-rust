@@ -243,6 +243,11 @@ impl ApiGateway {
 
     /// Force rebuild and cache of the router.
     ///
+    /// Replaces only the cached router; the serving router (and the throttling
+    /// key pruner paired with it, handed to `serve`) is unaffected, so the
+    /// rebuild's own pruner is deliberately discarded rather than allowed to
+    /// desynchronize `throttle_key_pruner` from the router actually served.
+    ///
     /// # Errors
     /// Returns an error if router building fails.
     pub fn rebuild_and_cache_router(&self) -> Result<()> {
@@ -363,11 +368,16 @@ impl ApiGateway {
     }
 
     /// Apply all middleware layers to a router (request ID, tracing, timeout, body limit, CORS, rate limiting, error mapping, auth)
+    ///
+    /// Returns the router together with the throttling key pruner built from
+    /// the same zone instances, so the caller can keep the pair consistent:
+    /// the pruner handed to `serve` must be the one paired with the router
+    /// actually being served.
     pub(crate) fn apply_middleware_stack(
         &self,
         mut router: Router,
         authn_client: Option<Arc<dyn AuthNResolverClient>>,
-    ) -> Result<Router> {
+    ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
         // Build route policy once
         let route_policy = self.build_route_policy_from_specs()?;
 
@@ -419,9 +429,6 @@ impl ApiGateway {
         // instance. The pre-auth map is layered later (step 9b).
         let (throttling_map, throttling_map_noauth, throttle_key_pruner) =
             middleware::throttling::build_maps(&specs, &config)?;
-        // Hand the keyed-store pruner to `serve`, which owns the lifecycle
-        // CancellationToken needed to bound the background prune task.
-        *self.throttle_key_pruner.lock() = Some(throttle_key_pruner);
 
         // 11b) Post-auth throttling (identity-keyed zones). Added before the auth
         // layer so it runs AFTER auth and can read SecurityContext for identity keys.
@@ -628,20 +635,36 @@ impl ApiGateway {
             crate::middleware::request_id::MakeReqId,
         ));
 
-        Ok(router)
+        Ok((router, throttle_key_pruner))
     }
 
     /// Build the HTTP router from registered routes and operations.
     ///
+    /// The pruner paired with the freshly built router is dropped: this entry
+    /// point serves inspection/caching callers, and the serving pairing kept
+    /// in `throttle_key_pruner` must not be overwritten by a router that is
+    /// not the one `serve` runs (see `get_or_build_router` for the serving
+    /// path, which keeps the pair together).
+    ///
     /// # Errors
     /// Returns an error if router building or middleware setup fails.
     pub fn build_router(&self) -> Result<Router> {
+        let (router, _pruner) = self.build_router_with_pruner()?;
+        Ok(router)
+    }
+
+    /// Build the router together with the throttling key pruner created from
+    /// the same zone instances (`None` when the cached router was reused and
+    /// nothing was rebuilt).
+    fn build_router_with_pruner(
+        &self,
+    ) -> Result<(Router, Option<middleware::throttling::ThrottleKeyPruner>)> {
         // If the cached router is currently held elsewhere (e.g., by the running server),
         // return it without rebuilding to avoid unnecessary allocations.
         let cached_router = self.router_cache.load();
         if Arc::strong_count(&cached_router) > 1 {
             tracing::debug!("Using cached router");
-            return Ok((*cached_router).clone());
+            return Ok(((*cached_router).clone(), None));
         }
 
         tracing::debug!("Building new router (standalone/fallback mode)");
@@ -659,7 +682,7 @@ impl ApiGateway {
             router = self.mount_proxy_fallback(router)?;
         }
 
-        let router = self.apply_middleware_stack(router, authn_client)?;
+        let (router, pruner) = self.apply_middleware_stack(router, authn_client)?;
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         let router = Self::apply_prefix(router, &prefix);
@@ -667,7 +690,7 @@ impl ApiGateway {
         // Cache the built router for future use
         self.router_cache.store(router.clone());
 
-        Ok(router)
+        Ok((router, Some(pruner)))
     }
 
     /// Build `OpenAPI` specification from registered routes and components.
@@ -719,6 +742,10 @@ impl ApiGateway {
     }
 
     /// Get the finalized router or build a default one.
+    ///
+    /// On the fallback path the freshly built pruner is stored so `serve`
+    /// picks up the one paired with the router it is about to run; the
+    /// REST-phase path relies on `rest_finalize` having stored that pair.
     fn get_or_build_router(self: &Arc<Self>) -> anyhow::Result<Router> {
         let stored = { self.final_router.lock().take() };
 
@@ -727,7 +754,11 @@ impl ApiGateway {
             Ok(router)
         } else {
             tracing::debug!("No router from REST phase, building default router");
-            self.build_router()
+            let (router, pruner) = self.build_router_with_pruner()?;
+            if let Some(pruner) = pruner {
+                *self.throttle_key_pruner.lock() = Some(pruner);
+            }
+            Ok(router)
         }
     }
 
@@ -1258,7 +1289,12 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         // unprefixed OperationBuilder paths; layers run before nest() strips the prefix).
         tracing::debug!("Applying middleware stack to finalized router");
         let authn_client = self.authn_client.lock().clone();
-        router = self.apply_middleware_stack(router, authn_client)?;
+        let (stacked, pruner) = self.apply_middleware_stack(router, authn_client)?;
+        router = stacked;
+        // Hand the keyed-store pruner paired with this router to `serve`,
+        // which owns the lifecycle CancellationToken needed to bound the
+        // background prune task.
+        *self.throttle_key_pruner.lock() = Some(pruner);
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         router = Self::apply_prefix(router, &prefix);

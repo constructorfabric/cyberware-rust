@@ -91,8 +91,13 @@ in-process and may be addressed in a later ADR.
   do not provide a cluster cache can only use in-process zones.
 * Per-key state must be serialized to and from cache bytes as the GCRA arrival
   time, and each write must carry a TTL equal to the bucket's full replenish
-  window so idle keys self-expire cluster-wide. This replaces the local pruner's
-  role for distributed zones and provides the `max_keys` bound implicitly.
+  window so idle keys self-expire cluster-wide. TTL replaces the local pruner's
+  *idle-key cleanup* role for distributed zones; it is **not** a cardinality
+  bound — between expirations the key count is limited only by the arrival rate
+  of distinct keys. The design must state an explicit distributed `max_keys`
+  policy: either an admission mechanism equivalent to the in-process one, or a
+  documented decision that distributed zones rely on cache-side memory limits
+  and TTL alone (with `max_keys` ignored and a startup warning).
 * The distributed path must compute arrival times against a **shared wall-clock**
   reference (not per-node monotonic clocks), accepting a bounded error under
   clock skew that must be documented.
@@ -107,9 +112,11 @@ in-process and may be addressed in a later ADR.
 * Observability must distinguish enforced rejections from cache-error /
   fail-open events (extend the existing `throttling.rejections` counter with a
   reason/label), so operators can see when distributed enforcement degrades.
-* Each throttled request on a distributed zone incurs (amortized) one cache
-  round-trip plus bounded CAS retries under contention; this is acceptable for
-  identity-keyed budgets and must be load-tested for hot pre-auth IP zones.
+* Each throttled request on a distributed zone incurs at least two cache
+  operations on the success path (a `get` of the current arrival time followed
+  by a `compare_and_swap`), plus additional `get`+CAS rounds under contention;
+  this is acceptable for identity-keyed budgets and must be load-tested for hot
+  pre-auth IP zones.
 
 ### Confirmation
 
