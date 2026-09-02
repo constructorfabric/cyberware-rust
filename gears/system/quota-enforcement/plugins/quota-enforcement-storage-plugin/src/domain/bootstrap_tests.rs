@@ -16,12 +16,12 @@ use toolkit_security::AccessScope;
 
 use super::StoragePlugin;
 use crate::domain::ports::{FoundationStore, SeedReport, StoreError};
-use crate::infra::storage::{Migrator, SqlFoundationStore};
 use crate::infra::storage::entity::{
     DEFAULT_KEY, contention_timeout_config, idempotency_retention_config, lease_capacity_config,
     schema_meta,
 };
 use crate::infra::storage::repo::config_repo;
+use crate::infra::storage::{Migrator, SqlFoundationStore};
 
 async fn test_db() -> Db {
     let opts = ConnectOpts {
@@ -111,7 +111,13 @@ async fn a_fresh_store_records_the_major_and_reports_the_seed() {
         .bootstrap(&BootstrapBundle::foundation())
         .await
         .expect("bootstrap");
-    assert_eq!(report, SeedReport { inserted: 3, present: 0 });
+    assert_eq!(
+        report,
+        SeedReport {
+            inserted: 3,
+            present: 0
+        }
+    );
 }
 
 #[tokio::test]

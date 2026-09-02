@@ -3003,6 +3003,7 @@ dependencies = [
  "cf-gears-toolkit",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "inventory",
  "sea-orm",

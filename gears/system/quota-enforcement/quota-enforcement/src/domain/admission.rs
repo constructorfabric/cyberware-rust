@@ -123,8 +123,9 @@ impl Admission {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-deny-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-deny
-        let access_scope =
-            outcome.map_err(|err| self.deny(&site, denial_reason(&err), DomainError::from_enforcer(err)))?;
+        let access_scope = outcome.map_err(|err| {
+            self.deny(&site, denial_reason(&err), DomainError::from_enforcer(err))
+        })?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-deny
         // @cpt-end:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-deny-if
 

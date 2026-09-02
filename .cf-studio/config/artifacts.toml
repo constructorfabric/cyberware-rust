@@ -323,6 +323,33 @@ name = "Nested SDK Examples"
 path = "{system_root}/{system}-sdk/examples"
 extensions = [".rs"]
 
+# Plugin crates that carry the gear's own name and a role suffix
+# (gears/system/$system/plugins/$system-<role>-plugin) realize the gear's plugin
+# contracts and carry @cpt markers for the parent gear's feature IDs. They ship no
+# docs of their own, so their code belongs to the parent scope. Codebase paths are
+# literal (no globs), one entry per role. Plugins named after a vendor or backend
+# (static-idp-plugin, keycloak-idp-plugin, timescaledb-usage-collector-plugin) are
+# not affected; the ones with their own docs keep their child scopes below.
+[[systems.autodetect.codebase]]
+name = "Storage Plugin"
+path = "{system_root}/plugins/{system}-storage-plugin/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Storage Plugin Tests"
+path = "{system_root}/plugins/{system}-storage-plugin/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Coordination Plugin"
+path = "{system_root}/plugins/{system}-coordination-plugin/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Coordination Plugin Tests"
+path = "{system_root}/plugins/{system}-coordination-plugin/tests"
+extensions = [".rs"]
+
 # Nested sub-plugin scope: account-management/docs/tr-plugin/ carries its own PRD/DESIGN/ADR.
 # Declared as a child of the `gears/system/$system` autodetect rule so the sub-plugin
 # artifacts are detected as belonging to tr-plugin, not to account-management.

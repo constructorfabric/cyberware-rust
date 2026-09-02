@@ -88,7 +88,7 @@ consumption-operations feature)
 
 ### Gear Bootstrap and Readiness
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-gear-bootstrap`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-gear-bootstrap`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-platform-operator`
 
@@ -102,24 +102,21 @@ consumption-operations feature)
 - PDP unreachable at startup: readiness fails (fail-closed)
 
 **Steps**:
-1. [ ] - `p1` - Operator starts the gear with a configuration naming exactly one active storage plugin - `inst-boot-start`
-2. [ ] - `p1` - DB: `bootstrap()` verifies the installed schema matches the plugin contract major version - `inst-boot-schema`
-3. [ ] - `p1` - **IF** schema version is incompatible - `inst-boot-schema-if`
-   1. [ ] - `p1` - Abort readiness with `SchemaVersionMismatch`; serve nothing - `inst-boot-schema-abort`
-4. [ ] - `p1` - DB: seed default config rows (`contention_timeout_config`, `lease_capacity_config`, `idempotency_retention_config`) when missing - `inst-boot-seed-config`
-5. [ ] - `p1` - API: resolve the cluster leader-election facade for the `quota-enforcement` profile with the
-   linearizable requirement; the cluster resolver validates the operator's backend binding - `inst-boot-cluster-resolve`
-6. [ ] - `p1` - API: verify `authz-resolver` reachability with one bounded PDP evaluation round trip; any decision
-   proves the PDP answered, a transport error or the deadline fails the probe - `inst-boot-pdp-probe`
-7. [ ] - `p1` - **IF** any probe or the cluster resolve fails - `inst-boot-probe-if`
-   1. [ ] - `p1` - Fail readiness and surface the failing dependency in the health endpoint - `inst-boot-probe-abort`
-8. [ ] - `p1` - Register REST routes into the platform `api-gateway` via ToolKit typed-operation registration - `inst-boot-rest`
-9. [ ] - `p1` - **RETURN** ready; later features extend this bootstrap hook with their own steps (the
-   resolution-policy-engine feature seeds the `global` Policy here once its Engine is registered) - `inst-boot-ready`
+1. [x] - `p1` - Operator starts the gear with a configuration naming exactly one active storage plugin - `inst-boot-start`
+2. [x] - `p1` - DB: `bootstrap()` verifies the installed schema matches the plugin contract major version - `inst-boot-schema`
+3. [x] - `p1` - **IF** schema version is incompatible - `inst-boot-schema-if`
+   1. [x] - `p1` - Abort readiness with `SchemaVersionMismatch`; serve nothing - `inst-boot-schema-abort`
+4. [x] - `p1` - DB: seed default config rows (`contention_timeout_config`, `lease_capacity_config`, `idempotency_retention_config`) when missing - `inst-boot-seed-config`
+5. [x] - `p1` - API: resolve the cluster leader-election facade for the `quota-enforcement` profile with the linearizable requirement; the cluster resolver validates the operator's backend binding - `inst-boot-cluster-resolve`
+6. [x] - `p1` - API: verify `authz-resolver` reachability with one bounded PDP evaluation round trip; any decision proves the PDP answered, a transport error or the deadline fails the probe - `inst-boot-pdp-probe`
+7. [x] - `p1` - **IF** any probe or the cluster resolve fails - `inst-boot-probe-if`
+   1. [x] - `p1` - Fail readiness and surface the failing dependency in the health endpoint - `inst-boot-probe-abort`
+8. [x] - `p1` - Register REST routes into the platform `api-gateway` via ToolKit typed-operation registration - `inst-boot-rest`
+9. [x] - `p1` - **RETURN** ready; later features extend this bootstrap hook with their own steps (the resolution-policy-engine feature seeds the `global` Policy here once its Engine is registered) - `inst-boot-ready`
 
 ### Authorized Operation Admission
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-authorized-admission`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-authorized-admission`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-consumer`
 
@@ -133,19 +130,14 @@ consumption-operations feature)
 - PDP unreachable: canonical `ServiceUnavailable`, fail-closed, nothing mutated
 
 **Steps**:
-1. [ ] - `p1` - Caller sends an operation request with a platform bearer token - `inst-adm-request`
-2. [ ] - `p1` - Platform `api-gateway` authenticates and populates the service principal in `SecurityContext`; target
-   attribution remains untrusted request data - `inst-adm-authn`
-3. [ ] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed
-   shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
-4. [ ] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver`
-   and compiles the response itself, returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and
-   keeps no PDP decision cache of its own - `inst-adm-pdp`
-5. [ ] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
-   1. [ ] - `p1` - **RETURN** the canonical error (`PermissionDenied` / `ServiceUnavailable`); no handler runs - `inst-adm-deny`
-6. [ ] - `p1` - Carry the returned `AccessScope` unmodified to the operation handler for `SecureConn` consumption - `inst-adm-scope`
-7. [ ] - `p1` - **RETURN** control to the operation handler with `SecurityContext` and `AccessScope` attached; the
-   in-process SDK client enters at this same admission step, so both transports share one authorization boundary - `inst-adm-forward`
+1. [x] - `p1` - Caller sends an operation request with a platform bearer token - `inst-adm-request`
+2. [x] - `p1` - Platform `api-gateway` authenticates and populates the service principal in `SecurityContext`; target attribution remains untrusted request data - `inst-adm-authn`
+3. [x] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
+4. [x] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver` and compiles the response itself, returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and keeps no PDP decision cache of its own - `inst-adm-pdp`
+5. [x] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
+   1. [x] - `p1` - **RETURN** the canonical error (`PermissionDenied` / `ServiceUnavailable`); no handler runs - `inst-adm-deny`
+6. [x] - `p1` - Carry the returned `AccessScope` unmodified to the operation handler for `SecureConn` consumption - `inst-adm-scope`
+7. [x] - `p1` - **RETURN** control to the operation handler with `SecurityContext` and `AccessScope` attached; the in-process SDK client enters at this same admission step, so both transports share one authorization boundary - `inst-adm-forward`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -160,30 +152,23 @@ consumption-operations feature)
 **Steps**:
 1. [ ] - `p1` - Accept `tenant_id` only after PDP authorizes the complete explicit target against the authenticated principal - `inst-pdp-derive`
 2. [ ] - `p1` - Bind the authorized `tenant_id` into the storage query as a mandatory filter (storage-layer half of defense-in-depth) - `inst-pdp-bind-tenant`
-3. [ ] - `p1` - Pass the `AccessScope` to `SecureConn` unmodified; QE never interprets, widens, or re-compiles scope
-   constraints itself - `inst-pdp-scope`
-4. [ ] - `p1` - DB: `SecureConn` compiles the scope into query filters; rows outside tenant or scope are unreachable by
-   construction - `inst-pdp-execute`
+3. [ ] - `p1` - Pass the `AccessScope` to `SecureConn` unmodified; QE never interprets, widens, or re-compiles scope constraints itself - `inst-pdp-scope`
+4. [ ] - `p1` - DB: `SecureConn` compiles the scope into query filters; rows outside tenant or scope are unreachable by construction - `inst-pdp-execute`
 5. [ ] - `p1` - **RETURN** the filtered result; cross-tenant rows never leave the storage layer - `inst-pdp-return`
 
 ### Bounded-Cardinality Telemetry Emission
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-telemetry-emission`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-telemetry-emission`
 
 **Input**: A gear-specific counter, histogram, or gauge observation with candidate labels
 
 **Output**: Emitted metric with only catalogue-declared, deployment-bounded labels
 
 **Steps**:
-1. [ ] - `p1` - Emit via `tracing` macros directly from the owning component (no adapter wrapper, no runtime filtering
-   layer) - `inst-tel-emit`
-2. [ ] - `p1` - Emission sites use only the fixed PRD §5.16 instrument catalogue and the deployment-bounded labels
-   declared there; canonical registered `metric` is permitted only on instruments that declare it - `inst-tel-closed`
-3. [ ] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, projection type,
-   caller attribution, and raw/unregistered metric input never appear as label values; a declared `metric` label is
-   populated only after registry/catalogue validation with the canonical registered identity; conformance is enforced
-   by tests and code review at each emission site - `inst-tel-highcard`
-4. [ ] - `p1` - **RETURN** the observation to the platform OTLP export when the `otel` feature is enabled - `inst-tel-export`
+1. [x] - `p1` - Emit through OpenTelemetry instruments declared on the platform `Meter` (ToolKit's global `SdkMeterProvider`), behind a domain metrics port with an infra adapter; no runtime filtering layer - `inst-tel-emit`
+2. [x] - `p1` - Emission sites use only the fixed PRD §5.16 instrument catalogue and the deployment-bounded labels declared there; canonical registered `metric` is permitted only on instruments that declare it - `inst-tel-closed`
+3. [x] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, projection type, caller attribution, and raw/unregistered metric input never appear as label values; a declared `metric` label is populated only after registry/catalogue validation with the canonical registered identity; conformance is enforced by tests and code review at each emission site - `inst-tel-highcard`
+4. [x] - `p1` - **RETURN** the observation to the platform OTLP export when the `otel` feature is enabled - `inst-tel-export`
 
 ## 4. States (CDSL)
 
@@ -194,7 +179,7 @@ The sweeper features consume them through the coordination adapter's run-while-l
 
 ### SDK Contract Crate
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-sdk-contracts`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-sdk-contracts`
 
 The system **MUST** ship a `quota-enforcement-sdk` crate defining `QuotaEnforcementStoragePluginV1` with its closed
 `StorageError` enum and the domain types and closed enums that contract references, so plugin authors implement
@@ -214,7 +199,7 @@ against a single dependency. The SDK defines no coordination contract; coordinat
 
 ### Reference Storage Plugin on toolkit-db
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-storage-plugin`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-storage-plugin`
 
 The system **MUST** provide the storage-plugin crate on `toolkit-db` using `SecureConn` exclusively. Foundation
 delivers the complete `QuotaEnforcementStoragePluginV1` SDK contract, the plugin crate skeleton with `bootstrap()`,
@@ -237,7 +222,7 @@ the trait names exists — no placeholder or `unimplemented!` method ever ships.
 
 ### Gateway Admission and Tenant Isolation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-gateway-admission`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-gateway-admission`
 
 The system **MUST** mount the Gateway into the platform `api-gateway`, reject unauthenticated requests before any
 handler, run phase-1 PDP admission via `authz-resolver-sdk::PolicyEnforcer` with fail-closed posture and no QE-side
@@ -258,7 +243,7 @@ in-process SDK entry, and stamp the PDP-authorized target `tenant_id` on every p
 
 ### Workspace and Crate Skeletons
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-workspace-crates`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-workspace-crates`
 
 The system **MUST** register the `quota-enforcement`, `quota-enforcement-sdk`, and storage plugin crates in the
 workspace so every crate compiles with only foundation behavior present. The gear **MUST** depend on `cluster-sdk`
@@ -283,7 +268,7 @@ hands each a child `CancellationToken`, and graceful shutdown cancels them withi
 
 ### Cluster Coordination Adapter
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-coordination-adapter`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-coordination-adapter`
 
 The system **MUST** provide the `CoordinationAdapter` (`cpt-cf-quota-enforcement-component-coordination-plugin`) over
 the platform `cluster` gear's leader election per `cpt-cf-quota-enforcement-adr-coordination-plugin`. The adapter
@@ -311,7 +296,7 @@ coordination contract, plugin crate, or bootstrap probe ships.
 
 ### Telemetry Conventions
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
 
 The system **MUST** emit gear-specific instruments via `tracing` with OTLP export under the `otel` feature, enforcing
 the bounded-cardinality label discipline as a compile-time/code-review convention with no high-cardinality identifier
