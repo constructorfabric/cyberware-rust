@@ -1,0 +1,52 @@
+[package]
+name = "cf-gears-quota-enforcement-coordination-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Quota Enforcement coordination plugin: database-backed TTL locks for the sweeper singletons"
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "quota"]
+categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "quota_enforcement_coordination_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+quota-enforcement-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+
+toolkit = { workspace = true }
+# Quickstart binds this plugin to SQLite at runtime; the feature must come from
+# the crate itself, not from dev-dependency unification.
+toolkit-db = { workspace = true, features = ["sqlite"] }
+toolkit-db-macros = { workspace = true }
+toolkit-security = { workspace = true }
+
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Required by the toolkit::gear macro.
+inventory = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+toolkit-canonical-errors = { workspace = true }

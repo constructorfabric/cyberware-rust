@@ -1,0 +1,7 @@
+[gear]
+name = "Quota Enforcement Storage Plugin"
+description = "toolkit-db storage backend for Quota Enforcement: schema, bootstrap, and configuration tables."
+category = "core-functionality"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

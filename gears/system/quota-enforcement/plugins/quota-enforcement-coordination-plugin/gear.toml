@@ -1,0 +1,7 @@
+[gear]
+name = "Quota Enforcement Coordination Plugin"
+description = "Database-backed TTL locks that coordinate the Quota Enforcement sweeper singletons."
+category = "core-functionality"
+is_plugin = true
+has_plugins = false
+has_extension_point = false

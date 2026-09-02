@@ -97,5 +97,12 @@ use usage_collector as _;
 #[cfg(feature = "timescaledb-usage-collector")]
 use timescaledb_usage_collector_plugin as _;
 
+#[cfg(feature = "quota-enforcement")]
+use quota_enforcement as _;
+#[cfg(feature = "quota-enforcement")]
+use quota_enforcement_coordination_plugin as _;
+#[cfg(feature = "quota-enforcement")]
+use quota_enforcement_storage_plugin as _;
+
 #[cfg(feature = "bss-pricing")]
 use bss_pricing as _;

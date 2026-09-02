@@ -142,6 +142,31 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
+  # Requires --features quota-enforcement. The storage plugin publishes no
+  # client until the storage contract is complete, so the gear's bootstrap
+  # fails by design in a live server (see gears/system/quota-enforcement).
+  quota-enforcement:
+    config:
+      storage_vendor: "constructorfabric"
+      coordination_vendor: "constructorfabric"
+      probe_lock_ttl_secs: 5
+
+  quota-enforcement-storage-plugin:
+    database:
+      server: "sqlite_users"
+      file: "quota_enforcement.db"
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  quota-enforcement-coordination-plugin:
+    database:
+      server: "sqlite_users"
+      file: "quota_enforcement_coordination.db"
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
   account-management:
     database:
       server: "sqlite_users"
