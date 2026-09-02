@@ -646,6 +646,10 @@ impl ApiGateway {
     /// not the one `serve` runs (see `get_or_build_router` for the serving
     /// path, which keeps the pair together).
     ///
+    /// Side effect: every call rebuilds and re-stores into `router_cache`, so
+    /// `get_cached_router` reflects the latest build rather than staying
+    /// frozen after first use.
+    ///
     /// # Errors
     /// Returns an error if router building or middleware setup fails.
     pub fn build_router(&self) -> Result<Router> {
@@ -654,19 +658,16 @@ impl ApiGateway {
     }
 
     /// Build the router together with the throttling key pruner created from
-    /// the same zone instances (`None` when the cached router was reused and
-    /// nothing was rebuilt).
+    /// the same zone instances.
+    ///
+    /// Always builds fresh. A previous revision short-circuited to the cached
+    /// router when `Arc::strong_count(...) > 1`, but `RouterCache::load()` is
+    /// `ArcSwap::load_full()` — the swap always retains its own reference, so
+    /// the count was at least 2 and the "reuse" branch was taken
+    /// unconditionally, returning the stale cached router with no pruner.
     fn build_router_with_pruner(
         &self,
-    ) -> Result<(Router, Option<middleware::throttling::ThrottleKeyPruner>)> {
-        // If the cached router is currently held elsewhere (e.g., by the running server),
-        // return it without rebuilding to avoid unnecessary allocations.
-        let cached_router = self.router_cache.load();
-        if Arc::strong_count(&cached_router) > 1 {
-            tracing::debug!("Using cached router");
-            return Ok(((*cached_router).clone(), None));
-        }
-
+    ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
         tracing::debug!("Building new router (standalone/fallback mode)");
         // No "main" routes here — the empty router is tolerated (`has_routes` guard).
         // Health probes are not part of this router; see `health_router`.
@@ -690,7 +691,7 @@ impl ApiGateway {
         // Cache the built router for future use
         self.router_cache.store(router.clone());
 
-        Ok((router, Some(pruner)))
+        Ok((router, pruner))
     }
 
     /// Build `OpenAPI` specification from registered routes and components.
@@ -755,9 +756,7 @@ impl ApiGateway {
         } else {
             tracing::debug!("No router from REST phase, building default router");
             let (router, pruner) = self.build_router_with_pruner()?;
-            if let Some(pruner) = pruner {
-                *self.throttle_key_pruner.lock() = Some(pruner);
-            }
+            *self.throttle_key_pruner.lock() = Some(pruner);
             Ok(router)
         }
     }
@@ -1898,9 +1897,12 @@ mod tests {
 
         // Binding to `:0` lets the OS pick a free port; `serve` must publish the
         // actual bound address (via `listener.local_addr()`), not the configured
-        // `:0`.
+        // `:0`. Auth is disabled because this test exercises the fallback
+        // router build (no `rest_finalize`), which fails fast when auth is
+        // enabled but no AuthN Resolver client is available.
         let cfg = ApiGatewayConfig {
             bind_addr: "127.0.0.1:0".to_owned(),
+            auth_disabled: true,
             ..Default::default()
         };
         let api = Arc::new(ApiGateway::new(cfg));

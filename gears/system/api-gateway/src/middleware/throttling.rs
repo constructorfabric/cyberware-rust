@@ -86,12 +86,15 @@ impl RateZone {
     /// The cap is approximate rather than exact, deliberately: the
     /// check-then-insert is not atomic (a concurrent race can overshoot by a
     /// few entries), and the background prune resets the set while the limiter
-    /// may retain recently-active keys (so the combined state is transiently
-    /// bounded by ~2x the cap right after a sweep, converging within one
-    /// interval). Making it exact would require locking the request hot path;
-    /// the goal here is bounding memory growth, not a precise count. Unadmitted
-    /// keys never reach the limiter — in enforce mode they are rejected, in
-    /// dry-run mode logged and served without consulting it.
+    /// retains still-replenishing keys — a retained key that is not re-admitted
+    /// gets no further `check_key` calls, replenishes untouched, and is dropped
+    /// by the first sweep after the zone's replenish window
+    /// `W = (burst_limit + 1) / rps`, so limiter size stays bounded by
+    /// `max_keys x (1 + ceil(W / prune_interval))`. Making the cap exact would
+    /// require locking the request hot path; the goal here is bounding memory
+    /// growth, not a precise count. Unadmitted keys never reach the limiter —
+    /// in enforce mode they are rejected, in dry-run mode logged and served
+    /// without consulting it.
     fn admit(&self, key: &str) -> bool {
         if self.admitted.contains(key) {
             return true;

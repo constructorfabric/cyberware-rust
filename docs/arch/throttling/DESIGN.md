@@ -267,21 +267,31 @@ This is the reviewer's second suggested remedy ("a bounded keyed store").
   create keyed-store state past the cap, unbounding memory exactly in the mode
   operators use for tuning.
 * The background sweep clears the admission set in the same tick it calls
-  `retain_recent()` / `shrink_to_fit()`, keeping the two views from drifting.
-  Clearing rather than selectively pruning is deliberate: without a containment
-  test on `governor`'s side there is no way to prune the two structures in
-  agreement, and a full clear is self-correcting within one interval. The known
-  residual desynchronization: keys still active enough to survive
-  `retain_recent()` stay in the limiter while admission reopens, so combined
-  state is transiently bounded by ~2× `max_keys` immediately after a sweep,
-  converging within one interval. Eliminating that window requires the
+  `retain_recent()` / `shrink_to_fit()`. Clearing rather than selectively
+  pruning is deliberate: without a containment test on `governor`'s side there
+  is no way to prune the two structures in agreement, and a full clear is
+  self-correcting — over the zone's replenish window, not within a single
+  interval. The residual desynchronization, bounded: a key that survives
+  `retain_recent()` but is not re-admitted receives no further `check_key`
+  calls, so its GCRA state replenishes untouched and becomes
+  indistinguishable-from-fresh after the replenish window
+  `W = (burst_limit + 1) / rps` seconds (worst-case stored arrival time is
+  `last_hit + t·(burst_limit − 1) + t` with `t = 1/rps`, and `retain_recent`
+  drops the key once `now ≥ TAT + t`); the first sweep after that drops it.
+  Steady-state limiter size is therefore bounded by
+  `max_keys × (1 + ⌈W / T⌉)` with `T` the prune interval (10 s) — the
+  currently admitted cohort plus up to `⌈W/T⌉` dying cohorts of previous
+  intervals. For zones whose replenish window fits one interval this is the
+  familiar 2×; a zone with a large `burst_limit / rps` ratio pays
+  proportionally more. Eliminating the factor entirely requires the
   custom-`StateStore` variant below, where admission and eviction live in one
   structure by construction.
 
 Cost: one extra hash lookup on the throttling path, and a duplicated copy of the
 key string per tracked key. The duplication is the price of a bound that
-`governor` cannot provide; peak memory becomes `O(max_keys)` in both structures
-rather than unbounded in one.
+`governor` cannot provide; peak memory becomes `O(max_keys)` in the admission
+set and `O(max_keys × (1 + ⌈W/T⌉))` in the limiter — zone-config-dependent, but
+no longer unbounded in either.
 
 **Rejected alternatives**
 
@@ -325,11 +335,13 @@ rather than unbounded in one.
 * **The requirement is an approximate memory cap, not an exact count** (this
   supersedes any reading of "never exceeds `max_keys`" as an exact invariant;
   acceptance tests assert admission behavior and the dry-run bound, not an
-  exact count). Two tolerated deviations, both bounded and converging within
-  one prune interval: the unsynchronized check-then-insert can overshoot by at
-  most the number of concurrently-admitting requests, and the sweep's
-  admission reset while the limiter retains recently-active keys transiently
-  allows ~2x `max_keys` of combined state. Unadmitted keys never reach the
+  exact count). Two tolerated deviations, both bounded: the unsynchronized
+  check-then-insert can overshoot by at most the number of
+  concurrently-admitting requests, and the sweep's admission reset while the
+  limiter retains still-replenishing keys bounds limiter state by
+  `max_keys × (1 + ⌈W / T⌉)` with `W = (burst_limit + 1) / rps` and `T` the
+  prune interval (see the sweep bullet above for the derivation). Unadmitted
+  keys never reach the
   limiter in any mode — enforce rejects them, dry-run logs and serves without
   consulting it — so neither mode grows the keyed store past the cap between
   sweeps. Making the cap exact would require locking the hot path (or the
@@ -395,10 +407,12 @@ keys — and is why the bound must be observable and the default `max_keys`
 generous. Document the interaction; do not silently ship it.
 
 The full-clear on each sweep bounds how long a client stays locked out to one
-prune interval, but it also means an established client loses its tracked rate
-state at the same moment. Under sustained saturation this makes admission
-roughly round-robin by arrival rather than stable per client. Accept it as the
-cost of a hard bound, or revisit if a zone in production shows churn.
+prune interval. An established client loses its *admission*, not its limiter
+state: `retain_recent` keeps active keys' GCRA state across the sweep, and the
+state fades only over the replenish window when re-admission fails. Under
+sustained saturation this makes admission roughly round-robin by arrival rather
+than stable per client. Accept it as the cost of a hard bound, or revisit if a
+zone in production shows churn.
 
 ### [Risk] `max_keys` semantics differ between zone kinds
 
