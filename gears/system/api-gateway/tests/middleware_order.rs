@@ -88,7 +88,6 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
         .with_throttling(ThrottlingSpec {
             rate_limit_zone: Some("rl_order".to_owned()),
             in_flight_limit_zone: None,
-            identity_key_func: None,
             require_security_context: false,
             dry_run: false,
         })
@@ -222,7 +221,6 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
         .with_throttling(ThrottlingSpec {
             rate_limit_zone: Some("rl_order".to_owned()),
             in_flight_limit_zone: None,
-            identity_key_func: None,
             require_security_context: false,
             dry_run: false,
         })

@@ -335,7 +335,6 @@ async fn metrics_capture_rate_limit() -> Result<()> {
         .with_throttling(ThrottlingSpec {
             rate_limit_zone: Some("rl_limited".to_owned()),
             in_flight_limit_zone: None,
-            identity_key_func: None,
             require_security_context: false,
             dry_run: false,
         })

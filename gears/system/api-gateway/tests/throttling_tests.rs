@@ -104,7 +104,6 @@ fn ip_throttling(rate_zone: &str, inflight_zone: &str) -> ThrottlingSpec {
     ThrottlingSpec {
         rate_limit_zone: zone(rate_zone),
         in_flight_limit_zone: zone(inflight_zone),
-        identity_key_func: None,
         require_security_context: false,
         dry_run: false,
     }

@@ -545,7 +545,9 @@ pub struct RateLimitZone {
     pub response_retry_after: RetryAfter,
     /// Keying strategy.
     pub key: KeyConfig,
-    /// Maximum number of distinct keys tracked (LRU eviction beyond this).
+    /// Cap on distinct keys tracked at once (approximate). Requests with a new
+    /// key beyond the cap are rejected with `response_status_code` until the
+    /// periodic prune drops stale keys and reopens admission.
     pub max_keys: u64,
 }
 

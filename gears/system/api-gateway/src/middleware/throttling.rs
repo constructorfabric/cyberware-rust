@@ -7,7 +7,7 @@
 //!   restricted to IP-keyed zones (identity keying is unavailable pre-auth).
 //! - [`ThrottlingMap`] — operations with `require_security_context = true`.
 //!   Enforced *after* authentication; identity-keyed zones use the subject id
-//!   (or a code-supplied [`IdentityExtractor`]).
+//!   from the request's `SecurityContext`.
 //!
 //! Each `(method, path)` lands in exactly one map (decided by the per-operation
 //! flag).
@@ -30,7 +30,7 @@ use axum::extract::{ConnectInfo, Request};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use governor::clock::{Clock, DefaultClock};
 use governor::middleware::StateInformationMiddleware;
 use governor::state::keyed::DefaultKeyedStateStore;
@@ -39,7 +39,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
-use toolkit::api::{IdentityKeyFn, OperationSpec, ThrottlingSpec};
+use toolkit::api::{OperationSpec, ThrottlingSpec};
 use toolkit_security::SecurityContext;
 
 use crate::config::{ApiGatewayConfig, InFlightLimitZone, KeyType, RateLimitZone, RetryAfter};
@@ -47,28 +47,6 @@ use crate::middleware::common;
 use crate::middleware::errors::ApiGatewayGatewayError;
 
 type ThrottleKey = (Method, String);
-
-/// Extracts a throttling key (identity) from an incoming request.
-///
-/// Gear authors implement this and adapt it into the [`IdentityKeyFn`] closure
-/// stored in an operation's [`ThrottlingSpec`] via [`identity_key_fn`]. It is
-/// used when a throttling zone is configured with `key.type = identity`: the
-/// returned string becomes the per-key bucket identifier (e.g. a subject id,
-/// tenant id, or a value derived from a request header).
-pub trait IdentityExtractor: Send + Sync {
-    /// Compute the identity key for the given request.
-    fn extract(&self, req: &Request) -> String;
-}
-
-/// Adapt an [`IdentityExtractor`] into the [`IdentityKeyFn`] closure stored in
-/// [`ThrottlingSpec::identity_key_func`].
-///
-/// Keeping the stored type a plain closure lets `toolkit` reference it without
-/// depending on this gear (which would otherwise be a dependency cycle).
-#[must_use]
-pub fn identity_key_fn(extractor: Arc<dyn IdentityExtractor>) -> IdentityKeyFn {
-    Arc::new(move |req| extractor.extract(req))
-}
 
 /// Floor for the `Retry-After` hint on in-flight rejections (seconds).
 const DEFAULT_IN_FLIGHT_RETRY_AFTER_SECS: u64 = 5;
@@ -92,6 +70,45 @@ struct RateZone {
     cfg: RateLimitZone,
     limiter: KeyedRateLimiter,
     policy: HeaderValue,
+    /// Keys currently admitted into the limiter's keyed store, capped at
+    /// `cfg.max_keys` (see [`RateZone::admit`]).
+    admitted: DashSet<String>,
+}
+
+impl RateZone {
+    /// Admit `key` into the zone, enforcing the `max_keys` cap.
+    ///
+    /// Returns `true` when the key is already admitted or the admission set is
+    /// under `cfg.max_keys` (the key is then inserted); `false` when the set is
+    /// saturated — the request should be rejected rather than allowed to grow
+    /// the limiter's keyed store.
+    ///
+    /// The cap is approximate rather than exact, deliberately: the
+    /// check-then-insert is not atomic (a concurrent race can overshoot by a
+    /// few entries), a dry-run operation still feeds unadmitted keys to the
+    /// limiter, and the background prune resets the set while the limiter may
+    /// retain recently-active keys. Making it exact would require locking the
+    /// request hot path; the goal here is bounding memory growth, not a precise
+    /// count.
+    fn admit(&self, key: &str) -> bool {
+        if self.admitted.contains(key) {
+            return true;
+        }
+        if (self.admitted.len() as u64) < self.cfg.max_keys {
+            self.admitted.insert(key.to_owned());
+            return true;
+        }
+        false
+    }
+
+    /// Reset admission tracking; called by the background prune right after the
+    /// limiter's own stale-key sweep so freed capacity becomes admittable again.
+    /// Keys that survived the limiter sweep are re-admitted on their next
+    /// request.
+    fn reset_admitted(&self) {
+        self.admitted.clear();
+        self.admitted.shrink_to_fit();
+    }
 }
 
 /// Per-key concurrency gate for an in-flight zone.
@@ -281,12 +298,13 @@ pub fn build_maps(
 
 /// Owns the throttling zones whose keyed stores require periodic pruning.
 ///
-/// Neither keyed store evicts on the request path, so without this the stores
-/// grow one entry per distinct key — attacker-influenced for IP-keyed pre-auth
-/// zones — with no regard for the configured `max_keys` bound. Doing the prune
-/// off the hot path also avoids turning a distinct-key flood into a per-request
-/// all-shard write-locking scan. Call [`ThrottleKeyPruner::spawn`] once the
-/// gear's lifecycle token is available.
+/// Neither keyed store evicts on the request path: rate zones cap growth via
+/// the `max_keys` admission set (see [`RateZone::admit`]) and rely on this
+/// sweep to drop stale buckets and reopen admission; in-flight zones drop idle
+/// gates once over their soft cap. Doing the prune off the hot path avoids
+/// turning a distinct-key flood into a per-request all-shard write-locking
+/// scan. Call [`ThrottleKeyPruner::spawn`] once the gear's lifecycle token is
+/// available.
 pub struct ThrottleKeyPruner {
     rate_zones: Vec<Arc<RateZone>>,
     inflight_zones: Vec<Arc<InFlightZone>>,
@@ -315,9 +333,11 @@ impl ThrottleKeyPruner {
                         for zone in &self.rate_zones {
                             // Drop buckets that have fully replenished
                             // (indistinguishable from never-seen keys), then
-                            // release the reclaimed capacity.
+                            // release the reclaimed capacity and reopen
+                            // `max_keys` admission.
                             zone.limiter.retain_recent();
                             zone.limiter.shrink_to_fit();
+                            zone.reset_admitted();
                         }
                         for zone in &self.inflight_zones {
                             // Drop gates no longer held by an in-flight request.
@@ -455,6 +475,7 @@ fn get_or_build_rate_zone(
         cfg: cfg.clone(),
         limiter,
         policy,
+        admitted: DashSet::new(),
     });
     zones.insert(name.to_owned(), Arc::clone(&zone));
     Ok(zone)
@@ -510,7 +531,22 @@ async fn enforce(inner: &ThrottlingInner, req: Request, next: Next) -> Response 
 
     // Rate limiting.
     if let Some(zone) = entry.rate_zone.as_ref() {
-        let id = compute_key(zone.cfg.key.key_type, entry, &req, inner.trusted_proxy_hops);
+        let id = compute_key(zone.cfg.key.key_type, &req, inner.trusted_proxy_hops);
+        // `max_keys` admission cap: a new key beyond the cap is rejected before
+        // it can grow the limiter's keyed store (until the next prune frees
+        // capacity). Existing keys are unaffected.
+        if !zone.admit(&id) {
+            if entry.spec.dry_run {
+                log_dry_run_rate(&id);
+            } else {
+                record_rejection(inner, &key, &zone.name, "max_keys", &id);
+                return throttle_response(
+                    zone.cfg.response_status_code,
+                    Some(KEY_PRUNE_INTERVAL.as_secs()),
+                    Some((&zone.policy, zone.cfg.burst_limit)),
+                );
+            }
+        }
         match zone.limiter.check_key(&id) {
             Ok(snapshot) => {
                 rate_headers = Some(RateHeaders {
@@ -544,7 +580,7 @@ async fn enforce(inner: &ThrottlingInner, req: Request, next: Next) -> Response 
 
     // In-flight concurrency limiting.
     if let Some(zone) = entry.inflight_zone.as_ref() {
-        let id = compute_key(zone.cfg.key.key_type, entry, &req, inner.trusted_proxy_hops);
+        let id = compute_key(zone.cfg.key.key_type, &req, inner.trusted_proxy_hops);
         if !zone.excluded.contains(&id) {
             let gate = zone.gate(&id);
             let Some(permit) = gate.acquire(zone.cfg.backlog_timeout).await else {
@@ -600,22 +636,13 @@ fn apply_rate_headers(response: &mut Response, rate_headers: Option<&RateHeaders
 }
 
 /// Compute the throttling key for a request according to the zone key type.
-fn compute_key(
-    kind: KeyType,
-    entry: &ThrottlingEntry,
-    req: &Request,
-    trusted_proxy_hops: usize,
-) -> String {
+fn compute_key(kind: KeyType, req: &Request, trusted_proxy_hops: usize) -> String {
     match kind {
         KeyType::Ip => client_ip(req, trusted_proxy_hops),
-        KeyType::Identity => entry.spec.identity_key_func.as_ref().map_or_else(
-            || {
-                req.extensions()
-                    .get::<SecurityContext>()
-                    .map_or_else(|| "anonymous".to_owned(), |sc| sc.subject_id().to_string())
-            },
-            |ext| ext(req),
-        ),
+        KeyType::Identity => req
+            .extensions()
+            .get::<SecurityContext>()
+            .map_or_else(|| "anonymous".to_owned(), |sc| sc.subject_id().to_string()),
     }
 }
 
@@ -761,13 +788,6 @@ mod tests {
 
     use toolkit::api::operation_builder::VendorExtensions;
 
-    struct StaticIdentity(&'static str);
-    impl IdentityExtractor for StaticIdentity {
-        fn extract(&self, _req: &Request) -> String {
-            self.0.to_owned()
-        }
-    }
-
     fn op(method: Method, path: &str, throttling: Option<ThrottlingSpec>) -> OperationSpec {
         OperationSpec {
             method,
@@ -794,16 +814,10 @@ mod tests {
         (!name.is_empty()).then(|| name.to_owned())
     }
 
-    fn thr(
-        rate_zone: &str,
-        inflight_zone: &str,
-        require_ctx: bool,
-        extractor: Option<Arc<dyn IdentityExtractor>>,
-    ) -> ThrottlingSpec {
+    fn thr(rate_zone: &str, inflight_zone: &str, require_ctx: bool) -> ThrottlingSpec {
         ThrottlingSpec {
             rate_limit_zone: zone(rate_zone),
             in_flight_limit_zone: zone(inflight_zone),
-            identity_key_func: extractor.map(identity_key_fn),
             require_security_context: require_ctx,
             dry_run: false,
         }
@@ -813,7 +827,6 @@ mod tests {
         ThrottlingSpec {
             rate_limit_zone: zone(rate_zone),
             in_flight_limit_zone: zone(inflight_zone),
-            identity_key_func: None,
             require_security_context: false,
             dry_run: true,
         }
@@ -857,8 +870,8 @@ mod tests {
             .insert("id".to_owned(), rate_zone_cfg(10, 10, KeyType::Identity));
 
         let specs = vec![
-            op(Method::GET, "/pre", Some(thr("ip", "", false, None))),
-            op(Method::GET, "/post", Some(thr("id", "", true, None))),
+            op(Method::GET, "/pre", Some(thr("ip", "", false))),
+            op(Method::GET, "/post", Some(thr("id", "", true))),
             op(Method::GET, "/none", None),
         ];
 
@@ -882,7 +895,7 @@ mod tests {
     #[test]
     fn pre_auth_identity_zone_is_rejected() {
         let cfg = cfg_with_rate("id", rate_zone_cfg(10, 10, KeyType::Identity));
-        let specs = vec![op(Method::GET, "/x", Some(thr("id", "", false, None)))];
+        let specs = vec![op(Method::GET, "/x", Some(thr("id", "", false)))];
         let err = ThrottlingMapNoAuth::from_specs(&specs, &cfg)
             .err()
             .expect("should error")
@@ -896,7 +909,7 @@ mod tests {
     #[test]
     fn undefined_zone_is_rejected() {
         let cfg = ApiGatewayConfig::default();
-        let specs = vec![op(Method::GET, "/x", Some(thr("missing", "", false, None)))];
+        let specs = vec![op(Method::GET, "/x", Some(thr("missing", "", false)))];
         let err = ThrottlingMapNoAuth::from_specs(&specs, &cfg)
             .err()
             .expect("should error")
@@ -908,8 +921,8 @@ mod tests {
     fn shared_zone_arc_within_map() {
         let cfg = cfg_with_rate("ip", rate_zone_cfg(10, 10, KeyType::Ip));
         let specs = vec![
-            op(Method::GET, "/a", Some(thr("ip", "", false, None))),
-            op(Method::GET, "/b", Some(thr("ip", "", false, None))),
+            op(Method::GET, "/a", Some(thr("ip", "", false))),
+            op(Method::GET, "/b", Some(thr("ip", "", false))),
         ];
         let map = ThrottlingMapNoAuth::from_specs(&specs, &cfg).unwrap();
         let a = map.inner.routes[&(Method::GET, "/a".to_owned())]
@@ -929,8 +942,8 @@ mod tests {
         // operation must resolve to a single limiter instance.
         let cfg = cfg_with_rate("ip", rate_zone_cfg(10, 10, KeyType::Ip));
         let specs = vec![
-            op(Method::GET, "/pre", Some(thr("ip", "", false, None))),
-            op(Method::GET, "/post", Some(thr("ip", "", true, None))),
+            op(Method::GET, "/pre", Some(thr("ip", "", false))),
+            op(Method::GET, "/post", Some(thr("ip", "", true))),
         ];
         let (auth, noauth, _pruner) = build_maps(&specs, &cfg).unwrap();
         let pre = noauth.inner.routes[&(Method::GET, "/pre".to_owned())]
@@ -1013,39 +1026,16 @@ mod tests {
     }
 
     #[test]
-    fn compute_key_identity_uses_extractor_then_subject() {
-        let entry_with_ext = ThrottlingEntry {
-            spec: thr(
-                "",
-                "",
-                true,
-                Some(Arc::new(StaticIdentity("from-extractor"))),
-            ),
-            rate_zone: None,
-            inflight_zone: None,
-        };
-        let req = Request::builder().body(Body::empty()).unwrap();
-        assert_eq!(
-            compute_key(KeyType::Identity, &entry_with_ext, &req, 0),
-            "from-extractor"
-        );
-
-        let entry_no_ext = ThrottlingEntry {
-            spec: thr("", "", true, None),
-            rate_zone: None,
-            inflight_zone: None,
-        };
+    fn compute_key_identity_uses_subject_or_anonymous() {
         // No SecurityContext present → anonymous.
-        assert_eq!(
-            compute_key(KeyType::Identity, &entry_no_ext, &req, 0),
-            "anonymous"
-        );
+        let req = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(compute_key(KeyType::Identity, &req, 0), "anonymous");
     }
 
     #[tokio::test]
     async fn rate_limit_denies_after_burst() {
         let cfg = cfg_with_rate("ip", rate_zone_cfg(1, 1, KeyType::Ip));
-        let specs = vec![op(Method::GET, "/x", Some(thr("ip", "", false, None)))];
+        let specs = vec![op(Method::GET, "/x", Some(thr("ip", "", false)))];
         let map = ThrottlingMapNoAuth::from_specs(&specs, &cfg).unwrap();
 
         let app =
@@ -1077,13 +1067,79 @@ mod tests {
         assert!(second.headers().contains_key("X-RateLimit-Limit"));
     }
 
+    #[test]
+    fn rate_zone_admit_caps_distinct_keys_until_reset() {
+        let mut zones = HashMap::new();
+        let mut cfg = rate_zone_cfg(1000, 1000, KeyType::Ip);
+        cfg.max_keys = 2;
+        let zone = get_or_build_rate_zone(&mut zones, "z", &cfg).unwrap();
+
+        assert!(zone.admit("a"));
+        assert!(zone.admit("b"));
+        // Saturated: a new key is refused, already-admitted keys still pass.
+        assert!(!zone.admit("c"));
+        assert!(zone.admit("a"));
+
+        // The prune resets admission; freed capacity is admittable again.
+        zone.reset_admitted();
+        assert!(zone.admit("c"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_max_keys_rejects_new_keys_when_saturated() {
+        let mut zone = rate_zone_cfg(1000, 1000, KeyType::Ip);
+        zone.max_keys = 2;
+        let cfg = cfg_with_rate("ip", zone);
+        let specs = vec![op(Method::GET, "/x", Some(thr("ip", "", false)))];
+        let map = ThrottlingMapNoAuth::from_specs(&specs, &cfg).unwrap();
+
+        let app =
+            Router::new()
+                .route("/x", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn(
+                    move |req: Request, next: Next| {
+                        let map = map.clone();
+                        async move { throttling_no_auth_middleware(map, req, next).await }
+                    },
+                ));
+
+        let req_from = |ip: &str| {
+            let mut req = Request::builder().uri("/x").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(ConnectInfo(
+                format!("{ip}:1000").parse::<SocketAddr>().unwrap(),
+            ));
+            req
+        };
+
+        // Two distinct client IPs fill the admission cap.
+        for ip in ["10.0.0.1", "10.0.0.2"] {
+            let resp = app.clone().oneshot(req_from(ip)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // A third, never-seen IP is refused admission outright.
+        let third = app.clone().oneshot(req_from("10.0.0.3")).await.unwrap();
+        assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            third
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some(KEY_PRUNE_INTERVAL.as_secs().to_string().as_str())
+        );
+
+        // Already-admitted keys keep flowing while the zone is saturated.
+        let again = app.oneshot(req_from("10.0.0.1")).await.unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn inflight_rejection_sets_retry_after() {
         let mut cfg = ApiGatewayConfig::default();
         // in_flight_limit = 0 with no backlog => first request is rejected.
         cfg.in_flight_limit_zones
             .insert("ifl".to_owned(), inflight_zone_cfg(0, KeyType::Ip, vec![]));
-        let specs = vec![op(Method::GET, "/x", Some(thr("", "ifl", false, None)))];
+        let specs = vec![op(Method::GET, "/x", Some(thr("", "ifl", false)))];
         let map = ThrottlingMapNoAuth::from_specs(&specs, &cfg).unwrap();
 
         let app =
@@ -1117,7 +1173,7 @@ mod tests {
             "ifl".to_owned(),
             inflight_zone_cfg(1, KeyType::Ip, vec!["unknown".to_owned()]),
         );
-        let specs = vec![op(Method::GET, "/x", Some(thr("", "ifl", false, None)))];
+        let specs = vec![op(Method::GET, "/x", Some(thr("", "ifl", false)))];
         let map = ThrottlingMapNoAuth::from_specs(&specs, &cfg).unwrap();
 
         let app =
@@ -1141,7 +1197,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_headers_on_success_response() {
         let cfg = cfg_with_rate("ip", rate_zone_cfg(10, 10, KeyType::Ip));
-        let specs = vec![op(Method::GET, "/x", Some(thr("ip", "", false, None)))];
+        let specs = vec![op(Method::GET, "/x", Some(thr("ip", "", false)))];
         let map = ThrottlingMapNoAuth::from_specs(&specs, &cfg).unwrap();
 
         let app =
@@ -1243,7 +1299,7 @@ mod tests {
         // A configured zone yields a pruner that spawns a task bound to the
         // lifecycle token; cancelling it must let the task exit cleanly.
         let cfg = cfg_with_rate("ip", rate_zone_cfg(10, 10, KeyType::Ip));
-        let specs = vec![op(Method::GET, "/x", Some(thr("ip", "", false, None)))];
+        let specs = vec![op(Method::GET, "/x", Some(thr("ip", "", false)))];
         let (_, _, pruner) = build_maps(&specs, &cfg).unwrap();
         let cancel = CancellationToken::new();
         let handle = pruner

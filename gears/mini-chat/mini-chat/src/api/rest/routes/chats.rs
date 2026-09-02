@@ -30,7 +30,6 @@ pub(super) fn register_chat_routes(
         .with_throttling(ThrottlingSpec {
             rate_limit_zone: Some("rl_mini_chat_chat".to_owned()),
             in_flight_limit_zone: Some("ifl_mini_chat_chat".to_owned()),
-            identity_key_func: None,
             require_security_context: false,
             dry_run: true,
         })
