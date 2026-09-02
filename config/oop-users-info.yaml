@@ -1,0 +1,68 @@
+# Local multi-process platform-host: users-info OoP gear (authenticated + DB).
+#
+# Run (after the host is up):
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+#     cargo run -p users-info-oop --bin users-info-oop -- --config config/oop-users-info.yaml
+#
+# Then (bearer required — any non-empty token is accepted by static-authn
+# accept_all and mapped to the platform-root tenant):
+#   curl -H 'Authorization: Bearer test-token' http://127.0.0.1:8087/users-info/v1/users   # via edge
+#   curl -H 'Authorization: Bearer test-token' http://127.0.0.1:9092/users-info/v1/users   # direct
+#
+# The pod authenticates the bearer locally (embedded authn stack), then calls
+# the platform-host's authz-resolver over REST (resolved via DirectoryService)
+# for every PEP check, and serves from its own SQLite database.
+
+server:
+  home_dir: "~/.cf-gears-users-info"
+
+database:
+  servers:
+    users_db:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-users-info.log"
+    file_level: info
+
+# OoP HTTP serving lifecycle: bind a local REST server + register its endpoint
+# with the DirectoryService so the edge can proxy to it.
+oop_http:
+  listen_addr: "127.0.0.1:9092"
+  advertise_uri: "http://127.0.0.1:9092"
+  allow_loopback_advertise: true
+
+gears:
+  # Target gear: needs the db capability + its own config.
+  users-info:
+    database:
+      server: "users_db"
+      file: "users_info.db"
+    config:
+      default_page_size: 50
+      max_page_size: 1000
+      audit_base_url: "http://audit.local"
+      notifications_base_url: "http://notifications.local"
+
+  # Embedded tenant-plane authn stack (in-memory; no DB).
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  types-registry:
+    config: {}

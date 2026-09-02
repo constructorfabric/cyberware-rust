@@ -56,7 +56,7 @@ magika = ["file_parser/magika"]
 bss-pricing = ["dep:bss_pricing"]
 
 [dependencies]
-mimalloc = { version = "0.1" }
+mimalloc = { workspace = true }
 # Local crates
 toolkit = { workspace = true, features = ["bootstrap"] }
 

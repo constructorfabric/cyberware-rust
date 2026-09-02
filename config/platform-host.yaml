@@ -1,0 +1,164 @@
+# CF/Gears Platform Host configuration (dev-plugins preset).
+#
+# Tailored to the `apps/platform-host` composition: trust-coupled core
+# (authz-resolver, tenant-resolver, resource-group, account-management) + system
+# gears (gear-orchestrator, types-registry, credstore, api-gateway, grpc-hub) +
+# embedded authn-resolver, wired with the static/dev plugin set so it boots with
+# zero external dependencies (SQLite + config-driven plugins).
+#
+# For the production image build (`--no-default-features --features prod-plugins`)
+# supply a config selecting the OIDC/tr-authz/rg-tr vendors and a real database.
+
+server:
+  home_dir: "~/.cf-gears-platform-host"
+
+database:
+  servers:
+    sqlite_users:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/platform-host.log"
+    file_level: info
+    max_age_days: 28
+    max_backups: 3
+    max_size_mb: 10
+
+gears:
+  api-gateway:
+    config:
+      # Bind all interfaces so the gear is reachable inside a container.
+      bind_addr: "0.0.0.0:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "CF/Gears Platform Host API"
+        version: "0.1.0"
+        description: "CF/Gears Platform Host API Documentation"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+      auth_disabled: false
+      require_auth_by_default: true
+
+  gear-orchestrator:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/cf-gears-platform-host-grpc"
+
+  # --- AuthN / AuthZ pipeline (static/dev plugins) ---
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  # --- Tenant resolution (static/dev plugin) ---
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      tenants:
+        # Structural root; must match DEFAULT_TENANT_ID in toolkit-security
+        # (used by auth-disabled mode and as the account-management root anchor).
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "platform-root"
+          parent_id: null
+          status: active
+
+  # --- Types Registry ---
+  # The AM envelope type schemas (`cf.core.am.tenant_type.v1~` and
+  # `cf.core.am.tenant_metadata.v1~`) are auto-seeded at link time via the AM
+  # SDK's `inventory::submit!` declarations. The concrete platform-root tenant
+  # type is operator-controlled and seeded here so account-management's
+  # bootstrap preflight can resolve `root_tenant_type`.
+  types-registry:
+    config:
+      entities:
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Platform-root tenant type (no parents)."
+          type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
+          x-gts-traits:
+            allowed_parent_types: []
+            idp_provisioning: false
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Customer tenant under the platform root."
+          type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
+          x-gts-traits:
+            allowed_parent_types:
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+              - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+            idp_provisioning: false
+
+  # --- Account Management ---
+  account-management:
+    database:
+      server: "sqlite_users"
+      file: "account_management.db"
+    config:
+      bootstrap:
+        root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+        root_name: "platform-root"
+        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_wait_timeout: "5m"
+        idp_retry_backoff_initial: "2s"
+        idp_retry_backoff_max: "30s"
+        strict: false
+      idp:
+        required: true
+
+  # --- Resource Group ---
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
+  # --- Credstore ---
+  credstore:
+    database:
+      server: "sqlite_users"
+      file: "credstore.db"
+    config:
+      vendor: "constructorfabric"
+
+  static-credstore-plugin:
+    config:
+      secrets: []

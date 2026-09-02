@@ -1,0 +1,52 @@
+[package]
+name = "hello"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Minimal self-contained REST OoP demo gear (Profile 3)"
+
+[lints]
+workspace = true
+
+# OoP binary: only built when the `oop_module` feature is enabled (pulls in the
+# tokio runtime + bootstrap entrypoint). The library is always available for
+# in-process linking (Profile 1) without the binary.
+[[bin]]
+name = "hello-oop"
+path = "src/main.rs"
+required-features = ["oop_module"]
+
+[features]
+default = []
+# Build the standalone OoP binary (adds the async runtime, CLI, and allocator).
+oop_module = ["dep:tokio", "dep:clap", "dep:mimalloc", "toolkit/bootstrap"]
+# Kubernetes TokenReview platform-plane auth.
+k8s-auth = ["toolkit/k8s-auth"]
+
+[dependencies]
+# ToolKit
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+
+# Axum & HTTP
+axum = { workspace = true }
+http = { workspace = true }
+
+# Serialization (REST DTOs / OpenAPI)
+serde = { workspace = true }
+utoipa = { workspace = true }
+
+# Async
+async-trait = { workspace = true }
+tokio = { workspace = true, optional = true }
+
+# Utils
+anyhow = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+
+# OoP-only, gated behind `oop_module`.
+clap = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }

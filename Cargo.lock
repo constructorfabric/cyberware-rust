@@ -1501,6 +1501,8 @@ dependencies = [
  "async-trait",
  "axum",
  "cf-api-contracts-sdk",
+ "cf-gears-authn-resolver",
+ "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
@@ -1508,9 +1510,12 @@ dependencies = [
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-transport-grpc",
+ "cf-gears-types-registry",
+ "clap",
  "futures-core",
  "futures-util",
  "http",
+ "mimalloc",
  "mockall",
  "parking_lot",
  "secrecy",
@@ -1534,11 +1539,16 @@ dependencies = [
  "axum",
  "cf-api-contracts",
  "cf-api-contracts-sdk",
+ "cf-gears-authn-resolver",
+ "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
  "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "clap",
+ "mimalloc",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -2975,6 +2985,38 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "cf-gears-platform-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cf-gears-account-management",
+ "cf-gears-api-gateway",
+ "cf-gears-authn-resolver",
+ "cf-gears-authz-resolver",
+ "cf-gears-credstore",
+ "cf-gears-gear-orchestrator",
+ "cf-gears-grpc-hub",
+ "cf-gears-oidc-authn-plugin",
+ "cf-gears-resource-group",
+ "cf-gears-rg-tr-plugin",
+ "cf-gears-single-tenant-tr-plugin",
+ "cf-gears-static-authn-plugin",
+ "cf-gears-static-authz-plugin",
+ "cf-gears-static-credstore-plugin",
+ "cf-gears-static-idp-plugin",
+ "cf-gears-static-tr-plugin",
+ "cf-gears-tenant-resolver",
+ "cf-gears-toolkit",
+ "cf-gears-tr-authz-plugin",
+ "cf-gears-types-registry",
+ "clap",
+ "mimalloc",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5973,6 +6015,25 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hello"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-macros",
+ "clap",
+ "http",
+ "inventory",
+ "mimalloc",
+ "serde",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -12375,8 +12436,10 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "cf-gears-authn-resolver",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
+ "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
@@ -12386,9 +12449,12 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-sdk",
  "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "clap",
  "futures-util",
  "http",
  "inventory",
+ "mimalloc",
  "opentelemetry",
  "opentelemetry_sdk",
  "sea-orm",

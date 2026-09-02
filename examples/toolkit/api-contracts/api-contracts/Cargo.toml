@@ -19,17 +19,30 @@ grpc-client = [
     "dep:tonic",
     "dep:toolkit-transport-grpc",
 ]
+# OoP binary (api-contracts-oop): bootstrap + embedded authn stack.
+oop_module = [
+    "dep:tokio",
+    "dep:clap",
+    "dep:mimalloc",
+    "toolkit/bootstrap",
+    "dep:authn-resolver",
+    "dep:static-authn-plugin",
+    "dep:types-registry",
+]
+# Kubernetes TokenReview platform-plane auth.
+k8s-auth = ["toolkit/k8s-auth"]
 
 [lints]
 workspace = true
 
+[[bin]]
+name = "api-contracts-oop"
+path = "src/main.rs"
+required-features = ["oop_module"]
+
 [dependencies]
-# Neither side is optional. `rest-server` because `src/api/rest/` calls the
-# generated `register_payment_api_rest_routes()` unconditionally — this gear
-# exists to serve the contract, so a build without routes is meaningless.
-# `rest-client` because `tests/runtime_eventual_readiness.rs` uses
-# `#[toolkit::consumes]`, whose output names `PaymentApiRestResolvingClient`
-# unconditionally, and integration tests inherit the package feature table.
+# rest-server to serve the contract; rest-client for the resolving client
+# used in tests.
 api-contracts-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
 toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
 toolkit.workspace = true
@@ -51,6 +64,14 @@ http.workspace = true
 
 tonic = { workspace = true, features = ["transport"], optional = true }
 toolkit-transport-grpc = { workspace = true, optional = true }
+
+# OoP-only, gated behind `oop_module`.
+tokio = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+authn-resolver = { package = "cf-gears-authn-resolver", path = "../../../../gears/system/authn-resolver/authn-resolver", optional = true }
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+types-registry = { package = "cf-gears-types-registry", path = "../../../../gears/system/types-registry/types-registry", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

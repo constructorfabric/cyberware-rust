@@ -91,6 +91,7 @@ pub fn register_manual_routes(
         )
         .tag(API_TAG)
         .authenticated()
+        .exposed()
         .no_license_required()
         // Even a hand-registered route should take its query parameters from
         // the struct's `#[derive(QueryParams)]` rather than restating them:

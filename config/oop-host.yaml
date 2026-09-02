@@ -1,0 +1,137 @@
+# Local multi-process platform-host: platform-host (edge + DirectoryService).
+#
+# Run:
+#   cargo run -p cf-gears-platform-host -- --config config/oop-host.yaml run
+#
+# grpc-hub listens on TCP so a separate OoP gear process can register; the
+# api-gateway edge reverse-proxies discovered OoP routes.
+
+server:
+  home_dir: "~/.cf-gears-host"
+
+database:
+  servers:
+    sqlite_users:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-host.log"
+    file_level: info
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      openapi:
+        title: "CF/Gears Host API"
+        version: "0.1.0"
+        description: "CF/Gears platform host"
+      defaults:
+        body_limit_bytes: 64000000
+        rate_limit:
+          rps: 1000
+          burst: 200
+          in_flight: 64
+      auth_disabled: false
+      require_auth_by_default: true
+      gateway_proxy:
+        enabled: true
+        directory_endpoint: "http://127.0.0.1:50051"
+        sync_interval_secs: 5
+
+  gear-orchestrator:
+    config: {}
+
+  grpc-hub:
+    config:
+      listen_addr: "127.0.0.1:50051"
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      tenants:
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "platform-root"
+          parent_id: null
+          status: active
+
+  types-registry:
+    config:
+      entities:
+        - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+          $schema: "http://json-schema.org/draft-07/schema#"
+          description: "Platform-root tenant type (no parents)."
+          type: "object"
+          allOf:
+            - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
+          x-gts-traits:
+            allowed_parent_types: []
+            idp_provisioning: false
+
+  account-management:
+    database:
+      server: "sqlite_users"
+      file: "account_management.db"
+    config:
+      bootstrap:
+        root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+        root_name: "platform-root"
+        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_wait_timeout: "5m"
+        idp_retry_backoff_initial: "2s"
+        idp_retry_backoff_max: "30s"
+        strict: false
+      idp:
+        required: true
+
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
+
+  credstore:
+    database:
+      server: "sqlite_users"
+      file: "credstore.db"
+    config:
+      vendor: "constructorfabric"
+
+  static-credstore-plugin:
+    config:
+      secrets: []

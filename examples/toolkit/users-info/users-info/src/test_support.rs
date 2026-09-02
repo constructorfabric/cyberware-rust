@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{
-    AuthZResolverApi,
+    AuthZResolverApi, PolicyEnforcer,
     constraints::{Constraint, EqPredicate, InPredicate, Predicate},
     models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
@@ -226,7 +226,7 @@ pub fn build_services_with_authz(
         db,
         Arc::new(MockEventPublisher),
         Arc::new(MockAuditPort),
-        authz,
+        PolicyEnforcer::new(authz),
         config,
         Arc::new(MockUsersMetricsPort),
     ))

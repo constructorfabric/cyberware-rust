@@ -14,6 +14,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
         .description("Retrieve a paginated list of users using cursor-based pagination")
         .tag(API_TAG)
         .authenticated()
+        .exposed()
         .query_param_typed(
             "limit",
             false,
@@ -39,6 +40,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
     router = OperationBuilder::get("/users-info/v1/users/{id}")
         .operation_id("users_info.get_user")
         .authenticated()
+        .exposed()
         .require_license_features::<License>([])
         .summary("Get user by ID")
         .description("Retrieve a specific user by their UUID")
@@ -57,6 +59,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
     router = OperationBuilder::post("/users-info/v1/users")
         .operation_id("users_info.create_user")
         .authenticated()
+        .exposed()
         .require_license_features::<License>([])
         .summary("Create a new user")
         .description("Create a new user with the provided information")
@@ -85,6 +88,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
     router = OperationBuilder::patch("/users-info/v1/users/{id}")
         .operation_id("users_info.update_user")
         .authenticated()
+        .exposed()
         .require_license_features::<License>([])
         .summary("Update user")
         .description("Partially update a user with the provided fields")
@@ -110,6 +114,7 @@ pub(super) fn register_user_routes(mut router: Router, openapi: &dyn OpenApiRegi
     router = OperationBuilder::delete("/users-info/v1/users/{id}")
         .operation_id("users_info.delete_user")
         .authenticated()
+        .exposed()
         .require_license_features::<License>([])
         .summary("Delete user")
         .description("Delete a user by their UUID")

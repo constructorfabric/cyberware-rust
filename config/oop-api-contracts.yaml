@@ -1,0 +1,41 @@
+# Local multi-process platform-host: api-contracts PaymentApi PROVIDER OoP gear.
+#
+# Run (after the host is up):
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+#     cargo run -p cf-api-contracts --features oop_module --bin api-contracts-oop -- --config config/oop-api-contracts.yaml
+#
+# The pod authenticates the bearer locally (embedded authn stack) and serves the
+# PaymentApi REST contract at /api-contracts/v1/... . Consumer pods discover this
+# endpoint via the DirectoryService and call it over REST (OoP gear-to-gear).
+
+server:
+  home_dir: "~/.cf-gears-api-contracts"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-api-contracts.log"
+    file_level: info
+
+oop_http:
+  listen_addr: "127.0.0.1:9097"
+  advertise_uri: "http://127.0.0.1:9097"
+  allow_loopback_advertise: true
+
+gears:
+  api-contracts:
+    config: {}
+
+  # Embedded tenant-plane authn stack (in-memory; no DB).
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  types-registry:
+    config: {}
