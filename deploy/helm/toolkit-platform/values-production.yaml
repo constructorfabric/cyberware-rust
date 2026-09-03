@@ -1,0 +1,53 @@
+# Production preset (scaffold): platform-host + OoP gears from a real registry.
+#
+# NOTE: this is a starting point for the production stack. It assumes images are
+# published to ghcr.io/constructorfabric and pulled normally. Production hardening
+# (real database backends, prod plugin presets, SA-token enforcement + RBAC,
+# resource tuning, network policies) is tracked in OoP-8 and follow-ups.
+#
+#   helm install platform deploy/helm/toolkit-platform -f deploy/helm/toolkit-platform/values-production.yaml
+
+platform-host:
+  enabled: true
+  fullnameOverride: platform-host
+  replicaCount: 1
+  image:
+    repository: ghcr.io/constructorfabric/platform-host
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      memory: 4Gi
+  # External entry point in front of the api-gateway edge. Replace the host with
+  # your real domain and provision a TLS secret (e.g. via cert-manager, then
+  # reference it under `tls`).
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    hosts:
+      - host: platform.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+      # - hosts:
+      #     - platform.example.com
+      #   secretName: platform-host-tls
+
+hello:
+  enabled: true
+  fullnameOverride: hello
+  replicaCount: 2
+  image:
+    repository: ghcr.io/constructorfabric/hello
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  directoryEndpoint: "http://platform-host:50051"

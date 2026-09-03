@@ -1,0 +1,184 @@
+# Default values for the users-info (OoP gear) chart.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/constructorfabric/users-info
+  tag: "dev"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  automount: true
+  annotations: {}
+
+command: ["/app/gear"]
+args: ["--config", "/app/config/gear.yaml"]
+
+service:
+  type: ClusterIP
+  # OoP REST + probes port (matches oop_http.listen_addr).
+  port: 9092
+
+grpc:
+  enabled: false
+  port: 50051
+
+# DirectoryService (platform-host grpc-hub) this gear registers with and uses to
+# resolve the remote authz-resolver. Injected as TOOLKIT_DIRECTORY_ENDPOINT.
+directoryEndpoint: "http://platform-host:50051"
+
+# SA-token projection for platform-plane auth (mounted; used when
+# oop_http.internal_auth is configured).
+saToken:
+  enabled: true
+  audience: toolkit-internal
+  mountPath: /var/run/secrets/tokens/toolkit-internal
+  fileName: token
+  expirationSeconds: 3600
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    # Generous: the gear waits for the platform-host DirectoryService + the
+    # remote authz-resolver dependency to resolve before it reports ready.
+    failureThreshold: 30
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+podLabels: {}
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+# ---------------------------------------------------------------------------
+# PostgreSQL connection.
+#
+# The gear owns its own logical database. Two topologies are supported via the
+# `postgres.enabled` switch:
+#
+#   * enabled: true  -> a single-replica Postgres is deployed *alongside* this
+#     gear (self-contained; `host` defaults to "<fullname>-postgres").
+#   * enabled: false -> the gear connects to an EXISTING/shared Postgres. Set
+#     `host` to that server's Service DNS (e.g. "shared-postgres") and point
+#     `database`/`user`/`password` at the gear's database on it.
+#
+# In the umbrella dev preset we use the shared model: the `postgres` subchart
+# deploys one server and this gear connects to its own `usersinfo` database.
+# ---------------------------------------------------------------------------
+postgres:
+  enabled: false
+  # Service DNS of the Postgres server. Empty => "<fullname>-postgres" (the
+  # bundled instance). Set to the shared server's name for the shared topology.
+  host: "shared-postgres"
+  image: "postgres:17-alpine"
+  pullPolicy: IfNotPresent
+  database: usersinfo
+  user: platform
+  # Demo credential. Override with `--set postgres.password=...` for anything
+  # beyond a local minikube demo. Must match the shared server when enabled=false.
+  password: "platform-demo-pw"
+  persistence:
+    enabled: false
+    size: 1Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# ---------------------------------------------------------------------------
+# Gear config mounted at /app/config/gear.yaml (rendered with `tpl`, so Helm
+# template expressions below are evaluated).
+#
+#   * The gear binds 0.0.0.0:9092 and advertises its in-cluster Service DNS so
+#     the api-gateway edge (in the platform-host pod) can reverse-proxy to it.
+#   * PostgreSQL is reached via the bundled Postgres Service (fullname-postgres).
+#   * The embedded authn stack (authn-resolver + static-authn-plugin) validates
+#     tenant-plane bearer tokens locally; authz-resolver is resolved remotely.
+# ---------------------------------------------------------------------------
+config:
+  mountPath: /app/config/gear.yaml
+  fileName: gear.yaml
+  content: |
+    server:
+      home_dir: "/app/data"
+
+    logging:
+      default:
+        console_format: "json"
+        console_level: info
+
+    database:
+      servers:
+        users_pg:
+          engine: "postgres"
+          host: "{{ .Values.postgres.host | default (printf "%s-postgres" (include "toolkit-common.fullname" .)) }}"
+          port: 5432
+          user: {{ .Values.postgres.user | quote }}
+          password: {{ .Values.postgres.password | quote }}
+          dbname: {{ .Values.postgres.database | quote }}
+          pool:
+            max_conns: 10
+            acquire_timeout: "30s"
+
+    oop_http:
+      listen_addr: "0.0.0.0:9092"
+      advertise_uri: "http://{{ include "toolkit-common.fullname" . }}:9092"
+      internal_auth:
+        provider: kube
+        audiences: ["toolkit-internal"]
+        token_path: /var/run/secrets/tokens/toolkit-internal/token
+
+    gears:
+      users-info:
+        database:
+          server: "users_pg"
+        config:
+          default_page_size: 50
+          max_page_size: 1000
+          audit_base_url: "http://audit.local"
+          notifications_base_url: "http://notifications.local"
+
+      authn-resolver:
+        config:
+          vendor: "constructorfabric"
+
+      static-authn-plugin:
+        config:
+          vendor: "constructorfabric"
+          priority: 100
+          mode: accept_all
+
+      types-registry:
+        config: {}

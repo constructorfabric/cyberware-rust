@@ -1,0 +1,41 @@
+# Shared PostgreSQL for the CF/Gears demo.
+#
+# One Postgres server, a database per gear. Each OoP gear connects with the
+# shared bootstrap role but to its OWN database (see `databases` below); gears
+# never share tables (cross-gear reads go through SDK contracts, not SQL).
+#
+# NOTE: this is a demo-grade, single-replica Postgres with a static credential
+# and (by default) ephemeral storage. Replace with a managed/HA database and a
+# real secret for anything beyond minikube.
+
+nameOverride: ""
+# Stable Service DNS name that gears reference in their DB config.
+fullnameOverride: "shared-postgres"
+
+image: "postgres:17-alpine"
+pullPolicy: IfNotPresent
+
+auth:
+  # Bootstrap superuser; owns every per-gear database.
+  username: platform
+  password: "platform-demo-pw"
+  # Maintenance DB the server always creates (used for probes / \gexec host).
+  maintenanceDb: postgres
+
+# One database per gear, created idempotently on first init.
+databases:
+  - usersinfo
+
+persistence:
+  enabled: false
+  size: 1Gi
+
+service:
+  port: 5432
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

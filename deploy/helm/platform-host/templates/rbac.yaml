@@ -1,0 +1,28 @@
+{{- /*
+Platform-plane TokenReview RBAC.
+
+grpc-hub validates inbound platform-plane credentials by submitting a
+Kubernetes TokenReview. The reviewer identity is this release's ServiceAccount
+(the pod's default mounted token), which must be allowed to create
+TokenReviews. The built-in `system:auth-delegator` ClusterRole grants exactly
+`create` on `tokenreviews`/`subjectaccessreviews`.
+
+Rendered only when platform-plane auth is active (saToken.enabled) and a
+dedicated ServiceAccount is created.
+*/}}
+{{- if and .Values.saToken.enabled .Values.serviceAccount.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "toolkit-common.fullname" . }}-auth-delegator
+  labels:
+    {{- include "toolkit-common.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "toolkit-common.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

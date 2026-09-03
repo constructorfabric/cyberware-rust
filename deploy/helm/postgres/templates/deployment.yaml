@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "postgres.fullname" . }}
+  labels:
+    {{- include "postgres.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "postgres.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "postgres.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Re-run init when the database list changes (only takes effect on a
+        # fresh data dir, but forces a pod roll so the new ConfigMap is mounted).
+        checksum/init: {{ include (print $.Template.BasePath "/init-configmap.yaml") . | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70
+        fsGroup: 70
+      containers:
+        - name: postgres
+          image: {{ .Values.image | quote }}
+          imagePullPolicy: {{ .Values.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: {{ include "postgres.fullname" . }}
+          env:
+            # Keep the data subdir off the mount root so an emptyDir (or PVC)
+            # mounted at /var/lib/postgresql/data initializes cleanly.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.auth.username | quote }}, "-d", {{ .Values.auth.maintenanceDb | quote }}]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.auth.username | quote }}, "-d", {{ .Values.auth.maintenanceDb | quote }}]
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: init
+          configMap:
+            name: {{ include "postgres.fullname" . }}-init
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "postgres.fullname" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "postgres.fullname" . }}
+  labels:
+    {{- include "postgres.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size | quote }}
+{{- end }}

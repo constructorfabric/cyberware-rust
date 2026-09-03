@@ -1,0 +1,13 @@
+apiVersion: v2
+name: hello
+description: >-
+  Hello - a minimal REST OoP demo gear. Deploys as its own pod, registers its
+  REST endpoint with the platform host's DirectoryService, and is reverse-proxied
+  by the api-gateway edge. Demonstrates the Profile 3 out-of-process gear path.
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: toolkit-common
+    version: 0.1.0
+    repository: "file://../toolkit-common"

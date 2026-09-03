@@ -1,0 +1,15 @@
+apiVersion: v2
+name: platform-host
+description: >-
+  CF/Gears Platform Host - the trust-coupled core (authz-resolver,
+  tenant-resolver, resource-group, account-management) plus system gears
+  (gear-orchestrator, types-registry, credstore, api-gateway, grpc-hub) and the
+  embedded authn-resolver, deployed as a single pod. Serves the edge api-gateway
+  and the DirectoryService (grpc-hub) that OoP gear pods register with.
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: toolkit-common
+    version: 0.1.0
+    repository: "file://../toolkit-common"

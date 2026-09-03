@@ -386,3 +386,8 @@ testing/e2e/logs/
 
 # Local reports from the toolkit-pr-review-v2 skill (never committed)
 /REVIEW_*.md
+
+# Helm chart artifacts (never committed)
+*.tgz
+Chart.lock
+

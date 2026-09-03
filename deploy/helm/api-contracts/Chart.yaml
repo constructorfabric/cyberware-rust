@@ -1,0 +1,14 @@
+apiVersion: v2
+name: api-contracts
+description: >-
+  api-contracts - the PaymentApi REST PROVIDER OoP gear. Deploys as its own pod,
+  authenticates tenant-plane requests locally, and serves the PaymentApi
+  contract at /api-contracts/v1. Consumer pods discover and call it over REST via
+  the DirectoryService (Profile 3 out-of-process gear-to-gear).
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: toolkit-common
+    version: 0.1.0
+    repository: "file://../toolkit-common"

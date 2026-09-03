@@ -1,0 +1,101 @@
+# Dev preset: platform-host + shared Postgres + 4 OoP gears, locally-built images.
+#
+# Intended for a minikube demo where images are loaded into the node (so
+# pullPolicy: Never avoids a registry round-trip). The Postgres image is public,
+# so only platform-host and the 4 gear images need loading:
+#
+#   for img in platform-host hello users-info api-contracts api-contracts-consumer; do
+#     minikube image load "ghcr.io/constructorfabric/${img}:dev"
+#   done
+#   helm install demo deploy/helm/toolkit-platform -f deploy/helm/toolkit-platform/values-dev.yaml
+
+platform-host:
+  enabled: true
+  fullnameOverride: platform-host
+  image:
+    repository: ghcr.io/constructorfabric/platform-host
+    tag: "dev"
+    pullPolicy: Never
+  # External entry point via the minikube nginx ingress addon
+  # (`minikube addons enable ingress`). Reach it without editing /etc/hosts:
+  #   curl --resolve platform-host.local:80:$(minikube ip) \
+  #        http://platform-host.local/hello/v1/ping
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    hosts:
+      - host: platform-host.local
+        paths:
+          - path: /
+            pathType: Prefix
+  # Connect account-management/resource-group/credstore to the shared Postgres
+  # below (no local SQLite).
+  postgres:
+    host: shared-postgres
+    user: platform
+    password: "platform-demo-pw"
+    databases:
+      accountManagement: accountmanagement
+      resourceGroup: resourcegroup
+      credstore: credstore
+
+# Shared PostgreSQL (one server, a database per OoP gear). Uses the public
+# postgres:17-alpine image, so no local image load is needed.
+postgres:
+  enabled: true
+  fullnameOverride: shared-postgres
+  databases:
+    - accountmanagement
+    - resourcegroup
+    - credstore
+    - usersinfo
+
+hello:
+  enabled: true
+  fullnameOverride: hello
+  image:
+    repository: ghcr.io/constructorfabric/hello
+    tag: "dev"
+    pullPolicy: Never
+  directoryEndpoint: "http://platform-host:50051"
+
+users-info:
+  enabled: true
+  fullnameOverride: users-info
+  image:
+    repository: ghcr.io/constructorfabric/users-info
+    tag: "dev"
+    pullPolicy: Never
+  directoryEndpoint: "http://platform-host:50051"
+  # Connect to the shared Postgres above (no bundled instance).
+  postgres:
+    enabled: false
+    host: shared-postgres
+    database: usersinfo
+    user: platform
+    password: "platform-demo-pw"
+
+# OoP gear-to-gear REST demo: the consumer pod resolves the PaymentApi contract
+# from the provider pod over REST (via the DirectoryService).
+api-contracts:
+  enabled: true
+  fullnameOverride: api-contracts
+  image:
+    repository: ghcr.io/constructorfabric/api-contracts
+    tag: "dev"
+    pullPolicy: Never
+  directoryEndpoint: "http://platform-host:50051"
+
+api-contracts-consumer:
+  enabled: true
+  fullnameOverride: api-contracts-consumer
+  image:
+    repository: ghcr.io/constructorfabric/api-contracts-consumer
+    tag: "dev"
+    pullPolicy: Never
+  directoryEndpoint: "http://platform-host:50051"

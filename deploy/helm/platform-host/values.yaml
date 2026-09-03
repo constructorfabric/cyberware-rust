@@ -1,0 +1,310 @@
+# Default values for the platform-host chart.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/constructorfabric/platform-host
+  # Defaults to the chart's appVersion when unset.
+  tag: "dev"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  automount: true
+  annotations: {}
+
+# Override the container command/args to point at the Helm-mounted config.
+command: ["/app/platform-host"]
+args: ["--config", "/app/config/platform-host.yaml", "run"]
+
+service:
+  type: ClusterIP
+  # HTTP edge (api-gateway) + probes.
+  port: 8087
+
+# gRPC DirectoryService (grpc-hub) exposed so OoP gear pods can register/resolve
+# across pods via this Service's DNS name.
+grpc:
+  enabled: true
+  port: 50051
+
+# Optional external HTTP entry point in front of the api-gateway edge.
+# Disabled by default; the umbrella dev/prod presets enable it. OoP gears are
+# reached through this gateway by path prefix, not via their own Ingress
+# (ADR-0007).
+ingress:
+  enabled: false
+  className: ""
+  # When fronted by nginx-ingress, the edge benefits from controller tuning so
+  # it can proxy streaming responses and larger request bodies without the
+  # default 60s stream timeout / 1MB body cap. The umbrella dev/prod presets set
+  # these; enable them here if using this chart standalone:
+  #   nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+  annotations: {}
+  hosts:
+    - host: platform-host.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# The platform-host is the DirectoryService, so it does not itself dial one.
+directoryEndpoint: ""
+
+# SA-token projection: the platform-host is BOTH the receiver/validator of
+# platform-plane tokens (grpc-hub TokenReview) AND a caller — its api-gateway
+# reverse-proxy polls the DirectoryService over gRPC and must present its own
+# projected token. A ClusterRoleBinding to `system:auth-delegator` (see
+# templates/rbac.yaml) grants this SA permission to submit TokenReviews.
+saToken:
+  enabled: true
+  audience: toolkit-internal
+  mountPath: /var/run/secrets/tokens/toolkit-internal
+  fileName: token
+  expirationSeconds: 3600
+
+# Shared Postgres connection for platform-host's own trust-coupled-core gears
+# (account-management, resource-group, credstore). Each gets its own database
+# on the shared server (see the umbrella's `postgres.databases`), not a shared
+# schema. Points at the `postgres` chart deployed alongside this one.
+postgres:
+  host: "shared-postgres"
+  user: platform
+  password: "platform-demo-pw"
+  databases:
+    accountManagement: accountmanagement
+    resourceGroup: resourcegroup
+    credstore: credstore
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 15
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    failureThreshold: 6
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+podLabels: {}
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+# ---------------------------------------------------------------------------
+# Gear configuration mounted at /app/config/platform-host.yaml.
+#
+# This is the Kubernetes variant of config/platform-host.yaml:
+#   * grpc-hub listens on TCP 0.0.0.0:50051 (reachable cross-pod via Service DNS)
+#     instead of a Unix domain socket.
+#   * api-gateway runs the embedded-edge reverse proxy (gateway_proxy), polling
+#     the in-pod DirectoryService and proxying external requests to OoP gears.
+#   * tenant-plane auth is enforced at the edge: `.authenticated()` routes
+#     require a bearer token, validated by the authn-resolver + static-authn
+#     plugin (accept_all maps any non-empty bearer to the platform-root tenant).
+# ---------------------------------------------------------------------------
+config:
+  mountPath: /app/config/platform-host.yaml
+  fileName: platform-host.yaml
+  content: |
+    server:
+      home_dir: "/app/data"
+
+    database:
+      servers:
+        account_management_pg:
+          engine: "postgres"
+          host: "{{ .Values.postgres.host }}"
+          port: 5432
+          user: {{ .Values.postgres.user | quote }}
+          password: {{ .Values.postgres.password | quote }}
+          dbname: {{ .Values.postgres.databases.accountManagement | quote }}
+          pool:
+            max_conns: 10
+            acquire_timeout: "30s"
+        resource_group_pg:
+          engine: "postgres"
+          host: "{{ .Values.postgres.host }}"
+          port: 5432
+          user: {{ .Values.postgres.user | quote }}
+          password: {{ .Values.postgres.password | quote }}
+          dbname: {{ .Values.postgres.databases.resourceGroup | quote }}
+          pool:
+            max_conns: 10
+            acquire_timeout: "30s"
+        credstore_pg:
+          engine: "postgres"
+          host: "{{ .Values.postgres.host }}"
+          port: 5432
+          user: {{ .Values.postgres.user | quote }}
+          password: {{ .Values.postgres.password | quote }}
+          dbname: {{ .Values.postgres.databases.credstore | quote }}
+          pool:
+            max_conns: 10
+            acquire_timeout: "30s"
+
+    logging:
+      default:
+        console_format: "json"
+        console_level: info
+        file_level: info
+
+    gears:
+      api-gateway:
+        config:
+          bind_addr: "0.0.0.0:8087"
+          # In-cluster Service DNS other pods use to reach this gateway. The pod
+          # binds 0.0.0.0, so this must be set explicitly: it is advertised in
+          # the DirectoryService for in-process REST providers (e.g.
+          # authz-resolver) so out-of-process gears (users-info) can resolve and
+          # call them over REST.
+          advertise_uri: "http://platform-host:8087"
+          enable_docs: true
+          cors_enabled: false
+          openapi:
+            title: "CF/Gears Platform Host API"
+            version: "0.1.0"
+            description: "CF/Gears Platform Host API Documentation"
+          defaults:
+            body_limit_bytes: 64000000
+            rate_limit:
+              rps: 1000
+              burst: 200
+              in_flight: 64
+          auth_disabled: false
+          require_auth_by_default: true
+          internal_auth:
+            provider: kube
+            audiences: ["toolkit-internal"]
+            token_path: /var/run/secrets/tokens/toolkit-internal/token
+          gateway_proxy:
+            enabled: true
+            directory_endpoint: "http://127.0.0.1:50051"
+            sync_interval_secs: 5
+
+      gear-orchestrator:
+        config: {}
+
+      grpc-hub:
+        config:
+          listen_addr: "0.0.0.0:50051"
+          internal_auth:
+            provider: kube
+            audiences: ["toolkit-internal"]
+          internal_auth_enforcement: required
+
+      authn-resolver:
+        config:
+          vendor: "constructorfabric"
+
+      authz-resolver:
+        config:
+          vendor: "constructorfabric"
+
+      static-authn-plugin:
+        config:
+          vendor: "constructorfabric"
+          priority: 100
+          mode: accept_all
+
+      static-authz-plugin:
+        config:
+          vendor: "constructorfabric"
+          priority: 100
+
+      tenant-resolver:
+        config:
+          vendor: "constructorfabric"
+
+      static-tr-plugin:
+        config:
+          vendor: "constructorfabric"
+          priority: 20
+          tenants:
+            - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+              name: "platform-root"
+              parent_id: null
+              status: active
+
+      types-registry:
+        config:
+          entities:
+            - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+              $schema: "http://json-schema.org/draft-07/schema#"
+              description: "Platform-root tenant type (no parents)."
+              type: "object"
+              allOf:
+                - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
+              x-gts-traits:
+                allowed_parent_types: []
+                idp_provisioning: false
+            - $id: "gts://gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+              $schema: "http://json-schema.org/draft-07/schema#"
+              description: "Customer tenant under the platform root."
+              type: "object"
+              allOf:
+                - $ref: "gts://gts.cf.core.am.tenant_type.v1~"
+              x-gts-traits:
+                allowed_parent_types:
+                  - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+                  - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
+                idp_provisioning: false
+
+      account-management:
+        database:
+          server: "account_management_pg"
+        config:
+          bootstrap:
+            root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+            root_name: "platform-root"
+            root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+            idp_wait_timeout: "5m"
+            idp_retry_backoff_initial: "2s"
+            idp_retry_backoff_max: "30s"
+            strict: false
+          idp:
+            required: true
+
+      resource-group:
+        database:
+          server: "resource_group_pg"
+        config: {}
+
+      credstore:
+        database:
+          server: "credstore_pg"
+        config:
+          vendor: "constructorfabric"
+
+      static-credstore-plugin:
+        config:
+          secrets: []

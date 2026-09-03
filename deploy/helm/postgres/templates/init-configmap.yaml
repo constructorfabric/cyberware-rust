@@ -1,0 +1,20 @@
+{{/*
+Init SQL runs ONLY on first boot (empty data dir), executed by the postgres
+image's docker-entrypoint from /docker-entrypoint-initdb.d. It idempotently
+creates one database per gear ("database per service") on this shared server.
+`\gexec` is a psql meta-command; CREATE DATABASE cannot run inside a DO block or
+a transaction, so we generate + execute it via \gexec instead.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "postgres.fullname" . }}-init
+  labels:
+    {{- include "postgres.labels" . | nindent 4 }}
+data:
+  10-databases.sql: |
+    -- Create a dedicated database for each gear if it does not already exist.
+    {{- range .Values.databases }}
+    SELECT format('CREATE DATABASE %I OWNER %I', '{{ . }}', '{{ $.Values.auth.username }}')
+    WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '{{ . }}')\gexec
+    {{- end }}
