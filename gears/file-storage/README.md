@@ -48,9 +48,9 @@ gears and users. It replaces ad-hoc per-gear file handling with a centralized, t
 
 ## Implementation status
 
-### P1 (foundation)
+### Control plane and sidecar
 
-The **P1 control plane** is implemented and tested. Highlights:
+FileStorage's control plane and data-plane sidecar are implemented and tested. Highlights:
 
 - Two crates: `cf-gears-file-storage-sdk` (public API) + `cf-gears-file-storage` (gear lib + `sidecar` binary).
 - Control-plane REST under `/api/file-storage/v1` (create/presign/bind, download-URL, metadata CRUD, list,
@@ -65,9 +65,9 @@ The **P1 control plane** is implemented and tested. Highlights:
   client-issued request (see [DESIGN.md](docs/DESIGN.md) §3.6 and
   [ADR-0003](docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)).
 
-### P2 (this branch)
+### Policies, lifecycle, and governance
 
-Built on top of P1, the following shipped:
+Built on top of the control plane and sidecar above, FileStorage also provides:
 
 - **Policy engine** — allowed-types / size / custom-metadata-limit policies, resolved at tenant and user scope
   (`GET`/`PUT /policy`, `GET /policy/effective`). See
@@ -77,40 +77,53 @@ Built on top of P1, the following shipped:
   [docs/features/retention-cleanup.md](docs/features/retention-cleanup.md).
 - **Idempotent create** — `POST /files` is safe to retry.
 - **Audit outbox** — a transactional outbox recording write operations (create, finalize, bind, metadata update,
-  delete, ownership transfer, backend migration, …) for downstream audit consumption. The write side is fully
-  shipped and tested; **the drain/relay side is not implemented** — see
-  [docs/features/audit-trail.md](docs/features/audit-trail.md) for the tracked gap.
-- **Events outbox** — file lifecycle events (`file.content_updated`, `file.owner_transferred`, …) are written
-  transactionally alongside the mutation. **Not yet drained** to the platform EventBroker — see Tier 4 item 4.1 in
-  the P2 remediation plan (same undrained-relay gap as the audit outbox above).
+  delete, ownership transfer, backend migration, …) for downstream audit consumption. The write side is implemented
+  and tested; **draining and relaying those records to a downstream consumer is not implemented** — see
+  [docs/features/audit-trail.md](docs/features/audit-trail.md).
+- **Events outbox** — file lifecycle events (`file.created`, `file.content_updated`, `file.metadata_updated`,
+  `file.owner_transferred`, `file.deleted`) are written transactionally alongside the mutation. They are **not
+  drained** to the platform EventBroker (the same undrained-relay characteristic as the audit outbox above). The
+  `enabled_event_types` policy knob **is stored but not enforced** — `PolicyBody` round-trips an
+  `enabled_event_types` list through `GET`/`PUT /policy`, but no enqueue path consults it: every event type above is
+  always enqueued, regardless of policy. See [docs/features/policy-engine.md](docs/features/policy-engine.md) for
+  detail.
 - **Ownership transfer** — `POST /files/{id}/transfer`, atomic owner swap with audit + event + usage-delta reporting.
   Target-owner validation is **partial** — only the nil-UUID sentinel is rejected; see
-  [docs/features/ownership-transfer.md](docs/features/ownership-transfer.md) for the tracked gap.
+  [docs/features/ownership-transfer.md](docs/features/ownership-transfer.md).
 - **Backend migration** — `POST /files/{id}/migrate`, relocates a non-versioned file's content to a different backend
   with a verified, mode-aware content-hash check before committing. See
   [docs/features/backend-migration.md](docs/features/backend-migration.md).
-- **Multipart upload** — server-authoritative parts plan, per-part signed URLs, and the sidecar's report-part
-  callback are wired end-to-end. **Functional only against a `multipart_native` backend** (today: the non-durable
-  in-memory backend for dev/test, and configured S3 backends) — the default `local-fs` backend does not declare
-  `multipart_native`, so `POST /files/{id}/multipart` is rejected against the real default topology. S3 remains
-  opt-in and merge/release-gated by the ADR-0005 external-dependency security review. See
-  [docs/features/multipart-coordinator.md](docs/features/multipart-coordinator.md) for the tracked gap and current
-  vs. intended `complete` contract.
-- **Storage quota — consumer scaffolding only, not enforced.** `check_quota`/`check_quota_bytes` gate every
-  storage-increasing operation (`create_file`, `presign_version`, multipart initiate) via the `QuotaClient` port
-  (`src/infra/external_clients.rs`), and are designed to fail **closed** once a real client is wired (a client
-  error is propagated and denies the request — see `tests/enforce_test.rs`). **But `gear.rs` always constructs both
-  services with `quota_client: None`** (`TODO(P2)`, Tier 1 item 1.4), and `None` makes the check a no-op
-  (`Ok(())`) — so **storage quota is not enforced in any deployment today**; the effective default is permissive /
-  fail-**open**, the opposite of the fail-closed design intent. This is blocked on a Quota Enforcement SDK crate,
-  which does not exist yet: `gears/system/quota-enforcement/` is docs-only (PRD/DESIGN/ADRs, no Rust crate).
-  Contrast with usage reporting, which is further along — a `usage-collector-sdk` crate exists (P2 1.12), even
-  though `usage_reporter` is also still wired as `None` pending its own integration work.
+- **Multipart upload** — the control plane computes a server-authoritative parts plan and mints a per-part signed
+  URL for each; the sidecar's report-part callback records each part's hash. `complete` returns `200` with the
+  version id, size, composite hash, and manifest, accepts an optional `If-Match`, and returns `409` with the list of
+  missing parts when the upload is incomplete; `GET .../multipart/{upload_id}` introspects an in-progress upload and
+  reissues signed URLs for missing parts (resume); abort deletes the part rows and the pending version.
+  **Functional only against a `multipart_native` backend** (today: the non-durable in-memory backend for dev/test,
+  and configured S3 backends) — the default `local-fs` backend does not declare `multipart_native`, so
+  `POST /files/{id}/multipart` is rejected against the default topology. S3 remains opt-in and gated by the
+  ADR-0005 external-dependency security review. See
+  [docs/features/multipart-coordinator.md](docs/features/multipart-coordinator.md) for the full contract, including
+  the part-hash trust note below.
+- **Storage quota is not enforced.** `check_quota`/`check_quota_bytes` gate every storage-increasing operation
+  (`create_file`, `presign_version`, multipart initiate) via the `QuotaClient` port
+  (`src/infra/external_clients.rs`), and are designed to fail **closed** once a real client is wired — a client
+  error is propagated and denies the request (see `tests/enforce_test.rs`). `gear.rs` constructs both services with
+  `quota_client: None`, and `None` makes the check a no-op (`Ok(())`), so **no deployment enforces storage quota
+  today**; the effective default is permissive (fail-**open**), the opposite of the port's fail-closed design. This
+  is blocked on a Quota Enforcement SDK: `gears/system/quota-enforcement/` is docs-only (PRD/DESIGN/ADRs, no Rust
+  crate) — there is no real client to wire in. Usage reporting is further along: a `usage-collector-sdk` crate
+  exists, though `usage_reporter` is likewise wired as `None` pending its own integration.
+- **Multipart uploads trust the caller-reported per-part hash.** Single-shot uploads re-derive
+  size/hash/MIME from a real backend read-back at finalize time, so a forged claim cannot corrupt
+  stored metadata. Multipart uploads have no equivalent: `report_part` persists the caller-supplied
+  per-part hash after only a length/size check, and `complete` builds the composite hash from those
+  stored hashes with no re-read of the assembled object. See
+  [ADR-0003](docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)'s "Known gap" note for the
+  mitigation available today (`require_finalize_internal_secret`).
 
-**Not yet implemented**: sharing (shareable links), WebDAV, and quota enforcement wiring (Tier 1 item 1.4, see the P2
-storage-quota status above). The S3 backend (Tier 1 item 1.7) is implemented and wired as an opt-in backend for the
-control plane and sidecar, but it remains gated by the ADR-0005 external-dependency security review before merge or
-release use.
+**Not yet implemented**: sharing (shareable links) and WebDAV. Storage-quota enforcement is likewise not wired (see
+above). The S3 backend is implemented and available as an opt-in backend for the control plane and sidecar, gated
+by the ADR-0005 external-dependency security review before merge or release use.
 
 ### Run
 
@@ -119,5 +132,9 @@ cargo build -p cf-gears-file-storage                 # control-plane gear (lib)
 cargo build -p cf-gears-file-storage --bin sidecar   # data-plane sidecar
 cargo test  -p cf-gears-file-storage -p cf-gears-file-storage-sdk
 
-# Sidecar env (P1 static): FS_SIDECAR_ADDR, FS_SIDECAR_PUBLIC_KEY (base64url Ed25519), FS_SIDECAR_BACKEND_ROOT
+# Sidecar env (4 of 9 — see docs/operations.md for the rest): FS_SIDECAR_ADDR,
+# FS_SIDECAR_PUBLIC_KEY (base64url Ed25519), FS_SIDECAR_BACKEND_ROOT,
+# FS_SIDECAR_CONTROL_URL (control-plane base URL for the finalize/report-part
+# callbacks -- without it, uploads default to http://localhost:8080 and stay
+# `pending` forever against any other control-plane address)
 ```

@@ -136,10 +136,23 @@ CREATE TABLE file_storage.file_versions (
     mime_type        text         NOT NULL,
     size             bigint       NOT NULL  CHECK (size >= 0),  -- 0 permitted (empty file)
 
-    -- Content hash. P1 allow-list locked to SHA-256 per ADR-0002; widened in P2.
+    -- Content hash. P1 allow-list locked to SHA-256 per ADR-0002. ADR-0002's P2
+    -- vision of widening this CHECK (hash_policy/allowed_algorithms) was
+    -- superseded by ADR-0006 and never implemented: this CHECK stays locked to
+    -- SHA-256 as actually shipped (see the "P2 hash-policy widening" note below).
     hash_algorithm   text         NOT NULL  DEFAULT 'SHA-256'
                                   CHECK (hash_algorithm = 'SHA-256'),
     hash_value       bytea        NOT NULL  CHECK (octet_length(hash_value) = 32),
+
+    -- ADR-0006 content-hash mode (shipped, m20260707_000001_content_hash_modes):
+    -- which of the two hash modes produced hash_value. Every pre-existing row
+    -- backfills to 'whole-sha256' via the column default.
+    hash_mode        text         NOT NULL  DEFAULT 'whole-sha256'
+                                  CHECK (hash_mode IN ('whole-sha256', 'multipart-composite-sha256')),
+    -- Set only for hash_mode = 'multipart-composite-sha256' (number of parts
+    -- folded into the offset-manifest); NULL for 'whole-sha256'. Enforced by
+    -- the presence CHECK below.
+    part_count       integer,
 
     -- Lifecycle: 'pending' from pre-register until bind, then 'available'.
     status           text         NOT NULL  DEFAULT 'pending'
@@ -171,6 +184,11 @@ CREATE TABLE file_storage.file_versions (
 COMMENT ON TABLE file_storage.file_versions IS
     'Immutable content versions. Backend object /{file_id}/{version_id} is never mutated; a content write is a new version + a pointer swap (files.content_id).';
 
+-- ADR-0006: hash_mode = 'multipart-composite-sha256' <=> part_count IS NOT NULL.
+ALTER TABLE file_storage.file_versions
+    ADD CONSTRAINT file_versions_part_count_presence_check
+        CHECK ((hash_mode = 'multipart-composite-sha256') = (part_count IS NOT NULL));
+
 -- At most one current version per file.
 CREATE UNIQUE INDEX file_versions_current_idx
     ON file_storage.file_versions (file_id)
@@ -184,6 +202,28 @@ CREATE INDEX file_versions_pending_idx
 -- Recovery / debugging index on backend pointer ("which versions live on backend X?").
 CREATE INDEX file_versions_backend_idx
     ON file_storage.file_versions (backend_id);
+
+-- version_id is globally unique in practice (assigned via gen_random_uuid());
+-- this index makes that a DB-enforced fact so version_hash_manifest below can
+-- carry a single-column FK into file_versions despite its PK being the
+-- composite (file_id, version_id). Shipped in m20260707_000001_content_hash_modes.
+CREATE UNIQUE INDEX file_versions_version_id_unique_idx
+    ON file_storage.file_versions (version_id);
+
+
+-- Table: file_storage.version_hash_manifest ----------------------------------
+-- ADR-0006 (shipped, m20260707_000001_content_hash_modes): one row per
+-- hash_mode = 'multipart-composite-sha256' version, carrying the canonical
+-- offset-manifest text (content-hash-modes.md §3 grammar) that
+-- hash_value = sha256(manifest) was derived from. No row for a
+-- 'whole-sha256' version.
+
+CREATE TABLE file_storage.version_hash_manifest (
+    version_id  uuid         NOT NULL  PRIMARY KEY
+                             REFERENCES file_storage.file_versions (version_id) ON DELETE CASCADE,
+    manifest    text         NOT NULL,
+    created_at  timestamptz  NOT NULL  DEFAULT now()
+);
 
 
 -- Table: file_storage.files_custom_metadata ----------------------------------
@@ -209,8 +249,12 @@ COMMENT ON TABLE file_storage.files_custom_metadata IS
 
 -- P2 hash-policy widening (NOT IMPLEMENTED) ----------------------------------
 -- The P1 `file_versions.hash_algorithm` CHECK stays locked to 'SHA-256' in P2
--- as actually shipped (ADR-0002).
--- Content-hash modes (hash_mode/part_count/version_hash_manifest) are a PROPOSED future design — see ADR-0006; NOT migrated.
+-- as actually shipped (ADR-0002). There is no `hash_policy`/`allowed_algorithms`
+-- config surface in code.
+-- Content-hash modes (hash_mode/part_count/version_hash_manifest) ARE shipped —
+-- see ADR-0006 and the `file_versions.hash_mode`/`part_count` columns plus the
+-- `version_hash_manifest` table above (migrated by
+-- m20260707_000001_content_hash_modes.rs).
 
 
 -- Table: file_storage.multipart_uploads --------------------------------------
@@ -306,7 +350,7 @@ CREATE TABLE file_storage.idempotency_keys (
     response_body   text        NOT NULL,
     response_etag   text        NOT NULL,
 
-    -- P2 remediation 0.10: the authenticated subject that created this key.
+    -- The authenticated subject that created this key.
     -- Not part of the PK (the composite key below is unchanged); the domain
     -- layer fetches by the composite key and then verifies
     -- `record.subject_id == ctx.subject_id()`, treating a mismatch as
@@ -315,10 +359,11 @@ CREATE TABLE file_storage.idempotency_keys (
     -- match a real subject.
     subject_id     uuid         NOT NULL  DEFAULT '00000000-0000-0000-0000-000000000000',
 
-    -- P2 remediation 2.1: SHA-256 over a canonicalized, length-prefixed
-    -- encoding of the identity-relevant request fields (name, gts_file_type,
-    -- mime_type, custom_metadata) at insert time. A replay recomputes this
-    -- hash from the current request and rejects a mismatch with 409 Conflict
+    -- SHA-256 over a canonicalized, length-prefixed
+    -- encoding of the identity-relevant request fields (owner_kind, owner_id,
+    -- name, gts_file_type, mime_type, custom_metadata) at insert time. A
+    -- replay recomputes this hash from the current request and rejects a
+    -- mismatch with 409 Conflict
     -- ("idempotency key reused with a different request body"), instead of
     -- silently replaying the original ticket. Pre-migration rows default to
     -- an empty blob, which can never match a freshly computed digest.
@@ -345,7 +390,11 @@ CREATE TABLE file_storage.audit_outbox (
     actor_kind      text         NOT NULL,
     actor_id        uuid         NOT NULL,
     file_id         uuid,
-    operation       text         NOT NULL,        -- 'create' | 'patch_content' | 'patch_metadata' | 'delete' | etc.
+    operation       text         NOT NULL,        -- 'create' | 'patch_content' | 'patch_metadata' | 'delete_file' |
+                                                   -- 'delete_version' | 'multipart_complete' | 'multipart_abort' |
+                                                   -- 'finalize_version' | 'retention_delete' | 'backend_migrate' |
+                                                   -- 'orphan_reconcile' | 'transfer_ownership'
+                                                   -- (exhaustive: see `AuditOperation::as_str`, src/domain/audit.rs)
     outcome         text         NOT NULL,        -- 'success' | 'failure'
     detail          jsonb        NOT NULL,        -- arbitrary structured detail
     occurred_at     timestamptz  NOT NULL  DEFAULT now(),
@@ -359,15 +408,26 @@ CREATE INDEX audit_outbox_unpublished_idx
 
 -- Table: file_storage.events_outbox ------------------------------------------
 -- Outbox for EventBroker file-event publication. Same pattern as audit_outbox
--- but targets the platform EventBroker (policy-gated, per
--- cpt-cf-file-storage-fr-file-events).
+-- but targets the platform EventBroker, per cpt-cf-file-storage-fr-file-events.
+--
+-- NOT YET ENFORCED (tracked gap): PRD.md's fr-file-events requires owner
+-- policy to define which event types are enabled
+-- (`PolicyBody.enabled_event_types`, src/domain/policy.rs), and that field is
+-- stored/round-tripped through GET/PUT /policy. But no enqueue path
+-- currently consults it — every event type below is enqueued unconditionally
+-- on its triggering mutation. "Policy-gated" describes the intended design,
+-- not the shipped behavior.
 
 CREATE TABLE file_storage.events_outbox (
     event_id        uuid         PRIMARY KEY  DEFAULT gen_random_uuid(),
     tenant_id       uuid         NOT NULL,
     owner_id        uuid         NOT NULL,
     file_id         uuid         NOT NULL,
-    event_type      text         NOT NULL,        -- 'file.created' | 'file.content_replaced' | 'file.metadata_updated' | 'file.deleted'
+    event_type      text         NOT NULL,        -- 'file.created' | 'file.content_updated' |
+                                                   -- 'file.metadata_updated' | 'file.owner_transferred' |
+                                                   -- 'file.deleted'
+                                                   -- (exhaustive: see every `make_file_event`/`FileEvent{...}`
+                                                   -- call site under src/domain/service/ and src/domain/cleanup.rs)
     payload         jsonb        NOT NULL,
     occurred_at     timestamptz  NOT NULL  DEFAULT now(),
     published_at    timestamptz
@@ -405,7 +465,7 @@ CREATE TABLE file_storage.policies (
 CREATE INDEX policies_scope_idx
     ON file_storage.policies (tenant_id, scope, scope_owner_id);
 
--- P2 remediation 2.4: two partial unique indexes (not one plain composite
+-- Two partial unique indexes (not one plain composite
 -- unique index) close the upsert delete-then-insert race. Postgres (and
 -- SQLite) treat every NULL as distinct for uniqueness, so a single
 -- `UNIQUE (tenant_id, scope, scope_owner_id)` index would dedupe user-scope

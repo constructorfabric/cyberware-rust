@@ -4,12 +4,11 @@ Updated:  2026-07-08 by Constructor Tech
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-audit-trail-implemented`
 
-> **Status: write-side shipped; drain/relay deferred.** Every write mutation this
-> gear performs inserts an audit row transactionally into `audit_outbox`. What is
-> **not** implemented is anything downstream of that insert: there is no consumer,
-> exporter, or relay that ever reads a row back out and marks it `published_at`.
-> See [§5 "Outbox Drain to a Downstream Sink (NOT IMPLEMENTED)"](#outbox-drain-to-a-downstream-sink-not-implemented)
-> below for the explicit gap.
+> Every write mutation this gear performs inserts an audit row transactionally
+> into `audit_outbox`. There is nothing downstream of that insert: no consumer,
+> exporter, or relay ever reads a row back out and marks it `published_at`. See
+> [§5 "Outbox Drain to a Downstream Sink (NOT IMPLEMENTED)"](#outbox-drain-to-a-downstream-sink-not-implemented)
+> below.
 
 
 
@@ -40,15 +39,41 @@ Updated:  2026-07-08 by Constructor Tech
 
 ### 1.1 Overview
 
-A transactional-outbox audit trail: every write mutation this gear performs — file
-create, finalize, bind, metadata patch, delete (file/version), multipart
-complete/abort, ownership transfer, backend migration, and the background
-cleanup engine's retention-delete/orphan-reconcile actions — inserts one
-`AuditEntry` row into the `audit_outbox` table **in the same DB transaction**
-as the mutation it describes. There is no separate "log after the fact" step
-and no code path that mutates state without also building an audit row, so a
-rolled-back mutation leaves zero audit rows (the same transaction covers
-both).
+A transactional-outbox audit trail: every write mutation that changes a
+**file's or version's durable, user-visible state** — create, finalize, bind,
+metadata patch, delete (file/version), multipart complete/abort, ownership
+transfer, backend migration, and the background cleanup engine's
+retention-delete/orphan-reconcile actions — inserts one `AuditEntry` row into
+the `audit_outbox` table **in the same DB transaction** as the mutation it
+describes. There is no separate "log after the fact" step for any of those
+operations, so a rolled-back mutation among them leaves zero audit rows (the
+same transaction covers both).
+
+This coverage is not, however, "every mutation in the gear" — a few mutating
+code paths are deliberately unaudited today:
+
+- **Transient coordination rows**, not yet a durable file/version state
+  change a consumer would care about: `presign_version`'s pending-version
+  insert (`FileService::presign_version` in `src/domain/service/create.rs` →
+  `Store::insert_pending_version`, `src/infra/storage/store/versions.rs`) and
+  multipart initiate's session + pending-version insert and per-part upserts
+  (`Store::create_multipart_upload`/`upsert_multipart_part`,
+  `src/infra/storage/store/multipart.rs`) write no audit row. These rows are
+  provisional — they either get promoted into an already-audited mutation
+  (`finalize_upload`/`bind`, `complete_multipart_upload`) or are cleaned up
+  by the orphan-reconciliation sweep (which *is* audited, as
+  `OrphanReconcile`) — so the durable outcome is always covered even though
+  the intermediate coordination state is not.
+- **Policy and retention-rule writes.** `upsert_policy`/`insert_retention_rule`/
+  `delete_retention_rule` (`src/infra/storage/store/policy.rs`) mutate
+  tenant/user policy and retention-rule rows with no audit row. The PRD's
+  audit-trail requirement (`cpt-cf-file-storage-fr-audit-trail`) scopes
+  audit records to file write operations (upload, content replacement,
+  delete, metadata update); policy and retention-rule administration is a
+  separate, unaudited surface. These are still durable configuration changes
+  with real compliance relevance (they alter what a *future* write is allowed
+  to do), so the absence of an audit row here is a real limitation worth
+  knowing about even though it sits outside this requirement's stated scope.
 
 This feature has **no REST endpoint of its own** — it is a pure side effect of
 other features' write paths. The only way to read `audit_outbox` rows today is
@@ -74,21 +99,20 @@ events — see `cpt-cf-file-storage-fr-file-events`).
 **Principles**: `cpt-cf-file-storage-principle-control-no-content` (audit rows carry
 only metadata/identifiers in `detail`, never content bytes)
 
-> **Caveat (P2 — outbox drain/relay is NOT implemented).** `audit_outbox.published_at`
-> is written as `NULL` on every insert (`AuditRepo::insert`) and nothing in this
-> codebase ever sets it. Tier-4 item 4.1 of the P2 remediation plan ("EventBroker
-> relay") — which would drain both `audit_outbox` and its sibling `events_outbox`
-> to a downstream platform sink — is **not scheduled/implemented**. Concretely
-> this means: (a) rows accumulate in `audit_outbox` indefinitely with no retention
-> or archival process; (b) the background cleanup sweep's idempotency-key-expiry
-> step (`cleanup.rs::run_sweep`, step 4) *deliberately* does **not** touch
+> **Caveat: outbox drain/relay is not implemented.** `audit_outbox.published_at`
+> is written as `NULL` on every insert (`AuditRepo::insert`), and nothing in
+> this codebase ever sets it. No relay drains `audit_outbox` (or its sibling
+> `events_outbox`) to a downstream platform sink. Concretely this means: (a)
+> rows accumulate in `audit_outbox` indefinitely with no retention or archival
+> process; (b) the background cleanup sweep's idempotency-key-expiry step
+> (`cleanup.rs::run_sweep`, step 4) *deliberately* does **not** touch
 > `audit_outbox`/`events_outbox` — the inline comment there explains that a
 > row-age-based purge would silently drop rows that were never delivered, since
 > `published_at` can never become non-`NULL` today; (c) there is no way for any
 > downstream consumer to actually receive these audit events short of a direct
 > database read. The write-side guarantee (100% coverage, same-transaction
-> atomicity) is real and tested; the "and it reaches an audit sink" half of the
-> feature does not exist yet. See `../DEFERRED_ITEMS_PLAN.md` Tier-4 item 4.1.
+> atomicity) is real and tested; nothing reads the outbox back out and
+> delivers it anywhere.
 
 ### 1.3 Actors
 
@@ -101,14 +125,25 @@ The background cleanup engine (`cpt-cf-file-storage-fr-orphan-reconciliation`,
 `cpt-cf-file-storage-fr-retention-policies`) also writes audit rows for its own
 sweep-triggered deletions, using a synthetic `actor_kind = "system"`,
 `actor_id = Uuid::nil()` identity rather than either actor above — there is no
-human or peer-gear caller to attribute those rows to. One inconsistency worth
-noting as observed, not corrected here: the `OrphanReconcile` audit rows built
-in `cleanup.rs` (`delete_abandoned_pending_version`, `orphan_reconcile_audit`)
-also set `tenant_id = Uuid::nil()`, whereas the `RetentionDelete` audit rows
-(`expire_file`) correctly carry the real `file.tenant_id`. `audit_outbox` has no
-tenant secure-column enforcement (`#[secure(no_tenant, ...)]`), so this does not
-bypass any access control, but it does mean a tenant-scoped query over
-orphan-reconcile rows by `tenant_id` would miss them.
+human or peer-gear caller to attribute those rows to. The `OrphanReconcile`
+audit rows built via `cleanup.rs`'s `orphan_reconcile_audit` helper carry the
+real `file.tenant_id` in the same way the `RetentionDelete` rows (`expire_file`)
+do: `maybe_delete_orphaned_file` resolves it from the orphan candidate's own
+file row, and `cleanup_expired_session_version`'s pending-version cleanup
+resolves it via a fresh `self.store.get_file(...)` lookup. `tenant_id` only
+falls back to `Uuid::nil()` in that second path when the file row is already
+gone by the time the sweep gets to it (`map_or_else(Uuid::nil, |file|
+file.tenant_id)`) — i.e. only when there is genuinely no real tenant left to
+attribute the row to.
+
+A fourth synthetic identity, `actor_kind = "sidecar"` with `actor_id =
+Uuid::nil()`, is used for `finalize_upload_by_token`'s `FinalizeVersion` audit
+row — the sidecar's token-authenticated finalize callback carries no
+`SecurityContext` to derive `"app"`/`"user"` from. The sidecar's sibling
+report-part callback (`MultipartService::report_part`) writes no audit row at
+all: it only records a provisional per-part upload upsert, one of the
+transient coordination writes described in §1.1 above, folded into an audited
+mutation only once `complete_multipart_upload` runs.
 
 ### 1.4 References
 
@@ -176,10 +211,10 @@ payload
 
 **Steps**:
 1. [x] - `p1` - Extract `tenant_id`/`actor_id` from the `SecurityContext` (`ctx.subject_tenant_id()`, `ctx.subject_id()`), or use `Uuid::nil()` for a background-sweep-originated entry - `inst-buildentry-identity`
-2. [x] - `p1` - Compute `actor_kind`: `"app"` if `ctx.subject_type() == Some("app")`, else `"user"`; `"system"` for the cleanup engine's own entries - `inst-buildentry-actor-kind`
+2. [x] - `p1` - Compute `actor_kind`: `"app"` if `ctx.subject_type() == Some("app")`, else `"user"` (`Self::actor_kind`); `"system"` for the cleanup engine's own entries; `"sidecar"` (with `Uuid::nil()` actor id) for `finalize_upload_by_token`'s token-authenticated callback, which has no `SecurityContext` to derive an actor from - `inst-buildentry-actor-kind`
 3. [x] - `p1` - Select the `AuditOperation` variant matching the mutation (`Create`, `PatchContent`, `PatchMetadata`, `DeleteFile`, `DeleteVersion`, `MultipartComplete`, `MultipartAbort`, `FinalizeVersion`, `RetentionDelete`, `BackendMigrate`, `OrphanReconcile`, `TransferOwnership`) - `inst-buildentry-operation`
 4. [x] - `p1` - Build a `detail` JSON object with operation-specific identifiers (e.g. `version_id`, `from_backend`/`to_backend`, `from_owner_id`/`to_owner_id`) — never content bytes - `inst-buildentry-detail`
-5. [x] - `p1` - Construct the `AuditEntry` via `AuditEntry::success(...)` (or `::failure(...)`, defined but not currently called by any production call site — every shipped call site only ever records successes, since a failed mutation's transaction rolls back before an audit row would matter) with `occurred_at = now_utc()` - `inst-buildentry-construct`
+5. [x] - `p1` - Construct the `AuditEntry` via `AuditEntry::success(...)` (or `::failure(...)`, defined but never called by any call site — every call site only ever records successes, since a failed mutation's transaction rolls back before an audit row would matter) with `occurred_at = now_utc()` - `inst-buildentry-construct`
 6. [x] - `p1` - `AuditRepo::insert` maps the entry to an `ActiveModel` (`event_id = Uuid::now_v7()`, `published_at = None`) and calls `secure_insert` under `AccessScope::allow_all()` (the table has no tenant secure-column; `tenant_id` is a plain data column set from the caller's context) - `inst-buildentry-insert`
 7. [x] - `p1` - **RETURN** control to the caller once the surrounding transaction commits - `inst-buildentry-return`
 
@@ -194,14 +229,14 @@ payload
 **Initial State**: unpublished (`published_at IS NULL`)
 
 **Transitions**:
-1. [ ] - `p2` - **FROM** unpublished **TO** published **WHEN** a downstream drain/relay process reads the row and marks `published_at` — **this transition never fires in the current codebase; no drain process exists** (Tier-4 item 4.1, NOT IMPLEMENTED) - `inst-st-audit-never-published`
+1. [ ] - `p2` - **FROM** unpublished **TO** published **WHEN** a downstream drain/relay process reads the row and marks `published_at` — **this transition never fires; no drain process exists** - `inst-st-audit-never-published`
 
-Every `audit_outbox` row shipped today is permanently `unpublished`. The
+Every `audit_outbox` row today is permanently `unpublished`. The
 `published_at` column and its supporting index
 (`audit_outbox_unpublished_idx ... WHERE published_at IS NULL`) were added in
 anticipation of a drain process that does not exist yet; they are inert schema
-today, not dead weight to be removed, since the intent is for item 4.1 to
-implement the consumer against this exact shape.
+today, not dead weight to be removed, since a future consumer would implement
+against this exact shape.
 
 ## 5. Definitions of Done
 
@@ -253,23 +288,22 @@ responsible for populating `tenant_id` correctly.
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-dod-audit-trail-relay`
 
-**NOT IMPLEMENTED, no target date.**
+**NOT IMPLEMENTED.**
 
 The system **SHOULD** eventually drain unpublished `audit_outbox` rows to a
-platform audit sink (the same Tier-4 item 4.1 "EventBroker relay" that would
-also drain `events_outbox`), marking `published_at` on successful delivery.
-**None of this exists today.** Nothing in `cf-gears-file-storage` reads
-`audit_outbox` back out except test helpers (`Store::list_audit`,
-`AuditRepo::list_for_file`) and ad hoc SQL. This DoD line is recorded
-specifically so the gap is tracked as an explicit, acknowledged limitation
-rather than silently assumed-done because the write side is fully tested.
+platform audit sink (the same relay that would also drain `events_outbox`),
+marking `published_at` on successful delivery. **None of this exists today.**
+Nothing in `cf-gears-file-storage` reads `audit_outbox` back out except test
+helpers (`Store::list_audit`, `AuditRepo::list_for_file`) and ad hoc SQL. This
+DoD line stays unchecked so the gap remains an explicit, acknowledged
+limitation rather than silently assumed done because the write side is fully
+tested.
 
 **Implements**: (nothing yet — this is the open item)
 
 **Touches**:
 - DB Table: `audit_outbox` (read side, not yet built)
-- Gears: a future relay/drain component (not yet designed beyond the Tier-4
-  plan entry)
+- Gears: a future relay/drain component (not yet designed)
 
 ## 6. Acceptance Criteria
 
@@ -285,5 +319,5 @@ rather than silently assumed-done because the write side is fully tested.
 - [x] `transfer_ownership` leaves exactly one `transfer_ownership` audit row (`tests/ownership_test.rs::transfer_ownership_leaves_audit_row`); a CAS-losing transfer (target row not found) leaves **no** audit row and **no** file event (`::transfer_ownership_no_row_means_no_audit_and_no_event`)
 - [x] `migrate_backend` leaves at least one `backend_migrate` audit row on a real migration, and **zero** when the migration is a same-backend no-op (`tests/cleanup_test.rs::migrate_backend_moves_content_and_updates_version_row`, `::migrate_backend_to_same_backend_is_noop`)
 - [x] The cleanup engine's retention-expiry sweep leaves a `retention_delete` audit row per expired file, and its abandoned-pending-version reclamation leaves an `orphan_reconcile` row (`tests/cleanup_test.rs`, retention/orphan sweep tests)
-- [ ] `audit_outbox` rows are drained/relayed to a downstream platform audit sink — **NOT IMPLEMENTED**; `published_at` is written `NULL` on every insert and never updated by any code path in this repository (Tier-4 item 4.1, no target date; see the caveat in §1.2 and the DoD in §5)
+- [ ] `audit_outbox` rows are drained/relayed to a downstream platform audit sink — **NOT IMPLEMENTED**; `published_at` is written `NULL` on every insert and never updated by any code path in this repository (see the caveat in §1.2 and the DoD in §5)
 - [ ] The audit trail is queryable through this gear's own REST API — **NOT IMPLEMENTED**; there is no `GET`-style audit endpoint, only direct SQL / test-only repo methods

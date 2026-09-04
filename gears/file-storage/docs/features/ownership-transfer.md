@@ -4,12 +4,11 @@ Updated:  2026-07-08 by Constructor Tech
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-ownership-transfer-implemented`
 
-> **Status: PARTIAL.** The endpoint, atomic owner swap, audit row, file event,
-> and usage-delta reporting are all shipped and tested. What is **not**
-> implemented is validating that `new_owner_id` names a real principal: the
-> only guard is rejecting the nil UUID. See
-> [§1.2's caveat](#12-purpose) and the acceptance criteria in §6 for the
-> explicit, tracked gap.
+> The endpoint, atomic owner swap, audit row, file event, and usage-delta
+> reporting are fully tested. Target-owner validation is partial: the only
+> guard is rejecting the nil UUID; `new_owner_id` is not verified to name a
+> real principal. See [§1.2's caveat](#12-purpose) and the acceptance
+> criteria in §6.
 
 
 
@@ -56,7 +55,7 @@ references to it. Because the swap, the audit row, and the file event are all
 written in one transaction, a caller can never observe a state where the
 owner changed but no audit trail exists for it, or vice versa.
 
-> **Caveat (P2 2.12 — target-owner validation is PARTIAL).** `transfer_ownership`
+> **Caveat: target-owner validation is partial.** `transfer_ownership`
 > rejects `new_owner_id` only when it is the **nil UUID** — an obviously
 > malformed sentinel value, checked with `Uuid::is_nil()`
 > (`src/domain/service/write.rs::transfer_ownership`). It does **not** verify
@@ -74,8 +73,8 @@ owner changed but no audit trail exists for it, or vice versa.
 > into a different tenant, only to (mis)attribute it to an arbitrary UUID
 > within the caller's own tenant. Whether ownership transfer should also
 > require a distinct privileged-transfer grant (rather than reusing the
-> ordinary file `WRITE` authorization) is a related, separately open decision
-> tied to item 0.7's admin-scope work — not resolved by this feature either.
+> ordinary file `WRITE` authorization) is a related, separately open
+> admin-scope authorization decision — not resolved by this feature either.
 
 **Requirements**: `cpt-cf-file-storage-fr-ownership-transfer`
 
@@ -111,9 +110,13 @@ owner changed but no audit trail exists for it, or vice versa.
 - The file's `owner_kind`/`owner_id` are atomically replaced; an audit row and
   a `file.owner_transferred` event are recorded in the same transaction; usage
   deltas are reported for the old and new owner; the caller receives the
-  updated `File` representation (captured metadata is read **before** the
-  transfer, since the caller may lose read access under the new owner
-  immediately afterward)
+  updated `File` representation, reflecting the new owner and bumped
+  `last_modified_at` — both the `File` row and its custom metadata are
+  captured **before** the transfer and the known post-transfer field changes
+  applied locally, rather than re-read from the DB afterward, since an
+  owner-constrained `AccessScope` captured before the swap would no longer
+  match the row under its new owner and a successful transfer would otherwise
+  incorrectly surface as `404`
 
 **Error Scenarios**:
 - `new_owner_id` is the nil UUID — `400` (`Validation`, field `new_owner_id`)
@@ -131,6 +134,8 @@ owner changed but no audit trail exists for it, or vice versa.
 3. [x] - `p1` - API: parse `new_owner_kind`; reject anything other than `"user"`/`"app"` with `400` - `inst-transfer-kind-parse`
 4. [x] - `p1` - Control plane: load the file scoped to the caller's tenant; authorize `WRITE` on `file_id` - `inst-transfer-authz`
 5. [x] - `p1` - Control plane: capture the file's custom metadata **before** the transfer, so a caller who loses read access under the new owner still receives accurate metadata in the response - `inst-transfer-capture-meta`
+
+   The `File` row itself is already held from step 4's prefetch; it is *not* re-read after the commit — the response is built by applying the known post-transfer field changes (`owner_kind`, `owner_id`, `last_modified_at`) to that pre-transfer row, avoiding a post-commit re-read under a now-stale, potentially owner-constrained `AccessScope`.
 6. [x] - `p1` - Build the `TransferOwnership` audit row and the `file.owner_transferred` file event, both carrying `from_owner_kind`/`from_owner_id`/`to_owner_kind`/`to_owner_id` - `inst-transfer-build-audit-event`
 7. [x] - `p1` - DB: `transfer_ownership_atomic` — in one transaction, `UPDATE files SET owner_kind, owner_id` scoped to the tenant + `file_id`, insert the audit row (only if the update matched a row), insert the event row; RETURN whether a row was updated - `inst-transfer-atomic-update`
 8. [x] - `p1` - **IF** no row was updated (file not found, or removed by a concurrent delete): RETURN `404 FileNotFound`, no audit row, no event - `inst-transfer-not-found`
@@ -213,5 +218,5 @@ nil-UUID guard.
 - [x] `new_owner_id == Uuid::nil()` is rejected with a validation error before any DB write (`::transfer_to_malformed_owner_is_rejected`)
 - [x] A well-formed `new_owner_id` under the caller's own tenant succeeds (`::transfer_to_same_tenant_member_succeeds`) — this is also the only kind of transfer the endpoint can perform, since `tenant_id` is never taken from the request
 - [x] Usage deltas are reported: the old owner is debited and the new owner is credited by the file's total available-version bytes, and by one `file_count_delta` each
-- [ ] `new_owner_id` is validated against a real, existing, same-tenant principal — **PARTIAL / NOT IMPLEMENTED**; only the nil-UUID sentinel is rejected today, blocked on an account-management SDK dependency (P2 remediation item 2.12; see the caveat in §1.2 and the DoD in §5)
-- [ ] Ownership transfer requires a distinct privileged-transfer authorization grant rather than reusing the file's ordinary `WRITE` grant — **not decided/not implemented**; tracked alongside item 0.7's admin-scope work, out of this feature's current scope
+- [ ] `new_owner_id` is validated against a real, existing, same-tenant principal — **PARTIAL**; only the nil-UUID sentinel is rejected today, blocked on an account-management SDK dependency (see the caveat in §1.2 and the DoD in §5)
+- [ ] Ownership transfer requires a distinct privileged-transfer authorization grant rather than reusing the file's ordinary `WRITE` grant — **not decided**; a separate, open admin-scope authorization question, out of this feature's current scope

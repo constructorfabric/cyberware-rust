@@ -30,11 +30,14 @@ date: 2026-07-07
 
 ## Context and Problem Statement
 
-Tier 1 item 1.7 of the P2 remediation plan (`../IMPLEMENTATION_PLAN_TEMP.txt`, "No durable/distributed storage backend
-(S3) despite doc claims") requires an `S3Backend` implementing the `StorageBackend` trait
-(`src/infra/backend/mod.rs`), the seam every backend type must satisfy. Today the crate only ships two non-durable
-backend types (`LocalFsBackend`, `InMemoryBackend`); neither survives a distributed, multi-replica deployment, which
-blocks the `durable: true` capability the plan's Tier 1 gate requires.
+Tier 1 item 1.7 of the P2 remediation plan ("No durable/distributed storage backend (S3) despite doc claims")
+requires an `S3Backend` implementing the `StorageBackend` trait (`src/infra/backend/mod.rs`), the seam every backend
+type must satisfy. Before this ADR, the crate shipped two backend types: `LocalFsBackend` (sets `durable: true` —
+writes survive a process restart on a single machine — but has no native multipart support) and `InMemoryBackend`
+(sets `multipart_native: true`, but is explicitly non-durable — content is lost on restart). Neither, on its own,
+survives a **distributed, multi-replica** deployment without an externally-shared mount: `local-fs` durability is
+real but confined to whatever filesystem the process sees, and `in-memory` durability is deliberately absent
+altogether. `S3Backend` is needed to close that distributed-durability gap.
 
 An `S3Backend` needs, at minimum, the following operations, all invoked from **async** (tokio) code:
 
@@ -154,7 +157,11 @@ whichever client is ultimately vendored — `rusty-s3` (+ `quick-xml`) per this 
 later invokes the documented fallback — **must clear a team security review before being merged as a real
 dependency**. The team has selected `rusty-s3` as the S3 client pending that review; this ADR records the comparison
 and the team's decision, but does not itself constitute the review. That is why this ADR's status is `proposed`, not
-`accepted`.
+`accepted`. The same gate also covers `S3Backend`'s create-exclusive `publish_exclusive` override (see Consequences
+below): it is implemented and opt-in (S3 itself is only used when a deployment configures `s3_backends`), but its
+atomic-write guarantee is provider-dependent, and confirming that a specific target endpoint actually honours
+`If-None-Match: *` conditional writes — rather than silently ignoring the header — is a required part of this
+review before S3 leaves the gate (see also ADR-0003's "Known gap" discussion of the same override).
 
 **Current implementation status (2026-07-08).** The branch contains working S3 backend code and runtime dependency
 wiring so integration tests and operator config can exercise the selected design. This does **not** close the gate
@@ -187,6 +194,11 @@ off.
   `ListObjectsV2` requests, extracting the continuation token from each `quick-xml`-parsed response and looping until
   exhausted, then flattening into `StorageBackend`'s contractual `Vec<String>`. Unlike an auto-paginating client
   abstraction, this pagination loop is code this gear owns and tests directly.
+* `StorageBackend::publish_exclusive` (the sidecar's single-shot upload path, ADR-0003) is implemented for `S3Backend`
+  as an atomic conditional write: `If-None-Match: *` on the terminal `PutObject`/`CompleteMultipartUpload`, mapping
+  S3's `412 Precondition Failed` to a `created: false` outcome instead of the trait's non-atomic `exists`-then-`put`
+  default. Like the rest of `S3Backend`, this is opt-in (only exercised once a deployment configures `s3_backends`)
+  and its guarantee is provider-dependent — see the Security-review gate above and ADR-0003's "Known gap" discussion.
 * **In-house XML/error-handling burden.** Because `rusty-s3` is sign-only, this gear — not the crate — owns parsing
   every S3 XML response body (`ListObjectsV2`, `CompleteMultipartUpload`) and mapping S3's XML error schema to
   `StorageBackend`'s error types, via `quick-xml`. This is an accepted, explicit trade-off for zero HTTP/TLS stack
@@ -208,9 +220,13 @@ off.
   recommends — covering their transitive dependency trees, licensing (`rusty-s3`: BSD-2-Clause; `quick-xml`: MIT,
   both compatible), and known advisories (confirming RUSTSEC-2026-0194 and RUSTSEC-2026-0195 are fixed at the pinned
   `quick-xml` version).
-* Code review confirming `S3Backend` is the only new backend type that sets `durable: true` and `multipart_native:
-  true` in its `BackendCapabilities`, and that it implements `get_range` and `size`/`exists` natively rather than via
-  the trait's default (whole-object) fallbacks.
+* Code review confirming `S3Backend` sets `durable: true` (already set by `LocalFsBackend`) **and**
+  `multipart_native: true` (already set by `InMemoryBackend`) — the first backend type to combine both in a way that
+  also survives a distributed, multi-replica deployment — and that it implements `get_range` and `size`/`exists`
+  natively rather than via the trait's default (whole-object) fallbacks.
+* Confirming, against the specific target S3-compatible endpoint(s) a deployment intends to use, that conditional
+  writes (`If-None-Match: *`) are actually enforced rather than silently ignored — required before `S3Backend`'s
+  `publish_exclusive` override can be relied on for the create-exclusive guarantee ADR-0003 describes.
 * `cargo tree` (or equivalent) run against the crate with `rusty-s3` and `quick-xml` added, confirming no second
   `reqwest`/`hyper`/TLS major version is pulled in beyond what the crate already links.
 * Integration tests (item 1.7's test strategy, `s3s-fs`-backed) covering: `put`/`get` round-trip, `Range` `get`,
@@ -367,7 +383,6 @@ has not yet run against the chosen `rusty-s3` + `quick-xml` pair (see [Confirmat
 - **PRD**: [PRD.md](../PRD.md)
 - **DESIGN**: [DESIGN.md](../DESIGN.md)
 - **Remediation plan**: Tier 1 item 1.7, "No durable/distributed storage backend (S3) despite doc claims"
-  (`../IMPLEMENTATION_PLAN_TEMP.txt`)
 - **Related**: [ADR-0003: Split the Data Plane into a Signed-URL Sidecar](./0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)
 - **Related**: [ADR-0004: Signed-URL Token Format & Transport](./0004-cpt-cf-file-storage-adr-signed-url-transport.md)
 
@@ -375,8 +390,9 @@ This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-file-storage-fr-backend-abstraction` — `S3Backend` is a new `StorageBackend` implementation, chosen client
   determines how cleanly it fits the trait's `put`/`get`/`get_range`/`size`/`exists`/`delete`/multipart surface
-* `cpt-cf-file-storage-fr-backend-capabilities` — `S3Backend` is the gear's first backend to set `durable: true` and
-  `multipart_native: true`
+* `cpt-cf-file-storage-fr-backend-capabilities` — `S3Backend` sets both `durable: true` (also set by
+  `LocalFsBackend`) and `multipart_native: true` (also set by `InMemoryBackend`); it is the first backend to combine
+  both while also surviving a distributed, multi-replica deployment
 * `cpt-cf-file-storage-nfr-bandwidth` (ADR-0003) — the sidecar is the sole component that opens the chosen S3 client
   and moves bytes against it; the client choice does not change the sidecar/control-plane split
 * `cpt-cf-file-storage-adr-signed-url-transport` (ADR-0004) — confirms the chosen client's presigning features are

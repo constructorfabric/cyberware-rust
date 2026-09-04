@@ -458,10 +458,8 @@ namespace, and has no JWT-bypass paths — its surface is identical for every co
 platform authentication and the Authorization Service.
 
 **Rationale**: Public/anonymous access is a sharing concern, not a storage concern. Keeping FileStorage purely
-internal in P1 (a) lets sharing semantics evolve independently inside a single gear with the appropriate
-data model, (b) eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage, and
-(c) matches the main-branch design where external sharing was already a separate (P2) FR rather than a P1
-storage concern.
+internal in P1 lets sharing semantics evolve independently inside a single gear with the appropriate data model, and
+eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage.
 
 ### 5.4 Policies (Phase 2)
 
@@ -535,9 +533,9 @@ exhaustion for the platform. Quota checks must cover all storage-consuming opera
 prevent quota bypass through versioned overwrites.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
-**Implementation status (P2)**: not met yet; the requirement remains open. Storage quota is
-**not enforced in any deployment** — the Quota Enforcement service this depends on does not exist yet.
-`file-storage` has built its side and is ready to consume the check once that service ships. Technical detail in
+**Current status**: Storage quota is **not enforced in any deployment** — the Quota Enforcement service this
+requirement depends on does not exist yet. `file-storage`'s consumer side (the `QuotaClient` port and its
+fail-closed call sites) is implemented and ready to enforce the check once that service exists. Technical detail in
 [DESIGN.md](./DESIGN.md) (`quota-adapter`) and [operations.md](./operations.md).
 
 ### 5.5 Metadata
@@ -961,7 +959,13 @@ system **MUST**:
 - Support `If-None-Match` on download/metadata reads — return `304 Not Modified` when the ETag matches
 - Support `If-Match` on reads — return `400 failed_precondition` when the ETag does not match
 - Require `If-Match` on every content **bind** (the optimistic CAS that swaps `content_id`) and on `DELETE` —
-  `400 failed_precondition` on mismatch. The retry re-binds the already-uploaded `version_id` without re-upload
+  `400 failed_precondition` on mismatch. The retry re-binds the already-uploaded `version_id` without re-upload.
+  The bind may also execute **inside** the upload itself (`bind: "auto"`, the
+  default on `POST /files`) — the CAS requirement is unchanged, only the transport differs: multipart `complete`
+  reuses its own `If-Match` (absent → the first-content `content_id IS NULL` case) as the embedded bind's
+  precondition, and the single-part finalize binds strictly under `content_id IS NULL` (first content of a new file
+  only). A lost CAS never fails the upload: it is reported (`bind_state: "conflict"` / `X-FS-Bound: conflict` with
+  the current ETag) and resolved by the same manual re-bind, still with no re-upload
 
 **ETag is content-only.** Metadata-only updates bump `meta_version` and `last_modified_at` but **MUST NOT** change the
 ETag or content hash — both remain tied to the content. Consequently `If-Match` on a metadata-only update protects
@@ -1196,8 +1200,8 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 (per `cpt-cf-file-storage-fr-storage-quota`)
 **Compatibility**: Contract follows platform quota enforcement protocol; changes require coordinated release.
 
-**Implementation status (P2)**: not satisfied yet — the Quota Enforcement counterparty does not
-exist, so this contract is not exercised in any deployment. `file-storage`'s side is ready. See [DESIGN.md](./DESIGN.md).
+**Current status**: The Quota Enforcement counterparty does not exist, so this contract is not exercised in any
+deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DESIGN.md).
 
 #### EventBroker Contract
 
