@@ -170,13 +170,22 @@ and a custom bounded store is feasible (see §3.2's rejected alternatives). The
 chosen bound is instead a small admission structure owned by the gateway; the
 mechanism, its costs, and why the custom store was rejected are in §3.2.
 
-### D4: `max_keys` on in-flight zones is left as-is
+### D4: `max_keys` on in-flight zones is enforced on admission too
 
-The in-flight gate already reads `max_keys` (`prune_idle_keys` skips the scan
-below the cap and evicts unreferenced gates above it) and is covered by tests. It
-is a soft bound — a gate held by an in-flight request cannot be evicted — but
-that ceiling is bounded by real concurrency, not by attacker-supplied key
-cardinality. No change.
+The in-flight gate originally read `max_keys` only in the sweep
+(`prune_idle_keys` skips the scan below the cap and evicts unreferenced gates
+above it). That left the gate map unbounded *between* sweeps: a pre-auth
+IP-keyed in-flight zone could be grown by attacker-supplied key cardinality
+exactly as rate zones could before W2. `InFlightZone::gate` now applies the
+same admission contract as `RateZone::admit`: a never-seen key past the cap is
+refused (`kind = "max_keys"`, `Retry-After` = prune interval) before a gate is
+created, dry-run logs and serves without a gate, and the sweep reopens
+admission. What remains different from rate zones is eviction only: a gate
+held by a live request is never evicted, so a cap filled by live requests
+stays closed until they finish.
+
+Both zone kinds keep the tracked-key count in an atomic counter next to the
+keyed structure, so the hot-path cap check never walks every `DashMap` shard.
 
 ## 3.1 Work Item W1 — Remove the runtime dependency from the contract
 
@@ -262,7 +271,7 @@ This is the reviewer's second suggested remedy ("a bounded keyed store").
   status **without** reaching `check_key`, so `governor`'s internal map cannot
   grow past the admitted set.
 * Unadmitted keys never reach `check_key` in **any** mode: enforce mode rejects
-  them, dry-run mode logs the would-be rejection and serves the request without
+  them, dry-run mode counts and logs the would-be rejection and serves the request without
   consulting the limiter. Feeding unadmitted dry-run keys to the limiter would
   create keyed-store state past the cap, unbounding memory exactly in the mode
   operators use for tuning.
@@ -416,10 +425,11 @@ zone in production shows churn.
 
 ### [Risk] `max_keys` semantics differ between zone kinds
 
-After this work, `max_keys` is a hard bound on rate zones and a soft bound on
-in-flight zones. Two meanings for one field name is a documentation hazard.
-Mitigation: state the difference in both zone structs' doc comments, or rename
-one. Renaming is a config-schema break and is not proposed here.
+After this work, `max_keys` caps admission on both zone kinds, but eviction
+differs: rate zones reset admission wholesale every sweep, in-flight zones
+evict only gates not held by a live request. The residual difference is stated
+in both zone structs' doc comments (see D4); renaming the field would be a
+config-schema break and is not proposed here.
 
 ### [Trade-off] Removing the extractor closes an extension point
 

@@ -402,6 +402,117 @@ async fn metrics_capture_rate_limit() -> Result<()> {
 }
 
 #[tokio::test]
+async fn metrics_capture_dry_run() -> Result<()> {
+    let _lock = METER_LOCK.lock().await;
+    let cfg = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "127.0.0.1:0",
+                "cors_enabled": false,
+                "auth_disabled": true,
+                "rate_limit_zones": {
+                    "rl_dry": {
+                        "rate_limit": "1/s",
+                        "burst_limit": 1,
+                        "key": { "type": "ip" },
+                        "max_keys": 1000
+                    },
+                    "rl_enforced": {
+                        "rate_limit": "1/s",
+                        "burst_limit": 1,
+                        "key": { "type": "ip" },
+                        "max_keys": 1000
+                    }
+                },
+            }
+        }
+    });
+
+    let (provider, exporter) = install_test_meter_provider();
+    let ctx = create_api_gateway_ctx(cfg);
+    let api = api_gateway::ApiGateway::default();
+    api.init(&ctx).await?;
+
+    let throttling = |zone: &str, dry_run: bool| ThrottlingSpec {
+        rate_limit_zone: Some(zone.to_owned()),
+        in_flight_limit_zone: None,
+        require_security_context: false,
+        dry_run,
+    };
+    let router = OperationBuilder::get("/tests/v1/dry")
+        .operation_id("test:limited-dry-run")
+        .summary("Rate-limited endpoint in dry-run mode")
+        .anonymous()
+        .with_throttling(throttling("rl_dry", true))
+        .json_response(StatusCode::OK, "OK")
+        .handler(axum::routing::get(ok_handler))
+        .register(Router::new(), &api);
+    let router = OperationBuilder::get("/tests/v1/enforced")
+        .operation_id("test:limited-enforced")
+        .summary("Rate-limited endpoint in enforce mode")
+        .anonymous()
+        .with_throttling(throttling("rl_enforced", false))
+        .json_response(StatusCode::OK, "OK")
+        .handler(axum::routing::get(ok_handler))
+        .register(router, &api);
+    let app = api.rest_finalize(
+        &ctx,
+        router,
+        Arc::new(toolkit::RestHealthcheckRegistry::new()),
+    )?;
+
+    let get = |uri: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request builds")
+    };
+
+    // Dry-run: both requests are served, the second exceeds the limit but is
+    // observed instead of enforced.
+    for _ in 0..2 {
+        let res = app.clone().oneshot(get("/tests/v1/dry")).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+    // Enforce: the second request is rejected, proving the two instruments
+    // are distinct and correctly named.
+    let res = app.clone().oneshot(get("/tests/v1/enforced")).await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app.oneshot(get("/tests/v1/enforced")).await?;
+    assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    provider.force_flush().unwrap();
+
+    let dry_attrs = [("zone", "rl_dry"), ("kind", "rate_limit")];
+    let enforced_attrs = [("zone", "rl_enforced"), ("kind", "rate_limit")];
+    let sum =
+        |name: &str, attrs: &[(&str, &str)]| counter_sum_with_attributes(&exporter, name, attrs);
+    assert_eq!(
+        sum("throttling.dry_run_rejections", &dry_attrs),
+        1,
+        "throttling.dry_run_rejections must count the would-be rejection for zone/kind"
+    );
+    assert_eq!(
+        sum("throttling.rejections", &enforced_attrs),
+        1,
+        "throttling.rejections must count the enforced 429"
+    );
+    assert_eq!(
+        sum("throttling.rejections", &dry_attrs),
+        0,
+        "dry-run must not count as an enforced rejection"
+    );
+    assert_eq!(
+        sum("throttling.dry_run_rejections", &enforced_attrs),
+        0,
+        "enforced rejection must not count as dry-run"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn metrics_route_attribute_uses_template() -> Result<()> {
     let _lock = METER_LOCK.lock().await;
     let (provider, exporter) = install_test_meter_provider();
