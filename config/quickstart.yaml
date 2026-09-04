@@ -148,21 +148,23 @@ gears:
   quota-enforcement:
     config:
       storage_vendor: "constructorfabric"
-      coordination_vendor: "constructorfabric"
-      probe_lock_ttl_secs: 5
+      election:
+        ttl_secs: 30
+        max_missed_renewals: 2
+      sweeper_stop_timeout_secs: 10
+
+  # The platform cluster gear elects the quota-enforcement sweepers. Linked by
+  # --features quota-enforcement together with grpc-hub, which cluster requires.
+  cluster:
+    config:
+      profiles:
+        quota-enforcement:
+          cache: { provider: standalone }
 
   quota-enforcement-storage-plugin:
     database:
       server: "sqlite_users"
       file: "quota_enforcement.db"
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-
-  quota-enforcement-coordination-plugin:
-    database:
-      server: "sqlite_users"
-      file: "quota_enforcement_coordination.db"
     config:
       vendor: "constructorfabric"
       priority: 100

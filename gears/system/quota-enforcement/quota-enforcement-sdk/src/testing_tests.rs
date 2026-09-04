@@ -8,10 +8,8 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{
-    InMemoryCoordination, InMemoryStorage, empty_engine_config, quota_draft, test_metric,
-    test_subject, test_tenant,
+    InMemoryStorage, empty_engine_config, quota_draft, test_metric, test_subject, test_tenant,
 };
-use crate::coordination_plugin::{CoordinationError, CoordinationPluginV1, LockScope};
 use crate::models::{
     ApplicableQuotas, BootstrapBundle, CapPatch, ConfigDefaults, Decision, DecisionResult,
     IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState, OperationType,
@@ -69,90 +67,6 @@ async fn seeded_quota(storage: &InMemoryStorage, cap: Option<u64>) -> QuotaId {
 
 fn plan(id: QuotaId, amount: u64) -> BTreeMap<QuotaId, QuotaDebitPlan> {
     BTreeMap::from([(id, QuotaDebitPlan { amount })])
-}
-
-// --- coordination ----------------------------------------------------------
-
-#[tokio::test]
-async fn coordination_grants_one_holder_per_scope_and_frees_on_release() {
-    let coord = InMemoryCoordination::new();
-    let ttl = Duration::from_mins(1);
-    let lock = coord
-        .try_lock(LockScope::LeaseSweeper, ttl)
-        .await
-        .expect("first acquisition");
-    assert!(coord.is_held(LockScope::LeaseSweeper));
-    assert!(
-        !coord.is_held(LockScope::RetentionSweeper),
-        "scopes are independent"
-    );
-
-    let conflict = coord.try_lock(LockScope::LeaseSweeper, ttl).await;
-    assert_eq!(
-        conflict,
-        Err(CoordinationError::Conflict {
-            scope: LockScope::LeaseSweeper
-        })
-    );
-
-    coord.release(lock).await.expect("release");
-    assert!(!coord.is_held(LockScope::LeaseSweeper));
-    coord
-        .try_lock(LockScope::LeaseSweeper, ttl)
-        .await
-        .expect("re-acquire after release without a TTL wait");
-    assert_eq!(coord.try_lock_calls(), 3);
-    assert_eq!(coord.release_calls(), 1);
-}
-
-#[tokio::test]
-async fn coordination_expired_hold_is_stealable_and_renew_reports_expiry() {
-    let coord = InMemoryCoordination::new();
-    let lock = coord
-        .try_lock(LockScope::RetentionSweeper, Duration::from_secs(30))
-        .await
-        .expect("acquire");
-    coord.expire_all();
-    assert!(!coord.is_held(LockScope::RetentionSweeper));
-    assert_eq!(
-        coord.renew(&lock).await,
-        Err(CoordinationError::LockExpired {
-            scope: LockScope::RetentionSweeper
-        })
-    );
-    coord
-        .try_lock(LockScope::RetentionSweeper, Duration::from_secs(30))
-        .await
-        .expect("a survivor steals the expired hold");
-    // The old holder's release must not evict the new holder.
-    coord
-        .release(lock)
-        .await
-        .expect("stale release is best-effort");
-    assert!(coord.is_held(LockScope::RetentionSweeper));
-}
-
-#[tokio::test]
-async fn coordination_injected_failure_covers_every_method_until_cleared() {
-    let coord = InMemoryCoordination::new();
-    let lock = coord
-        .try_lock(LockScope::LeaseSweeper, Duration::from_secs(5))
-        .await
-        .expect("acquire");
-    coord.fail_with(CoordinationError::BackendUnavailable("down".into()));
-    assert!(matches!(
-        coord
-            .try_lock(LockScope::RetentionSweeper, Duration::from_secs(5))
-            .await,
-        Err(CoordinationError::BackendUnavailable(_))
-    ));
-    assert!(matches!(
-        coord.renew(&lock).await,
-        Err(CoordinationError::BackendUnavailable(_))
-    ));
-    coord.clear_failure();
-    coord.renew(&lock).await.expect("renew after recovery");
-    assert_eq!(coord.renew_calls(), 2);
 }
 
 // --- storage bootstrap -----------------------------------------------------

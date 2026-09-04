@@ -7,12 +7,12 @@ fn readiness_starts_pending_and_records_the_last_transition() {
     assert_eq!(readiness.snapshot(), ReadinessState::Starting);
     assert!(!readiness.is_ready());
 
-    readiness.mark_failed(Dependency::Coordination, "probe failed");
+    readiness.mark_failed(Dependency::Cluster, "profile unbound");
     assert_eq!(
         readiness.snapshot(),
         ReadinessState::Failed {
-            dependency: Dependency::Coordination,
-            reason: "probe failed".to_owned(),
+            dependency: Dependency::Cluster,
+            reason: "profile unbound".to_owned(),
         }
     );
     assert!(!readiness.is_ready());

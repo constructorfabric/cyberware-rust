@@ -206,9 +206,9 @@ impl From<DomainError> for CanonicalError {
                     ))
                     .create()
             }
-            DomainError::CoordinationProbeFailed { .. } => CanonicalError::service_unavailable()
+            DomainError::ClusterUnavailable(_) => CanonicalError::service_unavailable()
                 .with_detail(format!(
-                    "{}: coordination backend unavailable",
+                    "{}: cluster unavailable",
                     reason::DEPENDENCY_UNAVAILABLE
                 ))
                 .create(),

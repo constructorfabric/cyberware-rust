@@ -11,10 +11,11 @@ pub struct QuotaEnforcementConfig {
     /// Vendor of the active storage plugin. Exactly one plugin is active per
     /// deployment (DESIGN, "Single storage plugin per deployment").
     pub storage_vendor: String,
-    /// Vendor of the active coordination plugin.
-    pub coordination_vendor: String,
-    /// TTL of the bootstrap `try_lock` + `release` probe, in seconds.
-    pub probe_lock_ttl_secs: u64,
+    /// Timing of the sweeper elections on the platform `cluster` gear.
+    pub election: ElectionTimingConfig,
+    /// Budget, in seconds, for a sweep body to stop after leadership loss or
+    /// shutdown. A body that overruns the budget is aborted.
+    pub sweeper_stop_timeout_secs: u64,
     /// Operational metrics.
     pub metrics: MetricsConfig,
 }
@@ -23,8 +24,8 @@ impl Default for QuotaEnforcementConfig {
     fn default() -> Self {
         Self {
             storage_vendor: "constructorfabric".to_owned(),
-            coordination_vendor: "constructorfabric".to_owned(),
-            probe_lock_ttl_secs: 5,
+            election: ElectionTimingConfig::default(),
+            sweeper_stop_timeout_secs: 10,
             metrics: MetricsConfig::default(),
         }
     }
@@ -35,29 +36,74 @@ impl QuotaEnforcementConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when a vendor is blank, the probe TTL is zero, or the
-    /// metrics prefix is not a valid instrument-name prefix.
+    /// Returns an error when the vendor is blank, a timing value is zero, or
+    /// the metrics prefix is not a valid instrument-name prefix.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.storage_vendor.trim().is_empty() {
             anyhow::bail!(
                 "[quota-enforcement].storage_vendor must not be empty or whitespace-only"
             );
         }
-        if self.coordination_vendor.trim().is_empty() {
-            anyhow::bail!(
-                "[quota-enforcement].coordination_vendor must not be empty or whitespace-only"
-            );
-        }
-        if self.probe_lock_ttl_secs == 0 {
-            anyhow::bail!("[quota-enforcement].probe_lock_ttl_secs must be at least 1");
+        self.election.validate()?;
+        if self.sweeper_stop_timeout_secs == 0 {
+            anyhow::bail!("[quota-enforcement].sweeper_stop_timeout_secs must be at least 1");
         }
         self.metrics.validate()
     }
 
-    /// TTL of the bootstrap coordination probe.
+    /// Budget for a sweep body to stop after leadership loss or shutdown.
     #[must_use]
-    pub const fn probe_lock_ttl(&self) -> Duration {
-        Duration::from_secs(self.probe_lock_ttl_secs)
+    pub const fn sweeper_stop_timeout(&self) -> Duration {
+        Duration::from_secs(self.sweeper_stop_timeout_secs)
+    }
+}
+
+/// Timing of one sweeper election (`[quota-enforcement.election]`).
+///
+/// The defaults are the cluster gear's defaults. A shorter TTL gives a faster
+/// takeover after a crash at the cost of more renewal traffic; a larger
+/// missed-renewal budget tolerates more backend jitter before leadership counts
+/// as lost.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ElectionTimingConfig {
+    /// Time-to-live of a leadership claim, in seconds. A crashed leader is
+    /// replaced within this window plus observation lag.
+    pub ttl_secs: u64,
+    /// Consecutive renewal failures tolerated before leadership counts as
+    /// lost. The cluster gear renews every `ttl / (max_missed_renewals + 1)`.
+    pub max_missed_renewals: u8,
+}
+
+impl Default for ElectionTimingConfig {
+    fn default() -> Self {
+        Self {
+            ttl_secs: 30,
+            max_missed_renewals: 2,
+        }
+    }
+}
+
+impl ElectionTimingConfig {
+    /// Reject timing values the cluster gear cannot run an election with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the TTL or the missed-renewal budget is zero.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.ttl_secs == 0 {
+            anyhow::bail!("[quota-enforcement.election].ttl_secs must be at least 1");
+        }
+        if self.max_missed_renewals == 0 {
+            anyhow::bail!("[quota-enforcement.election].max_missed_renewals must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// Time-to-live of a leadership claim.
+    #[must_use]
+    pub const fn ttl(&self) -> Duration {
+        Duration::from_secs(self.ttl_secs)
     }
 }
 

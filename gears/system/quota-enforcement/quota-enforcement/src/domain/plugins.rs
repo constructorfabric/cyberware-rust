@@ -1,16 +1,16 @@
-//! Plugin binding: select the storage and coordination plugins by vendor and
-//! resolve their scoped `ClientHub` clients.
+//! Plugin binding: select the storage plugin by vendor and resolve its scoped
+//! `ClientHub` client.
 //!
 //! Selection goes through the types registry (`GtsPluginSelector` semantics:
 //! same vendor, lowest priority wins). Nothing is cached here; bootstrap
-//! resolves once and the service keeps the handles.
+//! resolves once and the service keeps the handle.
+//!
+//! Singleton coordination is not a plugin of this gear. The platform `cluster`
+//! gear provides it, and `infra::cluster_coordination` resolves it (ADR-0006).
 
 use std::sync::Arc;
 
-use quota_enforcement_sdk::{
-    CoordinationPluginV1, QuotaEnforcementCoordinationPluginSpecV1,
-    QuotaEnforcementStoragePluginSpecV1, QuotaEnforcementStoragePluginV1,
-};
+use quota_enforcement_sdk::{QuotaEnforcementStoragePluginSpecV1, QuotaEnforcementStoragePluginV1};
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::choose_plugin_instance;
 use toolkit_macros::domain_model;
@@ -23,17 +23,15 @@ use super::error::{DomainError, PluginKind};
 pub struct PluginBinding {
     hub: Arc<ClientHub>,
     storage_vendor: String,
-    coordination_vendor: String,
 }
 
 impl PluginBinding {
-    /// Bind to the hub with the configured vendors.
+    /// Bind to the hub with the configured storage vendor.
     #[must_use]
-    pub fn new(hub: Arc<ClientHub>, storage_vendor: String, coordination_vendor: String) -> Self {
+    pub fn new(hub: Arc<ClientHub>, storage_vendor: String) -> Self {
         Self {
             hub,
             storage_vendor,
-            coordination_vendor,
         }
     }
 
@@ -55,21 +53,6 @@ impl PluginBinding {
             .await?;
         self.hub
             .try_get_scoped::<dyn QuotaEnforcementStoragePluginV1>(&ClientScope::gts_id(&gts_id))
-            .ok_or(DomainError::PluginClientNotRegistered { kind, gts_id })
-    }
-
-    /// Resolve the active coordination plugin.
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::resolve_storage`], for the coordination plugin family.
-    pub async fn resolve_coordination(&self) -> Result<Arc<dyn CoordinationPluginV1>, DomainError> {
-        let kind = PluginKind::Coordination;
-        let gts_id = self
-            .select::<QuotaEnforcementCoordinationPluginSpecV1>(kind, &self.coordination_vendor)
-            .await?;
-        self.hub
-            .try_get_scoped::<dyn CoordinationPluginV1>(&ClientScope::gts_id(&gts_id))
             .ok_or(DomainError::PluginClientNotRegistered { kind, gts_id })
     }
 

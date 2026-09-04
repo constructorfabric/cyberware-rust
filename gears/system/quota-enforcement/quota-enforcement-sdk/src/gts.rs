@@ -38,19 +38,9 @@ pub const OPERATION_RESOURCE: &str = gts_id!("cf.qe.resource.operation.v1~");
 )]
 pub struct QuotaEnforcementStoragePluginSpecV1;
 
-/// GTS plugin specification for quota-enforcement coordination backends.
-///
-/// The coordination backend is selected independently of the storage backend
-/// (ADR-0006), so it has its own spec and its own vendor selector.
-#[derive(Default)]
-#[gts_type_schema(
-    dir_path = "schemas",
-    base = PluginV1,
-    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.qe.coordination_plugin.v1~"),
-    description = "Quota Enforcement coordination plugin specification",
-    properties = "",
-)]
-pub struct QuotaEnforcementCoordinationPluginSpecV1;
+// Singleton coordination has no plugin spec: the gear consumes the platform
+// `cluster` gear's leader election, and the operator selects its backend in the
+// cluster profile YAML (ADR-0006).
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

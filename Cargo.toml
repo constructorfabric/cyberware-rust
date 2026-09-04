@@ -143,7 +143,6 @@ members = [
     "gears/system/quota-enforcement/quota-enforcement-sdk",
     "gears/system/quota-enforcement/quota-enforcement",
     "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin",
-    "gears/system/quota-enforcement/plugins/quota-enforcement-coordination-plugin",
     "gears/mini-chat/mini-chat-sdk",
     "gears/mini-chat/mini-chat",
     "examples/toolkit/api-contracts/api-contracts-sdk",
@@ -352,7 +351,6 @@ account-management = { package = "cf-gears-account-management", version = "0.7.2
 usage-collector = { package = "cf-gears-usage-collector", version = "0.2.10", path = "gears/system/usage-collector/usage-collector" }
 quota-enforcement = { package = "cf-gears-quota-enforcement", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement" }
 quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin" }
-quota-enforcement-coordination-plugin = { package = "cf-gears-quota-enforcement-coordination-plugin", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-coordination-plugin" }
 cluster = { package = "cf-gears-cluster", version = "0.2.2", path = "gears/system/cluster/cluster" }
 
 cf-gears-cluster-sdk = { version = "0.2.2", path = "gears/system/cluster/cluster-sdk" }

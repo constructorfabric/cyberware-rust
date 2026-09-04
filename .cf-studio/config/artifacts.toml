@@ -340,16 +340,6 @@ name = "Storage Plugin Tests"
 path = "{system_root}/plugins/{system}-storage-plugin/tests"
 extensions = [".rs"]
 
-[[systems.autodetect.codebase]]
-name = "Coordination Plugin"
-path = "{system_root}/plugins/{system}-coordination-plugin/src"
-extensions = [".rs"]
-
-[[systems.autodetect.codebase]]
-name = "Coordination Plugin Tests"
-path = "{system_root}/plugins/{system}-coordination-plugin/tests"
-extensions = [".rs"]
-
 # Nested sub-plugin scope: account-management/docs/tr-plugin/ carries its own PRD/DESIGN/ADR.
 # Declared as a child of the `gears/system/$system` autodetect rule so the sub-plugin
 # artifacts are detected as belonging to tr-plugin, not to account-management.

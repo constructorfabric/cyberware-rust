@@ -104,7 +104,7 @@ fn storage_errors_lift_one_to_one_with_the_two_documented_exceptions() {
 #[test]
 fn plugin_selection_errors_carry_the_plugin_kind() {
     let not_found = DomainError::plugin_selection(
-        PluginKind::Coordination,
+        PluginKind::Storage,
         ChoosePluginError::PluginNotFound {
             type_id: "gts.x".to_owned(),
             vendor: "acme".to_owned(),
@@ -113,11 +113,11 @@ fn plugin_selection_errors_carry_the_plugin_kind() {
     assert_eq!(
         not_found,
         DomainError::PluginNotFound {
-            kind: PluginKind::Coordination,
+            kind: PluginKind::Storage,
             vendor: "acme".to_owned(),
         }
     );
-    assert!(not_found.to_string().contains("coordination"));
+    assert!(not_found.to_string().contains("storage"));
     let invalid = DomainError::plugin_selection(
         PluginKind::Storage,
         ChoosePluginError::InvalidPluginInstance {
@@ -138,16 +138,18 @@ fn plugin_selection_errors_carry_the_plugin_kind() {
 fn dependency_labels_are_stable_health_code_fragments() {
     let labels: Vec<&str> = [
         Dependency::Storage,
-        Dependency::Coordination,
+        Dependency::Cluster,
         Dependency::Pdp,
         Dependency::TypesRegistry,
     ]
     .iter()
     .map(|d| d.as_label())
     .collect();
-    assert_eq!(
-        labels,
-        vec!["storage", "coordination", "pdp", "types_registry"]
+    assert_eq!(labels, vec!["storage", "cluster", "pdp", "types_registry"]);
+    let cluster = DomainError::ClusterUnavailable("profile unbound".to_owned());
+    assert!(
+        cluster.to_string().contains("cluster unavailable"),
+        "{cluster}"
     );
     let err = DomainError::NotReady {
         dependency: Dependency::Storage,

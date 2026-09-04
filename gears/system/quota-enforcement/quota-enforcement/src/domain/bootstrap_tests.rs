@@ -1,36 +1,33 @@
 use std::sync::Arc;
-use std::time::Duration;
 
-use quota_enforcement_sdk::testing::{InMemoryCoordination, InMemoryStorage};
-use quota_enforcement_sdk::{CONTRACT_MAJOR, CoordinationError, LockScope, StorageError};
+use quota_enforcement_sdk::testing::InMemoryStorage;
+use quota_enforcement_sdk::{CONTRACT_MAJOR, StorageError};
+use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
 
 use super::Bootstrap;
 use crate::domain::error::{Dependency, DomainError};
 use crate::domain::plugins::PluginBinding;
+use crate::domain::ports::coordination::SingletonScope;
 use crate::domain::readiness::{Readiness, ReadinessState};
 use crate::test_support::{
-    PermitTenantsPdp, coordination_instance, hub_with, register_coordination, register_pdp,
+    PermitTenantsPdp, StaticCoordinatorBinding, hub_with, idle_work, register_pdp,
     register_storage, storage_instance, tenant,
 };
 
 struct Harness {
     hub: Arc<ClientHub>,
     storage: Arc<InMemoryStorage>,
-    coordination: Arc<InMemoryCoordination>,
+    coordinator: Arc<StaticCoordinatorBinding>,
     readiness: Arc<Readiness>,
 }
 
 fn harness(storage: Arc<InMemoryStorage>, register_client: bool, with_pdp: bool) -> Harness {
     let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
-    let coordination_fixture =
-        coordination_instance("cf.core._.qe_db_coordination.v1", "acme", 100);
-    let hub = hub_with(&[&storage_fixture, &coordination_fixture]);
+    let hub = hub_with(&[&storage_fixture]);
     if register_client {
         register_storage(&hub, &storage_fixture, storage.clone());
     }
-    let coordination = Arc::new(InMemoryCoordination::new());
-    register_coordination(&hub, &coordination_fixture, coordination.clone());
     if with_pdp {
         register_pdp(
             &hub,
@@ -40,22 +37,22 @@ fn harness(storage: Arc<InMemoryStorage>, register_client: bool, with_pdp: bool)
     Harness {
         hub,
         storage,
-        coordination,
+        coordinator: StaticCoordinatorBinding::ok(),
         readiness: Arc::new(Readiness::new()),
     }
 }
 
 fn bootstrap(h: &Harness) -> Bootstrap {
     Bootstrap::new(
-        PluginBinding::new(h.hub.clone(), "acme".to_owned(), "acme".to_owned()),
+        PluginBinding::new(h.hub.clone(), "acme".to_owned()),
+        h.coordinator.clone(),
         h.hub.clone(),
-        Duration::from_secs(2),
         h.readiness.clone(),
     )
 }
 
 #[tokio::test]
-async fn a_complete_environment_bootstraps_probes_every_scope_and_becomes_ready() {
+async fn a_complete_environment_bootstraps_resolves_the_coordinator_and_becomes_ready() {
     let h = harness(Arc::new(InMemoryStorage::new()), true, true);
     let bound = bootstrap(&h).run().await.expect("bootstrap succeeds");
 
@@ -70,19 +67,19 @@ async fn a_complete_environment_bootstraps_probes_every_scope_and_becomes_ready(
         h.storage.bootstrapped_bundle().map(|b| b.contract_major),
         Some(CONTRACT_MAJOR)
     );
-    assert_eq!(h.coordination.try_lock_calls(), LockScope::ALL.len());
-    assert_eq!(h.coordination.release_calls(), LockScope::ALL.len());
-    for scope in LockScope::ALL {
-        assert!(
-            !h.coordination.is_held(scope),
-            "probe locks are released: {scope}"
-        );
-    }
+    assert_eq!(
+        h.coordinator.calls(),
+        1,
+        "the cluster binding resolved once"
+    );
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
     bound
-        .coordination
-        .try_lock(LockScope::LeaseSweeper, Duration::from_secs(1))
+        .coordinator
+        .run_while_leader(SingletonScope::LeaseSweeper, shutdown, idle_work())
         .await
-        .expect("the bound coordination handle is usable");
+        .expect("the bound coordinator is usable");
 }
 
 #[tokio::test]
@@ -109,11 +106,11 @@ async fn a_schema_mismatch_fails_bootstrap_on_the_storage_dependency() {
             ..
         }
     ));
-    assert_eq!(h.coordination.try_lock_calls(), 0, "later steps never run");
+    assert_eq!(h.coordinator.calls(), 0, "later steps never run");
 }
 
 #[tokio::test]
-async fn a_missing_storage_client_fails_bootstrap_before_any_probe() {
+async fn a_missing_storage_client_fails_bootstrap_before_the_cluster_resolve() {
     let h = harness(Arc::new(InMemoryStorage::new()), false, true);
     let err = bootstrap(&h)
         .run()
@@ -132,35 +129,28 @@ async fn a_missing_storage_client_fails_bootstrap_before_any_probe() {
         }
     ));
     assert_eq!(h.storage.bootstrap_calls(), 0);
+    assert_eq!(h.coordinator.calls(), 0);
 }
 
 #[tokio::test]
-async fn a_failing_coordination_probe_fails_bootstrap_on_the_coordination_dependency() {
-    let h = harness(Arc::new(InMemoryStorage::new()), true, true);
-    h.coordination
-        .fail_with(CoordinationError::BackendUnavailable("down".into()));
-    let err = bootstrap(&h).run().await.err().expect("probe fails");
-    assert!(
-        matches!(
-            err,
-            DomainError::CoordinationProbeFailed {
-                scope: LockScope::LeaseSweeper,
-                ..
-            }
-        ),
-        "the first scope is probed first: {err:?}"
-    );
+async fn a_failing_cluster_resolve_fails_bootstrap_on_the_cluster_dependency() {
+    let mut h = harness(Arc::new(InMemoryStorage::new()), true, true);
+    h.coordinator = StaticCoordinatorBinding::failing(DomainError::ClusterUnavailable(
+        "no backend bound for profile `quota-enforcement`".to_owned(),
+    ));
+    let err = bootstrap(&h).run().await.err().expect("resolve fails");
+    assert!(matches!(err, DomainError::ClusterUnavailable(_)), "{err:?}");
     match h.readiness.snapshot() {
         ReadinessState::Failed { dependency, reason } => {
-            assert_eq!(dependency, Dependency::Coordination);
-            assert!(reason.contains("lease_sweeper"), "{reason}");
+            assert_eq!(dependency, Dependency::Cluster);
+            assert!(reason.contains("quota-enforcement"), "{reason}");
         }
-        other => panic!("expected a coordination failure, got {other:?}"),
+        other => panic!("expected a cluster failure, got {other:?}"),
     }
     assert_eq!(
         h.storage.bootstrap_calls(),
         1,
-        "storage bootstrap ran before the probe"
+        "storage bootstrap ran before the cluster resolve"
     );
 }
 
@@ -174,7 +164,7 @@ async fn a_storage_backend_outage_at_bootstrap_is_unavailability() {
 }
 
 #[tokio::test]
-async fn a_missing_pdp_client_fails_bootstrap_after_the_probes() {
+async fn a_missing_pdp_client_fails_bootstrap_after_the_cluster_resolve() {
     let h = harness(Arc::new(InMemoryStorage::new()), true, false);
     let err = bootstrap(&h).run().await.err().expect("no PDP");
     assert!(matches!(err, DomainError::PdpUnavailable(_)), "{err:?}");
@@ -185,9 +175,5 @@ async fn a_missing_pdp_client_fails_bootstrap_after_the_probes() {
             ..
         }
     ));
-    assert_eq!(
-        h.coordination.release_calls(),
-        LockScope::ALL.len(),
-        "probes completed"
-    );
+    assert_eq!(h.coordinator.calls(), 1, "the cluster resolve completed");
 }

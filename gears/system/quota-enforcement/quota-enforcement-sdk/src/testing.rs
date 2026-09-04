@@ -1,14 +1,14 @@
-//! Test doubles for the plugin contracts. Enabled with the `test-util` feature.
+//! Test doubles for the plugin contract. Enabled with the `test-util` feature.
 //!
 //! [`InMemoryStorage`] implements every method of
 //! [`QuotaEnforcementStoragePluginV1`] with simple in-memory semantics, so the
 //! gear's bootstrap and readiness paths run against a complete contract
-//! (foundation `DoD`, "Workspace and Crate Skeletons"). [`InMemoryCoordination`]
-//! implements [`CoordinationPluginV1`] with deterministic expiry control, so
-//! tests never wait on a wall clock.
+//! (foundation `DoD`, "Workspace and Crate Skeletons").
 //!
-//! Both doubles accept an injected failure through `fail_with`, which makes
-//! every later call return that error until `clear_failure`.
+//! The double accepts an injected failure through `fail_with`, which makes
+//! every later call return that error until `clear_failure`. Singleton
+//! coordination is not a plugin contract of this gear: it is consumed from the
+//! platform `cluster` gear (ADR-0006), so no coordination double exists here.
 
 #![allow(
     clippy::expect_used,
@@ -27,7 +27,6 @@ use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use crate::coordination_plugin::{CoordinationError, CoordinationPluginV1, Lock, LockScope};
 use crate::models::{
     ApplicableQuotas, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults, ContractRef,
     DeactivateOutcome, DebitPlan, EnforcementMode, EventId, ExpiredLease, IdempotencyRecord,
@@ -87,143 +86,6 @@ pub fn quota_draft(subject: SubjectRef, cap: Option<u64>) -> QuotaDraft {
             ),
             version: 1,
         },
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Coordination double
-// ---------------------------------------------------------------------------
-
-struct Hold {
-    holder_id: Uuid,
-    expires_at: OffsetDateTime,
-}
-
-#[derive(Default)]
-struct CoordState {
-    holds: HashMap<LockScope, Hold>,
-    failure: Option<CoordinationError>,
-    try_lock_calls: usize,
-    renew_calls: usize,
-    release_calls: usize,
-}
-
-/// In-memory [`CoordinationPluginV1`] with deterministic expiry.
-#[derive(Default)]
-pub struct InMemoryCoordination {
-    state: Mutex<CoordState>,
-}
-
-impl InMemoryCoordination {
-    /// An empty backend.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Every later call fails with `err` until [`Self::clear_failure`].
-    pub fn fail_with(&self, err: CoordinationError) {
-        self.state.lock().failure = Some(err);
-    }
-
-    /// Stop the injected failure.
-    pub fn clear_failure(&self) {
-        self.state.lock().failure = None;
-    }
-
-    /// Move every hold's expiry into the past. Simulates a TTL elapse.
-    pub fn expire_all(&self) {
-        let past = OffsetDateTime::now_utc() - Duration::from_secs(1);
-        for hold in self.state.lock().holds.values_mut() {
-            hold.expires_at = past;
-        }
-    }
-
-    /// True when a live, unexpired hold exists for `scope`.
-    #[must_use]
-    pub fn is_held(&self, scope: LockScope) -> bool {
-        let now = OffsetDateTime::now_utc();
-        self.state
-            .lock()
-            .holds
-            .get(&scope)
-            .is_some_and(|h| h.expires_at > now)
-    }
-
-    /// Number of `try_lock` calls, failures included.
-    #[must_use]
-    pub fn try_lock_calls(&self) -> usize {
-        self.state.lock().try_lock_calls
-    }
-
-    /// Number of `renew` calls, failures included.
-    #[must_use]
-    pub fn renew_calls(&self) -> usize {
-        self.state.lock().renew_calls
-    }
-
-    /// Number of `release` calls, failures included.
-    #[must_use]
-    pub fn release_calls(&self) -> usize {
-        self.state.lock().release_calls
-    }
-}
-
-#[async_trait]
-impl CoordinationPluginV1 for InMemoryCoordination {
-    async fn try_lock(&self, scope: LockScope, ttl: Duration) -> Result<Lock, CoordinationError> {
-        let mut st = self.state.lock();
-        st.try_lock_calls += 1;
-        if let Some(err) = &st.failure {
-            return Err(err.clone());
-        }
-        let now = OffsetDateTime::now_utc();
-        if st.holds.get(&scope).is_some_and(|h| h.expires_at > now) {
-            return Err(CoordinationError::Conflict { scope });
-        }
-        let holder_id = Uuid::now_v7();
-        st.holds.insert(
-            scope,
-            Hold {
-                holder_id,
-                expires_at: now + ttl,
-            },
-        );
-        Ok(Lock::new(scope, holder_id, ttl, now))
-    }
-
-    async fn renew(&self, lock: &Lock) -> Result<(), CoordinationError> {
-        let mut st = self.state.lock();
-        st.renew_calls += 1;
-        if let Some(err) = &st.failure {
-            return Err(err.clone());
-        }
-        let now = OffsetDateTime::now_utc();
-        let scope = lock.scope();
-        match st.holds.get_mut(&scope) {
-            Some(hold) if hold.holder_id == lock.holder_id() && hold.expires_at > now => {
-                hold.expires_at = now + lock.ttl();
-                Ok(())
-            }
-            _ => Err(CoordinationError::LockExpired { scope }),
-        }
-    }
-
-    async fn release(&self, lock: Lock) -> Result<(), CoordinationError> {
-        let mut st = self.state.lock();
-        st.release_calls += 1;
-        if let Some(err) = &st.failure {
-            return Err(err.clone());
-        }
-        let scope = lock.scope();
-        if st
-            .holds
-            .get(&scope)
-            .is_some_and(|h| h.holder_id == lock.holder_id())
-        {
-            st.holds.remove(&scope);
-        }
-        Ok(())
     }
 }
 

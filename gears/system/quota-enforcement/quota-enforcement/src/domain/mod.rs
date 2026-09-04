@@ -13,5 +13,6 @@ pub use admission::{Admission, AdmissionTarget, Admitted};
 pub use bootstrap::{Bootstrap, Bound};
 pub use error::{Dependency, DomainError, PluginKind, ResourceKind};
 pub use plugins::PluginBinding;
+pub use ports::{CoordinatorBinding, LeaderWork, SingletonCoordinator, SingletonScope};
 pub use readiness::{Readiness, ReadinessState};
 pub use service::Service;

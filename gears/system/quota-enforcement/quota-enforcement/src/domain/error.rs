@@ -7,25 +7,25 @@
 use std::fmt;
 
 use authz_resolver_sdk::EnforcerError;
-use quota_enforcement_sdk::{LeaseToken, LockScope, PolicyId, StorageError};
+use quota_enforcement_sdk::{LeaseToken, PolicyId, StorageError};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
 
 /// Which plugin family a binding error is about.
+///
+/// Singleton coordination is not a plugin family: the gear consumes the
+/// platform `cluster` gear's leader election (ADR-0006).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginKind {
     /// `QuotaEnforcementStoragePluginV1`.
     Storage,
-    /// `CoordinationPluginV1`.
-    Coordination,
 }
 
 impl fmt::Display for PluginKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Storage => "storage",
-            Self::Coordination => "coordination",
         })
     }
 }
@@ -36,8 +36,8 @@ impl fmt::Display for PluginKind {
 pub enum Dependency {
     /// The storage plugin.
     Storage,
-    /// The coordination plugin.
-    Coordination,
+    /// The platform `cluster` gear (sweeper leader election).
+    Cluster,
     /// The PDP (`authz-resolver`).
     Pdp,
     /// The types registry.
@@ -50,7 +50,7 @@ impl Dependency {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::Storage => "storage",
-            Self::Coordination => "coordination",
+            Self::Cluster => "cluster",
             Self::Pdp => "pdp",
             Self::TypesRegistry => "types_registry",
         }
@@ -148,14 +148,11 @@ pub enum DomainError {
         /// The instance id.
         gts_id: String,
     },
-    /// The coordination probe on a scope failed at bootstrap.
-    #[error("coordination probe failed on scope {scope}: {reason}")]
-    CoordinationProbeFailed {
-        /// The probed scope.
-        scope: LockScope,
-        /// Error detail.
-        reason: String,
-    },
+    /// The platform `cluster` gear cannot provide the sweeper election: the
+    /// `quota-enforcement` profile is unbound, its backend has no linearizable
+    /// election, or the election closed.
+    #[error("cluster unavailable: {0}")]
+    ClusterUnavailable(String),
     /// Storage schema major differs from the contract major (I12).
     #[error("storage schema major {installed} does not match contract major {expected}")]
     SchemaVersionMismatch {
@@ -164,7 +161,7 @@ pub enum DomainError {
         /// Expected major.
         expected: u32,
     },
-    /// The storage or coordination backend could not be reached.
+    /// The storage backend could not be reached.
     #[error("backend unavailable: {0}")]
     BackendUnavailable(String),
 

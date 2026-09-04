@@ -1,19 +1,20 @@
 use std::time::Duration;
 
-use super::{MetricsConfig, QuotaEnforcementConfig};
+use super::{ElectionTimingConfig, MetricsConfig, QuotaEnforcementConfig};
 
 #[test]
-fn defaults_select_the_platform_vendor_and_a_five_second_probe() {
+fn defaults_select_the_platform_vendor_and_the_cluster_election_defaults() {
     let cfg = QuotaEnforcementConfig::default();
     assert_eq!(cfg.storage_vendor, "constructorfabric");
-    assert_eq!(cfg.coordination_vendor, "constructorfabric");
-    assert_eq!(cfg.probe_lock_ttl(), Duration::from_secs(5));
+    assert_eq!(cfg.election.ttl(), Duration::from_secs(30));
+    assert_eq!(cfg.election.max_missed_renewals, 2);
+    assert_eq!(cfg.sweeper_stop_timeout(), Duration::from_secs(10));
     assert_eq!(cfg.metrics.instrument_name("denial_total"), "denial_total");
     cfg.validate().expect("defaults are valid");
 }
 
 #[test]
-fn blank_vendors_and_a_zero_probe_ttl_are_rejected_with_the_field_name() {
+fn a_blank_vendor_and_zero_timings_are_rejected_with_the_field_name() {
     let cases: Vec<(QuotaEnforcementConfig, &str)> = vec![
         (
             QuotaEnforcementConfig {
@@ -24,17 +25,30 @@ fn blank_vendors_and_a_zero_probe_ttl_are_rejected_with_the_field_name() {
         ),
         (
             QuotaEnforcementConfig {
-                coordination_vendor: String::new(),
+                election: ElectionTimingConfig {
+                    ttl_secs: 0,
+                    ..ElectionTimingConfig::default()
+                },
                 ..QuotaEnforcementConfig::default()
             },
-            "coordination_vendor",
+            "ttl_secs",
         ),
         (
             QuotaEnforcementConfig {
-                probe_lock_ttl_secs: 0,
+                election: ElectionTimingConfig {
+                    max_missed_renewals: 0,
+                    ..ElectionTimingConfig::default()
+                },
                 ..QuotaEnforcementConfig::default()
             },
-            "probe_lock_ttl_secs",
+            "max_missed_renewals",
+        ),
+        (
+            QuotaEnforcementConfig {
+                sweeper_stop_timeout_secs: 0,
+                ..QuotaEnforcementConfig::default()
+            },
+            "sweeper_stop_timeout_secs",
         ),
     ];
     for (cfg, field) in cases {
@@ -67,6 +81,15 @@ fn unknown_keys_are_rejected_and_partial_configs_use_defaults() {
     let cfg: QuotaEnforcementConfig =
         serde_json::from_str(r#"{ "storage_vendor": "acme" }"#).expect("partial config");
     assert_eq!(cfg.storage_vendor, "acme");
-    assert_eq!(cfg.coordination_vendor, "constructorfabric");
+    assert_eq!(cfg.election.ttl_secs, 30);
+    let timing: QuotaEnforcementConfig =
+        serde_json::from_str(r#"{ "election": { "ttl_secs": 5 } }"#).expect("partial election");
+    assert_eq!(timing.election.ttl(), Duration::from_secs(5));
+    assert_eq!(timing.election.max_missed_renewals, 2);
     assert!(serde_json::from_str::<QuotaEnforcementConfig>(r#"{ "vendor": "acme" }"#).is_err());
+    assert!(
+        serde_json::from_str::<QuotaEnforcementConfig>(r#"{ "coordination_vendor": "acme" }"#)
+            .is_err(),
+        "the retired coordination plugin selector is rejected"
+    );
 }

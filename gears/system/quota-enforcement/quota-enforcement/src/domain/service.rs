@@ -2,12 +2,13 @@
 
 use std::sync::{Arc, OnceLock};
 
-use quota_enforcement_sdk::{CoordinationPluginV1, QuotaEnforcementStoragePluginV1};
+use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;
 use toolkit_macros::domain_model;
 
 use super::admission::Admission;
 use super::bootstrap::Bound;
 use super::error::{Dependency, DomainError};
+use super::ports::coordination::SingletonCoordinator;
 use super::readiness::Readiness;
 
 /// Composition root of the domain. Handlers and the in-process client reach
@@ -67,17 +68,17 @@ impl Service {
             })
     }
 
-    /// The active coordination plugin.
+    /// The sweeper coordinator over the platform `cluster` gear.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::NotReady`] before bootstrap completed.
-    pub fn coordination(&self) -> Result<Arc<dyn CoordinationPluginV1>, DomainError> {
+    pub fn coordinator(&self) -> Result<Arc<dyn SingletonCoordinator>, DomainError> {
         self.bound
             .get()
-            .map(|b| b.coordination.clone())
+            .map(|b| b.coordinator.clone())
             .ok_or(DomainError::NotReady {
-                dependency: Dependency::Coordination,
+                dependency: Dependency::Cluster,
             })
     }
 }

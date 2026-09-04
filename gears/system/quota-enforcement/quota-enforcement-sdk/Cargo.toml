@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "SDK for the quota-enforcement gear: storage and coordination plugin contracts, domain types, closed error enums, and GTS plugin specs"
+description = "SDK for the quota-enforcement gear: storage plugin contract, domain types, closed error enums, and GTS plugin spec"
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
@@ -19,8 +19,8 @@ name = "quota_enforcement_sdk"
 workspace = true
 
 [features]
-# Exposes `pub mod testing`: complete in-memory doubles for the storage and
-# coordination plugin contracts. Test-only; never enable in a production build.
+# Exposes `pub mod testing`: a complete in-memory double of the storage plugin
+# contract. Test-only; never enable in a production build.
 test-util = ["dep:parking_lot"]
 
 [dependencies]

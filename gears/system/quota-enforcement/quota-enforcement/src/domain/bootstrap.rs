@@ -7,17 +7,15 @@
 //! Later features extend [`Bootstrap::run`] with their own steps.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use authz_resolver_sdk::AuthZResolverApi;
-use quota_enforcement_sdk::{
-    BootstrapBundle, CoordinationPluginV1, LockScope, QuotaEnforcementStoragePluginV1, StorageError,
-};
+use quota_enforcement_sdk::{BootstrapBundle, QuotaEnforcementStoragePluginV1, StorageError};
 use toolkit::client_hub::ClientHub;
 use toolkit_macros::domain_model;
 
 use super::error::{Dependency, DomainError};
 use super::plugins::PluginBinding;
+use super::ports::coordination::{CoordinatorBinding, SingletonCoordinator};
 use super::readiness::Readiness;
 
 const LOG_TARGET: &str = "qe.bootstrap";
@@ -28,16 +26,16 @@ const LOG_TARGET: &str = "qe.bootstrap";
 pub struct Bound {
     /// The active storage plugin.
     pub storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
-    /// The active coordination plugin.
-    pub coordination: Arc<dyn CoordinationPluginV1>,
+    /// The sweeper coordinator over the platform `cluster` gear.
+    pub coordinator: Arc<dyn SingletonCoordinator>,
 }
 
 /// The bootstrap procedure.
 #[domain_model]
 pub struct Bootstrap {
     binding: PluginBinding,
+    coordinator: Arc<dyn CoordinatorBinding>,
     hub: Arc<ClientHub>,
-    probe_ttl: Duration,
     readiness: Arc<Readiness>,
 }
 
@@ -46,14 +44,14 @@ impl Bootstrap {
     #[must_use]
     pub fn new(
         binding: PluginBinding,
+        coordinator: Arc<dyn CoordinatorBinding>,
         hub: Arc<ClientHub>,
-        probe_ttl: Duration,
         readiness: Arc<Readiness>,
     ) -> Self {
         Self {
             binding,
+            coordinator,
             hub,
-            probe_ttl,
             readiness,
         }
     }
@@ -107,24 +105,16 @@ impl Bootstrap {
             .await
             .map_err(|e| (Dependency::Storage, lift_bootstrap_storage_error(e)))?;
 
-        let coordination = self
-            .binding
-            .resolve_coordination()
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
+        // The cluster resolver validates the operator's binding of the
+        // `quota-enforcement` profile: an unbound profile or a backend without a
+        // linearizable election fails here. There is no probe of our own.
+        let coordinator = self
+            .coordinator
+            .resolve()
             .await
-            .map_err(|e| (Dependency::Coordination, e))?;
-
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-coord-probe
-        for scope in LockScope::ALL {
-            let lock = coordination
-                .try_lock(scope, self.probe_ttl)
-                .await
-                .map_err(|e| probe_failed(scope, &e))?;
-            coordination
-                .release(lock)
-                .await
-                .map_err(|e| probe_failed(scope, &e))?;
-        }
-        // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-coord-probe
+            .map_err(|e| (Dependency::Cluster, e))?;
+        // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
         // Structural PDP probe: the admission boundary is unusable without the
@@ -137,7 +127,7 @@ impl Bootstrap {
 
         Ok(Bound {
             storage,
-            coordination,
+            coordinator,
         })
     }
 }
@@ -155,19 +145,6 @@ fn lift_bootstrap_storage_error(err: StorageError) -> DomainError {
         },
         other => DomainError::from(other),
     }
-}
-
-fn probe_failed(
-    scope: LockScope,
-    err: &quota_enforcement_sdk::CoordinationError,
-) -> (Dependency, DomainError) {
-    (
-        Dependency::Coordination,
-        DomainError::CoordinationProbeFailed {
-            scope,
-            reason: err.to_string(),
-        },
-    )
 }
 
 #[cfg(test)]

@@ -1,9 +1,15 @@
 //! Gear declaration of quota-enforcement.
 //!
-//! `init` wires the PEP boundary and the domain service. The lifecycle entry
-//! runs the fail-closed bootstrap before the ready signal. The REST surface
-//! mounts into the platform `api-gateway`; the readiness check reports the
-//! bootstrap state.
+//! `init` wires the PEP boundary, the domain service, and the cluster
+//! coordination binding. The lifecycle entry runs the fail-closed bootstrap
+//! before the ready signal. The REST surface mounts into the platform
+//! `api-gateway`; the readiness check reports the bootstrap state and the
+//! cluster requirements verdict.
+//!
+//! The gear declares no `deps = [cluster]` edge (cluster DESIGN section
+//! 3.17.7): a deployed consumer links no cluster gear. Start ordering comes
+//! from the cluster gear's `system` tier, readiness gating from the
+//! SDK-submitted consumer registration.
 
 use std::sync::{Arc, OnceLock};
 
@@ -22,6 +28,7 @@ use crate::api::healthcheck::ReadinessCheck;
 use crate::api::rest::routes;
 use crate::config::QuotaEnforcementConfig;
 use crate::domain::{Admission, Bootstrap, PluginBinding, Readiness, Service};
+use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
 use crate::infra::metrics;
 
 const LOG_TARGET: &str = "qe.lifecycle";
@@ -63,8 +70,9 @@ impl QuotaEnforcementGear {
 
     /// Lifecycle entry: bootstrap, signal ready, then idle until shutdown.
     ///
-    /// Later features spawn their background tasks here under child tokens of
-    /// `cancel`, after the ready signal.
+    /// Bootstrap resolves the cluster leader election here, in `start`, after
+    /// the cluster gear started. Later features spawn their sweepers here under
+    /// child tokens of `cancel`, after the ready signal.
     ///
     /// # Errors
     ///
@@ -108,7 +116,7 @@ impl QuotaEnforcementGear {
 
 #[async_trait]
 impl Gear for QuotaEnforcementGear {
-    #[tracing::instrument(skip_all, fields(storage_vendor, coordination_vendor))]
+    #[tracing::instrument(skip_all, fields(storage_vendor))]
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         if self.service.get().is_some() {
             anyhow::bail!("{} gear already initialized", Self::MODULE_NAME);
@@ -116,7 +124,6 @@ impl Gear for QuotaEnforcementGear {
         let cfg: QuotaEnforcementConfig = ctx.config_or_default()?;
         cfg.validate()?;
         tracing::Span::current().record("storage_vendor", cfg.storage_vendor.as_str());
-        tracing::Span::current().record("coordination_vendor", cfg.coordination_vendor.as_str());
 
         // PEP boundary: the PDP client is a hard dependency. Without it the gear
         // fails init and never serves a permissive decision.
@@ -131,12 +138,15 @@ impl Gear for QuotaEnforcementGear {
         let admission = Admission::new(enforcer, metrics);
         let service = Arc::new(Service::new(admission, readiness.clone()));
 
-        let binding = PluginBinding::new(
-            hub.clone(),
-            cfg.storage_vendor.clone(),
-            cfg.coordination_vendor.clone(),
-        );
-        let bootstrap = Bootstrap::new(binding, hub.clone(), cfg.probe_lock_ttl(), readiness);
+        let timing = ElectionTiming::new(
+            cfg.election.ttl(),
+            cfg.election.max_missed_renewals,
+            cfg.sweeper_stop_timeout(),
+        )
+        .context("[quota-enforcement.election] is not a valid election timing")?;
+        let coordinator = Arc::new(ClusterCoordinationBinding::new(hub.clone(), timing));
+        let binding = PluginBinding::new(hub.clone(), cfg.storage_vendor);
+        let bootstrap = Bootstrap::new(binding, coordinator, hub.clone(), readiness);
 
         self.hub
             .set(hub)
@@ -173,7 +183,18 @@ impl RestApiCapability for QuotaEnforcementGear {
 
     fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
         let service = self.service.get()?;
-        Some(Arc::new(ReadinessCheck::new(service.readiness().clone())))
+        // The cluster SDK's readiness contributor re-validates the profile
+        // requirements when the resolve deferred them, and reports a process
+        // with no cluster client wired at all. It has to be returned from a
+        // gear's `healthcheck()`; the SDK cannot register it itself.
+        let cluster = self
+            .hub
+            .get()
+            .map(|hub| cluster_sdk::cluster_readiness(hub.clone()));
+        Some(Arc::new(ReadinessCheck::new(
+            service.readiness().clone(),
+            cluster,
+        )))
     }
 }
 
