@@ -124,10 +124,11 @@ patterns = [
 ]
 
 [[ignore]]
-reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, and operations.md is an operator-facing config/runbook reference (P2 remediation item 3.8), not standalone SDLC artifacts."
+reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, operations.md is an operator-facing config/runbook reference, and concurrency-and-failure-model.md is a reference catalogue of the gear's races and failure modes (cited from its tests). All three are supplementary to DESIGN.md, not standalone SDLC artifacts."
 patterns = [
   "gears/file-storage/docs/api.md",
   "gears/file-storage/docs/operations.md",
+  "gears/file-storage/docs/concurrency-and-failure-model.md",
 ]
 
 [[ignore]]
