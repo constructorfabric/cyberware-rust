@@ -132,6 +132,14 @@ patterns = [
 ]
 
 [[ignore]]
+reason = "Ignore file-storage feature docs that declare CDSL flows (multipart collide/reclaim, policy-set, retention-create) — their instruction sets were reworked in the file-storage feature branch and cannot be validated against the current main code until the code MR (2/3) lands. PRD/DESIGN/ADR/DECOMPOSITION and the remaining feature docs stay validated via autodetect."
+patterns = [
+  "gears/file-storage/docs/features/multipart-coordinator.md",
+  "gears/file-storage/docs/features/policy-engine.md",
+  "gears/file-storage/docs/features/retention-cleanup.md",
+]
+
+[[ignore]]
 reason = "Ignore chat-engine companion doc — WEBHOOK-PROTOCOL.md documents the webhook JSON Schema (docs/webhook-protocol.json), the HTTP contract Chat Engine calls backend plugins over. A protocol reference supplementary to DESIGN.md, not a standalone SDLC artifact. Same class as the file-storage api.md/operations.md entry above."
 patterns = ["gears/chat-engine/docs/WEBHOOK-PROTOCOL.md"]
 
