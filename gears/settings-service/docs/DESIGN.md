@@ -393,7 +393,7 @@ Settings Service is **supplied as a Constructor Fabric Gear** — an SDK crate p
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-key-is-gts-type-id`
 
-The setting `key` is a **GTS type identifier** `gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~` for **both** authors. The base type is owned and registered by the Settings gear; toolkit does not own it. The derived half is the setting and has four segments before the version — `<vendor>.<package>.<namespace>.<type>` per the GTS grammar (§4.7), with no `gts.` prefix of its own. The category is always the third: a **module** provides its own half and the category is extracted from `<namespace>`; an **admin** setting uses `<vendor>.settings.<category>.<name>.v1`. The trailing `~` makes the key a type rather than an instance, which lets a policy name one setting (§4.8). The value's schema is separate: `value_type_id` names a toolkit-owned catalog type.
+The setting `key` is a **GTS type identifier** `gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~` for **both** authors. The base type is owned and registered by the Settings gear. A contributing gear supplies the derived half of its setting's id — `<vendor>.<package>.<namespace>.<type>` per the GTS grammar — and the Settings gear registers the derived type for it (§4.7).
 
 #### GTS validation
 
