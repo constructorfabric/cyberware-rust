@@ -811,7 +811,10 @@ fn throttle_response(
 /// log at `info` so operators have production visibility at the default level.
 ///
 /// The high-cardinality bucket key stays a structured field (`key`) — never in
-/// the message body and never a metric attribute.
+/// the message body and never a metric attribute. `key` carries personal data
+/// (a client IP or a subject UUID); keeping it a separate field lets a log
+/// pipeline redact it or shorten its retention. The request id is attached
+/// through the enclosing `http_request` span.
 fn record_rejection(inner: &ThrottlingInner, key: &ThrottleKey, zone: &str, kind: &str, id: &str) {
     if let Some(counter) = inner.rejections.as_ref() {
         counter.add(
@@ -835,7 +838,8 @@ fn record_rejection(inner: &ThrottlingInner, key: &ThrottleKey, zone: &str, kind
 /// Record a dry-run event: the request exceeded a limit (`kind` is
 /// `rate_limit`, `max_keys` or `in_flight`) but is served because the
 /// operation is in dry-run mode. Bumps the `zone`/`kind` dry-run counter and
-/// logs at `warn` with the same structured shape as [`record_rejection`].
+/// logs at `warn` with the same structured shape as [`record_rejection`],
+/// including the personal-data note on the `key` field.
 ///
 /// For `max_keys` the keyed store is deliberately not touched, so it stays
 /// capped in observe mode too.

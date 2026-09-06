@@ -334,6 +334,10 @@ no longer unbounded in either.
   attributes) with a distinguishing `kind = "max_keys"`, so an operator can
   tell a real rate rejection from a capacity rejection. ADR-0001 already
   anticipates a reason label on this counter; this is a compatible shape.
+  The bucket key (a client IP or a subject UUID, i.e. personal data) is a
+  structured log field, never message text or a metric attribute, so a log
+  pipeline can redact it or shorten its retention; the request id comes from
+  the enclosing `http_request` span.
 * Capacity rejections carry `Retry-After` equal to the prune interval — the
   upper bound on how long admission stays closed.
 * Accounting is per zone (`Arc<RateZone>`), shared across both auth partitions,
