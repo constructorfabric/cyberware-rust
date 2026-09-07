@@ -100,26 +100,33 @@ the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint prope
 
 * `cpt-cf-file-storage-design-signed-urls` (DESIGN §4.5), api.md, and the worked examples (§4.6/§4.7) change: the
   discrete `X-FS-*` parameters are replaced by a **single token** carried as `?fs-token=<token>` (query) or an
-  `X-FS-Token` header. SigV4-style canonical-string signing is replaced by **PASETO mint (control) / verify
-  (sidecar)**; all claims live inside the token.
-* **New dependency:** a PASETO v4 library — control plane signs (`v4.public`), sidecar verifies. Ed25519 keys as before
-  (private → control, public → sidecar); `kid` in the footer; rotation is P2.
-* **FIPS posture (binding constraint on the dependency, not a deferred fallback).** PASETO `v4.public` uses **Ed25519**,
+  `X-FS-Token` header. SigV4-style canonical-string signing is replaced by **asymmetric mint (control) / verify
+  (sidecar) — the bespoke codec-equivalent token specified under [Implementation note](#implementation-note-p2-2026-07),
+  not a literal PASETO library**; all claims live inside the token.
+* **No PASETO token-library dependency (bespoke codec):** the shipped token is
+  `base64url(json(claims)).base64url(ed25519_signature)` built on the already-present `base64` and `ring`/Ed25519
+  primitives through the in-house `SignatureProvider`/`SignatureVerifier` abstraction — **no `kid` footer** (a single
+  static sidecar public key; key rotation is a forward P2 concern), and no new third-party token format crate. Ed25519
+  keys as before (private → control, public → sidecar). Literal PASETO `v4.public` is not adopted in P1; it remains a
+  possible future wrapper over the same `SignatureProvider` seam (the format is opaque and codec-evolvable per the
+  Token Opacity Contract).
+* **FIPS posture (binding constraint on the dependency, not a deferred fallback).** The token signs with **Ed25519**,
   which *is* approved under **FIPS 186-5**, but approval requires the signing/verifying primitive to run inside a
-  **FIPS-validated cryptographic module** — a generic PASETO/Ed25519 crate is not automatically compliant. The binding
-  rule for implementation is therefore about *which crate we pull in*:
+  **FIPS-validated cryptographic module** — a generic Ed25519 crate (PASETO or otherwise) is not automatically
+  compliant. The binding rule for implementation is therefore about *which crate we pull in*:
   * **MUST NOT** introduce any new crate that hard-wires a **non-FIPS algorithm or a self-contained crypto
     implementation we cannot swap out.** No dependency may bake the signing primitive in such a way that the algorithm
     or its backing module is fixed at the crate boundary.
   * The token signer/verifier **MUST sit behind a thin in-house crypto-provider abstraction** (a `SignatureProvider`
-    trait: `sign(claims) -> token` on control, `verify(token) -> claims` on the sidecar). The PASETO codec calls that
-    abstraction; the abstraction is what binds to the concrete algorithm + module.
+    trait: `sign(claims) -> token` on control, `verify(token) -> claims` on the sidecar). The token codec (the bespoke
+    codec-equivalent format in P1) calls that abstraction; the abstraction is what binds to the concrete algorithm + module.
   * In FIPS deployments the provider **MUST** be backed by a FIPS-validated module (the platform already ships
-    `rustls-corecrypto-provider`); the PASETO/Ed25519 path must route through it. If no validated Ed25519 module is
+    `rustls-corecrypto-provider`); the Ed25519 token path must route through it. If no validated Ed25519 module is
     available for a target, the provider is swapped for a FIPS-approved alternative (e.g. ECDSA P-256 / a JWS profile
     over the validated module) — **without touching the token codec, claim-set, or the rest of this design**, because
     the token is **opaque and the codec is freely evolvable** (Token Opacity Contract).
-  * Concretely this means we evaluate the candidate PASETO crate for this property **before** adding it: prefer one that
+  * Concretely this means we evaluate any candidate crypto/token crate for this property **before** adding it (a literal
+    PASETO wrapper, if ever adopted, included): prefer one that
     accepts an external signer/key backend (so the algorithm is replaceable), and reject any that statically links a
     non-replaceable non-FIPS implementation.
 

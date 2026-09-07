@@ -4,9 +4,15 @@ Updated:  2026-07-08 by Constructor Tech
 
 - [ ] `p2` - **ID**: `cpt-cf-file-storage-featstatus-audit-trail-implemented`
 
-> Every write mutation this gear performs inserts an audit row transactionally
-> into `audit_outbox`. There is nothing downstream of that insert: no consumer,
-> exporter, or relay ever reads a row back out and marks it `published_at`. See
+> Every in-scope durable file/version mutation this gear performs inserts an
+> audit row transactionally into `audit_outbox` — create/finalize, content and
+> metadata patch, delete, multipart complete/abort (including the DELETE of the
+> session's pending version), retention delete, backend migrate, ownership
+> transfer, and orphan reconcile (including the sweep of abandoned pending
+> versions). Policy and retention-rule writes (the `policy_service` config
+> surface) are not audited. There is nothing downstream of the insert: no
+> consumer, exporter, or relay ever reads a row back out and marks it
+> `published_at`. See
 > [§5 "Outbox Drain to a Downstream Sink (NOT IMPLEMENTED)"](#outbox-drain-to-a-downstream-sink-not-implemented)
 > below.
 

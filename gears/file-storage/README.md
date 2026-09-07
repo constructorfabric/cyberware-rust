@@ -61,8 +61,12 @@ FileStorage's control plane and data-plane sidecar are implemented and tested. H
   PASETO `v4.public` — see [ADR-0004](docs/ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md)'s
   Implementation note); SHA-256 + magic-byte content-type validation; HTTP `Range`. Data-plane **sidecar** binary
   verifies tokens and streams bytes, then calls a token-authenticated `finalize` callback back to the control plane
-  (`pending → available`); binding a version as the file's live content (`content_id`) is always a separate,
-  client-issued request (see [DESIGN.md](docs/DESIGN.md) §3.6 and
+  (`pending → available`); binding a version as the file's live content (`content_id`) is a separate client-issued
+  request **except** on the auto-bind path — `POST /files` with `bind: "auto"` (the default for a brand-new file)
+  binds the first content without a separate `bind`: for a single-part upload the token carries the
+  `bind_on_finalize` claim and the finalize callback performs the bind itself under a `content_id IS NULL` CAS; for
+  a multipart plan the session records `auto_bind` and the bind runs inside the same transaction as `complete`'s
+  finalize (see [DESIGN.md](docs/DESIGN.md) §3.6 and
   [ADR-0003](docs/ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md)).
 
 ### Policies, lifecycle, and governance

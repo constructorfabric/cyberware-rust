@@ -234,11 +234,16 @@ is **create-exclusive, not overwrite-safe**: `StorageBackend::publish_exclusive`
 given backend path is empty — a retried `PUT` to the same signed URL never overwrites bytes already landed there,
 it reports `created: false` and leaves the stored blob untouched. The documented recovery is still to retry the
 `PUT`: if the earlier publish landed but finalize never ran, this retry's measured bytes match what's already
-stored and the handler answers `200` (a benign retry has converged) via a fresh finalize attempt; if the version
-was already finalized or the retried bytes disagree with what's stored, it answers `409 Conflict` instead — never
-a silent overwrite. For the finalize case specifically, the version may already be correctly finalized
-server-side even though the client saw a transient `502` on a preceding attempt (re-verify via
-`GET /files/{id}/versions` before assuming failure).
+stored and the handler answers `200` (a benign retry has converged) via a fresh finalize attempt. If the version
+was already finalized, the outcome depends on the token: a replay **with** the `bind_on_finalize` claim
+(auto-bind `POST /files` path) whose size and content hash match the stored version is answered `200` — the
+`X-FS-Bound`/`ETag` headers are recomputed against the file's *current* `content_id`, so a concurrent bind in
+between can still flip `bound`↔`conflict` (F4 in the concurrency-and-failure model, and `write.rs`'s
+already-available replay branch); a manual path replaying an already-`available` version answers `409`
+("version already finalized"), and a mismatched replay is answered `409`/`400` (hash or size check) — never a
+silent overwrite. For the finalize case specifically, the version may already be correctly finalized server-side
+even though the client saw a transient `502` on a preceding attempt (re-verify via `GET /files/{id}/versions`
+before assuming failure).
 
 ## The background cleanup sweep
 

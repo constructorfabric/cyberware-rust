@@ -422,28 +422,41 @@ implicit. Wire/storage value: `hash_mode` ∈ `whole-sha256` | `multipart-compos
 algorithm choice, only a per-mode *shape* difference in what `hash_value`
 means.
 
-**On-the-fly principle (rule 4).** Every mode
-below is computed **as bytes transit the sidecar during upload** — never by
-re-reading the stored object afterward. This is the fourth rule of the
-design, alongside the two modes below, and it applies identically to
-both: mode 1's whole-object hash is the direct streaming tap it always was;
-mode 2's manifest and root are built entirely from already-computed per-part
-digests, no re-read of the assembled object required.
+**Wire-hash rules over the two modes.**
+Mode 1's whole-object hash is derived by the **control plane at finalize**,
+not from the caller: `finalize_upload`/`finalize_upload_by_token` re-read the
+stored object via `read_back_and_hash_streaming` and recompute size/hash from
+the real bytes, and that recomputed `actual_hash` is what is stored — so
+single-shot's persisted hash is verifier-derived, never trusted from the
+caller. Mode 2's manifest and root are built entirely from already-computed
+per-part digests (`multipart_upload_parts.part_hash`) **with no read of the
+assembled object to compute the root** — this is the mode for which "no
+re-read to compute the hash" holds, and it is what ADR-0006's composite rule
+is about; multipart `complete` has no assemble-then-rehash step. (That is not
+a general "never touches the object again" claim: `complete` still reads a
+short prefix of the assembled object for MIME magic-byte sniffing, and the
+takeover path probes a byte range to confirm the object exists — neither feeds
+the root.)
 
 #### Mode 1 — non-multipart, whole-object SHA-256
 
 - **Per-part computation**: N/A (single stream).
-- **Complete computation**: unchanged — `hash::Hasher`-style streaming
-  accumulator over every chunk as it transits the sidecar
-  (`put_stream`/`write_stream_to_tmp`/`read_back_and_hash_streaming`).
+- **Complete computation**: at finalize the control plane streams the stored
+  object back (`read_back_and_hash_streaming`) and recomputes size/hash from
+  the real bytes; that recomputed `actual_hash` is what is stored (the sidecar
+  never records the caller's claimed digest for this mode).
 - **Stored fields**: `hash_algorithm = 'SHA-256'`, `hash_mode =
   'whole-sha256'`, `hash_value` = 32-byte whole-object SHA-256 digest. No
   manifest row for this mode — it is **not** represented as a 1-part
   manifest; there is nothing to reconstruct beyond re-hashing the bytes.
-- **Verification/recompute**: identical to the existing behavior — stream the object back,
-  recompute SHA-256, compare.
-- **Re-download avoided?** N/A — this mode has never re-downloaded; it hashes
-  on the original write/read-back streaming tap. No regression either way.
+- **Verification/recompute**: the finalize read-back recomputes SHA-256 over the
+  stored bytes and **compares** it with the digest the upload actually reported
+  — the sidecar's digest passed in the finalize-callback `hash_value`
+  (`finalize_upload_by_token`), or the in-process data-plane digest
+  (`finalize_upload`) — and a mismatch is rejected (`hash_mismatch`); only the
+  recomputed `actual_hash` is persisted as `hash_value`.
+- **Re-download avoided?** No — single-shot deliberately re-reads once at
+  finalize to derive the stored hash (verifier-driven, never caller-trusted).
 
 #### Mode 2 — multipart, SHA-256 offset-manifest composite
 
