@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
-use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
+use authz_resolver_sdk::constraints::{
+    Constraint, InPredicate, InTenantSubtreePredicate, Predicate,
+};
 use authz_resolver_sdk::models::{
     DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
 };
@@ -113,6 +115,41 @@ impl AuthZResolverApi for PermitTenantsPdp {
     }
 }
 
+/// Permits every request with an `owner_tenant_id IN SUBTREE(root)` constraint,
+/// the shape a hierarchy-aware PDP returns. The filter has no literal values in
+/// memory; only `SecureConn` can evaluate it.
+pub struct PermitSubtreePdp {
+    root: Uuid,
+}
+
+impl PermitSubtreePdp {
+    pub fn new(root: Uuid) -> Self {
+        Self { root }
+    }
+}
+
+#[async_trait]
+impl AuthZResolverApi for PermitSubtreePdp {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::InTenantSubtree(InTenantSubtreePredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        self.root,
+                    ))],
+                }],
+                ..EvaluationResponseContext::default()
+            },
+        })
+    }
+}
+
 /// Permits without any constraint. Under `require_constraints` the PEP must
 /// fail closed on it.
 pub struct PermitUnconstrainedPdp;
@@ -165,6 +202,20 @@ impl AuthZResolverApi for FailingPdp {
         _request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         Err(CanonicalError::internal("PDP unavailable").create())
+    }
+}
+
+/// A PDP that never answers.
+pub struct HangingPdp;
+
+#[async_trait]
+impl AuthZResolverApi for HangingPdp {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        std::future::pending().await
     }
 }
 

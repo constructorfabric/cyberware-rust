@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use authz_resolver_sdk::AuthZResolverApi;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use serde_json::json;
 use tokio::sync::oneshot;
@@ -14,8 +15,8 @@ use uuid::Uuid;
 use super::QuotaEnforcementGear;
 use crate::domain::{Dependency, ReadinessState};
 use crate::test_support::{
-    ClusterFixture, OtherProfile, PermitTenantsPdp, hub_with, register_pdp, register_storage,
-    storage_instance, tenant, wire_cluster, wire_cluster_with,
+    ClusterFixture, FailingPdp, OtherProfile, PermitTenantsPdp, hub_with, register_pdp,
+    register_storage, storage_instance, tenant, wire_cluster, wire_cluster_with,
 };
 
 struct StaticConfigProvider {
@@ -56,18 +57,28 @@ enum ClusterBinding {
     Other,
 }
 
-/// Registry with the storage plugin instance, the PDP double, a wired cluster,
-/// and optionally the storage double's scoped client.
+/// Registry with the storage plugin instance, a permitting PDP double, a wired
+/// cluster, and optionally the storage double's scoped client.
 fn environment(
     with_storage_client: bool,
     cluster: ClusterBinding,
 ) -> (Arc<ClientHub>, Arc<InMemoryStorage>, ClusterFixture) {
+    environment_with_pdp(
+        with_storage_client,
+        cluster,
+        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
+    )
+}
+
+/// [`environment`] with the given PDP double registered as the client.
+fn environment_with_pdp(
+    with_storage_client: bool,
+    cluster: ClusterBinding,
+    pdp: Arc<dyn AuthZResolverApi>,
+) -> (Arc<ClientHub>, Arc<InMemoryStorage>, ClusterFixture) {
     let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
     let hub = hub_with(&[&storage_fixture]);
-    register_pdp(
-        &hub,
-        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
-    );
+    register_pdp(&hub, pdp);
     let storage = Arc::new(InMemoryStorage::new());
     if with_storage_client {
         register_storage(&hub, &storage_fixture, storage.clone());
@@ -169,6 +180,49 @@ async fn serve_fails_and_never_signals_ready_when_bootstrap_fails() {
     let result = check.check().await;
     assert_eq!(result.status, HealthcheckResult::unhealthy("x").status);
     assert_eq!(result.code.as_deref(), Some("qe_storage_unavailable"));
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn serve_fails_on_the_pdp_dependency_when_the_registered_pdp_does_not_answer() {
+    // Init accepts the registered client; the bootstrap probe finds the PDP
+    // behind it unreachable, so the gear never reports ready.
+    let (hub, storage, fixture) =
+        environment_with_pdp(true, ClusterBinding::QuotaEnforcement, Arc::new(FailingPdp));
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    let ctx = make_ctx(hub);
+    gear.init(&ctx)
+        .await
+        .expect("init sees a registered client");
+
+    let (tx, rx) = oneshot::channel();
+    let err = gear
+        .clone()
+        .serve(CancellationToken::new(), ReadySignal::from_sender(tx))
+        .await
+        .expect_err("the PDP does not answer");
+    assert!(
+        format!("{err:#}").contains("authorization service unavailable"),
+        "{err:#}"
+    );
+    assert!(rx.await.is_err(), "the ready signal is never sent");
+    assert_eq!(
+        storage.bootstrap_calls(),
+        1,
+        "storage bootstrap and the cluster resolve ran before the PDP probe"
+    );
+
+    let service = gear.service().expect("service");
+    assert!(matches!(
+        service.readiness().snapshot(),
+        ReadinessState::Failed {
+            dependency: Dependency::Pdp,
+            ..
+        }
+    ));
+    let check = gear.healthcheck(&ctx).expect("health check");
+    let result = check.check().await;
+    assert_eq!(result.code.as_deref(), Some("qe_pdp_unavailable"));
     fixture.stop().await;
 }
 

@@ -8,14 +8,13 @@
 
 use std::sync::Arc;
 
-use authz_resolver_sdk::AuthZResolverApi;
 use quota_enforcement_sdk::{BootstrapBundle, QuotaEnforcementStoragePluginV1, StorageError};
-use toolkit::client_hub::ClientHub;
 use toolkit_macros::domain_model;
 
 use super::error::{Dependency, DomainError};
 use super::plugins::PluginBinding;
 use super::ports::coordination::{CoordinatorBinding, SingletonCoordinator};
+use super::ports::pdp::PdpProbe;
 use super::readiness::Readiness;
 
 const LOG_TARGET: &str = "qe.bootstrap";
@@ -35,7 +34,7 @@ pub struct Bound {
 pub struct Bootstrap {
     binding: PluginBinding,
     coordinator: Arc<dyn CoordinatorBinding>,
-    hub: Arc<ClientHub>,
+    pdp: Arc<dyn PdpProbe>,
     readiness: Arc<Readiness>,
 }
 
@@ -45,13 +44,13 @@ impl Bootstrap {
     pub fn new(
         binding: PluginBinding,
         coordinator: Arc<dyn CoordinatorBinding>,
-        hub: Arc<ClientHub>,
+        pdp: Arc<dyn PdpProbe>,
         readiness: Arc<Readiness>,
     ) -> Self {
         Self {
             binding,
             coordinator,
-            hub,
+            pdp,
             readiness,
         }
     }
@@ -117,12 +116,10 @@ impl Bootstrap {
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
-        // Structural PDP probe: the admission boundary is unusable without the
-        // `authz-resolver` client. Its liveness is reported by its own health
-        // check, which api-gateway aggregates into `/readyz`.
-        self.hub
-            .get::<dyn AuthZResolverApi>()
-            .map_err(|e| (Dependency::Pdp, DomainError::PdpUnavailable(e.to_string())))?;
+        // One round trip to the PDP. `init` already proved the client is
+        // registered; a registered client over an unreachable PDP would still
+        // deny every request, so the gear must not report ready behind it.
+        self.pdp.probe().await.map_err(|e| (Dependency::Pdp, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
 
         Ok(Bound {

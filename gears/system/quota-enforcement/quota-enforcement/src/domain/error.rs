@@ -265,9 +265,6 @@ pub enum DomainError {
 }
 
 impl DomainError {
-    /// Closed reason token for the `PdpDenied` variant when the gateway's own
-    /// post-permit gate rejects the target tenant.
-    pub const TENANT_OUT_OF_SCOPE: &'static str = "TENANT_OUT_OF_SCOPE";
     /// Closed reason token when the PDP permit carried no usable constraints.
     pub const CONSTRAINT_COMPILE_FAILED: &'static str = "CONSTRAINT_COMPILE_FAILED";
     /// Closed reason token when storage caught a subject outside the scope.

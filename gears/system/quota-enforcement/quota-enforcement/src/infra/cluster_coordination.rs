@@ -14,6 +14,12 @@
 //! SDK combinator consumes the watch, and a dropped watch performs no resign.
 //! Keeping the watch is what lets graceful shutdown resign, so a successor is
 //! elected without a TTL wait.
+//!
+//! It departs from the SDK combinator on `Lagged` and `Reset`. The SDK leaves
+//! running work alone there; this adapter treats both as a gap in what it
+//! observed, stops the body, and resumes only from the backend's lossless
+//! status snapshot. A sweeper that outlives a missed `Lost` is a second active
+//! sweeper, which is the failure the election exists to prevent.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,9 +165,10 @@ impl SingletonCoordinator for ClusterCoordination {
 ///
 /// The work starts on `Leader` with a child token, is cancelled on `Lost` or
 /// `Follower`, is aborted after `stop_timeout` when it does not return, and
-/// restarts on re-election. `Lagged` and `Reset` change nothing: the next
-/// status event reconciles. On shutdown the running work is stopped first and
-/// the election is resigned afterwards.
+/// restarts on re-election. `Lagged` and `Reset` mean the stream missed
+/// transitions: the work is cancelled and restarts only when the status
+/// snapshot still reads `Leader`. On shutdown the running work is stopped
+/// first and the election is resigned afterwards.
 pub(crate) async fn drive(
     scope: SingletonScope,
     mut watch: LeaderWatch,
@@ -179,7 +186,8 @@ pub(crate) async fn drive(
         let Some(event) = event else {
             return resign_on_shutdown(scope, watch, active.take(), stop_timeout).await;
         };
-        if let Some(outcome) = apply_event(scope, event, &mut active, &work, stop_timeout).await {
+        let outcome = apply_event(scope, event, &watch, &mut active, &work, stop_timeout).await;
+        if let Some(outcome) = outcome {
             return outcome;
         }
     }
@@ -214,6 +222,7 @@ async fn resign_on_shutdown(
 async fn apply_event(
     scope: SingletonScope,
     event: LeaderWatchEvent,
+    watch: &LeaderWatch,
     active: &mut Option<ActiveWork>,
     work: &LeaderWork,
     stop_timeout: Duration,
@@ -228,9 +237,68 @@ async fn apply_event(
             tracing::warn!(target: LOG_TARGET, %scope, error = %err, "the election closed");
             Some(Err(cluster_unavailable(&err)))
         }
-        // `Lagged` and `Reset` do not change leadership; the next `Status`
-        // event reconciles. The enum is non-exhaustive on the SDK side.
-        _ => None,
+        // `Lagged`, `Reset`, and any variant this build does not know (the
+        // enum is non-exhaustive on the SDK side): a gap in the observed
+        // transitions.
+        gap => {
+            log_gap(scope, &gap);
+            reconcile_from_snapshot(scope, watch, active, work, stop_timeout).await;
+            None
+        }
+    }
+}
+
+fn log_gap(scope: SingletonScope, event: &LeaderWatchEvent) {
+    let cause = match event {
+        LeaderWatchEvent::Lagged { dropped } => {
+            format!("the election watch fell behind by {dropped} events")
+        }
+        LeaderWatchEvent::Reset => "the election subscription was re-established".to_owned(),
+        other => format!("unknown election watch event {other:?}"),
+    };
+    tracing::warn!(
+        target: LOG_TARGET,
+        %scope,
+        %cause,
+        "leadership is uncertain; the sweep body stops until the status snapshot is read"
+    );
+}
+
+/// A gap in the event stream: the body stops, because a `Lost` may be among
+/// the missed events, and resumes only from a known state.
+///
+/// That state is the status snapshot the backend maintains next to the stream.
+/// The snapshot is lossless: the SDK updates it before it offers each `Status`
+/// event, and a dropped event still updates it. Reading it is therefore the
+/// leader-watch form of the "re-read" the cluster design prescribes after a
+/// gap. Waiting for the next `Status` event instead would stall a stable
+/// leader whose missed transitions netted out to `Leader`: a stable election
+/// emits no further event, and the remote profile re-emits no status after a
+/// `Reset`.
+async fn reconcile_from_snapshot(
+    scope: SingletonScope,
+    watch: &LeaderWatch,
+    active: &mut Option<ActiveWork>,
+    work: &LeaderWork,
+    stop_timeout: Duration,
+) {
+    stop_if_active(scope, active.take(), stop_timeout).await;
+    match watch.status() {
+        LeaderStatus::Leader => {
+            tracing::info!(
+                target: LOG_TARGET,
+                %scope,
+                "the status snapshot reads leader; the sweep body restarts"
+            );
+            start_if_idle(scope, active, work);
+        }
+        LeaderStatus::Lost | LeaderStatus::Follower => {
+            tracing::info!(
+                target: LOG_TARGET,
+                %scope,
+                "the status snapshot reads follower; the sweep body stays stopped"
+            );
+        }
     }
 }
 

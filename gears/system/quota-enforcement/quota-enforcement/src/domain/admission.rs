@@ -2,9 +2,13 @@
 //!
 //! Every operation, from REST or from the in-process SDK client, enters here
 //! (`features/foundation.md`, "Authorized Operation Admission"). The order is
-//! fixed: public shape check, PDP call through `PolicyEnforcer`, post-permit
-//! tenant gate, then the `AccessScope` travels unmodified to the operation
-//! handler for `SecureConn`. QE keeps no PDP decision cache.
+//! fixed: public shape check, PDP call through `PolicyEnforcer`, then the
+//! `AccessScope` travels unmodified to the operation handler for `SecureConn`.
+//! The PDP authorizes the complete explicit target, the target tenant
+//! included as `owner_tenant_id`. QE never interprets the returned scope: its
+//! filters (`In`, `InTenantSubtree`, ...) are evaluated by `SecureConn` at the
+//! storage boundary, and an in-memory check cannot evaluate a subtree filter
+//! at all. QE keeps no PDP decision cache.
 
 use std::sync::Arc;
 
@@ -80,8 +84,8 @@ impl Admission {
     ///
     /// - [`DomainError::InvalidArgument`] on a malformed public target, before
     ///   any PDP call.
-    /// - [`DomainError::PdpDenied`] when the PDP denies, when its constraints
-    ///   do not compile, or when the permit does not cover the target tenant.
+    /// - [`DomainError::PdpDenied`] when the PDP denies or when its
+    ///   constraints do not compile.
     /// - [`DomainError::PdpUnavailable`] when the PDP cannot be reached.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-authorized-admission:p1
     pub async fn admit(
@@ -129,18 +133,13 @@ impl Admission {
         // @cpt-end:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-deny
         // @cpt-end:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-deny-if
 
-        // The PDP authorized the complete tuple. Accept `tenant_id` only when
-        // the returned scope covers it; a permit that names other tenants is a
-        // denial for this target.
-        if !scope_admits_tenant(&access_scope, target.tenant_id) {
-            let err = DomainError::PdpDenied {
-                reason: Some(DomainError::TENANT_OUT_OF_SCOPE.to_owned()),
-            };
-            return Err(self.deny(&site, DenialReason::PermissionDenied, err));
-        }
-
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-scope
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-forward
+        // The PDP authorized the complete tuple, `target.tenant_id` included.
+        // The scope is not inspected here: `SecureConn` evaluates its filters
+        // at the storage boundary, and an in-memory membership check cannot
+        // evaluate an `InTenantSubtree` filter, so it would deny an authorized
+        // descendant tenant.
         Ok(Admitted {
             tenant_id: target.tenant_id,
             access_scope,
@@ -188,13 +187,6 @@ fn validate_target_shape(target: AdmissionTarget) -> Result<(), DomainError> {
         });
     }
     Ok(())
-}
-
-/// True when the PDP scope covers `tenant`: either the permit is
-/// unconstrained or its tenant constraint names the tenant.
-fn scope_admits_tenant(scope: &AccessScope, tenant: TenantId) -> bool {
-    scope.is_unconstrained()
-        || scope.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant.as_uuid())
 }
 
 const fn denial_reason(err: &EnforcerError) -> DenialReason {

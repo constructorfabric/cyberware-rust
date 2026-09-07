@@ -24,7 +24,7 @@ pub(crate) struct OperationResource;
 
 /// Closed reason tokens of the canonical envelope.
 pub mod reason {
-    /// PDP denial, compile failure, or the gateway's tenant gate.
+    /// PDP denial or constraint compile failure.
     pub const AUTHZ: &str = "AUTHZ";
     /// Bootstrap has not completed.
     pub const NOT_READY: &str = "NOT_READY";

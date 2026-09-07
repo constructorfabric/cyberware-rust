@@ -30,6 +30,7 @@ use crate::config::QuotaEnforcementConfig;
 use crate::domain::{Admission, Bootstrap, PluginBinding, Readiness, Service};
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
 use crate::infra::metrics;
+use crate::infra::pdp_probe::PdpReachability;
 
 const LOG_TARGET: &str = "qe.lifecycle";
 
@@ -126,11 +127,13 @@ impl Gear for QuotaEnforcementGear {
         tracing::Span::current().record("storage_vendor", cfg.storage_vendor.as_str());
 
         // PEP boundary: the PDP client is a hard dependency. Without it the gear
-        // fails init and never serves a permissive decision.
+        // fails init and never serves a permissive decision. Whether the PDP
+        // behind the client answers is bootstrap's probe.
         let hub = ctx.client_hub();
         let authz: Arc<dyn AuthZResolverApi> = hub
             .get::<dyn AuthZResolverApi>()
             .with_context(|| format!("{} requires an authz-resolver client", Self::MODULE_NAME))?;
+        let pdp_probe = Arc::new(PdpReachability::new(authz.clone()));
         let enforcer = PolicyEnforcer::new(authz);
 
         let metrics = metrics::build_default_adapter(&cfg.metrics);
@@ -146,7 +149,7 @@ impl Gear for QuotaEnforcementGear {
         .context("[quota-enforcement.election] is not a valid election timing")?;
         let coordinator = Arc::new(ClusterCoordinationBinding::new(hub.clone(), timing));
         let binding = PluginBinding::new(hub.clone(), cfg.storage_vendor);
-        let bootstrap = Bootstrap::new(binding, coordinator, hub.clone(), readiness);
+        let bootstrap = Bootstrap::new(binding, coordinator, pdp_probe, readiness);
 
         self.hub
             .set(hub)

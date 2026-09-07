@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use cluster_sdk::{ClusterError, ClusterProfile, LeaderStatus, LeaderWatch};
+use cluster_sdk::{ClusterError, ClusterProfile, LeaderStatus, LeaderWatch, LeaderWatchEvent};
 use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
 
@@ -109,6 +109,101 @@ async fn drive_starts_the_body_on_election_stops_it_on_loss_and_resigns_on_shutd
         .expect("drive joins")
         .expect("drive returns Ok after the resign");
     assert_eq!(body.stops(), 2, "the body stopped before the resign");
+}
+
+#[tokio::test]
+async fn drive_restarts_the_body_after_a_gap_when_the_snapshot_still_reads_leader() {
+    let (sender, mut resigns, watch) = LeaderWatch::channel(8, LeaderStatus::Follower);
+    let body = Arc::new(Body::default());
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(drive(
+        SingletonScope::LeaseSweeper,
+        watch,
+        shutdown.clone(),
+        counting_work(body.clone()),
+        Duration::from_secs(1),
+    ));
+    sender
+        .send_status(LeaderStatus::Leader)
+        .await
+        .expect("watch alive");
+    wait_until("body started", || body.starts() == 1).await;
+
+    // The stream missed events. The body cannot be trusted to have seen a
+    // loss, so it stops; the snapshot still reads leader, so it restarts.
+    sender
+        .send(LeaderWatchEvent::Lagged { dropped: 3 })
+        .await
+        .expect("watch alive");
+    wait_until("body stopped on the gap", || body.stops() == 1).await;
+    wait_until("body restarted from the leader snapshot", || {
+        body.starts() == 2
+    })
+    .await;
+
+    // A re-established subscription is the same gap.
+    sender
+        .send(LeaderWatchEvent::Reset)
+        .await
+        .expect("watch alive");
+    wait_until("body stopped on the reset", || body.stops() == 2).await;
+    wait_until("body restarted after the reset", || body.starts() == 3).await;
+
+    shutdown.cancel();
+    let responder = resigns.recv().await.expect("shutdown resigns");
+    responder.respond(Ok(()));
+    task.await.expect("drive joins").expect("drive returns Ok");
+    assert_eq!(body.stops(), 3);
+}
+
+#[tokio::test]
+async fn drive_keeps_the_body_stopped_after_a_gap_when_the_snapshot_reads_follower() {
+    // One consumer-visible slot: the loss below overflows it and is dropped
+    // from the stream, exactly the missed `Lost` the gap handling exists for.
+    let (mut sender, mut resigns, watch) = LeaderWatch::channel(1, LeaderStatus::Follower);
+    let body = Arc::new(Body::default());
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(drive(
+        SingletonScope::RetentionSweeper,
+        watch,
+        shutdown.clone(),
+        counting_work(body.clone()),
+        Duration::from_secs(1),
+    ));
+    sender
+        .send_status(LeaderStatus::Leader)
+        .await
+        .expect("watch alive");
+    wait_until("body started", || body.starts() == 1).await;
+
+    // No await between the two: the `Lagged` fills the slot, the `Follower`
+    // updates the snapshot and its event is dropped. The loop sees only the
+    // gap and must recover the loss from the snapshot.
+    assert!(sender.try_send(LeaderWatchEvent::Lagged { dropped: 1 }));
+    assert!(sender.try_send_status(LeaderStatus::Follower));
+    wait_until("body stopped on the gap", || body.stops() == 1).await;
+
+    // A body wrongly restarted after the gap would be stopped by this status
+    // and raise the stop count; a correctly idle loop has nothing to stop.
+    sender
+        .send_status(LeaderStatus::Follower)
+        .await
+        .expect("watch alive");
+    sender
+        .send_status(LeaderStatus::Leader)
+        .await
+        .expect("watch alive");
+    wait_until("body restarted on re-election", || body.starts() == 2).await;
+    assert_eq!(
+        body.stops(),
+        1,
+        "nothing ran between the gap and the re-election"
+    );
+
+    shutdown.cancel();
+    let responder = resigns.recv().await.expect("shutdown resigns");
+    responder.respond(Ok(()));
+    task.await.expect("drive joins").expect("drive returns Ok");
 }
 
 #[tokio::test]

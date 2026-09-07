@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use quota_enforcement_sdk::TenantId;
-use toolkit_security::pep_properties;
+use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
 use super::{Admission, AdmissionTarget};
@@ -10,7 +10,8 @@ use crate::domain::error::DomainError;
 use crate::domain::pep::{actions, resources};
 use crate::domain::ports::metrics::DenialReason;
 use crate::test_support::{
-    DenyAllPdp, FailingPdp, PermitTenantsPdp, PermitUnconstrainedPdp, RecordingMetrics, ctx, tenant,
+    DenyAllPdp, FailingPdp, PermitSubtreePdp, PermitTenantsPdp, PermitUnconstrainedPdp,
+    RecordingMetrics, ctx, tenant,
 };
 
 fn admission(
@@ -53,10 +54,14 @@ async fn a_permit_that_names_the_target_tenant_is_admitted_with_the_scope_unmodi
 }
 
 #[tokio::test]
-async fn a_permit_for_other_tenants_is_denied_by_the_post_permit_gate() {
-    let other = Uuid::from_u128(0xbeef);
-    let (admission, metrics) = admission(Arc::new(PermitTenantsPdp::new(vec![other])));
-    let err = admission
+async fn a_subtree_permit_for_a_descendant_tenant_is_admitted_with_the_scope_unmodified() {
+    // A hierarchy-aware PDP answers with `owner_tenant_id IN SUBTREE(root)`.
+    // The target is a descendant of the root: the filter's literal values do
+    // not name it, so an in-memory membership check would deny an authorized
+    // caller. Admission passes the filter through for `SecureConn` instead.
+    let root = Uuid::from_u128(0xa11ce);
+    let (admission, metrics) = admission(Arc::new(PermitSubtreePdp::new(root)));
+    let admitted = admission
         .admit(
             &ctx(),
             &resources::QUOTA,
@@ -64,14 +69,25 @@ async fn a_permit_for_other_tenants_is_denied_by_the_post_permit_gate() {
             AdmissionTarget::tenant(tenant()),
         )
         .await
-        .expect_err("cross-tenant permit is a denial");
-    assert_eq!(
-        err,
-        DomainError::PdpDenied {
-            reason: Some(DomainError::TENANT_OUT_OF_SCOPE.to_owned()),
-        }
+        .expect("a subtree permit admits the descendant tenant");
+    assert_eq!(admitted.tenant_id, tenant());
+    let filters: Vec<&ScopeFilter> = admitted
+        .access_scope
+        .constraints()
+        .iter()
+        .flat_map(ScopeConstraint::filters)
+        .collect();
+    assert!(
+        matches!(filters.as_slice(), [ScopeFilter::InTenantSubtree(_)]),
+        "the subtree filter reaches the handler as the PDP returned it: {filters:?}"
     );
-    assert_eq!(metrics.denials(), vec![DenialReason::PermissionDenied]);
+    assert!(
+        !admitted
+            .access_scope
+            .contains_uuid(pep_properties::OWNER_TENANT_ID, tenant().as_uuid()),
+        "the literal-value view of the scope does not cover the target; only SecureConn can"
+    );
+    assert!(metrics.denials().is_empty());
 }
 
 #[tokio::test]
