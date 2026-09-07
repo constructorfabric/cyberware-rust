@@ -886,8 +886,11 @@ cancellation token, the resolved cluster backend renews the claim on its own cad
 leadership loss,
 the work is aborted after the configured stop timeout, and the work restarts on re-election. The adapter drives the
 election watch itself, with the same reactive pattern the SDK's `run_while_leader` implements, and keeps ownership of
-the watch: the SDK combinator consumes the watch, and a dropped watch performs no resign I/O. On graceful shutdown the
-adapter cancels the work and then resigns every held election so a successor is elected without waiting for the TTL.
+the watch: the SDK combinator consumes the watch, and a dropped watch performs no resign I/O. A `Lagged` or `Reset`
+watch event is a gap in the observed transitions: the adapter cancels the work, then restarts it only when the
+backend's lossless status snapshot still reads leader, so a missed loss can never leave a second sweeper running. On
+graceful shutdown the adapter cancels the work and then resigns every held election so a successor is elected without
+waiting for the TTL.
 Exposes the election TTL and the missed-renewal budget as operator configuration with the cluster defaults.
 
 ##### Responsibility boundaries

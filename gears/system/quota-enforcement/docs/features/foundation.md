@@ -109,7 +109,8 @@ consumption-operations feature)
 4. [ ] - `p1` - DB: seed default config rows (`contention_timeout_config`, `lease_capacity_config`, `idempotency_retention_config`) when missing - `inst-boot-seed-config`
 5. [ ] - `p1` - API: resolve the cluster leader-election facade for the `quota-enforcement` profile with the
    linearizable requirement; the cluster resolver validates the operator's backend binding - `inst-boot-cluster-resolve`
-6. [ ] - `p1` - API: verify `authz-resolver` reachability via the platform health check - `inst-boot-pdp-probe`
+6. [ ] - `p1` - API: verify `authz-resolver` reachability with one bounded PDP evaluation round trip; any decision
+   proves the PDP answered, a transport error or the deadline fails the probe - `inst-boot-pdp-probe`
 7. [ ] - `p1` - **IF** any probe or the cluster resolve fails - `inst-boot-probe-if`
    1. [ ] - `p1` - Fail readiness and surface the failing dependency in the health endpoint - `inst-boot-probe-abort`
 8. [ ] - `p1` - Register REST routes into the platform `api-gateway` via ToolKit typed-operation registration - `inst-boot-rest`
