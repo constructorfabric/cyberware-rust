@@ -1159,7 +1159,9 @@ signed-URL issuance. It does **not** carry file content — content moves over s
 **Type**: HTTP (signed-URL authorized)
 **Stability**: unstable
 **Description**: The sidecar's content surface (`GET`/`PUT`/part), addressed only via control-plane-issued signed
-URLs and served from its own domain. Verifies the PASETO `v4.public` token and its claims, validates the platform token
+URLs and served from its own domain. Verifies the bespoke codec-equivalent Ed25519 token and its claims per ADR-0004's
+Implementation note (base64url-encoded JSON plus a base64url-encoded signature; not a literal PASETO library), validates
+the platform token
 when a token-claim predicate is present, serves `Range` and conditional requests, and echoes the response headers
 baked into the URL. It holds **no** backend/tenant/user policy or quota state — all such limits (storage quota,
 allowed types, size policy, retention) live in the control plane and are applied at presign; the sidecar enforces only

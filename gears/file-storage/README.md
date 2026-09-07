@@ -99,7 +99,8 @@ Built on top of the control plane and sidecar above, FileStorage also provides:
   [docs/features/backend-migration.md](docs/features/backend-migration.md).
 - **Multipart upload** — the control plane computes a server-authoritative parts plan and mints a per-part signed
   URL for each; the sidecar's report-part callback records each part's hash. `complete` returns `200` with the
-  version id, size, composite hash, and manifest, accepts an optional `If-Match`, and returns `409` with the list of
+  version id, size, composite hash, and manifest **for plans of two or more parts** (a one-part plan degenerates to
+  `whole-sha256` with no manifest), accepts an optional `If-Match`, and returns `409` with the list of
   missing parts when the upload is incomplete; `GET .../multipart/{upload_id}` introspects an in-progress upload and
   reissues signed URLs for missing parts (resume); abort deletes the part rows and the pending version.
   **Functional only against a `multipart_native` backend** (today: the non-durable in-memory backend for dev/test,

@@ -152,7 +152,7 @@ User-facing interactions that start with an actor (human or external system) and
 **Actor**: `cpt-cf-file-storage-actor-platform-user`
 
 `complete` returns **`200`** with a JSON body
-(`version_id`, `size`, `hash_algorithm`, `content_hash`, `hash_mode`, `part_count`, `manifest`, `bind_state`,
+(`version_id`, `size`, `hash_algorithm`, `content_hash`, `hash_mode`, `part_count`, `manifest?`, `bind_state`,
 `etag?`, `current_etag?`) — **or `202`** with
 `{state: "completing", retry_after_secs}` while a concurrent completer holds the lease and the result is not yet
 recorded (the loser re-issues the same idempotent call to poll; see the concurrency-and-failure model's 202/polling
@@ -178,13 +178,15 @@ absent, in front of the generic `SUM(part.size) != declared_size` check. `comple
   leaves `content_id` untouched, returning `bind_state: "conflict"` with `current_etag` set to the ETag a manual
   `POST /files/{id}/bind` (as a fallback) would need for `If-Match`.
 
-`complete` computes the version's content hash per ADR-0006's **`multipart-composite-sha256`** mode
-(`cpt-cf-file-storage-adr-content-hash-modes`): the backend builds an offset-manifest from the per-part digests
-already persisted in `multipart_upload_parts` (`part_hash`, `offset`) and the root hash is `sha256(manifest)` --
-**no re-read/re-assembly of the object** is performed to compute it. The manifest text is persisted in
-`version_hash_manifest` and returned verbatim in the `complete` response body (`manifest` field) so a client can
-independently re-verify the composite hash (see [content-hash-modes.md](./content-hash-modes.md) §"Client-Side
-Manifest Re-Verification").
+`complete` computes the version's content hash per ADR-0006's **`multipart-composite-sha256`** mode when the
+plan has **two or more parts** (`cpt-cf-file-storage-adr-content-hash-modes`): the backend builds an offset-manifest
+from the per-part digests already persisted in `multipart_upload_parts` (`part_hash`, `offset`) and the root hash is
+`sha256(manifest)` -- **no re-read/re-assembly of the object** is performed to compute it. The manifest text is
+persisted in `version_hash_manifest` and returned verbatim in the `complete` response body (`manifest` field) so a
+client can independently re-verify the composite hash (see [content-hash-modes.md](./content-hash-modes.md)
+§"Client-Side Manifest Re-Verification"). A **one-part plan** degenerates to `whole-sha256`: the upload follows the
+single-part path (ADR-0006 amendment), `complete` is not issued, and no `manifest`/`part_count` composite is
+returned.
 
 **Success Scenarios**:
 - All reported parts are assembled and verified by the backend; the version is **finalized** (`pending -> available`)

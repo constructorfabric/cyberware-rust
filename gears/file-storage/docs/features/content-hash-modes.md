@@ -727,10 +727,12 @@ CREATE TABLE file_storage.version_hash_manifest (
 ```
 
 No new column is needed on `multipart_uploads` — there is exactly **one**
-multipart mode. Every multipart completion always produces a
-`multipart-composite-sha256` version; every non-multipart completion always
-produces a `whole-sha256` version. The mode is a function of *which code path
-ran*, not of any persisted configuration (§9).
+multipart mode. Every multipart completion of a plan with **two or more parts**
+produces a `multipart-composite-sha256` version; a multipart plan that
+collapses to exactly one part degenerates to `whole-sha256` (ADR-0006
+single-part amendment) and every non-multipart completion produces `whole-sha256`
+too. The mode is a function of *which code path ran*, not of any persisted
+configuration (§9).
 
 The existing `octet_length(hash_value) = 32` CHECK on `file_versions` is
 unchanged — `root` is a SHA-256 digest (32 bytes) exactly like the
@@ -872,10 +874,14 @@ preference.**
 
 - **Non-multipart upload → always `whole-sha256`.** No configuration knob,
   no per-request hint, no default to set.
-- **Multipart upload → always `multipart-composite-sha256`.** Same — no
-  choice, because there is only one multipart mode. `multipart_uploads`
-  needs no `hash_mode` column (§5) because the value is a constant, not a
-  per-session decision.
+- **Multipart upload with a plan of two or more parts → always
+  `multipart-composite-sha256`.** No choice, because there is only one
+  multipart composite mode. `multipart_uploads` needs no `hash_mode` column
+  (§5) because the value is a constant, not a per-session decision.
+- **A multipart plan of exactly one part → degenerates to `whole-sha256`**
+  (ADR-0006 single-part amendment §1.1): the single part's streaming digest is
+  already the whole-object digest, so the upload follows the single-part path
+  and produces no composite and no manifest.
 - **This drops ADR-0002's client-preference / selection-rules /
   discovery-endpoint vision entirely from scope**, not merely defers it —
   there is nothing left to prefer or discover once the algorithm is fixed
