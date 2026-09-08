@@ -1,24 +1,34 @@
 #![cfg(feature = "clickhouse")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 //! `ClickHouse`-backed integration tests for [`ChCatalogStore`]
-//! (create / get / list, plus the unimplemented delete).
+//! (create / get / list / delete).
 //!
 //! Mirror the `TimescaleDB` reference plugin catalog tests where the contract
-//! is shared. `delete_usage_type` is **not implemented** by this backend —
-//! `ClickHouse` has no foreign keys and the plugin has no coordination
-//! primitive to order a delete against concurrent record inserts — so the
-//! delete tests here assert the refusal and that the row is left in place.
+//! is shared. `delete` is the one place the two backends reach the same
+//! contract by different means: Postgres has a real
+//! `ON DELETE RESTRICT` foreign key, while this backend emulates it with a
+//! capped pre-delete reference probe and a post-delete orphan sweep. The
+//! delete tests here therefore assert the *observable* contract —
+//! `UsageTypeNotFound` on absence, `UsageTypeReferenced` on a live reference,
+//! removal visible to the next read otherwise — plus the two properties the
+//! emulation adds: that the catalog row goes away before the sweep (so the
+//! record store starts refusing new records on its own), and that the sweep's
+//! mutation is synchronous. The residual race between probe and delete is
+//! accepted by design and is not testable from here; see `ChCatalogStore::
+//! delete`.
 //!
 //! Requires Docker for `ClickHouse`.
 
 mod common;
 
+use rust_decimal::Decimal;
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
 use toolkit_odata::{CursorV1, ODataQuery};
+use uuid::Uuid;
 
 use usage_collector_sdk::{UsageCollectorPluginError, UsageKind};
 
-use clickhouse_usage_collector_plugin::domain::ports::CatalogStore;
+use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
 
 const VCPU_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.vcpu_hours.v1";
 const RAM_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.ram_gb.v1";
@@ -133,12 +143,14 @@ async fn ch_get_missing_is_not_found() {
     );
 }
 
-/// `delete_usage_type` is not implemented by this backend: it is refused with
-/// `Internal` and the row is left exactly where it was — for a present type
-/// and for an absent one alike, since no read is issued to tell them apart.
+/// An unreferenced type deletes cleanly and is gone by the very next read.
+///
+/// `ALTER TABLE … DELETE` is asynchronous by default, so the `get` below is
+/// what pins the `mutations_sync` setting: without it the mutation could still
+/// be in flight and the row still resolvable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
-async fn ch_delete_is_unimplemented_and_leaves_the_row() {
+async fn ch_delete_removes_an_unreferenced_type() {
     let Some(h) = common::bring_up_or_skip().await else {
         return;
     };
@@ -149,30 +161,134 @@ async fn ch_delete_is_unimplemented_and_leaves_the_row() {
         .await
         .expect("create");
 
-    let err = store
+    store
         .delete(common::fixture_gts_id(VCPU_GTS))
         .await
-        .expect_err("delete is not implemented");
-    match err {
-        UsageCollectorPluginError::Internal(msg) => assert!(
-            msg.contains("not implemented"),
-            "the refusal must say why, got: {msg}"
-        ),
-        other => panic!("expected Internal, got {other:?}"),
-    }
+        .expect("an unreferenced type must delete cleanly");
 
-    store
+    let err = store
         .get(common::fixture_gts_id(VCPU_GTS))
         .await
-        .expect("the usage type must still exist after the refused delete");
+        .expect_err("the type must be gone once delete returns");
+    assert!(
+        matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+        "expected UsageTypeNotFound after delete, got {err:?}"
+    );
+}
+
+/// Deleting a type that was never created is `UsageTypeNotFound`, not a silent
+/// success: the gateway has to distinguish "already gone" from "deleted now".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_delete_of_an_absent_type_is_not_found() {
+    let Some(h) = common::bring_up_or_skip().await else {
+        return;
+    };
+    let store = common::catalog_store(&h);
 
     let err = store
         .delete(common::fixture_gts_id(MISSING_GTS))
         .await
-        .expect_err("delete of an absent type is refused the same way");
+        .expect_err("an absent type must not delete silently");
     assert!(
-        matches!(err, UsageCollectorPluginError::Internal(_)),
-        "no existence read is issued, so an absent type is not NotFound but Internal, got {err:?}"
+        matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+        "expected UsageTypeNotFound, got {err:?}"
+    );
+}
+
+/// A type with a usage record referencing it is refused, and the catalog row
+/// survives the refusal.
+///
+/// This is the FK-emulation seam: `ClickHouse` has no `ON DELETE RESTRICT`, so
+/// the pre-delete probe is the only thing standing between a delete and an
+/// orphaned record. `sample_ref_count` must be a usable diagnostic (>= 1),
+/// which is what the gear lifts into the 409 problem document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_delete_of_a_referenced_type_is_refused() {
+    let Some(h) = common::bring_up_or_skip().await else {
+        return;
+    };
+    let store = common::catalog_store(&h);
+    // The synchronous record store: an `async_insert` write can still be
+    // buffered server-side when the probe runs, which would make this test
+    // flaky for a reason that has nothing to do with what it asserts.
+    let records = common::record_store_sync(&h);
+
+    store
+        .create(common::fixture_usage_type(RAM_GTS, "counter", &[]))
+        .await
+        .expect("create the type");
+    records
+        .create(common::fixture_usage_record(
+            RAM_GTS,
+            Uuid::new_v4(),
+            "ref-guard-1",
+            Decimal::from(1),
+        ))
+        .await
+        .expect("create a referencing record");
+
+    let err = store
+        .delete(common::fixture_gts_id(RAM_GTS))
+        .await
+        .expect_err("a referenced type must not be deletable");
+    match err {
+        UsageCollectorPluginError::UsageTypeReferenced {
+            gts_id,
+            sample_ref_count,
+        } => {
+            assert_eq!(gts_id, common::fixture_gts_id(RAM_GTS));
+            assert!(
+                sample_ref_count >= 1,
+                "sample_ref_count must be a usable diagnostic, got {sample_ref_count}"
+            );
+        }
+        other => panic!("expected UsageTypeReferenced, got {other:?}"),
+    }
+
+    store
+        .get(common::fixture_gts_id(RAM_GTS))
+        .await
+        .expect("a refused delete must leave the catalog row untouched");
+}
+
+/// Once the catalog row is gone, the record store refuses new records for that
+/// `gts_id` on its own.
+///
+/// This is what bounds the accepted race window: the delete removes the
+/// catalog row *before* sweeping, so from that moment the insert-time
+/// existence check — not the sweep — is what keeps new orphans out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_records_are_refused_for_a_deleted_type() {
+    let Some(h) = common::bring_up_or_skip().await else {
+        return;
+    };
+    let store = common::catalog_store(&h);
+    let records = common::record_store_sync(&h);
+
+    store
+        .create(common::fixture_usage_type(DISK_GTS, "counter", &[]))
+        .await
+        .expect("create the type");
+    store
+        .delete(common::fixture_gts_id(DISK_GTS))
+        .await
+        .expect("delete the unreferenced type");
+
+    let err = records
+        .create(common::fixture_usage_record(
+            DISK_GTS,
+            Uuid::new_v4(),
+            "post-delete-1",
+            Decimal::from(1),
+        ))
+        .await
+        .expect_err("a record for a deleted type must be refused");
+    assert!(
+        matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+        "expected UsageTypeNotFound, got {err:?}"
     );
 }
 
@@ -388,8 +504,11 @@ async fn ch_list_rejects_backward_cursor() {
 /// Every catalog read/write surfaces a backend failure as a plugin error — none
 /// swallows it or reports a false empty result.
 ///
-/// `delete` is deliberately absent: it never reaches the backend, so it has no
-/// backend failure to surface (it refuses before any I/O regardless).
+/// `delete` is included: its first step is an existence read, so an
+/// unreachable backend must surface as an error rather than as a
+/// `UsageTypeNotFound` inferred from a read that never happened — the failure
+/// mode that would silently report "already gone" for a type that is very much
+/// still there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker (testcontainers)"]
 async fn ch_catalog_backend_failure_is_surfaced_by_every_operation() {
@@ -410,6 +529,15 @@ async fn ch_catalog_backend_failure_is_surfaced_by_every_operation() {
         .create(common::fixture_usage_type(RAM_GTS, "counter", &[]))
         .await
         .expect_err("create must surface the backend failure");
+
+    let err = store
+        .delete(common::fixture_gts_id(RAM_GTS))
+        .await
+        .expect_err("delete must surface the backend failure");
+    assert!(
+        !matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+        "an unreachable backend must not be reported as an absent type, got {err:?}"
+    );
 }
 
 /// `ChCatalogStore` holds a `clickhouse::Client` carrying the DSN, and therefore

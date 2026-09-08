@@ -187,7 +187,7 @@ gears:
       # validate honours: it rejects a plaintext http:// database_url at
       # startup unless this is set, because the URL embeds credentials. The
       # test container serves no TLS. MUST NOT be set in production.
-      database_url: "http://default:ch_test_pw@127.0.0.1:18123/default"
+      database_url: "http://default:ch_test_pw@127.0.0.1:__E2E_CH_PORT__/default"
       allow_insecure_http: true
       request_timeout_secs: 30
       # 10 years. Long enough that the usage_records TTL can never drop test

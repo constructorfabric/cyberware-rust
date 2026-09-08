@@ -130,9 +130,9 @@ There is **no** `uc_clickhouse_dedup_outcomes_total` and no `outcome` label: the
 
 | Instrument | Kind | Labels | Description |
 | --- | --- | --- | --- |
-| `uc_clickhouse_usage_type_catalog_size` | Gauge | — | Current distinct `usage_type_catalog` `gts_id` count (refreshed by the background worker). Monotone non-decreasing: the catalog is append-only. |
+| `uc_clickhouse_usage_type_catalog_size` | Gauge | — | Current distinct `usage_type_catalog` `gts_id` count (refreshed by the background worker). **Not** monotone: `delete_usage_type` removes rows and signals the same worker. |
 
-There are **no coordination-lock instruments**. The plugin uses no lock (DESIGN.md §3.5), and `uc_clickhouse_usage_type_referenced_total` is likewise not registered — `delete_usage_type` is not implemented by this backend, so nothing could increment either.
+There are **no coordination-lock instruments**: the plugin uses no lock (DESIGN.md §3.5), so nothing could increment them. `uc_clickhouse_usage_type_referenced_total` and `uc_clickhouse_orphaned_reference_detected_total` **are** registered — `delete_usage_type` increments the first when it refuses a referenced type and the second when its post-delete sweep finds records that landed inside the probe→delete window (DESIGN.md §3.6).
 
 **Backend health**:
 
@@ -141,10 +141,12 @@ There are **no coordination-lock instruments**. The plugin uses no lock (DESIGN.
 | `uc_clickhouse_ready` | Gauge | — | `0` recorded at `init` entry, `1` once after successful registration, back to `0` when the gear cancellation token fires (see [§4](#4-states-cdsl)). |
 | `uc_clickhouse_backend_errors_total` | Counter | `error_category: transient \| internal` | `ClickHouse`/backend errors by the SPI transient-vs-internal classification only. |
 | `uc_clickhouse_migration_failures_total` | Counter | — | Schema-migration failures at plugin startup (the signal that pairs with a readiness gauge stuck at `0`). |
+| `uc_clickhouse_usage_type_referenced_total` | Counter | — | `delete_usage_type` calls refused because the pre-delete probe found referencing rows (the 409 path). |
+| `uc_clickhouse_orphaned_reference_detected_total` | Counter | — | `delete_usage_type` calls whose post-delete sweep found records that landed inside the probe→delete window. A nonzero rate means deletes are being run against types with live ingest. |
 
-**Defense-in-depth**: none. `uc_clickhouse_orphaned_reference_detected_total` is **not implemented and not registered** — the reconciliation scan that would be its only legitimate incrementer is deferred, so the instrument is omitted rather than exported as a permanently-zero series; it is added back together with that worker (see [Orphaned Reference Reconciliation](#orphaned-reference-reconciliation-defense-in-depth)).
+**Defense-in-depth**: `uc_clickhouse_orphaned_reference_detected_total` is registered and incremented by the delete sweep, but the periodic reconciliation *scan* that would catch orphans the delete path never saw is still deferred — so a zero value is not proof that no orphan exists (see [Orphaned Reference Reconciliation](#orphaned-reference-reconciliation-defense-in-depth)).
 
-**Deliberately not implemented** (each with a backend-specific reason recorded in `src/infra/metrics.rs`): a `dedup_stale` counter (ClickHouse has no server-side dedup and thus no MVCC-window analogue), a batch-retry counter (no deadlock-victim retries on this backend), a TLS-handshake-failure counter (the HTTP client surfaces TLS errors as generic network errors), pool-size gauges (the `clickhouse` 0.15.x crate exposes no counters for `reqwest`'s internal pool), and `uc_clickhouse_orphaned_reference_detected_total` (deferred worker, above).
+**Deliberately not implemented** (each with a backend-specific reason recorded in `src/infra/metrics.rs`): a `dedup_stale` counter (ClickHouse has no server-side dedup and thus no MVCC-window analogue), a batch-retry counter (no deadlock-victim retries on this backend), a TLS-handshake-failure counter (the HTTP client surfaces TLS errors as generic network errors), and pool-size gauges (the `clickhouse` 0.15.x crate exposes no counters for `reqwest`'s internal pool).
 
 ### Label and Bucket Conventions
 
@@ -160,11 +162,11 @@ There are **no coordination-lock instruments**. The plugin uses no lock (DESIGN.
 
 - [ ] `p3` - **ID**: `cpt-cf-uc-ch-plugin-algo-observability-orphan-reconciliation`
 
-> **DEFERRED — NOT IMPLEMENTED.** No reconciliation worker exists in the crate: nothing scans for orphaned references, no reconciliation interval is configurable (there is no such config field), and the `uc_clickhouse_orphaned_reference_detected_total` instrument is not registered at all — `src/infra/metrics.rs` records the omission and its reason instead of exporting a permanently-zero series. Operators therefore have **no** orphan signal today, and absence of the series **MUST NOT** be read as evidence that no orphan exists. The paragraph below is the retained specification for if/when the worker is built, not a description of current behavior.
+> **PARTIALLY DEFERRED.** No reconciliation *worker* exists in the crate: nothing periodically scans for orphaned references and no reconciliation interval is configurable (there is no such config field). The `uc_clickhouse_orphaned_reference_detected_total` instrument **is** registered, and `delete_usage_type`'s post-delete sweep increments it (DESIGN.md §3.6) — so operators do have an orphan signal, but only for orphans the delete path itself observed. Absence of a nonzero value **MUST NOT** be read as evidence that no orphan exists: one created by an out-of-band `DELETE`, or by an insert that committed after the sweep, is invisible until a worker scans for it. The paragraph below is the retained specification for that worker.
 
-Specification (deferred): a periodic background reconciliation job scans `usage_records` for rows whose `gts_id` is absent from `usage_type_catalog` (a LEFT JOIN / NOT IN subquery, bounded to avoid full-table scans). Each detected orphan increments `uc_clickhouse_orphaned_reference_detected_total`. This counter would remain at zero in production; a nonzero value would be an operator signal to investigate a code regression or an out-of-band `usage_type_catalog` deletion. The reconciliation interval would be configurable and default to a low-frequency background schedule (e.g. every 5 minutes) to avoid contending with the ingestion or query paths.
+Specification (deferred): a periodic background reconciliation job scans `usage_records` for rows whose `gts_id` is absent from `usage_type_catalog` (a LEFT JOIN / NOT IN subquery, bounded to avoid full-table scans). Each detected orphan increments `uc_clickhouse_orphaned_reference_detected_total` — the same instrument the delete sweep already uses, so the worker adds a second incrementer rather than a new series. The reconciliation interval would be configurable and default to a low-frequency background schedule (e.g. every 5 minutes) to avoid contending with the ingestion or query paths.
 
-Why it is safe to defer: an orphan requires a usage type to disappear after a record referenced it, and this backend never removes one — `delete_usage_type` is not implemented (DESIGN.md §3.6), so the catalog is append-only and the insert-time existence check is sufficient. The only way to create an orphan is an out-of-band `DELETE` run by an operator, which the procedure in DESIGN.md §3.6 already scopes. The scan is defense-in-depth only.
+Why the worker is still safe to defer: the two ways an orphan can arise are both already narrow and both already leave a trace. `delete_usage_type` removes the catalog row *before* it sweeps, so the insert-time existence check refuses new records from that moment and the sweep cleans the window's own arrivals — and when it fires, it increments the counter. The remaining cases are an insert that committed after the sweep (the accepted residual, DESIGN.md §3.6) and an out-of-band `DELETE` run by an operator. Both are real and neither is detected today; the worker is what would close that gap, which is why it stays on the roadmap rather than being dropped.
 
 ## 4. States (CDSL)
 
@@ -206,7 +208,7 @@ The system **MUST** implement `uc_clickhouse_query_duration_seconds` (Histogram,
 
 - [x] `p3` - **ID**: `cpt-cf-uc-ch-plugin-dod-observability-lock-instruments`
 
-The system **MUST NOT** register `uc_clickhouse_lock_acquire_duration_seconds`, `uc_clickhouse_lock_contention_total`, `uc_clickhouse_lock_manager_unavailable_total`, or `uc_clickhouse_usage_type_referenced_total`. The plugin has no coordination lock and does not implement `delete_usage_type`, so nothing could ever increment them; registering an instrument that stays at zero is indistinguishable from a healthy one and is worse than its absence.
+The system **MUST NOT** register `uc_clickhouse_lock_acquire_duration_seconds`, `uc_clickhouse_lock_contention_total`, or `uc_clickhouse_lock_manager_unavailable_total`. The plugin has no coordination lock, so nothing could ever increment them; registering an instrument that stays at zero is indistinguishable from a healthy one and is worse than its absence. The system **MUST** register `uc_clickhouse_usage_type_referenced_total` and `uc_clickhouse_orphaned_reference_detected_total`, both of which `delete_usage_type` increments.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-observability-inventory` (lock instruments), `cpt-cf-uc-ch-plugin-flow-observability-request-path`
 
@@ -216,7 +218,7 @@ The system **MUST NOT** register `uc_clickhouse_lock_acquire_duration_seconds`, 
 
 - [x] `p3` - **ID**: `cpt-cf-uc-ch-plugin-dod-observability-gauges`
 
-The system **MUST** implement `uc_clickhouse_ready` (Gauge, recorded `0` at `init` entry, `1` exactly once after a successful `init()`, and `0` again when the cancellation token fires — see [§4](#4-states-cdsl)), `uc_clickhouse_backend_errors_total` (Counter, label `error_category` with the two values `transient` / `internal`), `uc_clickhouse_migration_failures_total` (Counter, incremented when startup schema provisioning fails), and `uc_clickhouse_usage_type_catalog_size` (Gauge, updated by the background catalog-size refresh worker in `ChCatalogStore`).
+The system **MUST** implement `uc_clickhouse_ready` (Gauge, recorded `0` at `init` entry, `1` exactly once after a successful `init()`, and `0` again when the cancellation token fires — see [§4](#4-states-cdsl)), `uc_clickhouse_backend_errors_total` (Counter, label `error_category` with the two values `transient` / `internal`), `uc_clickhouse_migration_failures_total` (Counter, incremented when startup schema provisioning fails), `uc_clickhouse_usage_type_catalog_size` (Gauge, updated by the background catalog-size refresh worker in `ChCatalogStore`, and **not** monotone since `delete_usage_type` removes rows), `uc_clickhouse_usage_type_referenced_total` (Counter, incremented when a delete is refused for a referenced type), and `uc_clickhouse_orphaned_reference_detected_total` (Counter, incremented when a delete's post-delete sweep finds orphans).
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-observability-inventory` (health/catalog instruments), `cpt-cf-uc-ch-plugin-flow-observability-readiness`
 
@@ -226,7 +228,7 @@ The system **MUST** implement `uc_clickhouse_ready` (Gauge, recorded `0` at `ini
 
 - [ ] `p3` - **ID**: `cpt-cf-uc-ch-plugin-dod-observability-orphan-counter`
 
-> **DEFERRED — intentionally unchecked.** Neither the counter nor the reconciliation worker specified below exists: `src/infra/metrics.rs` documents the instrument's omission rather than registering it. This DoD is not scheduled for v1; it is defense-in-depth over a race the coordination lock already closes (see [§3 Orphaned Reference Reconciliation](#orphaned-reference-reconciliation-defense-in-depth)). Closing it requires new code, not a documentation change.
+> **PARTIALLY DEFERRED — intentionally unchecked.** The counter exists and `delete_usage_type`'s post-delete sweep increments it; the periodic reconciliation *worker* specified below does not. The worker is not scheduled for v1, but it is no longer merely defense-in-depth over a closed race: this plugin has no coordination lock, so the delete admits a residual orphaning window (DESIGN.md §3.6) that only a scan can detect after the fact (see [§3 Orphaned Reference Reconciliation](#orphaned-reference-reconciliation-defense-in-depth)). Closing it requires new code, not a documentation change.
 
 The system **MUST** implement `uc_clickhouse_orphaned_reference_detected_total` (Counter) and a periodic background reconciliation worker that increments it for each orphaned `usage_records` row whose `gts_id` is absent from `usage_type_catalog`. The worker **MUST** be bounded (use `LIMIT` to avoid full-table scans), race against the gear cancellation token for prompt shutdown, and default to a low-frequency schedule (configurable, defaulting to 5 minutes).
 
@@ -241,7 +243,8 @@ The system **MUST** implement `uc_clickhouse_orphaned_reference_detected_total` 
 - [x] All histograms declare explicit bucket boundaries.
 - [x] `uc_clickhouse_ready` is `0` from `init` entry, `1` exactly once after successful registration, and `0` again once the cancellation token fires; it is never re-armed to `1` by the catalog-size refresh worker.
 - [x] `uc_clickhouse_dedup_absorbed_total`, `uc_clickhouse_idempotency_conflicts_total`, and `uc_clickhouse_compensations_total` are incremented for their respective outcomes on both the single and batch insert paths.
-- [x] No `uc_clickhouse_lock_*` series and no `uc_clickhouse_usage_type_referenced_total` are registered: the plugin has no coordination lock and does not implement `delete_usage_type`.
+- [x] No `uc_clickhouse_lock_*` series is registered: the plugin has no coordination lock.
+- [x] `uc_clickhouse_usage_type_referenced_total` and `uc_clickhouse_orphaned_reference_detected_total` are registered, and `delete_usage_type` increments them on the refused-delete and swept-orphan paths respectively.
 - [ ] **Deferred, not asserted**: `uc_clickhouse_orphaned_reference_detected_total` and its reconciliation worker are not implemented, so no acceptance test asserts the instrument's existence or its value (see the DoD note in [§5](#5-definitions-of-done)).
 - [x] `uc_clickhouse_usage_type_catalog_size` is refreshed **asynchronously and eventually**, not synchronously per mutation: a `create_usage_type` signals the background worker via `tokio::sync::Notify`, and the worker coalesces a burst into at most one `SELECT uniqExact(gts_id) FROM usage_type_catalog` per wake (feature 0004 `cpt-cf-uc-ch-plugin-algo-catalog-size-refresh`). The gauge therefore lags a mutation briefly and a burst of *n* creates does not produce *n* gauge updates.
 - [x] All instruments use the `opentelemetry` SDK-agnostic API (global meter); the plugin does not hard-depend on a specific OTLP exporter.

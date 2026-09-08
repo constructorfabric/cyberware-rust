@@ -7,8 +7,8 @@
 //!
 //! - `storage::pool`: connection pool and schema migration.
 //! - `storage::record_store`: usage-record persistence.
-//! - `storage::catalog_store`: usage-type catalog create / get / list
-//!   (delete is not implemented by this backend).
+//! - `storage::catalog_store`: usage-type catalog create / get / list /
+//!   delete.
 //! - `metrics`: `uc_clickhouse_*` OpenTelemetry instruments.
 //!
 //! There is no coordination primitive: every write path is a plain

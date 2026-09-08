@@ -20,9 +20,13 @@
 //!   best-effort; (b) `IdempotencyConflict` is raised only when the earlier row
 //!   is already visible at pre-read time; (c) `UsageTypeNotFound` comes from a
 //!   catalog read with no ordering guarantee against a concurrent
-//!   `create_usage_type`; (d) usage types are never deleted (see
-//!   `catalog_store`), so referential integrity needs no runtime coordination
-//!   beyond the insert-time catalog check.
+//!   `create_usage_type`; (d) that same catalog read has no ordering guarantee
+//!   against a concurrent `delete_usage_type` either — the delete's own
+//!   post-delete sweep (see `catalog_store`) removes rows that land inside its
+//!   window, but an insert that passed the check before the delete and commits
+//!   after the sweep orphans a row. That residual is accepted by design; the
+//!   insert-time catalog check is what bounds it, since a deleted type is
+//!   refused here from the moment its catalog row is gone.
 //! - **No `UPDATE`**: deactivation uses versioned marker rows (INSERT with
 //!   `status = 'inactive'` and a higher `version`, same `id`) rather than
 //!   `ALTER TABLE … UPDATE` (an async mutation unsuitable for the request path).
@@ -191,9 +195,18 @@ impl ChRecordStore {
     /// existence check for a single record.
     ///
     /// Returns `Ok(())` if the usage type exists; `UsageTypeNotFound`
-    /// otherwise. Usage types are never removed once created (the catalog
-    /// store does not implement delete), so a type seen here stays valid for
-    /// the `INSERT` that follows.
+    /// otherwise.
+    ///
+    /// A type seen here is **not** guaranteed to still exist when the `INSERT`
+    /// that follows commits: `delete_usage_type` removes the catalog row with
+    /// no mutual exclusion against this path. That is the accepted residual
+    /// documented on
+    /// [`ChCatalogStore::delete`](crate::infra::storage::catalog_store) — the
+    /// delete's post-delete sweep removes rows that land inside its own
+    /// window, but a check that passed *before* the delete and an `INSERT`
+    /// that commits *after* the sweep still orphan a row. This check is what
+    /// keeps that window narrow rather than unbounded: once the catalog row is
+    /// gone, every subsequent insert for the `gts_id` is refused here.
     ///
     /// No version resolution: the question is only whether *any* row carries
     /// this `gts_id`. Existence is invariant across versions — every physical

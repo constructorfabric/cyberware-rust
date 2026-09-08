@@ -158,9 +158,23 @@ pub struct Metrics {
     migration_failure: Counter<u64>,
     /// `uc_clickhouse_query_requests_total` — labelled by `query_kind`.
     query_requests: Counter<u64>,
+    /// `uc_clickhouse_usage_type_referenced_total` — `delete_usage_type` calls
+    /// refused because the pre-delete reference probe found referencing rows.
+    usage_type_referenced: Counter<u64>,
+    /// `uc_clickhouse_orphaned_reference_detected_total` — usage records found
+    /// to reference a `gts_id` whose catalog row is already gone.
+    ///
+    /// Incremented once per `delete_usage_type` whose post-delete sweep found
+    /// rows that landed inside the probe→delete window, i.e. exactly the
+    /// residual race this backend accepts. A non-zero rate is the signal that
+    /// deletes are being run against types with live ingest.
+    orphaned_reference_detected: Counter<u64>,
 
     // --- Synchronous gauges ---
     /// `uc_clickhouse_usage_type_catalog_size` — live catalog row count.
+    ///
+    /// Not monotone: `delete_usage_type` removes the catalog row, so the gauge
+    /// can decrease as well as increase.
     usage_type_catalog_size: Gauge<u64>,
     /// `uc_clickhouse_ready` — 1 = healthy, 0 = degraded.
     ///
@@ -190,15 +204,14 @@ pub struct Metrics {
     //   `pool_connections_idle`): the `clickhouse` 0.15.x crate uses `reqwest`'s
     //   internal HTTP connection pool and exposes no pool-size counters.
     //
-    // - No `uc_clickhouse_orphaned_reference_detected_total`: its only
-    //   legitimate incrementer is the periodic orphan-reconciliation worker,
-    //   which is deferred (see `docs/features/0006-*`). The instrument is added
-    //   back together with that worker.
+    // - No `uc_clickhouse_lock_*` series: the plugin uses no coordination lock
+    //   (DESIGN.md §3.5), so nothing could ever increment them.
     //
-    // - No `uc_clickhouse_lock_*` series and no
-    //   `uc_clickhouse_usage_type_referenced_total`: the plugin has no
-    //   coordination lock and does not implement `delete_usage_type`, so
-    //   nothing could ever increment them.
+    // `uc_clickhouse_orphaned_reference_detected_total` IS registered above.
+    // It was previously omitted because its only intended incrementer was the
+    // deferred periodic orphan-reconciliation worker; the `delete_usage_type`
+    // post-delete sweep is now a second, shipped incrementer, and the deferred
+    // worker reuses the same instrument when it lands.
 }
 
 impl Metrics {
@@ -276,6 +289,18 @@ impl Metrics {
                 "Query requests dispatched to `ClickHouse`, by kind (workload mix observable)",
             )
             .build();
+        let usage_type_referenced = meter
+            .u64_counter("uc_clickhouse_usage_type_referenced_total")
+            .with_description(
+                "`delete_usage_type` calls refused because the type is still referenced",
+            )
+            .build();
+        let orphaned_reference_detected = meter
+            .u64_counter("uc_clickhouse_orphaned_reference_detected_total")
+            .with_description(
+                "Usage records found referencing a `gts_id` whose catalog row is already gone",
+            )
+            .build();
         let usage_type_catalog_size = meter
             .u64_gauge("uc_clickhouse_usage_type_catalog_size")
             .with_description("Current live usage-type catalog row count in `ClickHouse`")
@@ -297,6 +322,8 @@ impl Metrics {
             backend_error,
             migration_failure,
             query_requests,
+            usage_type_referenced,
+            orphaned_reference_detected,
             usage_type_catalog_size,
             ready,
         }
@@ -363,6 +390,19 @@ impl Metrics {
     pub(crate) fn inc_query_request(&self, kind: QueryKind) {
         self.query_requests
             .add(1, &[KeyValue::new(label::QUERY_KIND, kind.as_label())]);
+    }
+
+    /// Increment the referenced-usage-type counter (a refused delete).
+    pub(crate) fn inc_usage_type_referenced(&self) {
+        self.usage_type_referenced.add(1, &[]);
+    }
+
+    /// Increment the orphaned-reference counter.
+    ///
+    /// Called once per `delete_usage_type` whose post-delete sweep found rows
+    /// that landed inside the probe→delete window.
+    pub(crate) fn inc_orphaned_reference_detected(&self) {
+        self.orphaned_reference_detected.add(1, &[]);
     }
 
     // --- Synchronous gauge setters ---

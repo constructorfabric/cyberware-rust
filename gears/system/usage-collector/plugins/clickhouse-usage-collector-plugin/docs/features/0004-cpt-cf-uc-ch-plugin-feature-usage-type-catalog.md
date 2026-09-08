@@ -12,10 +12,10 @@
   - [Create Usage Type](#create-usage-type)
   - [Get Usage Type](#get-usage-type)
   - [List Usage Types (Keyset Paginated)](#list-usage-types-keyset-paginated)
-  - [Delete Usage Type — Not Implemented](#delete-usage-type--not-implemented)
+  - [Delete Usage Type — Probe, Delete, Sweep](#delete-usage-type--probe-delete-sweep)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Create Pre-Existence Check and Idempotency Absorb](#create-pre-existence-check-and-idempotency-absorb)
-  - [Delete-Side Protocol (Retired)](#delete-side-protocol-retired)
+  - [Delete-Side Protocol](#delete-side-protocol)
   - [Catalog Size Background Refresh](#catalog-size-background-refresh)
 - [4. States (CDSL)](#4-states-cdsl)
   - [Usage Type Existence](#usage-type-existence)
@@ -23,7 +23,7 @@
   - [Implement create_usage_type](#implement-create_usage_type)
   - [Implement get_usage_type](#implement-get_usage_type)
   - [Implement list_usage_types with keyset pagination](#implement-list_usage_types-with-keyset-pagination)
-  - [Refuse delete_usage_type as not implemented](#refuse-delete_usage_type-as-not-implemented)
+  - [Implement delete_usage_type as probe-delete-sweep](#implement-delete_usage_type-as-probe-delete-sweep)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Non-Applicable Concerns](#7-non-applicable-concerns)
 
@@ -39,13 +39,13 @@
 
 ### 1.1 Overview
 
-Own the sole store for the `usage_type_catalog` table. `create_usage_type` pre-checks then inserts with no coordination primitive between the two statements; `get`/`list` resolve versions in SQL; `delete_usage_type` is **not implemented** by this backend and returns `Internal` without issuing SQL, so the catalog is append-only.
+Own the sole store for the `usage_type_catalog` table. `create_usage_type` pre-checks then inserts with no coordination primitive between the two statements; `get`/`list` resolve versions in SQL; `delete_usage_type` probes for references, removes the catalog row with `ALTER TABLE … DELETE`, then sweeps any record that landed in between — narrowing, not closing, the orphaning window.
 
 ### 1.2 Purpose
 
-This feature owns the create-idempotency absorb, the catalog point-read and keyset list, and the explicit refusal of `delete_usage_type`. ClickHouse has no native FK and this plugin has no mutual-exclusion primitive, so a delete could not be ordered against concurrent `create_usage_record(s)` calls referencing the same `gts_id`; rather than admit an orphaning window, the backend does not offer delete at all. The create-side half of referential integrity (the insert-time catalog check) is owned by Feature 2 and is sufficient on its own once types can never disappear.
+This feature owns the create-idempotency absorb, the catalog point-read and keyset list, and the delete-side half of referential integrity. ClickHouse has no native FK and this plugin has no mutual-exclusion primitive, so a delete cannot be ordered against concurrent `create_usage_record(s)` calls referencing the same `gts_id`. The delete therefore pairs a capped pre-delete reference probe with a post-delete orphan sweep and removes the catalog row between them, so that Feature 2's insert-time check — the create-side half — starts refusing new records for the `gts_id` and bounds the window the probe cannot close. The residual is accepted and documented, not eliminated.
 
-**Requirements**: `cpt-cf-uc-ch-plugin-fr-referential-integrity` (create-side only; the delete-side half is out of scope for this backend)
+**Requirements**: `cpt-cf-uc-ch-plugin-fr-referential-integrity` (the delete-side half; the create-side half is owned by Feature 2)
 
 **Constraints**: `cpt-cf-uc-ch-plugin-constraint-no-transactions`. `cpt-cf-uc-ch-plugin-constraint-gts-lock-required` is superseded — no coordination lock exists in this plugin (DESIGN.md §2.2).
 
@@ -123,21 +123,31 @@ This feature owns the create-idempotency absorb, the catalog point-read and keys
 2. [ ] - `p1` - **IF** result contains `n+1` rows — truncate to `n`, encode the `n+1`-th row's `gts_id` as the next-cursor - `inst-ch-cat-list-2`
 3. [ ] - `p1` - **RETURN** a `Page` of at most `n` types plus an optional next-cursor - `inst-ch-cat-list-3`
 
-### Delete Usage Type — Not Implemented
+### Delete Usage Type — Probe, Delete, Sweep
 
 - [ ] `p1` - **ID**: `cpt-cf-uc-ch-plugin-flow-catalog-delete-type`
 
 **Actor**: `cpt-cf-uc-ch-plugin-actor-plugin-host`
 
-**Success Scenarios**: none — this backend does not delete usage types.
+**Success Scenarios**:
+
+- The `gts_id` exists and no `usage_records` row references it → the catalog row is removed and `Ok(())` returned. The removal is visible to the next read (`mutations_sync = 1`).
+- Same, plus records landed inside the probe→delete window → those records are swept, `uc_clickhouse_orphaned_reference_detected_total` is incremented, and `Ok(())` is still returned.
 
 **Error Scenarios**:
 
-- Every call → return `Internal` with the fixed message `delete_usage_type is not implemented by the ClickHouse plugin`. No SQL is issued, so an absent `gts_id` is refused the same way as a present one (never `UsageTypeNotFound`).
+- No row carries the `gts_id` → `UsageTypeNotFound { gts_id }` (HTTP 404). Absence is an error, not a silent success, so the gateway can distinguish "already gone" from "deleted now".
+- Any `usage_records` row references the `gts_id` → `UsageTypeReferenced { gts_id, sample_ref_count }` (HTTP 409), `uc_clickhouse_usage_type_referenced_total` incremented, catalog row untouched.
+- A backend failure on the existence read or the probe → `Transient` / `Internal` per the usual classification. It **MUST NOT** be reported as `UsageTypeNotFound`: a read that never happened is not evidence of absence.
+- A backend failure on the post-delete probe or sweep → logged at `error`, **not** propagated. The type is deleted; reporting failure would misstate the outcome and a retry could only answer `UsageTypeNotFound`.
 
 **Steps**:
 
-1. [ ] - `p1` - Log the refusal at `warn` with the `gts_id` and **RETURN** `Internal` (`DELETE_UNIMPLEMENTED_MSG`) without touching ClickHouse - `inst-ch-cat-del-1`
+1. [ ] - `p1` - `SELECT gts_id FROM usage_type_catalog WHERE gts_id = ? LIMIT 1`; **IF** no row → **RETURN** `UsageTypeNotFound` - `inst-ch-cat-del-1`
+2. [ ] - `p1` - `SELECT count() FROM (SELECT 1 FROM usage_records WHERE gts_id = ? LIMIT REF_COUNT_CAP)`; **IF** non-zero → increment `uc_clickhouse_usage_type_referenced_total` and **RETURN** `UsageTypeReferenced { gts_id, sample_ref_count }` - `inst-ch-cat-del-2`
+3. [ ] - `p1` - `ALTER TABLE usage_type_catalog DELETE WHERE gts_id = ?` with `mutations_sync = 1` - `inst-ch-cat-del-3`
+4. [ ] - `p1` - Re-run step 2's probe; **IF** non-zero → increment `uc_clickhouse_orphaned_reference_detected_total`, log at `warn`, and issue `ALTER TABLE usage_records DELETE WHERE gts_id = ?` with `mutations_sync = 1` - `inst-ch-cat-del-4`
+5. [ ] - `p1` - Signal the catalog-size refresh worker and **RETURN** `Ok(())` - `inst-ch-cat-del-5`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -149,17 +159,23 @@ This feature owns the create-idempotency absorb, the catalog point-read and keys
 
 Nothing serializes two concurrent creates for the same `gts_id`. Both may pass the pre-existence check and both may insert; `version = current_epoch_μs()` and `ReplacingMergeTree(version)` resolution then converge the physical rows to the one with the highest version, so inside that window the catalog is **last-writer-wins** and both callers observe `Ok` even when their payloads differ. Once the winner's row is visible, a later create sees it and returns an absorb or `UsageTypeAlreadyExists`.
 
-### Delete-Side Protocol (Retired)
+### Delete-Side Protocol
 
 - [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-catalog-delete-fk`
 
-**Retired.** The lock-protected verify-then-delete protocol this ID once described relied on a per-`gts_id` exclusive coordination lock that no longer exists in this plugin. Without a mutual-exclusion primitive, a reference-count probe cannot be made authoritative against concurrent inserts, and a lightweight `DELETE` could orphan records inserted between probe and removal. The backend therefore refuses `delete_usage_type` outright (see the Delete flow above); the ID is kept only so cross-artifact references stay resolvable.
+`delete_usage_type` emulates `ON DELETE RESTRICT` with a probe rather than a constraint, because ClickHouse has neither a foreign key nor (in this plugin) a mutual-exclusion primitive to make the probe authoritative.
+
+**Step order is the whole design.** The catalog row is removed *before* the orphan sweep. From that moment the record store's insert-time catalog existence check (Feature 2) refuses new records for the `gts_id` on its own, so the sweep has only the probe→delete window's own arrivals to clean up. Sweeping first would leave a strictly wider window, since new records could keep arriving until the catalog row went away.
+
+**The residual race.** The probe is a snapshot. A `create_usage_record` whose own catalog check passed before step 3 can commit after step 4 and orphan a row; with `async_insert` on (the default) it can sit in a server-side buffer, widening the window from microseconds to the flush interval. `plugin-spi.md` Method 9's "MUST NOT admit a window" clause is therefore **not** met by this backend — the window is bounded and instrumented, not closed. An earlier revision of this plugin used a per-`gts_id` exclusive cluster lock to close it and, once that lock was removed, withheld the operation entirely. Offering it with the race documented was chosen over withholding it: an append-only catalog left operators no way to remove a mis-registered type except hand-written SQL, which admits the same window with none of the probe, the sweep, the 409, or the counter.
+
+The mutation is a heavyweight `ALTER TABLE … DELETE`, not a lightweight `DELETE FROM`: it removes the physical rows, so a later `create_usage_type` for the same `gts_id` has no surviving `ReplacingMergeTree` copy to outrank.
 
 ### Catalog Size Background Refresh
 
 - [ ] `p3` - **ID**: `cpt-cf-uc-ch-plugin-algo-catalog-size-refresh`
 
-`ChCatalogStore` spawns a single background `tokio` worker that coalesces mutation-triggered refresh requests via a `tokio::sync::Notify` signal. Each refresh issues `SELECT uniqExact(gts_id) FROM usage_type_catalog` (`gts_id` is the whole sort key, so counting distinct ids reflects live types rather than unmerged duplicate copies, without paying for `FINAL`), raced against the gear cancellation token for prompt shutdown. The refreshed count is cached for the `uc_clickhouse_usage_type_catalog_size` gauge (Feature 6). Coalescing means that a burst of `create_usage_type` calls triggers at most one `count()` round-trip per worker-wake, not one per create. With no delete, the gauge is monotone non-decreasing.
+`ChCatalogStore` spawns a single background `tokio` worker that coalesces mutation-triggered refresh requests via a `tokio::sync::Notify` signal. Each refresh issues `SELECT uniqExact(gts_id) FROM usage_type_catalog` (`gts_id` is the whole sort key, so counting distinct ids reflects live types rather than unmerged duplicate copies, without paying for `FINAL`), raced against the gear cancellation token for prompt shutdown. The refreshed count is cached for the `uc_clickhouse_usage_type_catalog_size` gauge (Feature 6). Coalescing means that a burst of `create_usage_type` calls triggers at most one `count()` round-trip per worker-wake, not one per create. `delete_usage_type` signals the same worker, so the gauge is **not** monotone — it falls as types are removed.
 
 ## 4. States (CDSL)
 
@@ -170,9 +186,9 @@ Nothing serializes two concurrent creates for the same `gts_id`. Both may pass t
 | State | Description |
 | --- | --- |
 | Present | The `gts_id` row exists in `usage_type_catalog` (visible to a version-resolved read). `create_usage_record` catalog-existence check accepts this `gts_id`. |
-| Absent | The row never existed. `create_usage_record` rejects this `gts_id` with `UsageTypeNotFound`. |
+| Absent | The row does not exist — never created, or removed by `delete_usage_type`. `create_usage_record` rejects this `gts_id` with `UsageTypeNotFound`, and so does `delete_usage_type`. |
 
-**Transition**: Absent → Present via `create_usage_type`. There is no Present → Absent transition through the SPI: `delete_usage_type` is not implemented, so a type is permanent once created. Removing a mis-registered type is an operator action against the table directly.
+**Transitions**: Absent → Present via `create_usage_type`; Present → Absent via `delete_usage_type`, but only for a type no `usage_records` row references (otherwise the delete is refused with `UsageTypeReferenced` and the state does not change). Absent → Present again is permitted: the delete removes the physical rows, so a re-create is an ordinary create with no earlier row to outrank. The Present → Absent transition is not ordered against a concurrent `create_usage_record`; see the Delete-Side Protocol above for the residual.
 
 ## 5. Definitions of Done
 
@@ -211,11 +227,13 @@ The system **MUST** implement `list_usage_types` as a version-resolved keyset-pa
 
 **Touches**: Component: `cpt-cf-uc-ch-plugin-component-catalog-store`
 
-### Refuse delete_usage_type as not implemented
+### Implement delete_usage_type as probe-delete-sweep
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-dod-catalog-delete-type`
 
-The system **MUST** implement `delete_usage_type` as an unconditional refusal: return `UsageCollectorPluginError::Internal` carrying the fixed message `delete_usage_type is not implemented by the ClickHouse plugin` (`DELETE_UNIMPLEMENTED_MSG`), log the refusal at `warn`, and issue **no** SQL. The `usage_type_catalog` row, present or absent, **MUST** be left untouched. `ChCatalogStore` **MUST** be constructible without any coordination dependency (`new(client, cancel, metrics, request_timeout)`).
+The system **MUST** implement `delete_usage_type` as: an existence read (absent → `UsageTypeNotFound { gts_id }`, never a silent success); a capped reference probe over `usage_records` counting rows of every `status` (non-zero → `uc_clickhouse_usage_type_referenced_total` incremented and `UsageTypeReferenced { gts_id, sample_ref_count }` returned with the catalog row untouched); `ALTER TABLE usage_type_catalog DELETE WHERE gts_id = ?` under `mutations_sync = 1`; and a re-probe-gated `ALTER TABLE usage_records DELETE WHERE gts_id = ?` sweep that increments `uc_clickhouse_orphaned_reference_detected_total` when it fires.
+
+The catalog row **MUST** be removed before the sweep, so Feature 2's insert-time check bounds the window. A post-delete probe or sweep failure **MUST** be logged at `error` and **MUST NOT** be propagated — the type is deleted. A failure on the existence read or the pre-delete probe **MUST** surface as a backend error and **MUST NOT** be reported as `UsageTypeNotFound`. The catalog-size refresh worker **MUST** be signalled on success. `ChCatalogStore` **MUST** remain constructible without any coordination dependency (`new(client, cancel, metrics, request_timeout)`).
 
 **Implements**: `cpt-cf-uc-ch-plugin-flow-catalog-delete-type`
 
@@ -231,8 +249,12 @@ The system **MUST** implement `delete_usage_type` as an unconditional refusal: r
 - [x] `create_usage_type` absorbs silently on identical re-submission; returns `UsageTypeAlreadyExists` on a payload mismatch once the earlier row is visible; inserts with `version = current_epoch_μs()` on first create. No lock is taken; two concurrent creates for the same `gts_id` may both succeed and converge last-writer-wins.
 - [x] `get_usage_type` resolves versions (`ORDER BY version DESC LIMIT 1`); absent `gts_id` returns `UsageTypeNotFound`.
 - [x] `list_usage_types` resolves versions in an inner subquery (`LIMIT 1 BY gts_id`), returns pages ordered by `gts_id ASC`, uses `n+1` look-ahead cursor pattern.
-- [x] `delete_usage_type` returns `Internal` with the fixed not-implemented message for every input, present or absent, and issues no SQL (a store pointed at a socket that never answers returns immediately).
-- [x] After a refused delete, `get_usage_type` still returns the type.
+- [x] `delete_usage_type` removes an unreferenced type, and `get_usage_type` reports `UsageTypeNotFound` on the very next read (the mutation is synchronous).
+- [x] `delete_usage_type` on an absent `gts_id` returns `UsageTypeNotFound`, not a silent success.
+- [x] `delete_usage_type` on a type with any referencing record returns `UsageTypeReferenced` with `sample_ref_count >= 1`, and `get_usage_type` still returns the type afterwards.
+- [x] A type deleted and then re-created is readable, with no surviving earlier row to outrank.
+- [x] Once a type is deleted, `create_usage_record` for its `gts_id` returns `UsageTypeNotFound` — the property that bounds the delete's race window.
+- [x] Against an unreachable backend, `delete_usage_type` surfaces the failure and does **not** report `UsageTypeNotFound`.
 - [x] `ChCatalogStore` can be unit-tested offline without a live ClickHouse or any coordination backend.
 - [x] The `uc_clickhouse_usage_type_referenced_total` counter and every `uc_clickhouse_lock_*` series are not registered — nothing could increment them.
 

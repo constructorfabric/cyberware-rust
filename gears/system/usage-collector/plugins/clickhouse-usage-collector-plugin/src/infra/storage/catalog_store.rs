@@ -16,14 +16,22 @@
 //! Outside the window the loser sees the winner's row and gets either a
 //! silent absorb (identical payload) or `UsageTypeAlreadyExists`.
 //!
-//! `delete` is **not implemented** by this backend: `ClickHouse` has no
-//! foreign keys and this plugin has no mutual-exclusion primitive, so a
-//! delete could not be ordered against concurrent record inserts referencing
-//! the type. Usage types are therefore append-only here, and `delete` returns
-//! [`UsageCollectorPluginError::Internal`] without issuing any SQL.
+//! `delete` emulates the reference plugin's `ON DELETE RESTRICT` without a
+//! foreign key and without a mutual-exclusion primitive: existence read →
+//! capped reference probe → `ALTER TABLE … DELETE` of the catalog row →
+//! re-probe-gated sweep of any record that landed in between. The catalog row
+//! is removed *before* the sweep on purpose — once it is gone, the record
+//! store's insert-time existence check
+//! ([`crate::infra::storage::record_store`]) rejects new records for the
+//! `gts_id` on its own, which is what bounds the window to the span between
+//! the probe and the delete. That window is **not** closed: an insert whose
+//! own catalog check passed before the delete can still commit after the
+//! sweep and orphan a row. See [`CatalogStore::delete`] for the full list of
+//! accepted residuals.
 //!
 //! A single background refresh worker tracks the live catalog count via the
-//! `uc_clickhouse_usage_type_catalog_size` gauge.
+//! `uc_clickhouse_usage_type_catalog_size` gauge; because `delete` removes
+//! rows, that gauge is not monotone.
 
 use std::sync::Arc;
 #[cfg(test)]
@@ -63,12 +71,24 @@ use crate::infra::storage::query::{DEFAULT_PAGE_SIZE, effective_page_size};
 /// positional without SQL injection risk.
 const TYPE_COLUMNS: &str = "gts_id, kind, metadata_fields, version";
 
-/// Message carried by the `Internal` error `delete` returns.
+/// Upper bound on the pre-delete reference probe (`sample_ref_count`).
 ///
-/// Surfaced through the host's error chain as an HTTP 500; the wording is
-/// stable so operators can grep for it.
-pub const DELETE_UNIMPLEMENTED_MSG: &str =
-    "delete_usage_type is not implemented by the ClickHouse plugin";
+/// The count is a coarse diagnostic on the `delete` refusal path, so the read
+/// is capped rather than run unbounded over `usage_records`; the SPI declares
+/// `sample_ref_count` a bounded, plugin-tunable value. Same value as the
+/// reference plugin's `REF_COUNT_CAP`.
+const REF_COUNT_CAP: u64 = 1000;
+
+/// `mutations_sync` value used by both `ALTER TABLE … DELETE` statements.
+///
+/// `1` waits for the mutation to complete on the server that received it,
+/// which is what makes `delete` observable to the caller's next read. `2`
+/// (wait for all replicas) is deliberately not used: the shipped engine is
+/// non-replicated `ReplacingMergeTree`, so there is no replica to wait for,
+/// and on a replicated deployment the cross-node visibility lag is called out
+/// as an accepted residual on [`CatalogStore::delete`] rather than paid for on
+/// every request.
+const MUTATIONS_SYNC: &str = "1";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -260,8 +280,9 @@ impl ChCatalogStore {
             // Deliberately synchronous, independent of the record store's
             // `async_insert` setting, and therefore a literal rather than a
             // config-threaded field. `usage_type_catalog` is a control-plane
-            // table: writes come only from `create_usage_type`, types are never
-            // deleted, and the table is unpartitioned and tiny — so there is no
+            // table: writes come only from `create_usage_type` and
+            // `delete_usage_type`, and the table is unpartitioned and tiny —
+            // so there is no
             // concurrent insert stream for the server-side buffer to coalesce
             // and no part count to reduce. Enabling it would add the
             // buffer-flush wait to a request whose latency is directly
@@ -282,6 +303,145 @@ impl ChCatalogStore {
             .end()
             .await
             .map_err(|e| tracked_ch_err(&self.metrics, &e))
+    }
+
+    /// Whether any row carries this `gts_id`.
+    ///
+    /// No version resolution: `gts_id` is the whole sort key and no physical
+    /// copy is a tombstone, so existence is invariant across versions and
+    /// `LIMIT 1` on the first match is both correct and the cheapest form.
+    /// (Same reasoning as the record store's insert-time check.)
+    async fn type_exists(
+        &self,
+        gts_id: &UsageTypeGtsId,
+    ) -> Result<bool, UsageCollectorPluginError> {
+        let sql = "SELECT gts_id FROM usage_type_catalog WHERE gts_id = ? LIMIT 1";
+        let found: Option<String> = with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(sql)
+                .bind(gts_id.as_ref())
+                .fetch_optional::<String>(),
+        )
+        .await?;
+        Ok(found.is_some())
+    }
+
+    /// Count referencing `usage_records` rows, capped at [`REF_COUNT_CAP`].
+    ///
+    /// `gts_id` leads the `usage_records` sorting key, so this is a
+    /// primary-key range read rather than a scan, and the inner `LIMIT` stops
+    /// it early on a heavily referenced type.
+    ///
+    /// Counts rows of **every** `status`, `inactive` deactivation markers
+    /// included: that is what the reference plugin's FK counts, and a type
+    /// whose only records are deactivated still has rows that would be
+    /// orphaned by removing it.
+    async fn count_references(
+        &self,
+        gts_id: &UsageTypeGtsId,
+    ) -> Result<u64, UsageCollectorPluginError> {
+        let sql = format!(
+            "SELECT count() FROM \
+             (SELECT 1 FROM usage_records WHERE gts_id = ? LIMIT {REF_COUNT_CAP})"
+        );
+        with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .bind(gts_id.as_ref())
+                .fetch_one::<u64>(),
+        )
+        .await
+    }
+
+    /// Remove records that referenced `gts_id` after its catalog row went away.
+    ///
+    /// Called only once the catalog row is gone, so a row seen here landed
+    /// inside the probe→delete window and is by definition an orphan. The
+    /// re-probe gates the mutation: on the overwhelmingly common path nothing
+    /// landed and no write is issued against `usage_records` at all.
+    ///
+    /// Infallible by design — the type is already deleted, so neither a failed
+    /// probe nor a failed sweep can be reported as a failed delete without
+    /// misstating the outcome. Both are logged at `error` instead. Backend
+    /// errors still reach `uc_clickhouse_backend_errors_total` through
+    /// [`with_deadline`].
+    async fn sweep_orphaned_records(&self, gts_id: &UsageTypeGtsId) {
+        let orphans = self.count_orphans_after_delete(gts_id).await;
+        if orphans == 0 {
+            return;
+        }
+
+        self.metrics.inc_orphaned_reference_detected();
+        tracing::warn!(
+            gts_id = %gts_id.as_ref(),
+            orphan_sample_count = orphans,
+            "delete_usage_type: records landed while the type was being deleted; sweeping them"
+        );
+
+        if let Err(e) = self.delete_where_gts_id("usage_records", gts_id).await {
+            tracing::error!(
+                gts_id = %gts_id.as_ref(),
+                error = %e,
+                "delete_usage_type: the orphan sweep failed; the usage type is \
+                 deleted but records referencing it survive"
+            );
+        }
+    }
+
+    /// The post-delete orphan probe, reporting `0` when it could not run.
+    ///
+    /// A failed probe is indistinguishable from "no orphans" to the caller on
+    /// purpose: both leave the sweep unrun, and the type is deleted either way.
+    /// The distinction that matters to an operator — that the plugin does not
+    /// *know* whether orphans survive — is in the log line.
+    async fn count_orphans_after_delete(&self, gts_id: &UsageTypeGtsId) -> u64 {
+        match self.count_references(gts_id).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(
+                    gts_id = %gts_id.as_ref(),
+                    error = %e,
+                    "delete_usage_type: the post-delete orphan probe failed; \
+                     records inserted during the delete window may survive"
+                );
+                0
+            }
+        }
+    }
+
+    /// Run one `ALTER TABLE … DELETE WHERE gts_id = ?` mutation synchronously.
+    ///
+    /// `with_setting` rather than the crate's `with_option`: the latter is
+    /// `#[deprecated(since = "0.14.3")]` and the workspace lints deprecation
+    /// (the same reason [`configure_insert`] gives).
+    ///
+    /// A mutation is heavier than the `request_timeout` budget assumes — it
+    /// rewrites every part matching the predicate. On timeout the client await
+    /// is abandoned but the server keeps applying the mutation, so the
+    /// operation is left half-applied; that is one of the accepted residuals
+    /// on [`CatalogStore::delete`].
+    async fn delete_where_gts_id(
+        &self,
+        table: &str,
+        gts_id: &UsageTypeGtsId,
+    ) -> Result<(), UsageCollectorPluginError> {
+        // `table` is a `'static` caller literal, never caller input; `gts_id`
+        // is bound.
+        let sql = format!("ALTER TABLE {table} DELETE WHERE gts_id = ?");
+        with_deadline(
+            &self.metrics,
+            self.request_timeout,
+            self.client
+                .query(&sql)
+                .with_setting("mutations_sync", MUTATIONS_SYNC)
+                .bind(gts_id.as_ref())
+                .execute(),
+        )
+        .await
     }
 }
 
@@ -346,9 +506,11 @@ impl CatalogStore for ChCatalogStore {
         // Version scheme: epoch microseconds from `current_merge_version()` (the
         // same helper Record Store uses for usage_records). Nothing serialises
         // creates for one `gts_id`, so the version is what orders two racing
-        // inserts: read-time resolution keeps the higher one. Types are never
-        // deleted, so there is no earlier row a re-create would have to
-        // outrank.
+        // inserts: read-time resolution keeps the higher one. A re-create after
+        // a `delete` has no earlier row to outrank either: `delete` removes the
+        // physical rows with `ALTER TABLE … DELETE` rather than leaving a
+        // tombstone, so this INSERT is the only copy (pinned by
+        // `live::a_deleted_type_can_be_recreated`).
         let row = UsageTypeRow {
             gts_id: gts_id_raw,
             kind: usage_type.kind.into(),
@@ -514,23 +676,84 @@ impl CatalogStore for ChCatalogStore {
     }
 
     // @cpt-flow:cpt-cf-uc-ch-plugin-seq-delete-type
-    /// Deleting a usage type is not implemented by this backend.
+    /// Delete a usage type: probe for references, remove the catalog row, then
+    /// sweep any record that landed in between.
     ///
-    /// `ClickHouse` has no foreign keys and this plugin has no mutual-exclusion
-    /// primitive, so a delete could not be ordered against concurrent
-    /// `create_usage_record(s)` calls referencing the same `gts_id` — any
-    /// reference-count check would be racy and a removed type could acquire
-    /// orphaned records. Usage types are append-only here. This returns
-    /// [`UsageCollectorPluginError::Internal`] with
-    /// [`DELETE_UNIMPLEMENTED_MSG`] and issues no SQL.
+    /// `ClickHouse` has no foreign key to enforce `ON DELETE RESTRICT` and
+    /// this plugin has no mutual-exclusion primitive, so the FK is emulated in
+    /// four steps:
+    ///
+    /// 1. Existence read — absent → [`UsageCollectorPluginError::UsageTypeNotFound`],
+    ///    so the gateway can tell "already gone" from "deleted now".
+    /// 2. Capped reference probe — any referencing row →
+    ///    [`UsageCollectorPluginError::UsageTypeReferenced`] and the catalog
+    ///    row is left untouched.
+    /// 3. `ALTER TABLE usage_type_catalog DELETE` under `mutations_sync`.
+    ///    Ordered **before** the sweep deliberately: from this point the
+    ///    record store's insert-time existence check refuses new records for
+    ///    the `gts_id` on its own, which is what bounds the race window to the
+    ///    span between steps 2 and 3.
+    /// 4. Re-probe, and only if it is still non-zero, `ALTER TABLE
+    ///    usage_records DELETE` for the rows that landed inside that window.
+    ///    The gate keeps the common case (nothing landed) from issuing a
+    ///    mutation against the large table at all.
+    ///
+    /// # Accepted residuals
+    ///
+    /// This does **not** satisfy `plugin-spi.md` Method 9's "MUST NOT admit a
+    /// window" clause — that requires a serializable read-before-delete this
+    /// backend cannot express. The known gaps:
+    ///
+    /// - An insert whose own catalog check passed before step 3 can commit
+    ///   after step 4 and orphan a row.
+    /// - With `async_insert` on (the plugin default) a record can sit in a
+    ///   server-side buffer past the sweep, widening that window from
+    ///   microseconds to the flush interval.
+    /// - Two concurrent deletes for one `gts_id` both pass step 1 and both
+    ///   return `Ok(())`; neither sees `UsageTypeNotFound`.
+    /// - `mutations_sync = 1` waits only for the receiving server, so on a
+    ///   replicated deployment another process can briefly still see the type
+    ///   and accept a record for it.
+    /// - A step-3 or step-4 timeout abandons the client await while the server
+    ///   keeps applying the mutation, leaving the operation half-applied.
+    ///
+    /// A step-4 failure is logged at `error` and **not** propagated: the type
+    /// itself is deleted, so reporting failure would misstate the outcome and
+    /// a retry could only ever answer `UsageTypeNotFound`.
     async fn delete(&self, gts_id: UsageTypeGtsId) -> Result<(), UsageCollectorPluginError> {
-        tracing::warn!(
-            gts_id = %gts_id.as_ref(),
-            "delete_usage_type rejected: not implemented by the ClickHouse plugin"
-        );
-        Err(UsageCollectorPluginError::internal(
-            DELETE_UNIMPLEMENTED_MSG,
-        ))
+        // 1. Existence read — absence is an error, not a silent success.
+        if !self.type_exists(&gts_id).await? {
+            return Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id });
+        }
+
+        // 2. Reference probe. Non-zero refuses the delete and touches nothing.
+        let refs = self.count_references(&gts_id).await?;
+        if refs > 0 {
+            self.metrics.inc_usage_type_referenced();
+            tracing::info!(
+                gts_id = %gts_id.as_ref(),
+                sample_ref_count = refs,
+                "delete_usage_type refused: the type is still referenced"
+            );
+            return Err(UsageCollectorPluginError::UsageTypeReferenced {
+                gts_id,
+                // The probe ran under `refs > 0`, so the SPI's "sample count
+                // >= 1" holds without a clamp.
+                sample_ref_count: refs,
+            });
+        }
+
+        // 3. Remove the catalog row. From here new records for this `gts_id`
+        // are refused by the record store's own existence check.
+        self.delete_where_gts_id("usage_type_catalog", &gts_id)
+            .await?;
+
+        // 4. Sweep whatever landed between steps 2 and 3.
+        self.sweep_orphaned_records(&gts_id).await;
+
+        // 5. The catalog shrank; refresh the gauge off the request path.
+        self.request_catalog_size_refresh();
+        Ok(())
     }
 }
 

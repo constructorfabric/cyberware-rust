@@ -105,7 +105,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 - **Depends On**: `cpt-cf-uc-ch-plugin-feature-foundation`
 
 - **Scope**:
-  - Plugin-owned pre-insert referential-integrity check against the catalog (DESIGN.md §3.6 Ingest sequence steps 2-3), rejecting a reference to an absent (including previously deleted) usage type with `UsageTypeNotFound`. Because both create and delete paths acquire the **same exclusive mutex name** per `gts_id` (DESIGN.md §3.5), concurrent creates for the same `gts_id` also serialize — this is this feature's half of `cpt-cf-uc-ch-plugin-fr-referential-integrity`; the catalog-side lock-protected verify-then-delete protocol is owned by [§2.4](#24-usage-type-catalog--referential-integrity). The lock usage (acquire/release call sites) is owned here; the Coordination Lock Manager's cluster lock manager is constructed by [§2.1](#21-foundation-bootstrap-schema--spi-wiring).
+  - Plugin-owned pre-insert referential-integrity check against the catalog (DESIGN.md §3.6 Ingest sequence steps 2-3), rejecting a reference to an absent (including previously deleted) usage type with `UsageTypeNotFound`. This is this feature's half of `cpt-cf-uc-ch-plugin-fr-referential-integrity`; the delete-side half — reference probe, catalog-row removal, orphan sweep — is owned by [§2.4](#24-usage-type-catalog--referential-integrity). **No mutual exclusion** is involved on either side: this plugin holds no coordination lock (DESIGN.md §3.5), so this check is not ordered against a concurrent delete, and the residual window that leaves is bounded by this same check once the catalog row is gone.
   - Single insert with read-before-insert dedup check and `ReplacingMergeTree` convergence backstop; `metadata` persisted verbatim into `Map(String, String)`; `status = 'active'` on first accept.
   - Batch insert as exactly three statements regardless of how many usage types the batch spans — one catalog existence query over the distinct `gts_id`s, one dedup pre-read, one multi-row `INSERT` — with per-record results in input order.
   - Compensation persistence: signed `value` + optional `corrects_id` on the ordinary insert path; no netting computed.
@@ -122,7 +122,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
   - [x] `p1` - `cpt-cf-uc-ch-plugin-fr-idempotent-dedup`
   - [x] `p1` - `cpt-cf-uc-ch-plugin-fr-deactivation`
   - [x] `p1` - `cpt-cf-uc-ch-plugin-nfr-ingestion-throughput`
-  - [x] `p1` - `cpt-cf-uc-ch-plugin-fr-referential-integrity` (the insert-time catalog existence check only; there is no delete-side half, because [§2.4](#24-usage-type-catalog--referential-integrity) does not implement `delete_usage_type` and usage types are never removed)
+  - [x] `p1` - `cpt-cf-uc-ch-plugin-fr-referential-integrity` (the insert-time catalog existence check — the create-side half; the delete-side half, a reference probe plus post-delete orphan sweep, is owned by [§2.4](#24-usage-type-catalog--referential-integrity). This check is also what bounds the delete's residual race, since a deleted type is refused here from the moment its catalog row is gone)
 
 - **Design Principles Covered**: None (realizes principles owned by [§2.1](#21-foundation-bootstrap-schema--spi-wiring))
 
@@ -197,7 +197,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-feature-usage-type-catalog`
 
-- **Purpose**: Own the sole store for the usage-type catalog. Referential integrity between records and types is application-emulated (ClickHouse has no native FK) and is carried entirely by the insert-time catalog existence check owned by [§2.2](#22-record-persistence--lifecycle): there is no delete-side half, because this backend does not implement `delete_usage_type` and usage types are therefore never removed. `create_usage_type` is a version-resolved pre-existence read followed by an `INSERT`, with no critical section around the pair.
+- **Purpose**: Own the sole store for the usage-type catalog. Referential integrity between records and types is application-emulated (ClickHouse has no native FK) on both sides: the create-side half is the insert-time catalog existence check owned by [§2.2](#22-record-persistence--lifecycle); the delete-side half lives here, as `delete_usage_type`'s capped reference probe followed by an `ALTER TABLE … DELETE` of the catalog row and a re-probe-gated sweep of records that landed in between. Neither half has a critical section: `create_usage_type` is a version-resolved pre-existence read followed by an `INSERT`, and the delete's probe is a snapshot, so the delete narrows its orphaning window rather than closing it (DESIGN.md §3.6).
 
 - **Depends On**: `cpt-cf-uc-ch-plugin-feature-foundation`
 
@@ -213,7 +213,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
   - The insert-time catalog existence check — [§2.2](#22-record-persistence--lifecycle). This feature guarantees the invariant that check relies on (a type, once created, is never removed) but does not perform it.
 
 - **Requirements Covered**:
-  - [x] `p1` - `cpt-cf-uc-ch-plugin-fr-referential-integrity` (the append-only-catalog half: types are never removed, which is what makes [§2.2](#22-record-persistence--lifecycle)'s insert-time check sufficient)
+  - [x] `p1` - `cpt-cf-uc-ch-plugin-fr-referential-integrity` (the delete-side half: the pre-delete reference probe, the catalog-row removal, and the post-delete orphan sweep. Removing the catalog row before sweeping is what lets [§2.2](#22-record-persistence--lifecycle)'s insert-time check bound the residual window)
 
 - **Design Principles Covered**: None (realizes principles owned by [§2.1](#21-foundation-bootstrap-schema--spi-wiring))
 
@@ -283,7 +283,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 - **Scope**:
   - The `uc_clickhouse_*` metric inventory (insert/query/deactivate/pool-acquire duration, backend-error classification, readiness gauge, catalog-size gauge, dedup-outcome counters) with bounded label cardinality.
   - **No coordination-lock instrument set**: there is no lock to instrument, so no acquire-duration histogram, contention counter or lock-manager-unavailable counter is registered.
-  - The `uc_clickhouse_orphaned_reference_detected_total` defense-in-depth counter — specified as a safety net for an out-of-band `usage_type_catalog` deletion or a future code regression, not as a detector for an accepted race (the catalog is append-only, so the plugin itself cannot create an orphan). *
+  - The periodic orphan-reconciliation *scan*. The `uc_clickhouse_orphaned_reference_detected_total` counter itself ships, incremented by [§2.4](#24-usage-type-catalog--referential-integrity)'s post-delete sweep; what remains deferred is the background job that would also catch orphans the delete path never observed — one left by an insert committing after the sweep, or by an out-of-band `usage_type_catalog` deletion. *
   - Recording each SPI dispatch's ClickHouse work under the host's ambient tracing span.
 
 - **Out of scope**:
@@ -310,7 +310,7 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - **Multi-shard distributed-table topology, ClickHouse's own replication-serving cluster/cluster lock coordination** — governed by the operator's ClickHouse deployment guide, not by plugin features (PRD.md §4.2). This is distinct from, and does not include, this plugin's own use of the cluster gear's `DistributedLockV1` as a coordination-lock facade for referential integrity, which **is** in scope and owned jointly by [§2.1](#21-foundation-bootstrap-schema--spi-wiring) (client construction and `CatalogLockPort`/`LockGuardPort` traits), [§2.2](#22-record-persistence--lifecycle) (exclusive lock usage on the create path), and [§2.4](#24-usage-type-catalog--referential-integrity) (exclusive lock usage on the delete path).
 - **Product-level gear concerns** (authentication, PDP authorization, attribution/shape validation, idempotency-key presence, counter/gauge semantics, data classification) — owned by the parent Usage Collector gear, surfaced only as the pure-persistence boundary in [§2.1](#21-foundation-bootstrap-schema--spi-wiring).
-- **DB-enforced serializable dedup** — structurally unavailable on ClickHouse; not a deferred feature, a permanent architectural constraint documented in DESIGN.md §2.2/§3.6/§3.8 rather than assigned to a feature to "complete" later. (Referential integrity is, by contrast, closed exactly via the `gts_id` coordination lock — see [§2.2](#22-record-persistence--lifecycle)/[§2.4](#24-usage-type-catalog--referential-integrity) — not merely bounded or accepted as unavailable.)
+- **DB-enforced serializable dedup** — structurally unavailable on ClickHouse; not a deferred feature, a permanent architectural constraint documented in DESIGN.md §2.2/§3.6/§3.8 rather than assigned to a feature to "complete" later. (Referential integrity is in the same position: with no coordination lock, [§2.4](#24-usage-type-catalog--referential-integrity)'s delete side bounds its concurrent-reference window via the probe/sweep protocol and [§2.2](#22-record-persistence--lifecycle)'s insert-time check, rather than closing it.)
 - **Read/write pool split for workload isolation** — noted as a possible future, additive revision in DESIGN.md §3.5 if production experience shows contention; not committed to v1 scope.
 - **General schema-evolution / versioned-migration mechanism** — not designed in v1 (DESIGN.md §4 Deferred, PRD.md §13 Open Questions); Foundation ([§2.1](#21-foundation-bootstrap-schema--spi-wiring)) provisions only the initial schema shape.
 

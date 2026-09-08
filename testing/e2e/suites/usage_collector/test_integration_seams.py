@@ -192,9 +192,15 @@ async def test_delete_usage_type_referenced_by_record_is_rejected(api, make_usag
     No unit test can observe this: the constraint lives in the storage
     backend, and each plugin enforces it differently — TimescaleDB with a real
     FK `ON DELETE RESTRICT` (SQLite's default FK behaviour differs), ClickHouse
-    with a lock-protected verify-then-delete, since it has no FKs at all. The
-    gear's contract is identical either way, which is what this asserts: an
-    unreferenced type deletes cleanly (204), a referenced one is refused (409).
+    with a capped pre-delete reference probe plus a post-delete orphan sweep,
+    since it has no FKs at all. The gear's contract is identical either way,
+    which is what this asserts: an unreferenced type deletes cleanly (204), a
+    referenced one is refused (409).
+
+    The ClickHouse probe is not race-free — a record inserted between the probe
+    and the catalog delete can survive the sweep and orphan itself. That
+    residual is accepted by design and is not what this test covers; it asserts
+    only the uncontended contract, which both backends meet identically.
     """
     referenced_id, _ = await make_usage_type()
     unreferenced_id, _ = await make_usage_type()

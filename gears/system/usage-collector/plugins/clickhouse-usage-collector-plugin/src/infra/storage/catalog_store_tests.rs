@@ -6,7 +6,8 @@
 //!
 //! The offline tests need no live `ClickHouse` server: they exercise the
 //! refresh-worker cancellation / coalescing behaviour, the client-side
-//! deadline, the version scheme, and the unimplemented `delete`.
+//! deadline, the version scheme, and that `delete` surfaces a backend failure
+//! rather than a spurious success.
 //!
 //! The `live` module is gated behind `#[cfg(feature = "clickhouse")]` because
 //! its tests require a live `ClickHouse` server to return meaningful query
@@ -18,7 +19,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use usage_collector_sdk::UsageCollectorPluginError;
 
-use super::{ChCatalogStore, DELETE_UNIMPLEMENTED_MSG, RefreshOutcome};
+use super::{ChCatalogStore, RefreshOutcome};
 use crate::infra::metrics::Metrics;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -222,16 +223,21 @@ async fn a_black_holed_socket_is_cut_off_by_the_client_side_deadline() {
     );
 }
 
-// ── Test 4: delete is unimplemented and touches no backend ────────────────────
+// ── Test 4: delete reaches the backend on its very first step ─────────────────
 
-/// `delete` is not implemented by this backend: it returns `Internal` carrying
-/// the fixed not-implemented message and issues no SQL.
+/// `delete` issues its existence read before anything else, so an unreachable
+/// backend surfaces as a backend error rather than as a spurious success.
 ///
-/// The store points at a socket that accepts and never answers, with a long
-/// deadline: had `delete` issued any statement, the call would block for the
-/// whole deadline. Returning well under it proves no round-trip was attempted.
+/// The inverse of what this test asserted while `delete` was withheld: it then
+/// returned `Internal("not implemented")` *without* a round-trip, and the
+/// assertion was that no statement was issued. Now the first statement is
+/// step 1, so a socket that accepts and never answers must be cut off by the
+/// client-side deadline and reported `Transient` — the same shape as
+/// [`a_black_holed_socket_is_cut_off_by_the_client_side_deadline`], and proof
+/// that `delete` cannot report `Ok(())` (or `UsageTypeNotFound`) when it never
+/// managed to look.
 #[tokio::test]
-async fn delete_is_unimplemented_and_issues_no_sql() {
+async fn delete_surfaces_a_backend_failure_on_its_existence_read() {
     use usage_collector_sdk::UsageTypeGtsId;
 
     use crate::domain::ports::CatalogStore;
@@ -247,37 +253,32 @@ async fn delete_is_unimplemented_and_issues_no_sql() {
         }
     });
 
+    let deadline = Duration::from_millis(300);
     let store = ChCatalogStore::new(
         clickhouse::Client::default().with_url(format!("http://{addr}")),
         CancellationToken::new(),
         Arc::new(Metrics::new()),
-        TEST_DEADLINE,
+        deadline,
     );
 
     let gts_id =
-        UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~cf.compute._.delete_unimpl_test.v1")
+        UsageTypeGtsId::new("gts.cf.core.uc.usage_record.v1~cf.compute._.delete_offline_test.v1")
             .expect("valid gts_id");
 
     let started = std::time::Instant::now();
     let err = store
         .delete(gts_id)
         .await
-        .expect_err("delete is not implemented and must fail");
+        .expect_err("delete cannot succeed against a socket that never answers");
     let elapsed = started.elapsed();
 
     match err {
-        UsageCollectorPluginError::Internal(msg) => {
-            assert_eq!(msg, DELETE_UNIMPLEMENTED_MSG);
-            assert!(
-                msg.contains("not implemented"),
-                "message must say why: {msg}"
-            );
-        }
-        other => panic!("expected Internal, got {other:?}"),
+        UsageCollectorPluginError::Transient { .. } => {}
+        other => panic!("expected Transient, got {other:?}"),
     }
     assert!(
-        elapsed < Duration::from_secs(1),
-        "delete must return without any round-trip (the socket never answers), took {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "the call must return at roughly the deadline rather than hang, took {elapsed:?}"
     );
 }
 
@@ -455,28 +456,129 @@ mod live {
         }
     }
 
-    /// Against a live server the unimplemented `delete` still refuses and the
-    /// row stays exactly where it was.
+    /// An unreferenced type is removed, and the removal is visible to the very
+    /// next read.
+    ///
+    /// The visibility half is the point: `ALTER TABLE … DELETE` is an
+    /// asynchronous mutation by default, so without `mutations_sync` the `get`
+    /// below could still resolve the row. This test is what pins that setting.
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
-    async fn delete_is_unimplemented_and_leaves_the_row() {
+    async fn delete_removes_an_unreferenced_type_synchronously() {
         let (store, _client, _container) = start().await;
-        let ut = counter_usage_type("delete_unimplemented_test");
+        let ut = counter_usage_type("delete_unreferenced_test");
         let gts_id = ut.gts_id.clone();
         store.create(ut).await.expect("create must succeed");
 
-        let err = store
+        store
             .delete(gts_id.clone())
             .await
-            .expect_err("delete is not implemented");
+            .expect("an unreferenced type must delete cleanly");
+
+        let err = store
+            .get(gts_id)
+            .await
+            .expect_err("the type must be gone immediately after delete returns");
         assert!(
-            matches!(err, UsageCollectorPluginError::Internal(_)),
-            "expected Internal, got {err:?}"
+            matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+            "expected UsageTypeNotFound, got {err:?}"
         );
+    }
+
+    /// Deleting a type that was never created is `UsageTypeNotFound`, so the
+    /// gateway can distinguish "already gone" from "deleted now".
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn delete_of_an_absent_type_is_not_found() {
+        let (store, _client, _container) = start().await;
+
+        let err = store
+            .delete(counter_gts_id("delete_absent_test"))
+            .await
+            .expect_err("an absent type must not delete silently");
+        assert!(
+            matches!(err, UsageCollectorPluginError::UsageTypeNotFound { .. }),
+            "expected UsageTypeNotFound, got {err:?}"
+        );
+    }
+
+    /// Re-creating a deleted type succeeds — the delete really removed the
+    /// physical rows rather than leaving a higher-version copy behind.
+    ///
+    /// On a `ReplacingMergeTree` a delete implemented as a marker insert would
+    /// leave `create` to resolve against a surviving row; this asserts the
+    /// mutation path does not.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn a_deleted_type_can_be_recreated() {
+        let (store, _client, _container) = start().await;
+        let ut = counter_usage_type("delete_recreate_test");
+        let gts_id = ut.gts_id.clone();
+
+        store.create(ut.clone()).await.expect("first create");
+        store.delete(gts_id.clone()).await.expect("delete");
+        store
+            .create(ut)
+            .await
+            .expect("re-creating a deleted type must succeed, not conflict");
 
         store
             .get(gts_id)
             .await
-            .expect("the usage type must still exist after the refused delete");
+            .expect("the re-created type must be readable");
+    }
+
+    /// The sweep's mutation removes `usage_records` rows synchronously.
+    ///
+    /// The step-2/step-3 interleaving that produces a real orphan cannot be
+    /// driven through the public `delete`, so the sweep is covered as its two
+    /// halves: this test pins the mutation half (rows seeded directly are gone
+    /// by the next read), and `count_references` — the probe half that gates
+    /// it — is exercised by
+    /// `ch_delete_of_a_referenced_type_is_refused` in `catalog_integration_ch`.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn the_record_sweep_mutation_is_synchronous() {
+        let (store, client, _container) = start().await;
+        let gts_id = counter_gts_id("sweep_mutation_test");
+
+        // Seed an orphan directly: no catalog row, so this is exactly the
+        // shape a record that landed inside the delete window leaves behind.
+        client
+            .query(
+                "INSERT INTO usage_records \
+                 (id, tenant_id, gts_id, value, created_at, resource_id, resource_type, \
+                  subject_id, subject_type, idempotency_key, corrects_id, status, metadata, \
+                  ingested_at, version) \
+                 VALUES (generateUUIDv4(), generateUUIDv4(), ?, 1, now64(6), 'r', 't', \
+                  NULL, NULL, 'k', NULL, 'active', map(), now64(6), 1)",
+            )
+            .bind(gts_id.as_ref())
+            .execute()
+            .await
+            .expect("seeding an orphan record must succeed");
+
+        assert_eq!(
+            store
+                .count_references(&gts_id)
+                .await
+                .expect("the probe must see the seeded row"),
+            1,
+            "the seeded orphan must be visible to the probe"
+        );
+
+        store
+            .delete_where_gts_id("usage_records", &gts_id)
+            .await
+            .expect("the sweep mutation must succeed");
+
+        assert_eq!(
+            store
+                .count_references(&gts_id)
+                .await
+                .expect("the probe must succeed after the sweep"),
+            0,
+            "the sweep must be visible to the very next read"
+        );
     }
 }

@@ -69,7 +69,7 @@ Record Persistence owns the full lifecycle write path: referential-integrity che
 
 - Schema DDL (`usage_records` table, `TTL` clause) — created by Feature 1 (`cpt-cf-uc-ch-plugin-feature-foundation`); this feature is the row-writer.
 - Aggregation, keyset list, and pushed-down `GROUP BY` execution — Feature 3 (`cpt-cf-uc-ch-plugin-feature-query-aggregation`).
-- Usage-type create / get / list, and why delete is withheld — Feature 4 (`cpt-cf-uc-ch-plugin-feature-usage-type-catalog`). This feature's insert-time catalog check relies on that feature's append-only guarantee.
+- Usage-type create / get / list / delete — Feature 4 (`cpt-cf-uc-ch-plugin-feature-usage-type-catalog`). The relationship runs both ways: this feature's insert-time catalog check has no ordering guarantee against that feature's delete, and that delete relies on this check to bound the window its own sweep cannot cover.
 - `TTL` expiry of stored rows — Feature 5 (`cpt-cf-uc-ch-plugin-feature-retention`).
 
 ## 2. Actor Flows (CDSL)
@@ -87,7 +87,7 @@ Record Persistence owns the full lifecycle write path: referential-integrity che
 
 **Error Scenarios**:
 
-- Usage type absent → return `UsageTypeNotFound`. (A type is never removed once created, so "previously deleted" cannot arise — Feature 4.)
+- Usage type absent → return `UsageTypeNotFound`. Absent covers "never created" and "removed by `delete_usage_type`" alike (Feature 4); this check is what makes a deleted type unusable for new records.
 - Duplicate with differing canonical fields → return `IdempotencyConflict`.
 - ClickHouse error during check or insert → classify and return the error.
 
@@ -170,7 +170,9 @@ Record Persistence owns the full lifecycle write path: referential-integrity che
 
 - [ ] `p2` - **ID**: `cpt-cf-uc-ch-plugin-algo-record-persistence-ingest-dedup`
 
-The create-side referential-integrity half of `cpt-cf-uc-ch-plugin-fr-referential-integrity`: the exclusive `gts_id` coordination lock (same exclusive mutex name as the delete path) is held around the catalog-existence check and the dedup check/insert. Because no concurrent create or delete for the same `gts_id` can hold the lock simultaneously, the catalog check and the eventual `INSERT` are ordered against every `delete_usage_type` call for this `gts_id` with no gap — this satisfies `plugin-spi.md` Method 9's "MUST NOT admit a window" without qualification. The `ReplacingMergeTree(version)` convergence backstop is a defense-in-depth layer, not a primary integrity mechanism.
+The create-side referential-integrity half of `cpt-cf-uc-ch-plugin-fr-referential-integrity`: a catalog-existence check immediately before the dedup check and `INSERT`. **No lock is held** — this plugin has no coordination primitive (DESIGN.md §3.5; an earlier revision's per-`gts_id` cluster mutex was removed) — so the check and the `INSERT` are **not** ordered against a concurrent `delete_usage_type` for the same `gts_id`. `plugin-spi.md` Method 9's "MUST NOT admit a window" is therefore not satisfied without qualification; the delete side (Feature 4) sweeps the records that land inside its own probe→delete window, and the residual — a check that passed before the delete followed by an `INSERT` that commits after the sweep — is accepted and documented in PRD.md §5.
+
+This check is nonetheless what *bounds* that window rather than leaving it open-ended: from the moment the delete has removed the catalog row, every subsequent insert for the `gts_id` is refused here. The `ReplacingMergeTree(version)` convergence backstop is a defense-in-depth layer for duplicate creates, not a referential-integrity mechanism.
 
 ### Batch Partition by gts_id
 
@@ -277,7 +279,7 @@ The system **MUST** implement `deactivate_usage_record` as: one version-resolved
 
 - [ ] Single-row `usage_records` `INSERT`s carry `async_insert = 1` and `wait_for_async_insert = 1` (verifiable in `system.query_log`), while multi-row `INSERT`s and every `usage_type_catalog` write carry neither. Every `usage_records` `INSERT` carries a UUID `insert_deduplication_token`; on a synchronous store two racing identical single creates, or two racing identical batches, store exactly one physical row per id, and a deactivation marker is stored next to the row it supersedes rather than deduplicated against it. An exact create retry is still absorbed rather than inserting a second row, which is what proves the acknowledgement implies queryability.
 - [x] `create_usage_record` takes no lock of any kind: catalog check, dedup pre-read and `INSERT` are three independent statements.
-- [x] The catalog-existence check is `SELECT gts_id FROM usage_type_catalog WHERE gts_id = ? LIMIT 1`; an absent type returns `UsageTypeNotFound`. A type cannot be *previously deleted* — this backend never removes one.
+- [x] The catalog-existence check is `SELECT gts_id FROM usage_type_catalog WHERE gts_id = ? LIMIT 1`; an absent type returns `UsageTypeNotFound`, including a type that `delete_usage_type` previously removed.
 - [x] The dedup lookup keys on the canonical `(tenant_id, gts_id, created_at, idempotency_key)` tuple — emitted in sorting-key order (`gts_id` first) so it leads with the three-column sort-key prefix, never on `id` — and resolves versions per `id` (`ORDER BY id ASC, version DESC LIMIT 1 BY id`).
 - [x] An identical re-submission (same canonical fields) is absorbed silently; a re-submission with differing canonical fields returns `IdempotencyConflict`.
 - [x] No lease-renew step exists on the insert path; the engine's `insert_deduplication_token` window, not a lock, is what makes a racing retry of the same row a no-op.

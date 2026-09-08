@@ -29,10 +29,14 @@
 -- pass the pre-existence check and INSERT; convergence collapses the
 -- duplicate physical rows, keeping whichever insert's version is higher).
 --
--- Rows are never deleted by the plugin: `delete_usage_type` is not
--- implemented by this backend (it returns an Internal "not implemented"
--- error without issuing SQL), so the catalog is append-only and needs no
--- tombstone flag or versioned "deleted" marker (DESIGN.md §3.6).
+-- Rows ARE deleted by the plugin: `delete_usage_type` issues an
+-- `ALTER TABLE ... DELETE WHERE gts_id = ?` against this table under
+-- mutations_sync = 1 (DESIGN.md §3.6).  A heavyweight mutation rather than a
+-- lightweight DELETE FROM, and deliberately not a versioned "deleted" marker
+-- row: the mutation removes the physical rows, so a re-create of the same
+-- gts_id has no surviving higher-version copy to outrank.  That is why this
+-- table needs no tombstone flag.  The table is unpartitioned and tiny, so the
+-- part rewrite the mutation costs is trivial.
 --
 -- ORDER BY (gts_id): single-column sort key for point lookups on gts_id.
 -- There is no native PRIMARY KEY / UNIQUE constraint in ClickHouse; uniqueness
@@ -142,10 +146,20 @@ ORDER BY (gts_id);
 -- and re-insert it under an idempotency key already in use.
 --
 -- No FOREIGN KEY on gts_id — ClickHouse has no FK support.  gts_id is a soft
--- reference checked in application code at insert time (an existence read of
--- usage_type_catalog, which needs no version resolution); since usage types
--- are never deleted, no delete-side check or coordination is needed
--- (DESIGN.md §3.6).
+-- reference checked in application code on BOTH sides: an insert-time
+-- existence read of usage_type_catalog (which needs no version resolution),
+-- and, on the delete side, `delete_usage_type`'s capped reference probe over
+-- this table plus a post-delete sweep that issues an
+-- `ALTER TABLE ... DELETE WHERE gts_id = ?` against it for rows that landed
+-- inside its probe->delete window (DESIGN.md §3.6).
+--
+-- That emulation is NOT race-free: an insert whose own existence check passed
+-- before the catalog row was removed can commit after the sweep and orphan a
+-- row.  The window is bounded (the catalog row is removed before the sweep, so
+-- the insert-time check refuses new records from that point) and instrumented
+-- (uc_clickhouse_orphaned_reference_detected_total), not closed.  Deleting a
+-- usage type while ingest for it is in flight is an operational error the
+-- plugin cannot prevent.
 --
 -- No UNIQUE constraint, no ON CONFLICT — ClickHouse has neither.  Dedup is
 -- emulated at the application level (SELECT then INSERT), the engine's
