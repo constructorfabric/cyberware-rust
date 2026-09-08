@@ -67,7 +67,7 @@ inventory = { workspace = true }
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # A real cluster over the standalone backend for the adapter and gear tests.
-cluster = { workspace = true }
-standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../cluster/plugins/standalone-cluster-plugin", version = "0.2.2" }
+cluster = { package = "cf-gears-cluster", path = "../../cluster/cluster" }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../cluster/plugins/standalone-cluster-plugin" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

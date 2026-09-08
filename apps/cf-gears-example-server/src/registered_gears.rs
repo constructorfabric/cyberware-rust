@@ -102,9 +102,9 @@ use usage_collector as _;
 use timescaledb_usage_collector_plugin as _;
 
 #[cfg(feature = "quota-enforcement")]
-use quota_enforcement as _;
-#[cfg(feature = "quota-enforcement")]
 use cluster as _;
+#[cfg(feature = "quota-enforcement")]
+use quota_enforcement as _;
 #[cfg(feature = "quota-enforcement")]
 use quota_enforcement_storage_plugin as _;
 
