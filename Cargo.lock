@@ -1589,7 +1589,7 @@ dependencies = [
  "cf-gears-toolkit-utils",
  "futures",
  "http",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "parking_lot",
  "reqwest",
@@ -2717,7 +2717,7 @@ dependencies = [
  "http",
  "image",
  "inventory",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube",
  "multer",
  "opentelemetry",
@@ -6698,6 +6698,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "k8s-openapi"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c6922f6afe80418dd6019818af5d0d34584c371780ff09b9752370c25b4abb"
+dependencies = [
+ "base64 0.22.1",
+ "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kreuzberg"
 version = "4.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6790,7 +6802,7 @@ version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "acc5a6a69da2975ed9925d56b5dcfc9cc739b66f37add06785b7c9f6d1e88741"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.27.1",
  "kube-client",
  "kube-core",
 ]
@@ -6814,7 +6826,7 @@ dependencies = [
  "hyper-util",
  "jiff",
  "jsonpath-rust",
- "k8s-openapi",
+ "k8s-openapi 0.27.1",
  "kube-core",
  "pem",
  "rustls",
@@ -6840,7 +6852,7 @@ dependencies = [
  "form_urlencoded",
  "http",
  "jiff",
- "k8s-openapi",
+ "k8s-openapi 0.27.1",
  "serde",
  "serde-value",
  "serde_json",
