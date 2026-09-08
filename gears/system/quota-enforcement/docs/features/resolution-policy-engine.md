@@ -615,6 +615,11 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
 
 ## 7. Additional Context (optional)
 
+- **Policy compatibility at bootstrap (tracked here)**: the projection-contracts feature's catalogue bootstrap fails
+  when the configured catalogue is incompatible with an active Quota; the Policy half of that check waits for this
+  feature, because a Policy version carries no contract reference until Policy validation snapshots the request,
+  resource, and constraint contracts it type-checks against. This feature adds that reference and the bootstrap check
+  over it, which (with the quota-lifecycle database query) closes `cpt-cf-quota-enforcement-dod-projection-catalog`.
 - **ADR dependencies**: `cpt-cf-quota-enforcement-adr-evaluation-engine` (ADR-0005, accepted) fixes the
   capability-based Engine contract this document restates; `cpt-cf-quota-enforcement-adr-projection-contracts`
   (ADR-0007, accepted) fixes the Policy-write membership check and the CEL input contract; the

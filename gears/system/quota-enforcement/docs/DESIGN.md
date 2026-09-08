@@ -971,7 +971,7 @@ There is no projection-alias, Quota/counter-migration, or breaking-version activ
 | Field | Rust type | Rule |
 |-------|-----------|------|
 | `tenant_id` | `TenantId` | Required caller-supplied target tenant. Untrusted until PDP authorizes it for the authenticated service principal. |
-| `subjects` | `Vec<SubjectRef>` | Additional `{ kind: GtsInstanceId, id: String }` subjects. `kind` is a QE scope instance; ids are opaque and non-empty. Tenant scope is materialized from `tenant_id` and must not be repeated. |
+| `subjects` | `Vec<SubjectClaim>` | Additional `{ kind, id }` subjects; `kind` is a QE scope instance id and `id` an opaque non-empty string, both as text so a malformed value is a canonical `InvalidArgument`. Tenant scope is materialized from `tenant_id` and must not be repeated. `SubjectRef` is the mapped `(projection_type, subject_id)` pair the catalogue produces from a claim. |
 | `metadata` | `Map<String, JsonValue>` | One operation-level object, required on the wire including `{}` when empty; QE wraps it into the contract envelope `{type, metadata}` and validates the whole document against the metric request contract. |
 | `resource` | `Option<ResourceProjection>` | Optional concrete resource projection with `type`, optional `id`, and required `metadata`; descriptive in P1 and PDP-authorized with the attribution tuple. |
 
@@ -2219,7 +2219,15 @@ plugin chooses physical layout.
    invalid reference, contract mismatch, or `(metric, scope)` pair claimed by two configured projections fails
    bootstrap. Bootstrap also fails when the configured catalogue is incompatible with any active Quota or Policy.
    Registered projections outside the configured catalogue remain discoverable, but P1 rejects Quota and Policy writes
-   that reference them. The immutable catalogue is published to Gateway only after all checks pass.
+   that reference them. The immutable catalogue is published to Gateway only after all checks pass. Resolution
+   re-derives each selected contract with the `gts` library the registry validates with: the type, its parent chain,
+   and every type reached through a `gts://` reference are loaded into a local store, and the resolved body keeps its
+   Draft-07 dialect and `x-gts-ref` constraints for the compiled contract to assert at ingress. Request contracts are
+   discovered from the registry listing under `gts.cf.core.qe.request.v1~` and filtered to the admitted metrics, so an
+   unrelated owner's contract cannot fail bootstrap. The active-Quota compatibility check reads the distinct
+   `(metric, projection_type)` pairs through the caller-less, bootstrap-only storage primitive
+   `read_active_projection_bindings()`. A consistency-set failure names `catalog` as the failed dependency (health
+   code `qe_catalog_unavailable`); a registry that does not answer names `types_registry`.
 1. Seeding default rows for `contention_timeout_config(metric=NULL, timeout_ms=0)`,
    `lease_capacity_config(tenant_id=NULL, metric=NULL, max_active_leases=1000)`, and
    `idempotency_retention_config(tenant=NULL, metric=NULL, retention_seconds=86400)` when missing.
@@ -2297,7 +2305,7 @@ The complete QE-specific metric catalogue exposed alongside the framework baseli
 | `outbox_rejections_total`                  | Counter   | `queue`                  | Handler `Reject` outcomes; this is not a durable dead-letter row count                                                                                                                                                       |
 | `policy_version_transitions_total`         | Counter   | `transition_kind`        | `{create, update, rollback, delete}`                                                                                                                                                                                        |
 | `policy_version_conflict_rejections_total` | Counter   | —                        | Policy versioning concurrency rejections                                                                                                                                                                                    |
-| `contract_validation_failures_total`       | Counter   | `surface`, `reason`      | `surface` ∈ `{request_subject, request_resource, caller_attribution, arbitration, policy_pair, bootstrap}`; `reason` is a closed validation-reason enum                                                                 |
+| `contract_validation_failures_total`       | Counter   | `surface`, `reason`      | `surface` ∈ `{request_subject, request_resource, caller_attribution, arbitration, policy_pair, bootstrap}`; `reason` ∈ `{shape_invalid, metadata_missing, kind_unknown, kind_not_admitted, schema_violation, schema_invalid, unregistered, abstract, not_derived, scope_invalid, metric_unregistered, metric_not_instance, duplicate_pair, request_contract_missing, request_contract_ambiguous, constraint_invalid, definition_conflict, projection_not_resolvable, incompatible_state}`                                                                 |
 | `admitted_metric_violations_total`         | Counter   | `surface`                | Projection/metric incompatibility at request, Quota/Policy write, or bootstrap; no metric label                                                                                                                              |
 
 Label cardinality is bounded at compile time (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`).

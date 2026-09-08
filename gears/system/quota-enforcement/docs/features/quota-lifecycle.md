@@ -572,6 +572,12 @@ respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, p
 
 ## 7. Additional Context (optional)
 
+- **Bootstrap compatibility query (tracked here)**: the projection-contracts feature checks the configured catalogue
+  against `QuotaEnforcementStoragePluginV1::read_active_projection_bindings()` at bootstrap, the distinct
+  `(metric, projection_type)` pairs of active Quotas, implemented so far by the in-memory storage double only. This
+  feature adds the storage plugin's database query over the Quota table and its integration tests. Together with
+  Policy compatibility from the resolution-policy-engine feature, that closes
+  `cpt-cf-quota-enforcement-dod-projection-catalog` of the projection-contracts feature.
 - **Upstream catalogue gaps (tracked upstream prerequisites)**: PRD `cpt-cf-quota-enforcement-fr-quota-metadata`
   requires telemetry on metadata size distribution, and
   `cpt-cf-quota-enforcement-fr-metric-identity-validation` requires flagging Quotas whose metric was later removed;
