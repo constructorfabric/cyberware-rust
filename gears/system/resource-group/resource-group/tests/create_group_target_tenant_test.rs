@@ -15,10 +15,11 @@
 //! - explicit foreign `tenant_id` NOT covered by the `AccessScope` -> a
 //!   `TenantNotFound` domain error indistinguishable from "tenant doesn't
 //!   exist" (`foreign_tenant_denied_by_default_policy_returns_tenant_not_found`)
-//! - an `AccessScope` built only from an `InTenantSubtree` constraint can
-//!   never be resolved by this gear (no `tenant_closure` dependency) and is
-//!   therefore rejected fail-closed, even when the target tenant is
-//!   literally the constraint's own root
+//! - an `InTenantSubtree`-only constraint is rejected fail-closed at PEP
+//!   compile time: this gear never advertises `TenantHierarchy` (no
+//!   `tenant_closure` dependency), so the unadvertised predicate is a PDP
+//!   contract violation surfaced as `AccessDenied` — even when the target
+//!   tenant is literally the constraint's own root
 //!   (`in_tenant_subtree_scope_is_denied_fail_closed`)
 //! - explicit `tenant_id` conflicting with an explicit `parent_id`'s actual
 //!   tenant -> rejected, message does not leak tenant ids (style)
@@ -132,12 +133,13 @@ impl AuthZResolverApi for TargetTenantAllowAuthZ {
 }
 
 /// Permits, but the sole constraint is `InTenantSubtree` rooted at a
-/// caller-chosen tenant. Models a policy shape like "tenant admins may
-/// manage their own tenant's subtree" -- exercises the documented
-/// fail-closed limitation: `AccessScope::contains_uuid` cannot resolve
-/// subtree membership for this filter variant (no DB-backed
-/// `tenant_closure` lookup in this gear), so the request is denied even
-/// when the target tenant is literally the subtree's own root.
+/// caller-chosen tenant. Models a nonconforming PDP: this gear never
+/// advertises the `TenantHierarchy` capability (no DB-backed
+/// `tenant_closure` lookup), so per the capability negotiation contract a
+/// PDP must expand such a policy to explicit `in` predicates or deny --
+/// returning the native predicate anyway is a contract violation the PEP
+/// rejects fail-closed at compile time, even when the target tenant is
+/// literally the subtree's own root.
 struct InTenantSubtreeOnlyAuthZ {
     root_tenant_id: Uuid,
 }
@@ -286,13 +288,16 @@ async fn foreign_tenant_denied_by_default_policy_returns_tenant_not_found() {
     }
 }
 
-/// An `AccessScope` built only from an `InTenantSubtree` constraint can
-/// never be resolved by `AccessScope::contains_uuid` -- fail-closed by
-/// design (; see `GroupService::create_group`'s doc comment on the
-/// AuthZ gate). This holds even when the target tenant is literally the
-/// constraint's own `root_tenant_id`: the point is that this gear cannot
-/// verify subtree *membership* at all without a `tenant_closure` lookup it
-/// deliberately does not depend on, so it never tries.
+/// An `InTenantSubtree`-only constraint from the PDP is rejected fail-closed
+/// at PEP compile time: this gear never advertises `TenantHierarchy` (it has
+/// no `tenant_closure` dependency), so the unadvertised native predicate is
+/// a PDP contract violation surfaced as a typed
+/// `ConstraintCompileError::UnadvertisedCapabilities`, which this gear maps
+/// to a clean `AccessDenied` rather than an internal error. This holds even
+/// when the target tenant is literally the constraint's own
+/// `root_tenant_id`, and the denial fires before any tenant resolution --
+/// regardless of whether the target tenant exists -- so tenant existence
+/// still cannot be probed through this path.
 #[tokio::test]
 async fn in_tenant_subtree_scope_is_denied_fail_closed() {
     let db = common::test_db().await;
@@ -320,8 +325,14 @@ async fn in_tenant_subtree_scope_is_denied_fail_closed() {
         );
 
     match err {
-        DomainError::TenantNotFound { tenant_id } => assert_eq!(tenant_id, target_tenant),
-        other => panic!("expected DomainError::TenantNotFound, got: {other:?}"),
+        DomainError::AccessDenied { message } => {
+            assert!(
+                !message.contains(&target_tenant.to_string())
+                    && !message.contains(&caller_tenant.to_string()),
+                "message must not leak tenant ids: {message}"
+            );
+        }
+        other => panic!("expected DomainError::AccessDenied, got: {other:?}"),
     }
 }
 

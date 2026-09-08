@@ -108,15 +108,24 @@ pub mod pep_properties {
 /// scope filters into SQL subqueries without depending on entity types.
 ///
 /// **Note:** These tables are canonical to the RG gear's database.
-/// `resource_group_membership` is not projected to domain services.
-/// `InGroup`/`InGroupSubtree` predicates are only executable within the RG gear.
+/// `InGroup`/`InGroupSubtree` predicates are executable only where the RG tables
+/// are co-located or projected into the querying database.
 pub mod rg_tables {
-    /// Membership table (RG-internal, not projected to domain services).
+    /// Membership table owned by the RG gear.
     pub const MEMBERSHIP_TABLE: &str = "resource_group_membership";
     /// Column in membership table: the resource's external ID.
     pub const MEMBERSHIP_RESOURCE_ID: &str = "resource_id";
     /// Column in membership table: the group the resource belongs to.
     pub const MEMBERSHIP_GROUP_ID: &str = "group_id";
+    /// Column in membership table: the RG-local GTS type surrogate.
+    pub const MEMBERSHIP_GTS_TYPE_ID: &str = "gts_type_id";
+
+    /// RG-local GTS type registry table.
+    pub const GTS_TYPE_TABLE: &str = "gts_type";
+    /// Primary key in the RG-local GTS type registry.
+    pub const GTS_TYPE_ID: &str = "id";
+    /// External GTS schema identifier in the RG-local type registry.
+    pub const GTS_TYPE_SCHEMA_ID: &str = "schema_id";
 
     /// Closure table for group hierarchy.
     pub const CLOSURE_TABLE: &str = "resource_group_closure";
@@ -171,9 +180,13 @@ pub enum ScopeFilter {
     Eq(EqScopeFilter),
     /// Set membership: `property IN (values)`.
     In(InScopeFilter),
-    /// Group membership: `property IN (SELECT resource_id FROM membership WHERE group_id IN (group_ids))`.
+    /// Typed group membership. The membership subquery resolves
+    /// `gts_type_id` through `gts_type.schema_id = membership_resource_type`
+    /// and compares its opaque `resource_id` with `CAST(property AS text)`.
     InGroup(InGroupScopeFilter),
-    /// Group subtree: `property IN (SELECT resource_id FROM membership WHERE group_id IN (SELECT descendant_id FROM closure WHERE ancestor_id IN (ancestor_ids)))`.
+    /// Typed group subtree. Uses the same local `gts_type` resolution and text
+    /// comparison as [`ScopeFilter::InGroup`], with matching group IDs selected
+    /// from descendants in `resource_group_closure`.
     InGroupSubtree(InGroupSubtreeScopeFilter),
     /// Tenant subtree: `property IN (SELECT descendant_id FROM tenant_closure WHERE ancestor_id = root_tenant_id)`.
     InTenantSubtree(InTenantSubtreeScopeFilter),
@@ -259,19 +272,47 @@ impl InScopeFilter {
     }
 }
 
-/// Group membership scope filter.
+/// Group membership scope filter, qualified by the RG member-handle type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InGroupScopeFilter {
     property: String,
+    membership_resource_type: String,
     group_ids: Vec<ScopeValue>,
 }
 
 impl InGroupScopeFilter {
-    /// Create a group membership scope filter.
+    /// Create an untyped group membership scope filter.
+    ///
+    /// This source-compatible constructor cannot safely qualify RG membership
+    /// rows and therefore compiles to deny-all. New callers should use
+    /// [`Self::new_typed`].
+    #[deprecated(
+        since = "0.9.1",
+        note = "untyped group filters compile to deny-all; use `new_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn new(property: impl Into<String>, group_ids: Vec<ScopeValue>) -> Self {
         Self {
             property: property.into(),
+            membership_resource_type: String::new(),
+            group_ids,
+        }
+    }
+
+    /// Create a group membership scope filter qualified by the external GTS
+    /// schema id stored for the member handle in RG's local type registry.
+    ///
+    /// The containing [`ScopeConstraint`] must also include an
+    /// `owner_tenant_id` filter; SQL compilation rejects group-only constraints.
+    #[must_use]
+    pub fn new_typed(
+        property: impl Into<String>,
+        membership_resource_type: impl Into<String>,
+        group_ids: Vec<ScopeValue>,
+    ) -> Self {
+        Self {
+            property: property.into(),
+            membership_resource_type: membership_resource_type.into(),
             group_ids,
         }
     }
@@ -283,6 +324,13 @@ impl InGroupScopeFilter {
         &self.property
     }
 
+    /// The external GTS schema id qualifying membership rows.
+    #[inline]
+    #[must_use]
+    pub fn membership_resource_type(&self) -> &str {
+        &self.membership_resource_type
+    }
+
     /// The group IDs.
     #[inline]
     #[must_use]
@@ -291,19 +339,47 @@ impl InGroupScopeFilter {
     }
 }
 
-/// Group subtree scope filter.
+/// Group subtree scope filter, qualified by the RG member-handle type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InGroupSubtreeScopeFilter {
     property: String,
+    membership_resource_type: String,
     ancestor_ids: Vec<ScopeValue>,
 }
 
 impl InGroupSubtreeScopeFilter {
-    /// Create a group subtree scope filter.
+    /// Create an untyped group subtree scope filter.
+    ///
+    /// This source-compatible constructor cannot safely qualify RG membership
+    /// rows and therefore compiles to deny-all. New callers should use
+    /// [`Self::new_typed`].
+    #[deprecated(
+        since = "0.9.1",
+        note = "untyped group filters compile to deny-all; use `new_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn new(property: impl Into<String>, ancestor_ids: Vec<ScopeValue>) -> Self {
         Self {
             property: property.into(),
+            membership_resource_type: String::new(),
+            ancestor_ids,
+        }
+    }
+
+    /// Create a group subtree scope filter qualified by the external GTS schema
+    /// id stored for the member handle in RG's local type registry.
+    ///
+    /// The containing [`ScopeConstraint`] must also include an
+    /// `owner_tenant_id` filter; SQL compilation rejects group-only constraints.
+    #[must_use]
+    pub fn new_typed(
+        property: impl Into<String>,
+        membership_resource_type: impl Into<String>,
+        ancestor_ids: Vec<ScopeValue>,
+    ) -> Self {
+        Self {
+            property: property.into(),
+            membership_resource_type: membership_resource_type.into(),
             ancestor_ids,
         }
     }
@@ -313,6 +389,13 @@ impl InGroupSubtreeScopeFilter {
     #[must_use]
     pub fn property(&self) -> &str {
         &self.property
+    }
+
+    /// The external GTS schema id qualifying membership rows.
+    #[inline]
+    #[must_use]
+    pub fn membership_resource_type(&self) -> &str {
+        &self.membership_resource_type
     }
 
     /// The ancestor group IDs.
@@ -450,16 +533,61 @@ impl ScopeFilter {
         ))
     }
 
-    /// Create a group membership filter.
+    /// Create an untyped group membership filter that compiles to deny-all.
+    ///
+    /// Retained for source compatibility. New callers should use
+    /// [`Self::in_group_typed`] so membership rows can be safely qualified.
+    #[deprecated(
+        since = "0.9.1",
+        note = "untyped group filters compile to deny-all; use `in_group_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn in_group(property: impl Into<String>, group_ids: Vec<ScopeValue>) -> Self {
+        #[allow(deprecated)]
         Self::InGroup(InGroupScopeFilter::new(property, group_ids))
     }
 
-    /// Create a group subtree filter.
+    /// Create a group membership filter qualified by its RG member-handle type.
+    #[must_use]
+    pub fn in_group_typed(
+        property: impl Into<String>,
+        membership_resource_type: impl Into<String>,
+        group_ids: Vec<ScopeValue>,
+    ) -> Self {
+        Self::InGroup(InGroupScopeFilter::new_typed(
+            property,
+            membership_resource_type,
+            group_ids,
+        ))
+    }
+
+    /// Create an untyped group subtree filter that compiles to deny-all.
+    ///
+    /// Retained for source compatibility. New callers should use
+    /// [`Self::in_group_subtree_typed`] so membership rows can be safely
+    /// qualified.
+    #[deprecated(
+        since = "0.9.1",
+        note = "untyped group filters compile to deny-all; use `in_group_subtree_typed` with the RG member-handle type"
+    )]
     #[must_use]
     pub fn in_group_subtree(property: impl Into<String>, ancestor_ids: Vec<ScopeValue>) -> Self {
+        #[allow(deprecated)]
         Self::InGroupSubtree(InGroupSubtreeScopeFilter::new(property, ancestor_ids))
+    }
+
+    /// Create a group subtree filter qualified by its RG member-handle type.
+    #[must_use]
+    pub fn in_group_subtree_typed(
+        property: impl Into<String>,
+        membership_resource_type: impl Into<String>,
+        ancestor_ids: Vec<ScopeValue>,
+    ) -> Self {
+        Self::InGroupSubtree(InGroupSubtreeScopeFilter::new_typed(
+            property,
+            membership_resource_type,
+            ancestor_ids,
+        ))
     }
 
     /// Create a tenant subtree filter rooted at a single ancestor tenant.
@@ -1227,34 +1355,73 @@ mod tests {
 
     // --- ScopeFilter::InGroup ---
 
+    const MEMBER_TYPE: &str = "gts.cf.core.rg.type.v1~example.core.rg.member.v1~";
+
     #[test]
     fn scope_filter_in_group_constructor() {
-        let f = ScopeFilter::in_group(
+        let f = ScopeFilter::in_group_typed(
             pep_properties::OWNER_TENANT_ID,
+            MEMBER_TYPE,
             vec![ScopeValue::Uuid(uid(T1))],
         );
         assert_eq!(f.property(), pep_properties::OWNER_TENANT_ID);
         assert!(matches!(f, ScopeFilter::InGroup(_)));
         assert_eq!(f.values().iter().count(), 0);
+        let ScopeFilter::InGroup(filter) = &f else {
+            unreachable!("variant asserted above")
+        };
+        assert_eq!(filter.membership_resource_type(), MEMBER_TYPE);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_in_group_constructor_is_untyped() {
+        let f = ScopeFilter::in_group(
+            pep_properties::OWNER_TENANT_ID,
+            vec![ScopeValue::Uuid(uid(T1))],
+        );
+        let ScopeFilter::InGroup(filter) = f else {
+            unreachable!("constructor always returns InGroup")
+        };
+        assert!(filter.membership_resource_type().is_empty());
     }
 
     // --- ScopeFilter::InGroupSubtree ---
 
     #[test]
     fn scope_filter_in_group_subtree_constructor() {
-        let f = ScopeFilter::in_group_subtree(
+        let f = ScopeFilter::in_group_subtree_typed(
             pep_properties::OWNER_TENANT_ID,
+            MEMBER_TYPE,
             vec![ScopeValue::Uuid(uid(T1))],
         );
         assert_eq!(f.property(), pep_properties::OWNER_TENANT_ID);
         assert!(matches!(f, ScopeFilter::InGroupSubtree(_)));
         assert_eq!(f.values().iter().count(), 0);
+        let ScopeFilter::InGroupSubtree(filter) = &f else {
+            unreachable!("variant asserted above")
+        };
+        assert_eq!(filter.membership_resource_type(), MEMBER_TYPE);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn legacy_in_group_subtree_constructor_is_untyped() {
+        let f = ScopeFilter::in_group_subtree(
+            pep_properties::OWNER_TENANT_ID,
+            vec![ScopeValue::Uuid(uid(T1))],
+        );
+        let ScopeFilter::InGroupSubtree(filter) = f else {
+            unreachable!("constructor always returns InGroupSubtree")
+        };
+        assert!(filter.membership_resource_type().is_empty());
     }
 
     #[test]
     fn in_group_scope_contains_uuid_returns_false() {
-        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group(
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_typed(
             pep_properties::OWNER_TENANT_ID,
+            MEMBER_TYPE,
             vec![ScopeValue::Uuid(uid(T1))],
         )]));
         assert!(!scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
@@ -1262,10 +1429,13 @@ mod tests {
 
     #[test]
     fn in_group_subtree_scope_contains_uuid_returns_false() {
-        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_subtree(
-            pep_properties::OWNER_TENANT_ID,
-            vec![ScopeValue::Uuid(uid(T1))],
-        )]));
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_group_subtree_typed(
+                pep_properties::OWNER_TENANT_ID,
+                MEMBER_TYPE,
+                vec![ScopeValue::Uuid(uid(T1))],
+            ),
+        ]));
         assert!(!scope.contains_uuid(pep_properties::OWNER_TENANT_ID, uid(T1)));
     }
 

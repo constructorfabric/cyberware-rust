@@ -353,6 +353,10 @@ async fn group_predicates_from_request_properties() {
     let g1 = Uuid::now_v7();
     let g2 = Uuid::now_v7();
     let mut req = make_request(t1);
+    req.context.capabilities = vec![
+        authz_resolver_sdk::Capability::GroupMembership,
+        authz_resolver_sdk::Capability::GroupHierarchy,
+    ];
     req.resource.properties.insert(
         "group_ids".to_owned(),
         serde_json::json!([g1.to_string(), g2.to_string()]),
@@ -370,6 +374,50 @@ async fn group_predicates_from_request_properties() {
     assert!(matches!(&preds[0], Predicate::In(_)));
     assert!(matches!(&preds[1], Predicate::InGroup(_)));
     assert!(matches!(&preds[2], Predicate::InGroupSubtree(_)));
+}
+
+#[tokio::test]
+async fn empty_group_selector_is_denied_instead_of_widened() {
+    let tenant_id = Uuid::now_v7();
+    let mock = MockTenantResolver::with_tenants(tenant_id, vec![]);
+    let svc = Service::new(Arc::new(mock));
+
+    for property in ["group_ids", "ancestor_group_ids"] {
+        let mut request = make_request(tenant_id);
+        request.context.capabilities = vec![
+            authz_resolver_sdk::Capability::GroupMembership,
+            authz_resolver_sdk::Capability::GroupHierarchy,
+        ];
+        request
+            .resource
+            .properties
+            .insert(property.to_owned(), serde_json::json!([]));
+
+        let response = svc.evaluate(&request).await;
+        assert!(
+            !response.decision,
+            "an empty {property} selector must match nothing, not tenant-wide scope"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unadvertised_group_predicate_is_denied() {
+    let tenant_id = Uuid::now_v7();
+    let mock = MockTenantResolver::with_tenants(tenant_id, vec![]);
+    let svc = Service::new(Arc::new(mock));
+    let mut request = make_request(tenant_id);
+    request.resource.properties.insert(
+        "group_ids".to_owned(),
+        serde_json::json!([Uuid::now_v7().to_string()]),
+    );
+
+    let response = svc.evaluate(&request).await;
+
+    assert!(
+        !response.decision,
+        "the PDP must not emit an unadvertised native group predicate"
+    );
 }
 
 // ──────────────────────────────────────────────────────────────────────

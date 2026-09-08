@@ -22,7 +22,7 @@ use uuid::Uuid;
 use authz_resolver_sdk::{
     AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
     PolicyEnforcer,
-    constraints::{Constraint, InPredicate, Predicate},
+    constraints::{Constraint, InPredicate, InTenantSubtreePredicate, Predicate},
 };
 use sea_orm_migration::MigratorTrait;
 use toolkit::api::OpenApiRegistry;
@@ -138,9 +138,51 @@ fn make_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(authz)
 }
 
+/// Nonconforming PDP: permits, but the sole constraint is an
+/// `InTenantSubtree` predicate — a capability this gear never advertises.
+/// The PEP rejects it fail-closed at compile time; see
+/// `create_group_target_tenant_test.rs` for the domain-level pin. Here it
+/// drives the HTTP-level wire-shape assertion.
+struct InTenantSubtreeOnlyAuthZ;
+
+#[async_trait]
+impl AuthZResolverApi for InTenantSubtreeOnlyAuthZ {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let tenant_id = request
+            .subject
+            .properties
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .unwrap_or(Uuid::nil());
+
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::InTenantSubtree(InTenantSubtreePredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        tenant_id,
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
 async fn build_test_router() -> (Router, Arc<TypeService<TypeRepository>>) {
+    build_test_router_with_enforcer(make_enforcer()).await
+}
+
+async fn build_test_router_with_enforcer(
+    enforcer: PolicyEnforcer,
+) -> (Router, Arc<TypeService<TypeRepository>>) {
     let db = test_db().await;
-    let enforcer = make_enforcer();
 
     let type_svc = Arc::new(TypeService::new(
         db.clone(),
@@ -2340,4 +2382,58 @@ async fn create_group_with_foreign_tenant_id_returns_404() {
         foreign_tenant_id.to_string(),
         "problem resource_name should name the foreign tenant: {body}"
     );
+}
+
+/// A nonconforming PDP that returns an unadvertised `InTenantSubtree`
+/// predicate must surface as 403 `permission_denied` on the wire — never a
+/// 500 — and the problem body must not leak the predicate or capability
+/// names (they live only in a debug log; see `api/rest/error.rs`).
+#[tokio::test]
+async fn create_group_with_unadvertised_predicate_returns_403_without_leak() {
+    let (router, type_svc) =
+        build_test_router_with_enforcer(PolicyEnforcer::new(Arc::new(InTenantSubtreeOnlyAuthZ)))
+            .await;
+    let tenant_id = Uuid::now_v7();
+    let type_code = rg_type_id!("test.unadvertised.{}.v1~", Uuid::now_v7().as_simple());
+
+    type_svc
+        .create_type_unscoped(resource_group_sdk::CreateTypeRequest {
+            code: type_code.clone(),
+            can_be_root: true,
+            allowed_parent_types: vec![],
+            allowed_membership_types: vec![],
+            metadata_schema: None,
+        })
+        .await
+        .unwrap();
+
+    let req = json_request(
+        "POST",
+        "/resource-group/v1/groups",
+        Some(serde_json::json!({
+            "type": type_code,
+            "name": "Unadvertised Predicate Group",
+        })),
+        tenant_id,
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = response_body(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "expected 403, got {status}: {body}"
+    );
+    let rendered = body.to_string();
+    assert!(
+        rendered.contains("ACCESS_DENIED"),
+        "problem body should carry the stable ACCESS_DENIED reason: {body}"
+    );
+    for leak in ["InTenantSubtree", "tenant_hierarchy", "unadvertised"] {
+        assert!(
+            !rendered.contains(leak),
+            "problem body must not leak PDP internals ({leak}): {body}"
+        );
+    }
 }

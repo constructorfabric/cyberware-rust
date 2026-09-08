@@ -65,8 +65,12 @@ pub enum BarrierMode {
 /// Resource Group tables (`resource_group`, `resource_group_membership`, `resource_group_closure`).
 /// Services that can join against these tables may declare the capabilities;
 /// the PDP will then return `InGroup`/`InGroupSubtree` predicates directly.
-/// Services without access should omit these capabilities — the PDP will
-/// degrade group predicates to explicit `In` with pre-resolved resource IDs.
+/// Each capable [`crate::pep::ResourceType`] must also declare its RG
+/// member-handle GTS path with
+/// [`crate::pep::ResourceType::with_group_membership_type`]. The enforcer
+/// suppresses group capabilities on requests for resources without that
+/// mapping. Services without table access should omit these capabilities — the
+/// PDP will degrade group predicates to explicit `In` with pre-resolved IDs.
 #[derive(
     Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema, utoipa::ToSchema,
 )]
@@ -75,8 +79,11 @@ pub enum Capability {
     /// PEP understands tenant hierarchy constraints.
     TenantHierarchy,
     /// PEP can join against `resource_group_membership` to resolve group membership.
+    /// Required by both `InGroup` and `InGroupSubtree`.
     GroupMembership,
     /// PEP can join against `resource_group_closure` to resolve group hierarchy.
+    /// `InGroupSubtree` additionally requires [`Self::GroupMembership`] because
+    /// closure traversal supplies groups while membership supplies resources.
     GroupHierarchy,
 }
 

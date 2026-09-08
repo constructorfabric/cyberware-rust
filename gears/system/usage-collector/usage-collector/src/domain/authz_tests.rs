@@ -36,6 +36,10 @@ use crate::domain::test_support::{CapturingTenantPermitResolver, enforcer_for};
 
 const SAMPLE_GTS_ID: &str = gts_id!("cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1");
 
+/// Arbitrary RG member-handle type for group-filter fixtures — usage-collector
+/// rejects group predicates regardless of the type, so only the shape matters.
+const SAMPLE_MEMBER_TYPE: &str = gts_id!("cf.core.rg.type.v1~example.core.uc.owner.v1~");
+
 fn ctx() -> SecurityContext {
     SecurityContext::builder()
         .subject_id(Uuid::from_u128(0xA110))
@@ -294,6 +298,7 @@ async fn authorize_attribution_tuple_denies_record_outside_granted_tenant() {
 
 #[cfg(test)]
 mod scope_to_odata_tests {
+    use super::SAMPLE_MEMBER_TYPE;
     use toolkit_odata::ast::{CompareOperator, Expr, Value};
     use toolkit_security::{
         AccessScope, InGroupScopeFilter, InTenantSubtreeScopeFilter, ScopeConstraint, ScopeFilter,
@@ -450,7 +455,11 @@ mod scope_to_odata_tests {
         assert!(matches!(err, DomainError::AuthorizationDenied { .. }));
 
         let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::InGroup(
-            InGroupScopeFilter::new("owner_id", vec![ScopeValue::Uuid(uid(1))]),
+            InGroupScopeFilter::new_typed(
+                "owner_id",
+                SAMPLE_MEMBER_TYPE,
+                vec![ScopeValue::Uuid(uid(1))],
+            ),
         )]));
         let err = scope_to_odata_filter(&scope).expect_err("InGroup -> deny");
         assert!(matches!(err, DomainError::AuthorizationDenied { .. }));
@@ -575,6 +584,7 @@ mod scope_to_odata_tests {
 
 #[cfg(test)]
 mod attribution_gate_tests {
+    use super::SAMPLE_MEMBER_TYPE;
     use toolkit_security::{
         AccessScope, InGroupScopeFilter, ScopeConstraint, ScopeFilter, ScopeValue, pep_properties,
     };
@@ -762,8 +772,9 @@ mod attribution_gate_tests {
         let t = uid(1);
         let scope = AccessScope::single(ScopeConstraint::new(vec![
             ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, t),
-            ScopeFilter::InGroup(InGroupScopeFilter::new(
+            ScopeFilter::InGroup(InGroupScopeFilter::new_typed(
                 "owner_id",
+                SAMPLE_MEMBER_TYPE,
                 vec![ScopeValue::Uuid(uid(9))],
             )),
         ]));
@@ -780,8 +791,9 @@ mod attribution_gate_tests {
         let t = uid(1);
         let scope = AccessScope::from_constraints(vec![
             ScopeConstraint::new(vec![ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, t)]),
-            ScopeConstraint::new(vec![ScopeFilter::InGroup(InGroupScopeFilter::new(
+            ScopeConstraint::new(vec![ScopeFilter::InGroup(InGroupScopeFilter::new_typed(
                 "owner_id",
+                SAMPLE_MEMBER_TYPE,
                 vec![ScopeValue::Uuid(uid(9))],
             ))]),
         ]);

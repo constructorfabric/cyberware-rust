@@ -1,10 +1,11 @@
-use sea_orm::sea_query::{Alias, Query};
+use sea_orm::sea_query::{Alias, Query, SelectStatement, SimpleExpr};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, sea_query::Expr};
 
 use crate::secure::{AccessScope, ScopableEntity};
 use toolkit_security::access_scope::{
     ScopeConstraint, ScopeFilter, ScopeValue, rg_tables, tenant_tables,
 };
+use toolkit_security::pep_properties;
 
 /// Convert a [`ScopeValue`] to a `sea_query::SimpleExpr` for SQL binding.
 fn scope_value_to_sea_expr(v: &ScopeValue) -> sea_orm::sea_query::SimpleExpr {
@@ -29,9 +30,107 @@ fn scope_values_to_sea_values(values: &[ScopeValue]) -> Vec<sea_orm::Value> {
         .collect()
 }
 
+/// Convert values for RG hierarchy columns, which are UUID-backed on
+/// `PostgreSQL`. Valid UUID strings remain accepted for compatibility with
+/// directly constructed filters; every other scalar shape fails closed before
+/// SQL generation instead of producing a UUID/text operator error.
+fn uuid_scope_values_to_sea_values(values: &[ScopeValue]) -> Option<Vec<sea_orm::Value>> {
+    values
+        .iter()
+        .map(|value| match value {
+            ScopeValue::Uuid(uuid) => Some(sea_orm::Value::from(*uuid)),
+            ScopeValue::String(value) => {
+                uuid::Uuid::parse_str(value).ok().map(sea_orm::Value::from)
+            }
+            ScopeValue::Int(_) | ScopeValue::Bool(_) => None,
+        })
+        .collect()
+}
+
 /// Build a deny-all condition (`WHERE false`).
 fn deny_all() -> Condition {
     Condition::all().add(Expr::value(false))
+}
+
+/// Select the direct or closure-expanded group IDs used by a typed membership query.
+enum GroupSelection {
+    /// Match membership rows against explicit group UUIDs.
+    Direct(Vec<sea_orm::Value>),
+    /// Match membership rows against group IDs returned by a closure query.
+    Subtree(Box<SelectStatement>),
+}
+
+/// Log a group filter that was compiled to a deny-all condition.
+///
+/// Fail-closed group filters are otherwise silent: the query simply returns
+/// zero rows, which in production is indistinguishable from "the caller's
+/// group grants match nothing". Only the predicate shape, property name, and
+/// cause are logged — never group IDs or other filter values.
+fn warn_group_filter_denied(predicate: &'static str, property: &str, cause: &'static str) {
+    tracing::warn!(
+        predicate,
+        property,
+        cause,
+        "group scope filter compiled to deny-all"
+    );
+}
+
+/// Resolve an external member-handle GTS schema ID to RG-local `gts_type.id` values.
+fn membership_type_subquery(membership_resource_type: &str) -> SelectStatement {
+    let member_type = Alias::new("member_type");
+    Query::select()
+        .column((member_type.clone(), Alias::new(rg_tables::GTS_TYPE_ID)))
+        .from_as(Alias::new(rg_tables::GTS_TYPE_TABLE), member_type.clone())
+        .and_where(
+            Expr::col((member_type, Alias::new(rg_tables::GTS_TYPE_SCHEMA_ID)))
+                .eq(membership_resource_type),
+        )
+        .to_owned()
+}
+
+/// Build the common typed RG membership condition for direct and subtree predicates.
+///
+/// RG stores external resource IDs as opaque text, so the entity property is
+/// cast to text. Casting membership IDs to UUID would make valid non-UUID member
+/// types raise a `PostgreSQL` conversion error. An absent member-handle type fails
+/// closed because otherwise identical external IDs from different types could
+/// be conflated.
+fn typed_membership_condition(
+    entity_property: SimpleExpr,
+    membership_resource_type: &str,
+    group_selection: GroupSelection,
+) -> Option<SimpleExpr> {
+    if membership_resource_type.is_empty() {
+        return None;
+    }
+
+    let membership = Alias::new("membership");
+    let group_id = Expr::col((
+        membership.clone(),
+        Alias::new(rg_tables::MEMBERSHIP_GROUP_ID),
+    ));
+    let group_predicate = match group_selection {
+        GroupSelection::Direct(group_ids) => group_id.is_in(group_ids),
+        GroupSelection::Subtree(closure_subquery) => group_id.in_subquery(*closure_subquery),
+    };
+    let mut membership_subquery = Query::select()
+        .column((
+            membership.clone(),
+            Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID),
+        ))
+        .from_as(Alias::new(rg_tables::MEMBERSHIP_TABLE), membership.clone())
+        .and_where(group_predicate)
+        .to_owned();
+    membership_subquery.and_where(
+        Expr::col((membership, Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID)))
+            .in_subquery(membership_type_subquery(membership_resource_type)),
+    );
+
+    Some(
+        entity_property
+            .cast_as(Alias::new("text"))
+            .in_subquery(membership_subquery),
+    )
 }
 
 /// Builds a `SeaORM` `Condition` from an `AccessScope` using property resolution.
@@ -93,6 +192,53 @@ where
     if constraint.is_empty() {
         return Some(Condition::all());
     }
+
+    // Resource groups are tenant-scoped. A group predicate without a tenant
+    // filter in the same AND constraint would become an independent access
+    // path when constraints are OR-ed, allowing group membership to escape the
+    // mandatory tenant boundary. The single membership-type mapping also
+    // describes only the entity resource ID, never another property. Enforce
+    // both rules at the SQL compiler as well as the AuthZ response compiler so
+    // direct `AccessScope` construction cannot bypass either invariant.
+    let has_group_filter = constraint.filters().iter().any(|filter| {
+        matches!(
+            filter,
+            ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_)
+        )
+    });
+    let has_tenant_filter = constraint.filters().iter().any(|filter| {
+        filter.property() == pep_properties::OWNER_TENANT_ID
+            && matches!(
+                filter,
+                ScopeFilter::Eq(_) | ScopeFilter::In(_) | ScopeFilter::InTenantSubtree(_)
+            )
+    });
+    let has_group_filter_on_non_resource_property = constraint.filters().iter().any(|filter| {
+        matches!(
+            filter,
+            ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_)
+        ) && filter.property() != pep_properties::RESOURCE_ID
+    });
+    if has_group_filter && (!has_tenant_filter || has_group_filter_on_non_resource_property) {
+        let cause = if has_group_filter_on_non_resource_property {
+            "group filter on a property other than the resource id"
+        } else {
+            "group filter without an owner_tenant_id filter in the same constraint"
+        };
+        let offending_property = constraint
+            .filters()
+            .iter()
+            .find(|filter| {
+                matches!(
+                    filter,
+                    ScopeFilter::InGroup(_) | ScopeFilter::InGroupSubtree(_)
+                )
+            })
+            .map_or("", ScopeFilter::property);
+        warn_group_filter_denied("InGroup/InGroupSubtree", offending_property, cause);
+        return None;
+    }
+
     let mut and_cond = Condition::all();
     for filter in constraint.filters() {
         let col = E::resolve_property(filter.property())?;
@@ -106,42 +252,78 @@ where
                 and_cond = and_cond.add(col.is_in(sea_values));
             }
             ScopeFilter::InGroup(gf) => {
-                // col IN (SELECT resource_id FROM resource_group_membership
-                //          WHERE group_id IN (...))
-                let group_values = scope_values_to_sea_values(gf.group_ids());
-                let subquery = Query::select()
-                    .column(Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID))
-                    .from(Alias::new(rg_tables::MEMBERSHIP_TABLE))
-                    .and_where(
-                        Expr::col(Alias::new(rg_tables::MEMBERSHIP_GROUP_ID)).is_in(group_values),
-                    )
-                    .to_owned();
-                and_cond = and_cond.add(col.into_expr().in_subquery(subquery));
+                let Some(group_values) = uuid_scope_values_to_sea_values(gf.group_ids()) else {
+                    warn_group_filter_denied("InGroup", gf.property(), "non-UUID group_ids");
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                };
+                // An empty selector means "member of no group" — semantically
+                // a deny; building the subquery would emit `IN ()`, a SQL
+                // error on some engines.
+                if group_values.is_empty() {
+                    warn_group_filter_denied("InGroup", gf.property(), "empty group_ids");
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                }
+                let Some(condition) = typed_membership_condition(
+                    col.into_expr(),
+                    gf.membership_resource_type(),
+                    GroupSelection::Direct(group_values),
+                ) else {
+                    warn_group_filter_denied(
+                        "InGroup",
+                        gf.property(),
+                        "empty membership resource type (untyped filter)",
+                    );
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                };
+                and_cond = and_cond.add(condition);
             }
             ScopeFilter::InGroupSubtree(sf) => {
-                // col IN (SELECT resource_id FROM resource_group_membership
-                //          WHERE group_id IN (
-                //            SELECT descendant_id FROM resource_group_closure
-                //            WHERE ancestor_id IN (...)
-                //          ))
-                let ancestor_values = scope_values_to_sea_values(sf.ancestor_ids());
+                let Some(ancestor_values) = uuid_scope_values_to_sea_values(sf.ancestor_ids())
+                else {
+                    warn_group_filter_denied(
+                        "InGroupSubtree",
+                        sf.property(),
+                        "non-UUID ancestor_ids",
+                    );
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                };
+                // See the InGroup arm: an empty selector is a deny, and the
+                // closure subquery would otherwise emit `IN ()`.
+                if ancestor_values.is_empty() {
+                    warn_group_filter_denied("InGroupSubtree", sf.property(), "empty ancestor_ids");
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                }
+                let closure = Alias::new("group_closure");
                 let closure_subquery = Query::select()
-                    .column(Alias::new(rg_tables::CLOSURE_DESCENDANT_ID))
-                    .from(Alias::new(rg_tables::CLOSURE_TABLE))
+                    .column((
+                        closure.clone(),
+                        Alias::new(rg_tables::CLOSURE_DESCENDANT_ID),
+                    ))
+                    .from_as(Alias::new(rg_tables::CLOSURE_TABLE), closure.clone())
                     .and_where(
-                        Expr::col(Alias::new(rg_tables::CLOSURE_ANCESTOR_ID))
+                        Expr::col((closure, Alias::new(rg_tables::CLOSURE_ANCESTOR_ID)))
                             .is_in(ancestor_values),
                     )
                     .to_owned();
-                let membership_subquery = Query::select()
-                    .column(Alias::new(rg_tables::MEMBERSHIP_RESOURCE_ID))
-                    .from(Alias::new(rg_tables::MEMBERSHIP_TABLE))
-                    .and_where(
-                        Expr::col(Alias::new(rg_tables::MEMBERSHIP_GROUP_ID))
-                            .in_subquery(closure_subquery),
-                    )
-                    .to_owned();
-                and_cond = and_cond.add(col.into_expr().in_subquery(membership_subquery));
+                let Some(condition) = typed_membership_condition(
+                    col.into_expr(),
+                    sf.membership_resource_type(),
+                    GroupSelection::Subtree(Box::new(closure_subquery)),
+                ) else {
+                    warn_group_filter_denied(
+                        "InGroupSubtree",
+                        sf.property(),
+                        "empty membership resource type (untyped filter)",
+                    );
+                    and_cond = and_cond.add(Expr::value(false));
+                    continue;
+                };
+                and_cond = and_cond.add(condition);
             }
             ScopeFilter::InTenantSubtree(sf) => {
                 // Respect-barriers (default), no descendant_status filter:
@@ -331,14 +513,20 @@ mod tests {
         );
     }
 
+    const MEMBERSHIP_TYPE: &str = "gts.cf.core.rg.type.v1~example.core.rg.member.v1~";
+
     #[test]
-    fn test_in_group_filter_produces_subquery_condition() {
+    fn test_in_group_filter_produces_typed_text_subquery_condition() {
         let group_id = uuid::Uuid::new_v4();
-        let scope =
-            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::in_group(
+        let tenant_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_typed(
                 pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
                 vec![ScopeValue::Uuid(group_id)],
-            )])]);
+            ),
+        ])]);
         let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
         let cond_str = format!("{cond:?}");
         // Should NOT be deny-all
@@ -358,6 +546,189 @@ mod tests {
         assert!(
             cond_str.contains("resource_id"),
             "InGroup condition must join on resource_id, got: {cond_str}"
+        );
+        assert!(
+            cond_str.contains("gts_type_id") && cond_str.contains("schema_id"),
+            "InGroup condition must qualify the membership resource type, got: {cond_str}"
+        );
+        assert!(
+            cond_str.contains(MEMBERSHIP_TYPE) && cond_str.contains("Cast"),
+            "InGroup condition must cast the entity ID to text and bind the type, got: {cond_str}"
+        );
+    }
+
+    #[test]
+    fn test_typed_group_filter_without_tenant_constraint_denies_all() {
+        let group_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_typed(
+            pep_properties::RESOURCE_ID,
+            MEMBERSHIP_TYPE,
+            vec![ScopeValue::Uuid(group_id)],
+        )]));
+
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("Value(Bool(Some(false)))"),
+            "a group filter without tenant scope must fail closed, got: {cond_str}"
+        );
+    }
+
+    #[test]
+    fn test_direct_group_filter_on_non_resource_property_denies_all() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let group_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_typed(
+                "department_id",
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::Uuid(group_id)],
+            ),
+        ]));
+
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("Value(Bool(Some(false)))"),
+            "a group filter on a non-resource property must fail closed, got: {cond_str}"
+        );
+    }
+
+    /// Unlike the legacy tests below (which deny earlier, at the
+    /// constraint-shape guard, because they lack a tenant filter), this scope
+    /// is well-formed apart from the missing membership type — so it reaches
+    /// `typed_membership_condition`'s empty-type arm and pins that THAT arm
+    /// denies, without ever emitting a membership subquery.
+    #[test]
+    #[allow(deprecated)]
+    fn test_untyped_group_filter_with_tenant_denies_at_membership_arm() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let group_id = uuid::Uuid::new_v4();
+        let group_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(group_id)],
+            ),
+        ]));
+        let subtree_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_subtree(
+                pep_properties::RESOURCE_ID,
+                vec![ScopeValue::Uuid(group_id)],
+            ),
+        ]));
+
+        for scope in [&group_scope, &subtree_scope] {
+            let cond = build_scope_condition::<custom_prop_entity::Entity>(scope);
+            let cond_str = format!("{cond:?}");
+            assert!(
+                cond_str.contains("Value(Bool(Some(false)))"),
+                "an untyped group filter must fail closed at the membership arm, got: {cond_str}"
+            );
+            assert!(
+                !cond_str.contains("resource_group_membership"),
+                "no membership subquery may be emitted for an untyped filter, got: {cond_str}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_legacy_untyped_in_group_filter_denies_all() {
+        let group_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group(
+            pep_properties::RESOURCE_ID,
+            vec![ScopeValue::Uuid(group_id)],
+        )]));
+
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("Value(Bool(Some(false)))"),
+            "an untyped group filter must fail closed, got: {cond_str}"
+        );
+    }
+
+    /// An empty group selector means "member of no group" and must deny
+    /// before SQL generation — building the membership subquery would emit
+    /// `IN ()`, a SQL error on some engines. The PEP compiler rejects empty
+    /// selectors upstream, so only directly constructed scopes reach this arm.
+    #[test]
+    fn test_empty_group_selectors_deny_before_sql_generation() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let group_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_typed(pep_properties::RESOURCE_ID, MEMBERSHIP_TYPE, vec![]),
+        ]));
+        let subtree_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_subtree_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![],
+            ),
+        ]));
+
+        for scope in [&group_scope, &subtree_scope] {
+            let cond = build_scope_condition::<custom_prop_entity::Entity>(scope);
+            let cond_str = format!("{cond:?}");
+            assert!(
+                cond_str.contains("Value(Bool(Some(false)))"),
+                "empty group selectors must fail closed, got: {cond_str}"
+            );
+            assert!(
+                !cond_str.contains("resource_group_membership"),
+                "no membership subquery may be emitted for an empty selector, got: {cond_str}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_direct_group_ids_deny_before_sql_generation() {
+        let tenant_id = uuid::Uuid::new_v4();
+        let group_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::String("not-a-uuid".to_owned())],
+            ),
+        ]));
+        let subtree_scope = AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_subtree_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::Int(7)],
+            ),
+        ]));
+
+        for scope in [&group_scope, &subtree_scope] {
+            let cond = build_scope_condition::<custom_prop_entity::Entity>(scope);
+            let cond_str = format!("{cond:?}");
+            assert!(
+                cond_str.contains("Value(Bool(Some(false)))"),
+                "malformed UUID hierarchy keys must fail closed, got: {cond_str}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_legacy_untyped_in_group_subtree_filter_denies_all() {
+        let ancestor_id = uuid::Uuid::new_v4();
+        let scope = AccessScope::single(ScopeConstraint::new(vec![ScopeFilter::in_group_subtree(
+            pep_properties::RESOURCE_ID,
+            vec![ScopeValue::Uuid(ancestor_id)],
+        )]));
+
+        let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
+        let cond_str = format!("{cond:?}");
+        assert!(
+            cond_str.contains("Value(Bool(Some(false)))"),
+            "an untyped group subtree filter must fail closed, got: {cond_str}"
         );
     }
 
@@ -517,9 +888,12 @@ mod tests {
     #[test]
     fn test_in_group_subtree_filter_produces_subquery_condition() {
         let ancestor_id = uuid::Uuid::new_v4();
+        let tenant_id = uuid::Uuid::new_v4();
         let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
-            ScopeFilter::in_group_subtree(
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant_id]),
+            ScopeFilter::in_group_subtree_typed(
                 pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
                 vec![ScopeValue::Uuid(ancestor_id)],
             ),
         ])]);
@@ -538,6 +912,13 @@ mod tests {
             cond_str.contains("resource_id"),
             "InGroupSubtree condition must join on resource_id, got: {cond_str}"
         );
+        assert!(
+            cond_str.contains("gts_type_id")
+                && cond_str.contains("schema_id")
+                && cond_str.contains(MEMBERSHIP_TYPE)
+                && cond_str.contains("Cast"),
+            "InGroupSubtree must cast the entity ID and qualify membership type, got: {cond_str}"
+        );
     }
 
     #[test]
@@ -546,7 +927,11 @@ mod tests {
         let gid = uuid::Uuid::new_v4();
         let scope = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
             ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tid]),
-            ScopeFilter::in_group(pep_properties::RESOURCE_ID, vec![ScopeValue::Uuid(gid)]),
+            ScopeFilter::in_group_typed(
+                pep_properties::RESOURCE_ID,
+                MEMBERSHIP_TYPE,
+                vec![ScopeValue::Uuid(gid)],
+            ),
         ])]);
         let cond = build_scope_condition::<custom_prop_entity::Entity>(&scope);
         let cond_str = format!("{cond:?}");

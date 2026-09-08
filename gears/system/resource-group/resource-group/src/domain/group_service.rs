@@ -44,6 +44,18 @@ use crate::domain::repo::{GroupRepositoryTrait, TypeRepositoryTrait};
 use crate::domain::validation;
 
 /// `AuthZ` resource type descriptor for resource groups.
+///
+/// Deliberately carries no `with_group_membership_type` mapping: groups have
+/// no RG member-handle type. Group nesting is modeled through
+/// `resource_group.parent_id` and `resource_group_closure` (hierarchy), never
+/// through `resource_group_membership` rows, and `GROUP_RESOURCE_TYPE`
+/// (`gts.cf.core.rg.group.v1~`) is a PEP policy resource name that can never
+/// be registered in `gts_type` (`validate_type_code` requires the
+/// `gts.cf.core.rg.type.v1~` prefix) — a mapping here would make every native
+/// `in_group`/`in_group_subtree` predicate silently match zero rows. Without
+/// the mapping, `PolicyEnforcer` suppresses the group capabilities per
+/// request and the PDP must expand group scopes to explicit `in` predicates
+/// on `id`, or deny.
 pub const RG_GROUP_RESOURCE: ResourceType = ResourceType::from_static(
     GROUP_RESOURCE_TYPE,
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],

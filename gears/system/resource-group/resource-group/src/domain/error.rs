@@ -3,7 +3,7 @@
 // @cpt-dod:cpt-cf-resource-group-dod-testing-error-conversions:p2
 //! Domain error types for the resource-group gear.
 
-use authz_resolver_sdk::pep::EnforcerError;
+use authz_resolver_sdk::pep::{ConstraintCompileError, EnforcerError};
 use thiserror::Error;
 
 /// Domain-specific errors for the resource-group gear.
@@ -259,8 +259,25 @@ impl From<EnforcerError> for DomainError {
                     |reason| format!("access denied by PDP: {reason:?}"),
                 ),
             },
-            // PDP RPC or constraint compilation failures are infrastructure problems,
-            // not authorization denials — surface as internal errors.
+            // A PDP that emits a native predicate whose capability this gear
+            // never advertised (e.g. `in_tenant_subtree` — RG has no
+            // `tenant_closure` projection) violates the capability
+            // negotiation contract. The PEP fails compilation closed; surface
+            // it as a denial rather than a 500 so callers keep a clean,
+            // non-probeable error shape.
+            EnforcerError::CompileFailed(ConstraintCompileError::UnadvertisedCapabilities {
+                predicate,
+                missing,
+            }) => DomainError::AccessDenied {
+                message: format!(
+                    "access denied: PDP returned {predicate} predicate requiring \
+                     unadvertised capabilities ({})",
+                    missing.join(", ")
+                ),
+            },
+            // PDP RPC or other constraint compilation failures are
+            // infrastructure problems, not authorization denials — surface as
+            // internal errors.
             EnforcerError::EvaluationFailed(_) | EnforcerError::CompileFailed(_) => {
                 DomainError::InternalError
             }

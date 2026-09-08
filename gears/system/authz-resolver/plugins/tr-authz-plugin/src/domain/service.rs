@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::{
-    BarrierMode as AuthzBarrierMode, Constraint, EvaluationRequest, EvaluationResponse,
+    BarrierMode as AuthzBarrierMode, Capability, Constraint, EvaluationRequest, EvaluationResponse,
     EvaluationResponseContext, InGroupPredicate, InGroupSubtreePredicate, InPredicate, Predicate,
     TenantMode,
 };
@@ -136,7 +136,12 @@ impl Service {
         // malformed, the group predicate cannot be compiled; fail-closed to
         // avoid silently widening scope to tenant-wide access.
         if response.decision
-            && Self::append_group_predicates(&mut response, &request.resource.properties).is_err()
+            && Self::append_group_predicates(
+                &mut response,
+                &request.resource.properties,
+                &request.context.capabilities,
+            )
+            .is_err()
         {
             warn!("tr-authz: malformed group scoping properties -- deny");
             return Self::deny();
@@ -388,27 +393,36 @@ impl Service {
     /// Returns `Err(())` when a group scoping property is present but cannot
     /// be parsed as a full `Vec<Uuid>` (e.g. not an array, or contains a
     /// non-UUID string). Caller maps that to `deny` (fail-closed). Missing
-    /// properties and legitimately empty arrays are `Ok(())`.
+    /// properties are `Ok(())`, but a present empty array is a deny: its set
+    /// semantics are "match nothing", not "remove group filtering". A native
+    /// predicate that the PEP did not advertise is also rejected rather than
+    /// silently widening the response to tenant-only access.
     fn append_group_predicates(
         response: &mut EvaluationResponse,
         props: &std::collections::HashMap<String, serde_json::Value>,
+        capabilities: &[Capability],
     ) -> Result<(), ()> {
         let Some(Constraint { predicates }) = response.context.constraints.get_mut(0) else {
             return Ok(());
         };
         if let Some(group_ids) = props.get("group_ids") {
             let ids = Self::parse_uuid_array(group_ids).ok_or(())?;
-            if !ids.is_empty() {
-                predicates.push(Predicate::InGroup(InGroupPredicate::new("id", ids)));
+            if ids.is_empty() || !capabilities.contains(&Capability::GroupMembership) {
+                return Err(());
             }
+            predicates.push(Predicate::InGroup(InGroupPredicate::new("id", ids)));
         }
         if let Some(ancestor_ids) = props.get("ancestor_group_ids") {
             let ids = Self::parse_uuid_array(ancestor_ids).ok_or(())?;
-            if !ids.is_empty() {
-                predicates.push(Predicate::InGroupSubtree(InGroupSubtreePredicate::new(
-                    "id", ids,
-                )));
+            if ids.is_empty()
+                || !capabilities.contains(&Capability::GroupMembership)
+                || !capabilities.contains(&Capability::GroupHierarchy)
+            {
+                return Err(());
             }
+            predicates.push(Predicate::InGroupSubtree(InGroupSubtreePredicate::new(
+                "id", ids,
+            )));
         }
         Ok(())
     }

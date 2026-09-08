@@ -91,6 +91,26 @@ fn list_operation_with_tenant_context() {
 }
 
 #[test]
+fn group_selector_is_denied_instead_of_ignored() {
+    let tenant_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+    let service = Service::new();
+
+    for property in ["group_ids", "ancestor_group_ids"] {
+        let mut request = make_owner_tenant_request(true, Some(tenant_id));
+        request.resource.properties.insert(
+            property.to_owned(),
+            serde_json::json!([Uuid::new_v4().to_string()]),
+        );
+
+        let response = service.evaluate(&request);
+        assert!(
+            !response.decision,
+            "the static PDP must deny unsupported {property} rather than widen scope"
+        );
+    }
+}
+
+#[test]
 fn list_operation_without_tenant_falls_back_to_subject_properties() {
     let service = Service::new();
     let response = service.evaluate(&make_owner_tenant_request(true, None));

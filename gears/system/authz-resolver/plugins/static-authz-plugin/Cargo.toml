@@ -19,7 +19,7 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.4.0", path = "../../authz-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.5.0", path = "../../authz-resolver-sdk" }
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.7", path = "../../../types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 

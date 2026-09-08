@@ -508,11 +508,17 @@ impl AuthZResolverApi for GroupScopingAuthZ {
     }
 }
 
-/// Phase 2 test: `InGroup` predicate compiles to correct `AccessScope`
-/// containing both tenant filter AND group membership filter.
-// Scenario: L2-Tenant-06 - InGroup predicate produces combined scope (S14)
+/// Phase 2 test: `RG_GROUP_RESOURCE` carries no RG member-handle type
+/// mapping (groups nest through `parent_id`/`resource_group_closure`, not
+/// membership rows, and `gts.cf.core.rg.group.v1~` can never be registered
+/// in `gts_type`), so `PolicyEnforcer` suppresses the configured
+/// `GroupMembership` capability per request and a PDP that returns a native
+/// `InGroup` predicate anyway is rejected fail-closed with the typed
+/// unadvertised-capability error — never silently compiled into a
+/// zero-row membership subquery.
+// Scenario: L2-Tenant-06 - InGroup predicate against groups fails closed (S14)
 #[tokio::test]
-async fn group_based_in_group_predicate_produces_combined_scope() {
+async fn group_based_in_group_predicate_against_groups_fails_closed() {
     let group_a = Uuid::now_v7();
     let group_b = Uuid::now_v7();
     let tenant_id = Uuid::now_v7();
@@ -520,10 +526,11 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
     let authz: Arc<dyn AuthZResolverApi> = Arc::new(GroupScopingAuthZ {
         allowed_group_ids: vec![group_a, group_b],
     });
-    let enforcer = PolicyEnforcer::new(authz);
+    let enforcer = PolicyEnforcer::new(authz)
+        .with_capabilities(vec![authz_resolver_sdk::Capability::GroupMembership]);
     let ctx = make_ctx(tenant_id);
 
-    let scope = enforcer
+    let error = enforcer
         .access_scope(
             &ctx,
             &resource_group::domain::group_service::RG_GROUP_RESOURCE,
@@ -531,25 +538,19 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
             None,
         )
         .await
-        .expect("should succeed");
+        .expect_err("an InGroup predicate against the unmapped group resource must fail closed");
 
-    // Scope has 1 constraint with 2 filters: In(tenant) AND InGroup(groups)
-    assert_eq!(scope.constraints().len(), 1);
-    assert_eq!(scope.constraints()[0].filters().len(), 2);
-
-    // Tenant filter must be present (order-independent).
-    assert!(scope.contains_uuid(pep_properties::OWNER_TENANT_ID, tenant_id));
-
-    // At least one InGroup filter must be present. We do not assume the
-    // ordering of filters within a constraint — predicate compilation may
-    // reorder them and the semantics are unaffected.
-    let filters = scope.constraints()[0].filters();
-    assert!(
-        filters
-            .iter()
-            .any(|f| matches!(f, toolkit_security::ScopeFilter::InGroup(_))),
-        "expected at least one InGroup filter, got: {filters:?}"
-    );
+    let authz_resolver_sdk::pep::EnforcerError::CompileFailed(
+        authz_resolver_sdk::pep::ConstraintCompileError::UnadvertisedCapabilities {
+            predicate,
+            missing,
+        },
+    ) = error
+    else {
+        panic!("expected typed unadvertised-capability error, got: {error:?}");
+    };
+    assert_eq!(predicate, "InGroup");
+    assert_eq!(missing, vec!["group_membership"]);
 }
 
 /// Phase 2 test: memberships seeded into DB, verify that group-based
