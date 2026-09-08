@@ -38,6 +38,18 @@ pub mod resources {
     pub const POLICY: ResourceType = ResourceType::from_static("quota_enforcement.policy", &[]);
 }
 
+/// Resource properties of the PDP request beyond the platform-defined
+/// `owner_tenant_id`: the rest of the caller-supplied attribution tuple, so the
+/// PDP authorizes the complete tuple for the service principal (ADR-0007).
+pub mod properties {
+    /// The metric, as its GTS instance id.
+    pub const METRIC: &str = "metric";
+    /// The additional `{kind, id}` subjects, as an array.
+    pub const SUBJECTS: &str = "subjects";
+    /// The optional resource projection, as its `{type, id?, metadata}` document.
+    pub const RESOURCE: &str = "resource";
+}
+
 /// Actions.
 pub mod actions {
     /// Create a record.

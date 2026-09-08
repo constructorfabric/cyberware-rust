@@ -6,7 +6,9 @@ use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;
 use toolkit_macros::domain_model;
 
 use super::admission::Admission;
+use super::attribution::Attribution;
 use super::bootstrap::Bound;
+use super::catalog::ProjectionContractCatalog;
 use super::error::{Dependency, DomainError};
 use super::ports::coordination::SingletonCoordinator;
 use super::readiness::Readiness;
@@ -80,6 +82,37 @@ impl Service {
             .ok_or(DomainError::NotReady {
                 dependency: Dependency::Cluster,
             })
+    }
+
+    /// The published projection contract catalogue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub fn catalog(&self) -> Result<Arc<ProjectionContractCatalog>, DomainError> {
+        self.bound
+            .get()
+            .map(|b| b.catalog.clone())
+            .ok_or(DomainError::NotReady {
+                dependency: Dependency::Catalog,
+            })
+    }
+
+    /// The ingress step of every subject-based evaluation operation: shape
+    /// check, PDP admission of the attribution tuple, catalogue mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub fn attribution(&self) -> Result<Attribution<'_>, DomainError> {
+        let bound = self.bound.get().ok_or(DomainError::NotReady {
+            dependency: Dependency::Catalog,
+        })?;
+        Ok(Attribution::new(
+            &self.admission,
+            &bound.catalog,
+            self.admission.metrics(),
+        ))
     }
 }
 

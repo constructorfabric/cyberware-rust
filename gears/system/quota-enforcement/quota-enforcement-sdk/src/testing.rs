@@ -16,7 +16,7 @@
     reason = "test support: fixtures are built from constant, well-formed inputs"
 )]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -32,9 +32,9 @@ use crate::models::{
     DeactivateOutcome, DebitPlan, EnforcementMode, EventId, ExpiredLease, IdempotencyRecord,
     IdempotencyScope, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId,
     MutationResult, NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope,
-    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, Quota, QuotaDraft,
-    QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaType,
-    SubjectRef, TenantId, ValidityWindowPatch,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, ProjectionBinding, Quota,
+    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus,
+    QuotaType, SubjectRef, TenantId, ValidityWindowPatch,
 };
 use crate::storage_plugin::{CONTRACT_MAJOR, QuotaEnforcementStoragePluginV1, StorageError};
 
@@ -352,6 +352,22 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         }
         st.bootstrapped = Some(bundle.clone());
         Ok(())
+    }
+
+    async fn read_active_projection_bindings(
+        &self,
+    ) -> Result<HashSet<ProjectionBinding>, StorageError> {
+        let st = self.state.lock();
+        Self::check(&st)?;
+        Ok(st
+            .quotas
+            .values()
+            .filter(|quota| quota.status == QuotaStatus::Active)
+            .map(|quota| ProjectionBinding {
+                metric: quota.metric.clone(),
+                projection_type: quota.subject.projection_type.clone(),
+            })
+            .collect())
     }
 
     async fn create_quota(

@@ -636,3 +636,66 @@ async fn storage_reclaims_expired_idempotency_records_and_log_entries() {
         0
     );
 }
+
+#[tokio::test]
+async fn active_projection_bindings_are_the_distinct_pairs_of_active_quotas() {
+    let storage = InMemoryStorage::new();
+    assert!(
+        storage
+            .read_active_projection_bindings()
+            .await
+            .expect("empty store")
+            .is_empty()
+    );
+
+    let first = storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            quota_draft(test_subject("u1"), Some(10)),
+            &[],
+        )
+        .await
+        .expect("first");
+    storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            quota_draft(test_subject("u2"), Some(10)),
+            &[],
+        )
+        .await
+        .expect("same pair, other subject id");
+    let bindings = storage
+        .read_active_projection_bindings()
+        .await
+        .expect("bindings");
+    assert_eq!(
+        bindings.len(),
+        1,
+        "distinct by (metric, projection_type): {bindings:?}"
+    );
+    let binding = bindings.iter().next().expect("one");
+    assert_eq!(binding.metric, test_metric());
+    assert_eq!(binding.projection_type, test_subject("u1").projection_type);
+
+    storage
+        .deactivate_quota(&ctx(), &scope(), first, &[])
+        .await
+        .expect("deactivate one");
+    assert_eq!(
+        storage
+            .read_active_projection_bindings()
+            .await
+            .expect("bindings")
+            .len(),
+        1,
+        "the other active Quota keeps the pair"
+    );
+
+    storage.fail_with(StorageError::Unavailable("db down".into()));
+    assert!(matches!(
+        storage.read_active_projection_bindings().await,
+        Err(StorageError::Unavailable(_))
+    ));
+}

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
 use quota_enforcement_sdk::TenantId;
+use serde_json::{Map, Value};
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -78,6 +79,12 @@ impl Admission {
         Self { enforcer, metrics }
     }
 
+    /// The metrics port the boundary records on; the ingress step shares it.
+    #[must_use]
+    pub fn metrics(&self) -> &dyn QeMetrics {
+        self.metrics.as_ref()
+    }
+
     /// Admit `action` on `resource` for the explicit `target`.
     ///
     /// # Errors
@@ -94,6 +101,27 @@ impl Admission {
         resource: &ResourceType,
         action: &str,
         target: AdmissionTarget,
+    ) -> Result<Admitted, DomainError> {
+        self.admit_with_properties(ctx, resource, action, target, Map::new())
+            .await
+    }
+
+    /// [`Self::admit`] with further resource properties the PDP evaluates:
+    /// the rest of a caller-supplied attribution tuple (metric, subjects,
+    /// resource). The explicit `target` tenant is authoritative: it is written
+    /// after `properties`, so a caller-supplied `owner_tenant_id` can never
+    /// replace it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`].
+    pub async fn admit_with_properties(
+        &self,
+        ctx: &SecurityContext,
+        resource: &ResourceType,
+        action: &str,
+        target: AdmissionTarget,
+        properties: Map<String, Value>,
     ) -> Result<Admitted, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-authn
@@ -116,7 +144,13 @@ impl Admission {
         // @cpt-end:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-shape
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-pdp
-        let request = AccessRequest::new()
+        let mut request = AccessRequest::new();
+        for (key, value) in properties {
+            request = request.resource_property(key, value);
+        }
+        // Last on purpose: the authorized tenant is the explicit target, never
+        // a property the caller slipped into the tuple.
+        let request = request
             .resource_property(pep_properties::OWNER_TENANT_ID, target.tenant_id.as_uuid())
             .require_constraints(true);
         let outcome = self

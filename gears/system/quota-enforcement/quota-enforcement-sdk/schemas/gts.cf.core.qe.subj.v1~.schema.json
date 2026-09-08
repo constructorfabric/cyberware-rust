@@ -1,0 +1,46 @@
+{
+  "$id": "gts://gts.cf.core.qe.subj.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Abstract base for subject projections (ADR-0007). The metric owner derives one concrete projection per scope; QE maps a caller-supplied SubjectRef kind to the unique projection for (metric, scope). Operation metadata is defined once by the metric request contract, not by each projection.",
+  "x-gts-abstract": true,
+  "x-gts-traits-schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "scope": {
+        "type": "string",
+        "format": "gts-instance-id",
+        "x-gts-ref": "gts.cf.core.qe.scope.v1~",
+        "description": "Required scope discriminator: a well-known instance of gts.cf.core.qe.scope.v1~. QE reads the registry-validated effective trait and maps caller-supplied SubjectRef kinds through the catalogue; scope is never encoded in the type-id name segment."
+      },
+      "admitted_metrics": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "string",
+          "format": "gts-instance-id",
+          "x-gts-ref": "gts.cf.qe.metric.type.v1~",
+          "description": "Registered metric id under the platform metric base (illustrative base pending the cross-gear naming decision, PRD section 3.2)."
+        },
+        "description": "Metrics this projection admits. x-gts-ref narrowing is pattern-level only: metric registration, the instance-of relationship to the metric base, and debit admission are checked by QE at bootstrap and Gateway ingress (ADR-0007). At most one projection admits a given metric per (metric, scope) pair per deployment; narrowing this set is a breaking contract change."
+      }
+    },
+    "required": [
+      "scope",
+      "admitted_metrics"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "format": "gts-type-id",
+      "x-gts-ref": "gts.cf.core.qe.subj.v1~",
+      "description": "The concrete owner-declared subject projection. QE selects this type from the catalogue; consumers do not supply it."
+    }
+  },
+  "required": [
+    "type"
+  ]
+}

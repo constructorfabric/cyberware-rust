@@ -6,8 +6,11 @@
 //!
 //! - [`QuotaEnforcementStoragePluginV1`] with the closed [`StorageError`] and
 //!   the I1 to I13 invariants (see the [`storage_plugin`] module docs).
-//! - The domain types the contract references ([`models`]).
-//! - GTS plugin spec and resource identifiers ([`gts`]).
+//! - The domain types the contract references ([`models`]), including the
+//!   wire attribution types of a subject-based evaluation request
+//!   ([`EvaluationAttribution`]) and the scope discriminator ([`SubjectScope`]).
+//! - GTS plugin spec, resource identifiers, and the QE-owned projection
+//!   contract bases ([`gts`], ADR-0007).
 //!
 //! Singleton coordination for the sweepers is not a contract of this SDK: the
 //! gear consumes the platform `cluster` gear's leader election (ADR-0006).
@@ -26,18 +29,21 @@ pub mod storage_plugin;
 pub mod testing;
 
 pub use gts::{
-    LEASE_RESOURCE, OPERATION_RESOURCE, POLICY_RESOURCE, QUOTA_RESOURCE,
-    QuotaEnforcementStoragePluginSpecV1,
+    CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
+    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, REQUEST_BASE,
+    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
 };
 pub use models::{
     ApplicableQuotas, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults, ContractRef,
     CounterSnapshot, DeactivateOutcome, DebitPlan, Decision, DecisionResult, EnforcementMode,
-    EventId, ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
-    IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId, MutationResult,
-    NotificationEvent, NotificationEventKind, OperationType, PageRequest, PageResult, PayloadHash,
-    PeriodId, PeriodType, PeriodWindow, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersion, PolicyVersionMeta, PolicyVersionState, Quota, QuotaDebitPlan, QuotaDraft,
-    QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaType,
-    SubjectRef, TenantId, ThresholdCrossing, UnknownValue, ValidityWindow, ValidityWindowPatch,
+    EvaluationAttribution, EventId, ExpiredLease, IdempotencyRecord, IdempotencyScope,
+    IdempotencySubjectKey, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId,
+    MutationResult, NotificationEvent, NotificationEventKind, OperationType, PageRequest,
+    PageResult, PayloadHash, PeriodId, PeriodType, PeriodWindow, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState,
+    ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
+    QuotaSnapshot, QuotaSource, QuotaStatus, QuotaType, ResourceProjection, ScopeError,
+    SubjectClaim, SubjectRef, SubjectScope, TenantId, ThresholdCrossing, UnknownValue,
+    ValidityWindow, ValidityWindowPatch,
 };
 pub use storage_plugin::{CONTRACT_MAJOR, QuotaEnforcementStoragePluginV1, StorageError};

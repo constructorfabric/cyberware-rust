@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{ElectionTimingConfig, MetricsConfig, QuotaEnforcementConfig};
+use super::{CatalogSection, ElectionTimingConfig, MetricsConfig, QuotaEnforcementConfig};
 
 #[test]
 fn defaults_select_the_platform_vendor_and_the_cluster_election_defaults() {
@@ -91,5 +91,59 @@ fn unknown_keys_are_rejected_and_partial_configs_use_defaults() {
         serde_json::from_str::<QuotaEnforcementConfig>(r#"{ "coordination_vendor": "acme" }"#)
             .is_err(),
         "the retired coordination plugin selector is rejected"
+    );
+}
+
+#[test]
+fn the_catalog_section_accepts_type_ids_and_rejects_instances_and_duplicates() {
+    let section = CatalogSection {
+        subject_projections: vec![
+            "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~".to_owned(),
+            "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~".to_owned(),
+        ],
+        resource_projections: vec![
+            "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~".to_owned(),
+        ],
+    };
+    section.validate().expect("valid");
+    let domain = section.to_domain().expect("lowers");
+    assert_eq!(domain.subject_projections.len(), 2);
+    assert_eq!(domain.resource_projections.len(), 1);
+    assert!(
+        CatalogSection::default().validate().is_ok(),
+        "empty is a valid catalogue"
+    );
+
+    let instance = CatalogSection {
+        subject_projections: vec!["gts.cf.core.qe.scope.v1~cf.core.qe.user.v1".to_owned()],
+        ..CatalogSection::default()
+    };
+    let err = instance
+        .validate()
+        .expect_err("an instance id is not a type id");
+    assert!(err.to_string().contains("subject_projections[0]"), "{err}");
+
+    let duplicate = CatalogSection {
+        resource_projections: vec![
+            "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~".to_owned(),
+            "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~".to_owned(),
+        ],
+        ..CatalogSection::default()
+    };
+    let err = duplicate.validate().expect_err("duplicates rejected");
+    assert!(err.to_string().contains("twice"), "{err}");
+
+    let cfg: QuotaEnforcementConfig = serde_json::from_str(
+        r#"{ "catalog": { "subject_projections": ["gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"] } }"#,
+    )
+    .expect("partial catalog section");
+    assert_eq!(cfg.catalog.subject_projections.len(), 1);
+    assert!(cfg.catalog.resource_projections.is_empty());
+    assert!(
+        serde_json::from_str::<QuotaEnforcementConfig>(
+            r#"{ "catalog": { "request_contracts": [] } }"#
+        )
+        .is_err(),
+        "request contracts are discovered, never configured"
     );
 }

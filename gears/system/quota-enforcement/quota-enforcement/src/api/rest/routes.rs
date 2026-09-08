@@ -15,6 +15,11 @@ use crate::domain::Service;
 pub const PATH_PREFIX: &str = "/v1/quota-enforcement";
 
 /// Register the QE routes and attach the service.
+///
+/// No contract-registration route exists here or anywhere in the gear:
+/// owners publish their projections in `types-registry`
+/// (`cpt-cf-quota-enforcement-constraint-types-registry-delegation`).
+// @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-registry
 pub fn register_routes(
     router: Router,
     _openapi: &dyn OpenApiRegistry,
@@ -22,3 +27,4 @@ pub fn register_routes(
 ) -> Router {
     router.layer(Extension(service))
 }
+// @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-registry

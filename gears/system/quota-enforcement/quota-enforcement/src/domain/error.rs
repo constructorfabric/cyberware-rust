@@ -11,6 +11,8 @@ use quota_enforcement_sdk::{LeaseToken, PolicyId, StorageError};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
 
+use super::ports::metrics::ValidationReason;
+
 /// Which plugin family a binding error is about.
 ///
 /// Singleton coordination is not a plugin family: the gear consumes the
@@ -42,6 +44,8 @@ pub enum Dependency {
     Pdp,
     /// The types registry.
     TypesRegistry,
+    /// The projection contract catalogue built from the configured projections.
+    Catalog,
 }
 
 impl Dependency {
@@ -53,6 +57,7 @@ impl Dependency {
             Self::Cluster => "cluster",
             Self::Pdp => "pdp",
             Self::TypesRegistry => "types_registry",
+            Self::Catalog => "catalog",
         }
     }
 }
@@ -122,6 +127,15 @@ pub enum DomainError {
     /// The types registry could not answer.
     #[error("types registry unavailable: {0}")]
     TypesRegistryUnavailable(String),
+    /// The configured projection contract catalogue failed a bootstrap
+    /// consistency check. `subject` names the offending definition.
+    #[error("projection contract catalogue rejected {subject}: {reason}")]
+    CatalogInvalid {
+        /// Which check failed.
+        reason: ValidationReason,
+        /// The GTS id, metric, or pair the check failed on.
+        subject: String,
+    },
     /// No plugin instance matched the configured vendor.
     #[error("no {kind} plugin instance registered for vendor {vendor}")]
     PluginNotFound {
@@ -252,6 +266,12 @@ pub enum DomainError {
         /// The metric.
         metric: String,
     },
+    /// The projection is registered but outside the configured catalogue.
+    #[error("projection {projection} is not resolvable in the configured catalogue")]
+    ProjectionNotResolvable {
+        /// The projection type identifier.
+        projection: String,
+    },
     /// The projection is not registered.
     #[error("projection {projection} is not registered")]
     ProjectionNotRegistered {
@@ -267,6 +287,8 @@ pub enum DomainError {
 impl DomainError {
     /// Closed reason token when the PDP permit carried no usable constraints.
     pub const CONSTRAINT_COMPILE_FAILED: &'static str = "CONSTRAINT_COMPILE_FAILED";
+    /// Closed reason token when a projection is registered but not configured.
+    pub const PROJECTION_NOT_RESOLVABLE: &'static str = "PROJECTION_NOT_RESOLVABLE";
     /// Closed reason token when storage caught a subject outside the scope.
     pub const SUBJECT_OUT_OF_SCOPE: &'static str = "SUBJECT_OUT_OF_SCOPE";
 

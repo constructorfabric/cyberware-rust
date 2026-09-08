@@ -6,11 +6,13 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    BootstrapBundle, CapPatch, ConfigDefaults, Decision, DecisionResult, EnforcementMode,
-    IdempotencySubjectKey, LeaseState, MetricId, NotificationEventKind, OperationType, PageRequest,
-    PageResult, PeriodType, PolicyId, PolicyScope, QuotaDebitPlan, QuotaId, QuotaPatch,
-    QuotaSource, QuotaType, SubjectRef, UnknownValue, ValidityWindow,
+    BootstrapBundle, CapPatch, ConfigDefaults, ContractRef, Decision, DecisionResult,
+    EnforcementMode, EvaluationAttribution, IdempotencySubjectKey, LeaseState, MetricId,
+    NotificationEventKind, OperationType, PageRequest, PageResult, PeriodType, PolicyId,
+    PolicyScope, ProjectionBinding, QuotaDebitPlan, QuotaId, QuotaPatch, QuotaSource, QuotaType,
+    ResourceProjection, ScopeError, SubjectRef, SubjectScope, UnknownValue, ValidityWindow,
 };
+use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 use crate::storage_plugin::CONTRACT_MAJOR;
 
 fn ts(secs: i64) -> OffsetDateTime {
@@ -361,4 +363,170 @@ fn subject_ref_equality_covers_both_halves_of_the_identity() {
     };
     assert_ne!(a, b);
     assert_eq!(a.clone(), a);
+}
+
+// --- Scopes and attribution (projection-contracts feature) -----------------
+
+#[test]
+fn subject_scope_parse_and_deserialization_accept_only_scope_instances() {
+    let user = SubjectScope::parse(SCOPE_USER).expect("user scope");
+    assert_eq!(user, SubjectScope::user());
+    assert!(!user.is_tenant());
+    let tenant = SubjectScope::parse(SCOPE_TENANT).expect("tenant scope");
+    assert_eq!(tenant, SubjectScope::tenant());
+    assert!(tenant.is_tenant());
+
+    let rejected = [
+        SCOPE_TYPE,                                             // a type, not an instance
+        "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~", // another type
+        "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1", // an instance of another type
+        "not-a-gts-id",
+        "",
+    ];
+    for raw in rejected {
+        let direct = SubjectScope::parse(raw).expect_err(raw);
+        assert!(
+            matches!(
+                direct,
+                ScopeError::Invalid { .. } | ScopeError::NotAScope { .. }
+            ),
+            "{raw}: {direct:?}"
+        );
+        let json = serde_json::to_string(raw).expect("json string");
+        assert!(
+            serde_json::from_str::<SubjectScope>(&json).is_err(),
+            "deserialization must run the same check: {raw}"
+        );
+    }
+    assert!(matches!(
+        SubjectScope::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1"),
+        Err(ScopeError::NotAScope { .. })
+    ));
+}
+
+#[test]
+fn subject_scope_serializes_as_its_instance_id_and_round_trips() {
+    let json = serde_json::to_string(&SubjectScope::user()).expect("serialize");
+    assert_eq!(json, format!("\"{SCOPE_USER}\""));
+    let back: SubjectScope = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, SubjectScope::user());
+    assert_eq!(back.as_gts().as_ref(), SCOPE_USER);
+    assert_eq!(back.to_string(), SCOPE_USER);
+}
+
+#[test]
+fn evaluation_attribution_distinguishes_omitted_metadata_from_null() {
+    let tenant = Uuid::from_u128(7);
+    let metric = "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1";
+
+    let omitted: EvaluationAttribution =
+        serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric }))
+            .expect("metadata may be omitted at the type level");
+    assert_eq!(
+        omitted.metadata, None,
+        "the gear rejects the omission later"
+    );
+    assert!(omitted.subjects.is_empty());
+    assert_eq!(omitted.resource, None);
+
+    let empty: EvaluationAttribution =
+        serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric, "metadata": {} }))
+            .expect("an empty object is a present object");
+    assert_eq!(empty.metadata.as_ref().map(serde_json::Map::len), Some(0));
+
+    for field in ["metadata", "resource"] {
+        let explicit_null = json!({ "tenant_id": tenant, "metric": metric, field: null });
+        assert!(
+            serde_json::from_value::<EvaluationAttribution>(explicit_null).is_err(),
+            "{field}: null is not absence"
+        );
+    }
+    let unknown =
+        json!({ "tenant_id": tenant, "metric": metric, "metadata": {}, "caller_type": "x" });
+    assert!(serde_json::from_value::<EvaluationAttribution>(unknown).is_err());
+}
+
+#[test]
+fn resource_projection_keeps_an_absent_id_absent() {
+    let without_id: ResourceProjection = serde_json::from_value(json!({
+        "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
+        "metadata": { "model_family": "gpt" }
+    }))
+    .expect("id may be omitted");
+    assert_eq!(without_id.id, None);
+    let written = serde_json::to_value(&without_id).expect("serialize");
+    let mut keys: Vec<String> = written
+        .as_object()
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["metadata", "type"],
+        "no id key is written for an absent id"
+    );
+
+    let with_id: ResourceProjection = serde_json::from_value(json!({
+        "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
+        "id": "model-7",
+        "metadata": {}
+    }))
+    .expect("id may be present");
+    assert_eq!(with_id.id.as_deref(), Some("model-7"));
+
+    for field in ["id", "metadata"] {
+        let explicit_null = json!({
+            "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
+            "metadata": {},
+            field: null
+        });
+        assert!(
+            serde_json::from_value::<ResourceProjection>(explicit_null).is_err(),
+            "{field}: null is rejected, the resource base requires a value when present"
+        );
+    }
+    let no_metadata = json!({ "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~" });
+    let parsed: ResourceProjection = serde_json::from_value(no_metadata).expect("type only");
+    assert_eq!(
+        parsed.metadata, None,
+        "the gear rejects the omission at ingress"
+    );
+}
+
+#[test]
+fn contract_ref_for_type_takes_the_major_version_of_the_last_segment() {
+    let id = GtsTypeId::try_new(
+        "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v3~",
+    )
+    .expect("type id");
+    let reference = ContractRef::for_type(&id).expect("versioned");
+    assert_eq!(reference.type_id, id);
+    assert_eq!(reference.version, 3);
+}
+
+#[test]
+fn projection_bindings_are_distinct_by_pair() {
+    let metric =
+        MetricId::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1").expect("metric");
+    let user =
+        GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~").expect("type");
+    let tenant =
+        GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~").expect("type");
+    let set: std::collections::HashSet<ProjectionBinding> = [
+        ProjectionBinding {
+            metric: metric.clone(),
+            projection_type: user.clone(),
+        },
+        ProjectionBinding {
+            metric: metric.clone(),
+            projection_type: user,
+        },
+        ProjectionBinding {
+            metric,
+            projection_type: tenant,
+        },
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(set.len(), 2);
 }

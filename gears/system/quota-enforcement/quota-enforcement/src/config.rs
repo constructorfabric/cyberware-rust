@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
+use gts::GtsTypeId;
 use serde::Deserialize;
+
+use crate::domain::catalog::CatalogConfig;
 
 /// Gear configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -18,6 +21,8 @@ pub struct QuotaEnforcementConfig {
     pub sweeper_stop_timeout_secs: u64,
     /// Operational metrics.
     pub metrics: MetricsConfig,
+    /// The owner projections configured for evaluation.
+    pub catalog: CatalogSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -27,6 +32,7 @@ impl Default for QuotaEnforcementConfig {
             election: ElectionTimingConfig::default(),
             sweeper_stop_timeout_secs: 10,
             metrics: MetricsConfig::default(),
+            catalog: CatalogSection::default(),
         }
     }
 }
@@ -48,7 +54,8 @@ impl QuotaEnforcementConfig {
         if self.sweeper_stop_timeout_secs == 0 {
             anyhow::bail!("[quota-enforcement].sweeper_stop_timeout_secs must be at least 1");
         }
-        self.metrics.validate()
+        self.metrics.validate()?;
+        self.catalog.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -152,6 +159,67 @@ impl MetricsConfig {
             );
         }
         Ok(())
+    }
+}
+
+/// The evaluation catalogue (`[quota-enforcement.catalog]`): the concrete owner
+/// projections this deployment resolves at bootstrap (ADR-0007). Request and
+/// constraint contracts are discovered from the registry, not configured.
+/// Empty lists boot an empty catalogue.
+// @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-config
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CatalogSection {
+    /// GTS type ids of concrete subject projections derived from
+    /// `gts.cf.core.qe.subj.v1~`.
+    pub subject_projections: Vec<String>,
+    /// GTS type ids of concrete resource projections derived from
+    /// `gts.cf.core.qe.res.v1~`.
+    pub resource_projections: Vec<String>,
+}
+// @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-config
+
+impl CatalogSection {
+    /// Reject ids that are not GTS type ids and duplicate entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field and the offending entry.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        Self::validate_list("subject_projections", &self.subject_projections)?;
+        Self::validate_list("resource_projections", &self.resource_projections)
+    }
+
+    fn validate_list(field: &str, ids: &[String]) -> anyhow::Result<()> {
+        for (index, id) in ids.iter().enumerate() {
+            GtsTypeId::try_new(id).map_err(|e| {
+                anyhow::anyhow!(
+                    "[quota-enforcement.catalog].{field}[{index}] is not a GTS type id: {e}"
+                )
+            })?;
+            if ids[..index].contains(id) {
+                anyhow::bail!("[quota-enforcement.catalog].{field} lists {id} twice");
+            }
+        }
+        Ok(())
+    }
+
+    /// The domain view of the section.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an id does not parse; `validate` reports the same
+    /// condition with the field name.
+    pub fn to_domain(&self) -> anyhow::Result<CatalogConfig> {
+        let parse = |ids: &[String]| -> anyhow::Result<Vec<GtsTypeId>> {
+            ids.iter()
+                .map(|id| GtsTypeId::try_new(id).map_err(|e| anyhow::anyhow!("{id}: {e}")))
+                .collect()
+        };
+        Ok(CatalogConfig {
+            subject_projections: parse(&self.subject_projections)?,
+            resource_projections: parse(&self.resource_projections)?,
+        })
     }
 }
 

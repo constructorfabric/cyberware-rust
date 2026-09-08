@@ -104,6 +104,17 @@ impl From<DomainError> for CanonicalError {
                     "METRIC_NOT_QUOTA_GATED",
                 )
                 .create(),
+            DomainError::ProjectionNotResolvable { projection } => {
+                QuotaResource::failed_precondition()
+                    .with_precondition_violation(
+                        "subject.projection_type",
+                        format!(
+                            "projection {projection} is not resolvable in the configured catalogue"
+                        ),
+                        DomainError::PROJECTION_NOT_RESOLVABLE,
+                    )
+                    .create()
+            }
             DomainError::UnknownPolicyVersion { policy_id, version } => {
                 PolicyResource::failed_precondition()
                     .with_precondition_violation(
@@ -210,6 +221,13 @@ impl From<DomainError> for CanonicalError {
                 .with_detail(format!(
                     "{}: cluster unavailable",
                     reason::DEPENDENCY_UNAVAILABLE
+                ))
+                .create(),
+            // A rejected catalogue never leaves bootstrap; the gear is not ready.
+            DomainError::CatalogInvalid { .. } => CanonicalError::service_unavailable()
+                .with_detail(format!(
+                    "{}: projection contract catalogue rejected",
+                    reason::NOT_READY
                 ))
                 .create(),
 

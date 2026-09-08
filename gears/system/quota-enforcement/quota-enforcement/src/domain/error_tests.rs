@@ -141,11 +141,15 @@ fn dependency_labels_are_stable_health_code_fragments() {
         Dependency::Cluster,
         Dependency::Pdp,
         Dependency::TypesRegistry,
+        Dependency::Catalog,
     ]
     .iter()
     .map(|d| d.as_label())
     .collect();
-    assert_eq!(labels, vec!["storage", "cluster", "pdp", "types_registry"]);
+    assert_eq!(
+        labels,
+        vec!["storage", "cluster", "pdp", "types_registry", "catalog"]
+    );
     let cluster = DomainError::ClusterUnavailable("profile unbound".to_owned());
     assert!(
         cluster.to_string().contains("cluster unavailable"),

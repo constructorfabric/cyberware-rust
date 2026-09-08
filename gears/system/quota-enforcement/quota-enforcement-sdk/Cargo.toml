@@ -32,9 +32,11 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 time = { workspace = true }
 
-# GTS types
+# GTS types. `inventory` carries the QE-owned GTS definitions into the
+# process-wide registry seed (`toolkit_gts::InventoryTypeSchema`).
 gts = { workspace = true }
 toolkit-gts = { workspace = true }
+inventory = { workspace = true }
 
 # `AccessScope` and `SecurityContext` on the plugin contract signatures.
 toolkit-security = { workspace = true }

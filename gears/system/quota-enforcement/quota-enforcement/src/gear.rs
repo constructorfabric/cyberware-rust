@@ -23,14 +23,17 @@ use toolkit::context::GearCtx;
 use toolkit::lifecycle::ReadySignal;
 use toolkit::{Gear, Healthcheck, RestApiCapability};
 use tracing::info;
+use types_registry_sdk::TypesRegistryClient;
 
 use crate::api::healthcheck::ReadinessCheck;
 use crate::api::rest::routes;
 use crate::config::QuotaEnforcementConfig;
-use crate::domain::{Admission, Bootstrap, PluginBinding, Readiness, Service};
+use crate::domain::ports::QeMetrics;
+use crate::domain::{Admission, Bootstrap, CatalogBinding, PluginBinding, Readiness, Service};
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
 use crate::infra::metrics;
 use crate::infra::pdp_probe::PdpReachability;
+use crate::infra::types_registry::TypesRegistryContracts;
 
 const LOG_TARGET: &str = "qe.lifecycle";
 
@@ -136,9 +139,22 @@ impl Gear for QuotaEnforcementGear {
         let pdp_probe = Arc::new(PdpReachability::new(authz.clone()));
         let enforcer = PolicyEnforcer::new(authz);
 
-        let metrics = metrics::build_default_adapter(&cfg.metrics);
+        // The projection contract catalogue is built from the types registry at
+        // bootstrap; without the client there is no catalogue to publish.
+        let registry: Arc<dyn TypesRegistryClient> = hub
+            .get::<dyn TypesRegistryClient>()
+            .with_context(|| format!("{} requires a types-registry client", Self::MODULE_NAME))?;
+        let catalog = CatalogBinding {
+            registry: Arc::new(TypesRegistryContracts::new(registry)),
+            config: cfg
+                .catalog
+                .to_domain()
+                .context("[quota-enforcement.catalog] is not a valid catalogue")?,
+        };
+
+        let metrics: Arc<dyn QeMetrics> = metrics::build_default_adapter(&cfg.metrics);
         let readiness = Arc::new(Readiness::new());
-        let admission = Admission::new(enforcer, metrics);
+        let admission = Admission::new(enforcer, metrics.clone());
         let service = Arc::new(Service::new(admission, readiness.clone()));
 
         let timing = ElectionTiming::new(
@@ -149,7 +165,8 @@ impl Gear for QuotaEnforcementGear {
         .context("[quota-enforcement.election] is not a valid election timing")?;
         let coordinator = Arc::new(ClusterCoordinationBinding::new(hub.clone(), timing));
         let binding = PluginBinding::new(hub.clone(), cfg.storage_vendor);
-        let bootstrap = Bootstrap::new(binding, coordinator, pdp_probe, readiness);
+        let bootstrap =
+            Bootstrap::new(binding, coordinator, pdp_probe, catalog, metrics, readiness);
 
         self.hub
             .set(hub)

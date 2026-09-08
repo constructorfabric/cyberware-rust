@@ -5,6 +5,7 @@ use toolkit_canonical_errors::{CanonicalError, Problem};
 use uuid::Uuid;
 
 use crate::domain::error::{Dependency, DomainError, PluginKind, ResourceKind};
+use crate::domain::ports::metrics::ValidationReason;
 
 fn status(err: DomainError) -> u16 {
     Problem::from(CanonicalError::from(err))
@@ -27,6 +28,19 @@ fn every_variant_family_maps_to_its_documented_status() {
                 projection: "gts.x~".to_owned(),
             },
             400,
+        ),
+        (
+            DomainError::ProjectionNotResolvable {
+                projection: "gts.x~".to_owned(),
+            },
+            400,
+        ),
+        (
+            DomainError::CatalogInvalid {
+                reason: ValidationReason::Abstract,
+                subject: "gts.x~".to_owned(),
+            },
+            503,
         ),
         (
             DomainError::LeaseNotActive {

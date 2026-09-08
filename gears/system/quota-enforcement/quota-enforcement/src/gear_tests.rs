@@ -15,8 +15,10 @@ use uuid::Uuid;
 use super::QuotaEnforcementGear;
 use crate::domain::{Dependency, ReadinessState};
 use crate::test_support::{
-    ClusterFixture, FailingPdp, OtherProfile, PermitTenantsPdp, hub_with, register_pdp,
-    register_storage, storage_instance, tenant, wire_cluster, wire_cluster_with,
+    ClusterFixture, FailingPdp, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
+    OtherProfile, PermitTenantsPdp, hub_with_registry, in_process_registry, llm_gateway_documents,
+    metric_base_documents, plugin_instance_document, register_pdp, register_storage,
+    storage_instance, tenant, wire_cluster, wire_cluster_with,
 };
 
 struct StaticConfigProvider {
@@ -35,7 +37,11 @@ fn make_ctx(hub: Arc<ClientHub>) -> GearCtx {
             "config": {
                 "storage_vendor": "acme",
                 "election": { "ttl_secs": 1, "max_missed_renewals": 1 },
-                "sweeper_stop_timeout_secs": 1
+                "sweeper_stop_timeout_secs": 1,
+                "catalog": {
+                    "subject_projections": [LLM_USER_PROJECTION, LLM_TENANT_PROJECTION],
+                    "resource_projections": [LLM_MODEL_RESOURCE]
+                }
             }
         }
     });
@@ -70,14 +76,19 @@ fn environment(
     )
 }
 
-/// [`environment`] with the given PDP double registered as the client.
+/// [`environment`] with the given PDP double registered as the client. The
+/// types registry is the real in-process one, holding the storage plugin
+/// instance, the `llm_gateway` owner set, and the two metrics it admits.
 fn environment_with_pdp(
     with_storage_client: bool,
     cluster: ClusterBinding,
     pdp: Arc<dyn AuthZResolverApi>,
 ) -> (Arc<ClientHub>, Arc<InMemoryStorage>, ClusterFixture) {
     let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
-    let hub = hub_with(&[&storage_fixture]);
+    let mut documents = llm_gateway_documents();
+    documents.extend(metric_base_documents());
+    documents.push(plugin_instance_document(&storage_fixture));
+    let hub = hub_with_registry(in_process_registry(documents));
     register_pdp(&hub, pdp);
     let storage = Arc::new(InMemoryStorage::new());
     if with_storage_client {
@@ -99,6 +110,22 @@ async fn init_fails_closed_without_an_authz_resolver_client() {
         .await
         .expect_err("no PDP, no gear");
     assert!(format!("{err:#}").contains("authz-resolver"), "{err:#}");
+    assert!(gear.service().is_none());
+}
+
+#[tokio::test]
+async fn init_fails_closed_without_a_types_registry_client() {
+    let hub = Arc::new(ClientHub::new());
+    register_pdp(
+        &hub,
+        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
+    );
+    let gear = QuotaEnforcementGear::default();
+    let err = gear
+        .init(&make_ctx(hub))
+        .await
+        .expect_err("no registry, no catalogue, no gear");
+    assert!(format!("{err:#}").contains("types-registry"), "{err:#}");
     assert!(gear.service().is_none());
 }
 
@@ -132,6 +159,16 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
         service.coordinator().is_ok(),
         "the cluster election was resolved in start"
     );
+    let catalog = service
+        .catalog()
+        .expect("the catalogue was published by bootstrap");
+    assert!(
+        catalog
+            .subject_projection(&gts::GtsTypeId::new(LLM_USER_PROJECTION))
+            .is_some(),
+        "the configured projection resolved from the real registry"
+    );
+    assert!(service.attribution().is_ok());
     assert_eq!(storage.bootstrap_calls(), 1);
 
     let check = gear.healthcheck(&ctx).expect("health check after init");

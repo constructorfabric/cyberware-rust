@@ -43,6 +43,7 @@
 //! Every tenant-scoped call receives the caller's [`AccessScope`] unmodified
 //! and binds it through `SecureConn`. No scoped operation runs without it.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -53,8 +54,8 @@ use crate::models::{
     ApplicableQuotas, BatchDebitItem, BootstrapBundle, DeactivateOutcome, DebitPlan, ExpiredLease,
     IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MutationResult,
     NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersion, PolicyVersionMeta, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
-    QuotaSnapshot,
+    PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId,
+    QuotaPatch, QuotaSnapshot,
 };
 
 /// Major version of this contract. Coupled to the gear's major version. A
@@ -207,6 +208,22 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ///   differs from `bundle.contract_major`. The gear fails fast.
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn bootstrap(&self, bundle: &BootstrapBundle) -> Result<(), StorageError>;
+
+    /// The distinct `(metric, projection_type)` pairs bound by active Quotas.
+    ///
+    /// Bootstrap-only and platform-plane: the gear calls it once, before it
+    /// reports ready, to check the configured projection catalogue against the
+    /// Quotas storage holds (projection-contracts feature, "Catalogue Bootstrap
+    /// and Consistency Set"). It therefore carries no caller context and no
+    /// `AccessScope`, returns identities only, and is never called on a request
+    /// path. A failure fails readiness.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn read_active_projection_bindings(
+        &self,
+    ) -> Result<HashSet<ProjectionBinding>, StorageError>;
 
     // --- quota CRUD ---
 

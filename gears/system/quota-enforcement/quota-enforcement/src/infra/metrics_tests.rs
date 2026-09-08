@@ -6,9 +6,14 @@ use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
-use super::{DENIAL_TOTAL, QeMetricsMeter, build_default_adapter};
+use super::{
+    ADMITTED_METRIC_VIOLATIONS_TOTAL, CONTRACT_VALIDATION_FAILURES_TOTAL, DENIAL_TOTAL,
+    QeMetricsMeter, build_default_adapter,
+};
 use crate::config::MetricsConfig;
-use crate::domain::ports::metrics::{DenialReason, QeMetrics, REASON_LABEL};
+use crate::domain::ports::metrics::{
+    DenialReason, QeMetrics, REASON_LABEL, SURFACE_LABEL, ValidationReason, ValidationSurface,
+};
 
 fn local_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
     let exporter = InMemoryMetricExporter::default();
@@ -107,9 +112,60 @@ fn a_configured_prefix_namespaces_the_instrument() {
 }
 
 #[test]
-fn every_reason_label_is_a_distinct_snake_case_token() {
-    let labels: Vec<&str> = DenialReason::ALL.iter().map(|r| r.as_label()).collect();
-    let mut dedup = labels.clone();
+fn contract_validation_counters_render_with_their_closed_labels() {
+    let (provider, exporter) = local_provider();
+    let meter = QeMetricsMeter::new(
+        &provider.meter("quota-enforcement"),
+        &MetricsConfig::default(),
+    );
+
+    meter.record_contract_validation_failure(
+        ValidationSurface::RequestSubject,
+        ValidationReason::SchemaViolation,
+    );
+    meter.record_contract_validation_failure(
+        ValidationSurface::RequestSubject,
+        ValidationReason::SchemaViolation,
+    );
+    meter.record_contract_validation_failure(
+        ValidationSurface::Bootstrap,
+        ValidationReason::DuplicatePair,
+    );
+    meter.record_admitted_metric_violation(ValidationSurface::Bootstrap);
+    provider.force_flush().expect("flush");
+
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            CONTRACT_VALIDATION_FAILURES_TOTAL,
+            Some((SURFACE_LABEL, "request_subject"))
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            CONTRACT_VALIDATION_FAILURES_TOTAL,
+            Some((REASON_LABEL, "duplicate_pair"))
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        counter_sum(&exporter, CONTRACT_VALIDATION_FAILURES_TOTAL, None),
+        Some(3)
+    );
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            ADMITTED_METRIC_VIOLATIONS_TOTAL,
+            Some((SURFACE_LABEL, "bootstrap"))
+        ),
+        Some(1)
+    );
+}
+
+fn assert_distinct_snake_case(labels: &[&str]) {
+    let mut dedup = labels.to_vec();
     dedup.sort_unstable();
     dedup.dedup();
     assert_eq!(dedup.len(), labels.len(), "duplicate labels: {labels:?}");
@@ -119,6 +175,31 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
             "label {label:?} must be snake_case"
         );
     }
+}
+
+#[test]
+fn every_reason_label_is_a_distinct_snake_case_token() {
+    let denial: Vec<&str> = DenialReason::ALL.iter().map(|r| r.as_label()).collect();
+    assert_distinct_snake_case(&denial);
+    let surfaces: Vec<&str> = ValidationSurface::ALL
+        .iter()
+        .map(|s| s.as_label())
+        .collect();
+    assert_distinct_snake_case(&surfaces);
+    assert_eq!(
+        surfaces,
+        [
+            "request_subject",
+            "request_resource",
+            "caller_attribution",
+            "arbitration",
+            "policy_pair",
+            "bootstrap"
+        ],
+        "the DESIGN 5.16 surface set"
+    );
+    let reasons: Vec<&str> = ValidationReason::ALL.iter().map(|r| r.as_label()).collect();
+    assert_distinct_snake_case(&reasons);
 }
 
 #[test]

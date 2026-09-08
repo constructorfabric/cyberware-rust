@@ -5,6 +5,8 @@ use quota_enforcement_sdk::TenantId;
 use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
+use serde_json::{Map, Value};
+
 use super::{Admission, AdmissionTarget};
 use crate::domain::error::DomainError;
 use crate::domain::pep::{actions, resources};
@@ -197,4 +199,38 @@ async fn a_resource_target_forwards_the_resource_id_to_the_pdp() {
         .await
         .expect("admitted");
     assert_eq!(pdp.last_resource_id(), Some(resource_id.to_string()));
+}
+
+#[tokio::test]
+async fn extra_properties_reach_the_pdp_and_never_override_the_target_tenant() {
+    let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
+    let (admission, _) = admission(pdp.clone());
+    let other = Uuid::from_u128(0xbeef);
+    let mut properties = Map::new();
+    properties.insert("metric".to_owned(), Value::String("m".to_owned()));
+    properties.insert(
+        pep_properties::OWNER_TENANT_ID.to_owned(),
+        Value::String(other.to_string()),
+    );
+    admission
+        .admit_with_properties(
+            &ctx(),
+            &resources::OPERATION,
+            actions::DEBIT,
+            AdmissionTarget::tenant(tenant()),
+            properties,
+        )
+        .await
+        .expect("admitted");
+    let resource = pdp.last_resource().expect("the PDP saw the request");
+    assert_eq!(
+        resource.properties.get("metric"),
+        Some(&Value::String("m".to_owned())),
+        "extra properties are forwarded"
+    );
+    assert_eq!(
+        resource.properties.get(pep_properties::OWNER_TENANT_ID),
+        Some(&Value::String(tenant().as_uuid().to_string())),
+        "the explicit target tenant is authoritative"
+    );
 }
