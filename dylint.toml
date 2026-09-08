@@ -8,6 +8,10 @@
 # Paths where direct sha2/sha1/md5 imports are permitted (substring-matched).
 hasher_allowed_paths = [
     "gears/file-storage/file-storage/src/infra/content/hash.rs",
+    # SHA-256 as an injective object-name mapping only (DESIGN.md 2.2): derives a
+    # stable, DNS-safe Lease/CRD object name from a coordination name. Not a
+    # security or integrity hash — no FIPS boundary — so RustCrypto sha2 is fine.
+    "gears/system/cluster/plugins/k8s-cluster-plugin/src/naming.rs",
 ]
 
 # DE1101: Tests must be in separate files.

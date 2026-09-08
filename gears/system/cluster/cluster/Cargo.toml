@@ -43,6 +43,11 @@ workspace = true
 # `integration` feature so a default `cargo test` never requires a Docker
 # daemon. Run with `cargo test -p cf-gears-cluster --features integration`.
 integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+# Links the native Kubernetes coordination providers (cache + the first native
+# leader-election + lock in the tree) into `provider_registry`. Off by default:
+# kube is a heavy dependency tree a non-k8s deployment should not pay for, so a
+# profile binding `provider: k8s` requires a build with this feature.
+k8s = ["dep:cf-k8s-cluster-plugin"]
 # Kubernetes TokenReview platform-plane auth. Compiles the inbound internal-token
 # validator so the cluster pod can enforce `X-ToolKit-Internal-Token` on its
 # grpc-hub (coordination plane + DirectoryService registration) in Profile 3.
@@ -108,6 +113,13 @@ uuid = { workspace = true, features = ["v4"] }
 rand = { workspace = true }
 cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin", version = "0.2.3" }
 cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", version = "0.4.1" }
+# The native Kubernetes backend plugin, behind the `k8s` feature: kube is a heavy
+# dependency tree a non-k8s deployment must not link (mirrors mini-chat/chat-engine
+# gating their own k8s deps). Inline path + version like the Postgres/standalone
+# plugins above (a normal dep needs a version so `cargo publish` on this crate
+# succeeds); the dev-only cf-gears-cluster <-> plugin cycle stays release-plz-safe
+# via the plugin's path-only dev-dep back on cluster.
+cf-k8s-cluster-plugin = { path = "../plugins/k8s-cluster-plugin", version = "0.1.0", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `fence_retention: 1h` in operator YAML (DESIGN.md). Taken

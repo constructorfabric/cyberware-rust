@@ -666,7 +666,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-k8s coverage-cluster-k8s test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -753,6 +753,63 @@ test-types-registry-db: install-tools
 test-cluster-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-postgres-cluster-plugin --features integration --retries 1
+
+## Kubernetes cluster plugin: L2 (conformance) + L3 (integration) against a real
+## k3s API server (docs/TESTING.md 4, 7). Docker required, and k3s needs
+## **privileged** mode -- the one CI capability beyond a Docker daemon.
+##
+## Uses `cargo test`, not `nextest` (unlike test-cluster-pg): k3s takes ~20s to
+## become ready, so the fixture starts ONE k3s container (a `static` OnceCell,
+## see tests/integration/common) and isolates every scenario by namespace. All
+## scenarios live in a SINGLE test binary (`tests/integration/main.rs`) so that
+## one static -- hence one container -- serves the whole suite; nextest's
+## process-per-test, or the former file-per-binary layout, would each start a
+## fresh k3s per process. `--test-threads` caps how many scenarios hit the shared
+## cluster at once so they do not overload it.
+##
+## The container lives in a `static` (never `Drop`ped) and **testcontainers 0.27
+## ships no ryuk reaper**, so it keeps running after the test process exits: the
+## `trap` cleans up that single leftover, and a leading `k3s_cleanup` (plus the
+## fixture's own `reap_stale_fixture_containers` on startup) clears any from a
+## prior run. Cleanup filters on the fixture's own label so it never touches an
+## unrelated k3s container. One retry guards a flaky boot.
+test-cluster-k8s: install-tools
+	$(call print_target_banner)
+	@set -e; \
+	k3s_cleanup() { docker ps -aq --filter label=org.cf-gears.test-fixture=cf-k8s-cluster-plugin | xargs -r docker rm -f >/dev/null 2>&1 || true; }; \
+	trap k3s_cleanup EXIT; \
+	k3s_cleanup; \
+	echo "=== cf-gears-cluster: k8s provider registration (lib, no k3s) ==="; \
+	cargo test -p cf-gears-cluster --features k8s --lib provider_registry_resolves_k8s_for_every_primitive; \
+	echo "=== k8s-cluster-plugin: integration (single shared k3s) ==="; \
+	cargo test -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4 \
+		|| { echo "=== integration failed; retrying once (flake guard, cf. test-cluster-pg's --retries 1) ==="; k3s_cleanup; \
+			cargo test -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4; } \
+		|| exit 1
+
+## Accumulate the k8s plugin's L2/L3 coverage into the CURRENT cargo-llvm-cov
+## session -- the coverage sibling of `test-cluster-k8s`: the same single-binary
+## `cargo test` becomes `cargo llvm-cov test --no-report`. Deliberately does NOT
+## `clean` or `report`, and deliberately has no `install-tools` prereq: the
+## caller brackets it (a workspace pass before, `cargo llvm-cov report` after) so
+## it composes into one lcov, and supplies cargo-llvm-cov + CARGO_LLVM_COV_TARGET_DIR
+## itself. The single-container k3s handling is identical to test-cluster-k8s --
+## see that target's comment for the why. Called by the coverage job in
+## .github/workflows/ci.yml.
+##
+## Standalone (local): a report needs a bracketing clean + report --
+##   cargo llvm-cov clean --workspace && make coverage-cluster-k8s && cargo llvm-cov report --summary-only
+coverage-cluster-k8s:
+	$(call print_target_banner)
+	@set -e; \
+	k3s_cleanup() { docker ps -aq --filter label=org.cf-gears.test-fixture=cf-k8s-cluster-plugin | xargs -r docker rm -f >/dev/null 2>&1 || true; }; \
+	trap k3s_cleanup EXIT; \
+	k3s_cleanup; \
+	echo "=== coverage: k8s-cluster-plugin: integration (single shared k3s) ==="; \
+	cargo llvm-cov test --no-report -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4 \
+		|| { echo "=== integration failed; retrying once (flake guard) ==="; k3s_cleanup; \
+			cargo llvm-cov test --no-report -p cf-k8s-cluster-plugin --features integration --test integration -- --test-threads=4; } \
+		|| exit 1
 
 ## Run resource-group gear PostgreSQL smoke tests (Docker required; spins up
 ## its own postgres container via testcontainers -- see

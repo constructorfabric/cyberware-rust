@@ -95,6 +95,14 @@ Why version-based, not value-based:
 
 Trade-off: consumers must hold the version from `get()` if they want to write back. This is straightforward in practice and matches the natural read-modify-write pattern. The ergonomic cost is one extra struct field on `CacheEntry`.
 
+> **Correction (2026-08-06, added during the K8s plugin design).** The first bullet above is inaccurate for the backends whose revision is **cluster-global rather than per-key**, and the K8s plugin is the first backend to reach it.
+>
+> The decision this section records — version-based CAS, not value-based — stands unchanged, and the second bullet's use of `expected_resourceVersion` as the CAS *precondition* is correct and is exactly what the K8s plugin implements. What does not hold is "we just expose it": `metadata.resourceVersion` is a **cluster-global etcd revision**, so it neither starts at 1 for a new key nor returns to 1 when a key is deleted and re-created, both of which the cache contract requires and the conformance suite asserts (`SC-CACHE-002`, `SC-CACHE-009`). It is also documented as opaque and not to be parsed.
+>
+> The resolution is cheap and does not disturb this ADR's reasoning: a backend whose native revision is cluster-global maintains its own per-key `u64` counter in the same guarded write it was already issuing, and keeps the native revision in its correct role as the atomicity guard. The K8s plugin does this with a `spec.version` field on its own custom resource; see [`plugins/k8s-cluster-plugin/docs/DESIGN.md`](../../plugins/k8s-cluster-plugin/docs/DESIGN.md) §2.8.
+>
+> `etcd`'s `mod_revision` has the same cluster-global shape and very likely needs the same treatment; this has not been audited. `NATS revision` (per-key), `Postgres BIGSERIAL` (as used by the shipped plugin's own per-key column), Redis's Lua counter, and the in-process `AtomicU64` are unaffected.
+
 ### Consequences
 
 - K8s-only deployments have a clear ceiling for cache/lock workloads (~5,000 writes/sec etcd practical limit). Documentation must recommend adding Redis when workloads exceed this.

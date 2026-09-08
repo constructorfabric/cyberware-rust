@@ -872,3 +872,58 @@ mod shutdown_drain {
         );
     }
 }
+
+/// Phase 5 (docs/IMPLEMENTATION.md section 5): the `k8s` feature registers the
+/// native Kubernetes providers into `provider_registry` for all three primitives,
+/// so a profile binding `provider: k8s` resolves each one. This is the first
+/// **native** leader-election provider in the tree — every earlier provider left
+/// leader election to the SDK default over a cache.
+#[cfg(feature = "k8s")]
+mod k8s_registration {
+    use super::ClusterGear;
+
+    #[test]
+    fn provider_registry_resolves_k8s_for_every_primitive() {
+        let registry = ClusterGear::provider_registry();
+
+        let cache = registry
+            .cache_provider("k8s")
+            .expect("the k8s cache provider must be registered under the `k8s` feature");
+        let leader = registry
+            .leader_election_provider("k8s")
+            .expect("the k8s leader-election provider (the first native one) must be registered");
+        let lock = registry
+            .lock_provider("k8s")
+            .expect("the k8s lock provider must be registered under the `k8s` feature");
+
+        assert_eq!(cache.provider(), "k8s");
+        assert_eq!(leader.provider(), "k8s");
+        assert_eq!(lock.provider(), "k8s");
+
+        // The k8s cache is an *additional* entry — the pre-existing providers still
+        // resolve alongside it (the registry keys per name, per primitive).
+        assert!(registry.cache_provider("standalone").is_some());
+        assert!(registry.cache_provider("postgres").is_some());
+        assert!(registry.lock_provider("postgres").is_some());
+    }
+}
+
+/// Without the `k8s` feature the registry links neither the k8s providers nor kube,
+/// so a `provider: k8s` binding is an unknown provider the wiring rejects — while
+/// the unconditional standalone/postgres providers still resolve.
+#[cfg(not(feature = "k8s"))]
+mod no_k8s_registration {
+    use super::ClusterGear;
+
+    #[test]
+    fn provider_registry_has_no_k8s_providers_without_the_feature() {
+        let registry = ClusterGear::provider_registry();
+        assert!(registry.cache_provider("k8s").is_none());
+        assert!(registry.leader_election_provider("k8s").is_none());
+        assert!(registry.lock_provider("k8s").is_none());
+        // The base providers are unconditional.
+        assert!(registry.cache_provider("standalone").is_some());
+        assert!(registry.cache_provider("postgres").is_some());
+        assert!(registry.lock_provider("postgres").is_some());
+    }
+}

@@ -1,0 +1,47 @@
+# ClusterCacheEntry CRD (DESIGN.md §2.7). An operator prerequisite this plugin
+# verifies at startup (§6.7) and never installs. Apply once per cluster:
+#
+#   kubectl apply -f plugins/k8s-cluster-plugin/deploy/crd.yaml
+#
+# The group, kind, and the three spec fields are a wire contract (§2.7); changing
+# them is breaking. `src/crd/cache_entry.rs`'s `crd_manifest_matches_derived_type`
+# test asserts this manifest and the Rust `ClusterCacheEntry` type agree.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clustercacheentries.cluster.cf-gears.io
+spec:
+  group: cluster.cf-gears.io
+  scope: Namespaced
+  names:
+    kind: ClusterCacheEntry
+    plural: clustercacheentries
+    singular: clustercacheentry
+    shortNames: ["cce"]
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [value, version]
+              properties:
+                value:
+                  type: string
+                  format: byte          # base64 on the wire, opaque bytes to consumers
+                version:
+                  type: integer
+                  format: int64
+                  minimum: 1            # 0 is the SDK's reserved absent-sentinel
+                expiresAt:
+                  type: string
+                  format: date-time     # absent => Ttl::Indefinite
+      additionalPrinterColumns:
+        - { name: Version, type: integer, jsonPath: .spec.version }
+        - { name: Expires, type: string, jsonPath: .spec.expiresAt }
+        - { name: Key, type: string, jsonPath: '.metadata.annotations.cluster\.cf-gears\.io/name' }

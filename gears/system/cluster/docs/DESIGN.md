@@ -170,7 +170,7 @@ Each non-functional requirement from the PRD maps to its design response and ver
 │  Plugin crates (standalone + postgres shipped)                  │
 │  ┌────────────────┐ ┌──────────────┐ ┌────────────────┐         │
 │  │ standalone     │ │ postgres     │ │ k8s            │  ...    │
-│  │ (in-process)   │ │ (CRD+L/N)    │ │ (Lease+CRD)    │         │
+│  │ (in-process)   │ │ (table+L/N)  │ │ (Lease+CRD)    │         │
 │  └────────────────┘ └──────────────┘ └────────────────┘         │
 │  Each plugin: builder/handle pair (outbox pattern).             │
 ├─────────────────────────────────────────────────────────────────┤
@@ -493,10 +493,10 @@ Three consumer patterns are available, ordered by tolerance for transient dual-l
 
 The cluster SDK has **no external dependencies** of its own. External backend libraries (`sqlx`, `kube`, `redis`, `async-nats`, `etcd-client`, `hazelcast`) belong to the follow-up plugin crates (`cf-postgres-cluster-plugin`, `cf-k8s-cluster-plugin`, `cf-cluster-redis`, `cf-cluster-nats`, `cf-cluster-etcd`, `cf-cluster-hazelcast`) and are NOT SDK dependencies.
 
-| Plugin (follow-up) | External library | Purpose |
+| Plugin | External library | Purpose |
 |---|---|---|
-| Postgres plugin | `sqlx` | Connection pool, prepared statements, LISTEN/NOTIFY |
-| K8s plugin | `kube` | API client, watch streams, Lease/CRD types |
+| Postgres plugin (shipped) | `sqlx` | Connection pool, prepared statements, LISTEN/NOTIFY |
+| K8s plugin (shipped) | `kube` | API client, watch streams, `coordination.k8s.io/v1.Lease` types, `ClusterCacheEntry` CRD derive |
 | Redis plugin | `fred` (or `redis`) | Connection management, Lua script execution, keyspace notifications |
 | NATS plugin | `async-nats` | JetStream KV access, watch subscriptions |
 | etcd plugin | `etcd-client` | KV access, native lease/lock/election APIs |
@@ -817,7 +817,7 @@ cluster:
     # Mixed: native LE + auto-wrapped lock
     in-memory:
       cache: { provider: redis }
-      leader_election: { provider: k8s-lease }
+      leader_election: { provider: k8s }
       # lock omitted → CasBasedDistributedLockBackend over redis cache
 ```
 
@@ -878,7 +878,7 @@ Enumeration is provided by `ClusterCacheBackend::scan_prefix(prefix) -> Vec<Stri
        │                   │ ────────────────────────>│                      │
        │                   │                          │ read profile config  │
        │                   │                          │ (cache: redis,       │
-       │                   │                          │  leader: k8s-lease)  │
+       │                   │                          │  leader: k8s)        │
        │                   │                          │                      │
        │                   │                          │ Plugin::builder()    │
        │                   │                          │  .build_and_start()  │
@@ -939,7 +939,7 @@ Enumeration is provided by `ClusterCacheBackend::scan_prefix(prefix) -> Vec<Stri
 
 N/A — the cluster SDK has no persistent database schemas. Cluster is an in-process library that delegates all storage to plugin-owned backends (Redis, Postgres, K8s API, NATS, etcd), each of which manages its own schema or storage layout independently. The SDK's only durable types are the wire-stable contract surfaces (facade methods, backend traits, error variants) documented in §3.3 and §3.1; those are Rust types, not database tables.
 
-Per-backend storage layout (e.g., the Postgres plugin's `cluster_cache` and `cluster_cache_subscriber_lease` tables, the K8s plugin's CRDs) is documented in each follow-up plugin's own DESIGN, not here.
+Per-backend storage layout (e.g., the Postgres plugin's `cluster_cache` and `cluster_cache_subscriber_lease` tables, the K8s plugin's `Lease` layout and its `ClusterCacheEntry` CRD) is documented in each plugin's own DESIGN, not here.
 
 ### 3.15 Deployment Topology
 
@@ -1344,7 +1344,7 @@ Rust facades + backend traits version per-primitive `*V1`/`*V2` as today (ADR-00
 |---------|-------|----------------|-----------------|
 | **Standalone** (in-process, shipped) | Native (HashMap + AtomicU64) | Native (watch channel) | Native (Mutex + Notify) |
 | **Postgres** (shipped) | Native (table + LISTEN/NOTIFY) | SDK default (on PG cache) | Native (`cluster_lock` row, owner + fence) |
-| **K8s** (follow-up) | Native (CRD + `resourceVersion`) | Native (Lease API) | Native (Lease API) |
+| **K8s** (shipped) | Native (`ClusterCacheEntry` CRD + `spec.version`) | Native (Lease API) | Native (Lease API) |
 | **Redis** (follow-up) | Native (GET/SET/Lua) | SDK default (on Redis cache) | Native (SET NX EX + Lua) |
 | **NATS KV** (follow-up) | Native (KV bucket + revision) | SDK default (on NATS cache) | SDK default (on NATS cache) |
 | **etcd** (follow-up) | Native (KV + `mod_revision`) | Native (election API) | Native (lock API) |
@@ -1364,7 +1364,7 @@ Rust facades + backend traits version per-primitive `*V1`/`*V2` as today (ADR-00
 |-----------|--------|-------|----|----|----|----|
 | Dev / single-instance | `provider: standalone` | Standalone | Standalone | Standalone | Standalone | Zero deps |
 | Multi-instance, no K8s | `provider: postgres` | Postgres | SDK default | Postgres | SDK default | Zero new infra |
-| K8s, low-throughput | `provider: k8s` | K8s CRD | K8s Lease | K8s Lease | K8s Lease (per instance) | Zero new infra |
+| K8s, low-throughput | `provider: k8s` | K8s CRD | K8s Lease | K8s Lease | K8s Lease (per instance) | Zero new infra; needs a one-time CRD install |
 | K8s + Redis (recommended) | hybrid | Redis | K8s Lease | Redis | K8s Lease (per instance) | Best of both |
 | Redis-only | `provider: redis` | Redis | SDK default | Redis | SDK default | Single infra dep |
 | NATS stack | `provider: nats` | NATS KV | SDK default | SDK default | SDK default | Single infra dep |

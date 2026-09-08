@@ -1,0 +1,139 @@
+[package]
+name = "cf-k8s-cluster-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Kubernetes backend plugin for the cluster gear: native leader election and distributed lock over coordination.k8s.io/v1.Lease plus a native cache over a ClusterCacheEntry custom resource"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "k8s_cluster_plugin"
+
+# `testcontainers`/`testcontainers-modules` are declared as *optional* entries
+# under `[dependencies]` (not `[dev-dependencies]`) on purpose: Cargo does not
+# allow optional dev-dependencies, and the `integration` feature must name them
+# via `dep:` (docs/TESTING.md §7). cargo-shear's "misplaced optional dependency"
+# heuristic flags that placement; ignore it here since the placement is required,
+# not accidental.
+[package.metadata.cargo-shear]
+ignored = ["testcontainers", "testcontainers-modules"]
+
+[lints]
+workspace = true
+
+[features]
+# Gates the Layer 2/3 testcontainers (k3s) suites (docs/TESTING.md §4, §7) so a
+# default `cargo test` never requires a Docker daemon. See the postgres plugin's
+# Cargo.toml for why these deps live under `[dependencies]` as optional rather
+# than `[dev-dependencies]`. Run with
+# `cargo test -p cf-k8s-cluster-plugin --features integration`.
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+[dependencies]
+# `otel` pulls in the SDK's OpenTelemetry-backed `ClusterMetrics` adapter so the
+# cache signal set is emitted for free via `InstrumentedCache` (DESIGN §9); the
+# leader/lock signals are emitted natively via `ClusterMetrics::lock_op` /
+# `lock_op_duration` and the leader transition counter.
+cluster-sdk = { workspace = true, features = ["otel"] }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+# `StreamExt`/`TryStreamExt` to drive the `kube::runtime::watcher` streams that
+# back the leader, lock, and cache watches (DESIGN §4.3, §5.3, §6.3).
+futures-util = { workspace = true }
+# `v4`: one fresh UUID per lock acquisition, the holder-token fence (DESIGN §5.1).
+uuid = { workspace = true, features = ["v4"] }
+serde = { workspace = true }
+# Reads the provider's flattened operator-config options passed through by the
+# wiring crate as a serde map (DESIGN §3.5, §8).
+serde_json = { workspace = true }
+# `${VAR}` / `${VAR:-default}` expansion for `namespace`/`identity` (DESIGN §8),
+# via the `ExpandVars` derive (expands to `::toolkit::var_expand::ExpandVars`).
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+# Per-key / per-prefix watcher fan-out registries (cache/watch.rs, lock/waiters.rs).
+dashmap = { workspace = true }
+# Full-jitter on the acquire-contention backoff (DESIGN §4.1).
+rand = { workspace = true }
+# SHA-256 for the injective object-name mapping (DESIGN §2.2). Already a workspace
+# dep at 0.10 (used by file-storage, rustls-corecrypto-provider).
+sha2 = { workspace = true }
+# base64 encode/decode for the `ClusterCacheEntry.spec.value` byte field (DESIGN
+# §2.7): the CRD declares `format: byte` and the Rust spec holds the base64 text.
+base64 = { workspace = true }
+# The Kubernetes client. `derive` is required for the `ClusterCacheEntry`
+# `#[derive(CustomResource)]` (DESIGN §2.7); `runtime` for `kube::runtime::watcher`
+# (DESIGN §4.3, §5.3, §6.3). The workspace entry pins `default-features = false`,
+# which is load-bearing: it drops the default `ring` crypto provider so
+# `rustls-tls` + `aws-lc-rs` do not register two rustls providers and panic at
+# startup.
+kube = { workspace = true, features = [
+    "client",
+    "runtime",
+    "derive",
+    "rustls-tls",
+    "aws-lc-rs",
+] }
+k8s-openapi = { workspace = true, features = ["latest"] }
+# The `CustomResource` derive generates a `JsonSchema` impl for the CRD spec.
+schemars = { workspace = true }
+# Layer 2/3 k3s fixture (tests/common/mod.rs, DESIGN/TESTING §4.1) — optional,
+# only pulled in by `--features integration`. `k3s` is added at the member level
+# rather than the shared workspace entry so it stays scoped to this plugin's
+# integration build.
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true, features = ["k3s"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+# Parses the shipped `deploy/crd.yaml` in the L3 fixture so the *manifest* (not a
+# derived copy) is what gets applied and asserted `Established` — a broken manifest
+# then fails the fixture, not every cache scenario (docs/TESTING.md 4.1).
+serde_yaml_ng = { version = "0.10" }
+# A `tower` layer on the injected `kube::Client` counts the API requests the plugin
+# makes (by verb), for the request-volume scenarios (K8S-CACHE-014, K8S-LEAD-007,
+# K8S-WATCH-004, K8S-SPEC-010, …) — the plugin ships no `cluster_k8s_api_requests`
+# counter, so the harness measures at the transport instead.
+tower = { workspace = true }
+http = { workspace = true }
+# `${VAR}` expansion tests in config.rs set/scope env vars deterministically.
+temp-env = { workspace = true }
+# In-process OTel reader for the observability integration test (`K8S-SPEC-016`):
+# `opentelemetry` installs the global meter provider the plugin's `metrics_sink()`
+# reads via `from_global_meter`, and `opentelemetry_sdk`'s in-memory exporter reads
+# the emitted signals back for assertion.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# WARN capture from spawned tasks (reaper cardinality, heartbeat) via a
+# process-global subscriber rather than tracing-test's thread-local capture.
+tracing-subscriber = { workspace = true }
+# Layer 2 conformance suite (TESTING.md §3): the shared parametrized suites run
+# against this plugin's real k3s-backed cache/leader/lock in tests/conformance.rs.
+# Path-only, no version on purpose: cargo drops a path-only dev-dependency from
+# the published manifest, and this keeps the crate out of release-plz's cycle.
+cf-gears-cluster-conformance = { path = "../../cluster-conformance" }
+# `cluster::defaults::CasBased*` and `ClusterWiring::from_config` for the
+# omit-default and per-primitive-routing tests (TESTING.md §3, §4). Dev-dep only
+# and path-only — the resulting cf-gears-cluster <-> plugin cycle is dev-only,
+# which Cargo permits.
+cluster = { package = "cf-gears-cluster", path = "../../cluster" }
+# The "foreign provider on the other side of a mix" in `K8S-SPEC-006`.
+cf-gears-standalone-cluster-plugin = { path = "../standalone-cluster-plugin" }
+
+# The Layer 2 (conformance) + Layer 3 (integration) scenarios are ONE test
+# binary (`tests/integration/main.rs`, with the former per-suite files as its
+# submodules) so they share a single k3s API server via the fixture's `static`
+# cluster — see that file's header. The binary requires a Docker daemon (k3s),
+# so it is gated behind `required-features = ["integration"]` (docs/TESTING.md
+# §7): a bare `cargo test -p cf-k8s-cluster-plugin` skips building it entirely.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+required-features = ["integration"]
