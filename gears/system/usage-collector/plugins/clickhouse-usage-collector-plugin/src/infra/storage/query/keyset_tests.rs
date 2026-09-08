@@ -70,9 +70,63 @@ fn datetime_keyset_uses_epoch_microsecond_conversion() {
 
     assert_eq!(
         predicate,
-        "(created_at, id) > (fromUnixTimestamp64Micro(?), ?)"
+        "created_at >= fromUnixTimestamp64Micro(?) AND (created_at, id) > (fromUnixTimestamp64Micro(?), ?)"
     );
-    assert_eq!(ctx.binds.len(), 2);
+    // The leading bound binds the first key a second time, in text order.
+    assert_eq!(ctx.binds.len(), 3);
+    assert!(matches!(
+        (&ctx.binds[0], &ctx.binds[1]),
+        (SqlBind::DateTime64Micros(a), SqlBind::DateTime64Micros(b)) if a == b
+    ));
+    assert!(matches!(ctx.binds[2], SqlBind::Uuid(_)));
+}
+
+/// The leading bound is what the primary index can prune on: `ClickHouse`'s key
+/// analysis derives no range from a tuple comparison, so without it every deep
+/// page rescans the window from its start. It is implied by the tuple, so the
+/// result set is unchanged.
+#[test]
+fn keyset_predicate_leads_with_an_index_usable_bound_on_the_first_column() {
+    let mut ctx = SqlCtx::new();
+    let predicate = keyset_predicate(
+        &[("created_at", true), ("id", true)],
+        &[
+            "2026-08-10T11:00:00Z".to_owned(),
+            uuid::Uuid::from_u128(0x1).to_string(),
+        ],
+        record_column,
+        rec_kind,
+        rec_keyset_safe,
+        &mut ctx,
+    )
+    .unwrap();
+    let (bound, tuple) = predicate
+        .split_once(" AND ")
+        .expect("bound and tuple are two conjuncts");
+    assert_eq!(bound, "created_at >= fromUnixTimestamp64Micro(?)");
+    assert_eq!(tuple, "(created_at, id) > (fromUnixTimestamp64Micro(?), ?)");
+    assert!(
+        !bound.contains("id"),
+        "only the first ordering column carries the bound"
+    );
+}
+
+/// A failed key conversion must leave the caller's bind list untouched, or the
+/// binds already pushed would shift every later `?` in the statement.
+#[test]
+fn keyset_predicate_pushes_no_binds_when_a_key_fails_to_parse() {
+    let mut ctx = SqlCtx::new();
+    let err = keyset_predicate(
+        &[("created_at", true), ("id", true)],
+        &["2026-08-10T11:00:00Z".to_owned(), "not-a-uuid".to_owned()],
+        record_column,
+        rec_kind,
+        rec_keyset_safe,
+        &mut ctx,
+    )
+    .unwrap_err();
+    assert!(err.contains("invalid uuid cursor key"), "{err}");
+    assert!(ctx.binds.is_empty(), "no partial binds: {:?}", ctx.binds);
 }
 
 #[test]
@@ -169,7 +223,11 @@ fn keyset_predicate_descending_uses_less_than() {
         &mut ctx,
     )
     .unwrap();
-    assert_eq!(sql, "(created_at, id) < (fromUnixTimestamp64Micro(?), ?)");
+    assert_eq!(
+        sql,
+        "created_at <= fromUnixTimestamp64Micro(?) AND (created_at, id) < (fromUnixTimestamp64Micro(?), ?)"
+    );
+    assert_eq!(ctx.binds.len(), 3);
 }
 
 #[test]

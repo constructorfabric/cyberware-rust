@@ -24,18 +24,12 @@ clickhouse = []
 usage-collector-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
 types-registry = { workspace = true }
-cluster-sdk = { workspace = true }
-# Linked so `#[toolkit::gear(deps = [..., cluster])]` can resolve the gear crate;
-# also provides CasBasedDistributedLockBackend for tests via the same path dep.
-cluster = { workspace = true }
 
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-odata = { workspace = true }
 
 async-trait = { workspace = true }
-# `join_all` for the concurrent per-`gts_id` partition phase of create_batch.
-futures = { workspace = true }
 
 clickhouse = { workspace = true }
 url = { workspace = true }
@@ -59,7 +53,6 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
-xxhash-rust = { workspace = true }
 
 # Required by the toolkit::gear macro
 inventory = { workspace = true }
@@ -72,7 +65,5 @@ testcontainers = { workspace = true }
 # In-memory metric reader for the metrics-recording unit tests; the `testing`
 # feature gates `InMemoryMetricExporter`.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
-# CasBasedDistributedLockBackend + StandaloneCache for lock-manager unit / integration tests.
-cf-gears-standalone-cluster-plugin = { path = "../../../cluster/plugins/standalone-cluster-plugin" }
 # Non-human-readable serde for `ch_uuid` / `ch_decimal128_9` binary-path unit tests.
 postcard = { workspace = true }

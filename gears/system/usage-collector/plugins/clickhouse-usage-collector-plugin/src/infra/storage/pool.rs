@@ -1,10 +1,15 @@
 //! `ClickHouse` connection-pool bootstrap and schema migration.
 //!
-//! Exposes three public entry points:
+//! Exposes five entry points:
 //! - [`build_client`] — constructs and configures the `clickhouse::Client`.
+//! - `configure_insert` — applies this plugin's per-`INSERT` timeouts and
+//!   settings (including the insert dedup token) to a freshly acquired
+//!   `Insert` handle.
 //! - [`apply_migrations`] — runs the embedded DDL against the connected
 //!   `ClickHouse` instance.
 //! - [`ensure_retention_ttl`] — reconciles `usage_records` TTL with config.
+//! - [`ensure_insert_dedup_window`] — retrofits the `usage_records` insert
+//!   dedup window onto tables created before the migration carried it.
 
 use std::time::Duration;
 
@@ -120,6 +125,10 @@ pub(crate) const DEFAULT_RETENTION_SECS: u64 = 365 * 86_400;
 /// `send_timeout` and `receive_timeout` (both bound to
 /// `cfg.request_timeout_secs`).  The `clickhouse` 0.15.x `Client` is a
 /// lightweight handle over an internal `hyper` connection pool.
+///
+/// Settings attached here ride on **every** request this client makes,
+/// `SELECT`s included. Settings that must apply to writes only are attached
+/// per-statement by `configure_insert` instead.
 pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
     let url = cfg.database_url.expose();
 
@@ -183,6 +192,65 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
     }
 
     client
+}
+
+/// Apply this plugin's per-`INSERT` `ClickHouse` configuration to a freshly
+/// acquired `Insert` handle.
+///
+/// The single place all three insert sites (`record_store`'s single-row and
+/// batch writes, `catalog_store`'s type write) go through, so a change to
+/// insert-time timeouts or settings cannot land on two of the three.
+///
+/// * **Timeouts** — `with_timeouts` bounds the subsequent `write` / `end`
+///   awaits natively (yielding `ChError::TimedOut`, already classified
+///   retryable), which the crate documents as far cheaper than wrapping each
+///   of them in `tokio::time::timeout`.
+/// * **`async_insert`** — when `async_insert` is `true`, `async_insert = 1`
+///   plus `wait_for_async_insert = 1` plus `async_insert_deduplicate = 1`. Set
+///   here, on the `Insert`'s own cloned client, rather than on the shared
+///   `Client` in [`build_client`]: that client also serves every `SELECT` —
+///   including the table-metadata read the crate issues inside
+///   `Client::insert` when validation is on — and `async_insert` on a read is
+///   at best noise. See [`crate::config::ClickHousePluginConfig::async_insert`]
+///   for why `wait_for_async_insert` is pinned to `1` rather than exposed.
+/// * **`dedup_token`** — when `Some`, sent as `insert_deduplication_token`, so
+///   the engine drops the inserted block if a block with the same token landed
+///   within the table's dedup window (`non_replicated_deduplication_window`,
+///   see [`ensure_insert_dedup_window`]). Enforced on synchronous inserts. On
+///   asynchronous inserts it is enforced only for `Replicated*` tables (which
+///   is what `async_insert_deduplicate = 1` requests, and why it is set — it
+///   is accepted and inert on the shipped non-replicated engine); the token
+///   is still carried so the same call site is correct on either engine.
+///
+/// `with_setting` rather than the crate's `with_option`: the latter is
+/// `#[deprecated(since = "0.14.3")]`, and the workspace lints deprecation.
+///
+/// # Panics
+///
+/// The `clickhouse` crate panics if a setting is changed after the request has
+/// started, i.e. after the first `write`. Call this on the handle
+/// `Client::insert` returned, before any `write` — which is what every call
+/// site does.
+///
+/// No `#[must_use]` of its own: `clickhouse::insert::Insert` already carries
+/// one, so dropping the return value is caught either way.
+pub(crate) fn configure_insert<T>(
+    insert: clickhouse::insert::Insert<T>,
+    request_timeout: Duration,
+    async_insert: bool,
+    dedup_token: Option<&str>,
+) -> clickhouse::insert::Insert<T> {
+    let mut insert = insert.with_timeouts(Some(request_timeout), Some(request_timeout));
+    if async_insert {
+        insert = insert
+            .with_setting("async_insert", "1")
+            .with_setting("wait_for_async_insert", "1")
+            .with_setting("async_insert_deduplicate", "1");
+    }
+    if let Some(token) = dedup_token {
+        insert = insert.with_setting("insert_deduplication_token", token);
+    }
+    insert
 }
 
 /// Strip `--` SQL comments, returning only the executable source.
@@ -397,6 +465,47 @@ fn ttl_uses_todatetime_cast(create_table_query: &str) -> bool {
     create_table_query.contains("toDateTime(created_at)")
 }
 
+/// Upper bound on the span of one `usage_records` partition, in seconds.
+///
+/// The table is `PARTITION BY toYYYYMM(created_at)`, so a partition covers one
+/// calendar month — 31 days at most.
+const PARTITION_SPAN_SECS: u64 = 31 * 86_400;
+
+/// Retention below which the whole-partition TTL mode is worth warning about.
+///
+/// Two partition spans: at or above it the overshoot below is a small fraction
+/// of the window, under it the overshoot is comparable to the window itself.
+const SHORT_RETENTION_WARN_SECS: u64 = 2 * PARTITION_SPAN_SECS;
+
+/// Whether whole-partition TTL expiry materially overshoots `retention_period_secs`.
+///
+/// `usage_records` is provisioned `SETTINGS ttl_only_drop_parts = 1`, so TTL
+/// drops a partition once every row in it has expired rather than rewriting
+/// parts to delete rows individually. A row therefore lives for
+/// `retention_period_secs` **plus** up to the remaining span of its own
+/// partition. Against the 1-year default that is a few percent; against a
+/// one-week window it is several multiples, which an operator reading only
+/// `retention_period_secs` would not expect.
+pub(crate) fn retention_overshoots_partition(retention_period_secs: u64) -> bool {
+    retention_period_secs < SHORT_RETENTION_WARN_SECS
+}
+
+/// Log [`retention_overshoots_partition`] once per `init`.
+///
+/// Advisory only: the DDL cannot adapt, because `PARTITION BY` is fixed at
+/// `CREATE TABLE` while retention is configuration.
+fn warn_on_short_retention(retention_period_secs: u64) {
+    if retention_overshoots_partition(retention_period_secs) {
+        tracing::warn!(
+            retention_period_secs,
+            partition_span_secs = PARTITION_SPAN_SECS,
+            "configured retention is shorter than two usage_records partitions; expiry drops \
+             whole monthly partitions (ttl_only_drop_parts = 1), so a row can outlive the \
+             configured window by up to one partition span"
+        );
+    }
+}
+
 /// Reconcile `usage_records` TTL with the configured retention window.
 ///
 /// Reads the live `create_table_query` from `system.tables`. When the table
@@ -417,24 +526,9 @@ pub async fn ensure_retention_ttl(
     retention_period_secs: u64,
     deadline: Duration,
 ) -> anyhow::Result<()> {
-    let create_sql: String = tokio::time::timeout(
-        deadline,
-        client
-            .query(
-                "SELECT create_table_query \
-                 FROM system.tables \
-                 WHERE database = currentDatabase() AND name = 'usage_records'",
-            )
-            .fetch_one::<String>(),
-    )
-    .await
-    .map_err(|_elapsed| {
-        anyhow::anyhow!(
-            "reading usage_records create_table_query exceeded the {}s client-side deadline",
-            deadline.as_secs()
-        )
-    })?
-    .context("failed to read usage_records create_table_query from system.tables")?;
+    let create_sql = read_records_create_sql(client, deadline).await?;
+
+    warn_on_short_retention(retention_period_secs);
 
     let current = parse_ttl_seconds(&create_sql);
     if current == Some(retention_period_secs) && !ttl_uses_todatetime_cast(&create_sql) {
@@ -463,6 +557,105 @@ pub async fn ensure_retention_ttl(
             )
         })?
         .with_context(|| format!("failed to apply retention TTL:\n{alter}"))?;
+
+    Ok(())
+}
+
+/// Number of recent inserted blocks `usage_records` deduplicates
+/// `insert_deduplication_token`s against (`non_replicated_deduplication_window`).
+///
+/// Each synchronous single-record create is one block; each batch or marker
+/// statement is one block per `toYYYYMM` partition it touches. The window only
+/// has to outlast the race it guards — two retries of one write milliseconds
+/// apart — so 10 000 blocks is ample headroom rather than a retention horizon.
+/// The value in `migrations/0001_init.sql` must match; `pool_tests` pins it.
+pub(crate) const INSERT_DEDUP_WINDOW_BLOCKS: u64 = 10_000;
+
+/// Read the live `create_table_query` of `usage_records` from `system.tables`.
+///
+/// Shared by [`ensure_retention_ttl`] and [`ensure_insert_dedup_window`], both
+/// of which reconcile a table-level setting by parsing this text.
+async fn read_records_create_sql(
+    client: &clickhouse::Client,
+    deadline: Duration,
+) -> anyhow::Result<String> {
+    tokio::time::timeout(
+        deadline,
+        client
+            .query(
+                "SELECT create_table_query \
+                 FROM system.tables \
+                 WHERE database = currentDatabase() AND name = 'usage_records'",
+            )
+            .fetch_one::<String>(),
+    )
+    .await
+    .map_err(|_elapsed| {
+        anyhow::anyhow!(
+            "reading usage_records create_table_query exceeded the {}s client-side deadline",
+            deadline.as_secs()
+        )
+    })?
+    .context("failed to read usage_records create_table_query from system.tables")
+}
+
+/// Parse `non_replicated_deduplication_window` from a `CREATE TABLE` /
+/// `create_table_query` string; `None` when the setting is absent.
+pub(crate) fn parse_dedup_window(create_table_query: &str) -> Option<u64> {
+    extract_u64_after(create_table_query, "non_replicated_deduplication_window = ")
+}
+
+/// Reconcile the `usage_records` insert dedup window with
+/// [`INSERT_DEDUP_WINDOW_BLOCKS`].
+///
+/// The migration's `CREATE TABLE IF NOT EXISTS` carries the setting for fresh
+/// deployments but cannot retrofit a table created before it did, so this
+/// reads the live `create_table_query` and issues
+/// `ALTER TABLE usage_records MODIFY SETTING non_replicated_deduplication_window = <n>`
+/// when the live value differs. `MODIFY SETTING` is metadata-only and safe to
+/// repeat; the read keeps startup silent when nothing changes — the same
+/// posture as [`ensure_retention_ttl`].
+///
+/// On a table an operator provisioned as `Replicated*`, the setting is
+/// accepted but inert (`replicated_deduplication_window` governs instead), so
+/// this is harmless there.
+///
+/// # Errors
+///
+/// Returns an error if the table is missing, either statement fails, or either
+/// exceeds `deadline`.
+pub async fn ensure_insert_dedup_window(
+    client: &clickhouse::Client,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    let create_sql = read_records_create_sql(client, deadline).await?;
+    let current = parse_dedup_window(&create_sql);
+    if current == Some(INSERT_DEDUP_WINDOW_BLOCKS) {
+        tracing::debug!(
+            window_blocks = INSERT_DEDUP_WINDOW_BLOCKS,
+            "usage_records insert dedup window already set"
+        );
+        return Ok(());
+    }
+
+    let alter = format!(
+        "ALTER TABLE usage_records MODIFY SETTING \
+         non_replicated_deduplication_window = {INSERT_DEDUP_WINDOW_BLOCKS}"
+    );
+    tracing::info!(
+        previous = ?current,
+        window_blocks = INSERT_DEDUP_WINDOW_BLOCKS,
+        "setting usage_records insert dedup window"
+    );
+    tokio::time::timeout(deadline, client.query(&alter).execute())
+        .await
+        .map_err(|_elapsed| {
+            anyhow::anyhow!(
+                "insert dedup window alter exceeded the {}s client-side deadline:\n{alter}",
+                deadline.as_secs()
+            )
+        })?
+        .with_context(|| format!("failed to apply insert dedup window:\n{alter}"))?;
 
     Ok(())
 }

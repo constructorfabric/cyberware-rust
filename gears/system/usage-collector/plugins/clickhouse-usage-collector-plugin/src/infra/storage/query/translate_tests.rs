@@ -51,6 +51,47 @@ fn in_list_yields_correct_placeholders() {
     assert_eq!(ctx.binds.len(), 2);
 }
 
+/// A one-element `IN` is an equality. The gateway's authorization scope sends
+/// `tenant_id in (<one tenant>)` on every request, and only an equality lets
+/// `ClickHouse` treat the sorting-key prefix as fixed — which is what makes the
+/// list read in key order and stop at its `LIMIT` (measured ~11x fewer rows).
+#[test]
+fn single_element_in_list_is_emitted_as_an_equality() {
+    let field = <UsageRecordFilterField as FilterField>::from_name("tenant_id").unwrap();
+    let tenant = uuid::Uuid::from_u128(0xA0);
+    let node: FilterNode<UsageRecordFilterField> = FilterNode::InList {
+        field,
+        values: vec![ODataValue::Uuid(tenant)],
+    };
+
+    let mut ctx = SqlCtx::new();
+    let frag = translate_record_filter(&node, &mut ctx).unwrap();
+    assert_eq!(
+        frag, "tenant_id = ?",
+        "one value must not render as `IN (?)`"
+    );
+    assert_eq!(ctx.binds.len(), 1);
+    assert!(matches!(ctx.binds[0], SqlBind::Uuid(u) if u == tenant));
+}
+
+/// The equality rewrite keeps the bind's own placeholder shape, so a
+/// `DateTime64` value still goes through `fromUnixTimestamp64Micro(?)`.
+#[test]
+fn single_element_in_list_keeps_the_typed_placeholder() {
+    let field = <UsageRecordFilterField as FilterField>::from_name("created_at").unwrap();
+    let node: FilterNode<UsageRecordFilterField> = FilterNode::InList {
+        field,
+        values: vec![ODataValue::DateTime(
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        )],
+    };
+
+    let mut ctx = SqlCtx::new();
+    let frag = translate_record_filter(&node, &mut ctx).unwrap();
+    assert_eq!(frag, "created_at = fromUnixTimestamp64Micro(?)");
+    assert_eq!(ctx.binds.len(), 1);
+}
+
 #[test]
 fn unknown_field_is_rejected() {
     // Build a binary node for a field not in the allowlist.

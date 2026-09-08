@@ -1,33 +1,26 @@
 //! `ClickHouse`-backed [`CatalogStore`] over the `usage_type_catalog` table.
 //!
-//! Implements `create` / `get` / `list` / `delete` against `ClickHouse` using
-//! the `clickhouse` 0.15.x crate. All reads include `FINAL` so a row's
-//! `ReplacingMergeTree(version)`-resolved state (the highest-version physical
-//! copy) is what every read observes. Deletion is a real row removal via a
-//! lightweight `DELETE FROM usage_type_catalog WHERE gts_id = ?` — never
-//! `ALTER TABLE … DELETE`, which is an asynchronous background mutation
-//! unsuitable for the request path. The statement sets
-//! `lightweight_deletes_sync = 2` itself rather than inheriting the server
-//! default, which is what makes a deleted row absent from every subsequent
-//! query, with no tombstone flag or versioned marker required to represent
-//! "deleted".
+//! Implements `create` / `get` / `list` against `ClickHouse` using the
+//! `clickhouse` 0.15.x crate. Every read resolves
+//! `ReplacingMergeTree(version)` explicitly in SQL — `ORDER BY version DESC`
+//! plus `LIMIT 1 [BY gts_id]`, see [`query::dedup`] — so the highest-version
+//! physical copy is what every read observes, without `FINAL`'s merge-on-read
+//! cost.
 //!
-//! `delete` acquires an exclusive per-`gts_id` coordination lock via
-//! [`CatalogLockPort`], runs an authoritative bounded reference-count probe
-//! under the lock, renews the lock lease immediately before the `DELETE`
-//! (`ensure_still_held`), and issues the `DELETE` only when no references
-//! exist. No rollback step exists; the exclusive lock closes the
-//! referential-integrity race entirely (DESIGN.md §3.6).
+//! There is no coordination primitive: `create` is a plain version-resolved
+//! pre-existence read followed by an `INSERT`. Two concurrent creates for the
+//! same `gts_id` can both pass the read and both insert; `ReplacingMergeTree`
+//! then converges the physical rows to the one with the highest `version`
+//! (epoch microseconds at compose time), so the catalog is last-writer-wins
+//! inside that window and neither caller observes `UsageTypeAlreadyExists`.
+//! Outside the window the loser sees the winner's row and gets either a
+//! silent absorb (identical payload) or `UsageTypeAlreadyExists`.
 //!
-//! The referential-integrity guarantee is unconditional: no
-//! `create_usage_record`/`create_usage_records` call can insert a row for
-//! this `gts_id` while the exclusive lock is held, so the reference-count
-//! probe observes every committed reference with no residual window
-//! (DESIGN.md §3.6 step 6 "No residual race"). `ensure_still_held` is a
-//! lock-lease renewal guard against TTL expiry during the critical section
-//! — an operational safeguard, not a referential-integrity closure
-//! mechanism; if it fails the `DELETE` is aborted with `Transient` so the
-//! write is never issued past a detected lease expiry.
+//! `delete` is **not implemented** by this backend: `ClickHouse` has no
+//! foreign keys and this plugin has no mutual-exclusion primitive, so a
+//! delete could not be ordered against concurrent record inserts referencing
+//! the type. Usage types are therefore append-only here, and `delete` returns
+//! [`UsageCollectorPluginError::Internal`] without issuing any SQL.
 //!
 //! A single background refresh worker tracks the live catalog count via the
 //! `uc_clickhouse_usage_type_catalog_size` gauge.
@@ -48,11 +41,12 @@ use usage_collector_sdk::{
 };
 
 use crate::domain::ports::CatalogStore;
-use crate::infra::coordination::lock_manager::LockGuardPort;
-use crate::infra::metrics::{LockMode, Metrics};
+use crate::infra::metrics::Metrics;
 use crate::infra::storage::entity::{UsageTypeKindCode, UsageTypeRow};
 use crate::infra::storage::error::{tracked_ch_err, with_deadline};
 use crate::infra::storage::mapper::current_merge_version;
+use crate::infra::storage::pool::configure_insert;
+use crate::infra::storage::query::dedup::{LATEST_ONE, latest_by};
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate,
 };
@@ -69,14 +63,12 @@ use crate::infra::storage::query::{DEFAULT_PAGE_SIZE, effective_page_size};
 /// positional without SQL injection risk.
 const TYPE_COLUMNS: &str = "gts_id, kind, metadata_fields, version";
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-
-/// Upper bound on the reference probe inside `delete`.
+/// Message carried by the `Internal` error `delete` returns.
 ///
-/// The SPI declares `sample_ref_count` a bounded, plugin-tunable value;
-/// `REF_COUNT_CAP` caps the sub-query `LIMIT` so the probe never full-scans
-/// `usage_records`.
-const REF_COUNT_CAP: i64 = 1000;
+/// Surfaced through the host's error chain as an HTTP 500; the wording is
+/// stable so operators can grep for it.
+pub const DELETE_UNIMPLEMENTED_MSG: &str =
+    "delete_usage_type is not implemented by the ClickHouse plugin";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -88,9 +80,6 @@ fn gts_id_asc_order() -> ODataOrderBy {
         dir: SortDir::Asc,
     }])
 }
-
-// Re-export so catalog unit tests can keep `use super::CatalogLockPort`.
-pub use crate::infra::coordination::lock_manager::CatalogLockPort;
 
 // ── RefreshOutcome ────────────────────────────────────────────────────────────
 
@@ -114,7 +103,6 @@ enum RefreshOutcome {
 #[derive(Clone)]
 pub struct ChCatalogStore {
     client: clickhouse::Client,
-    lock_manager: Arc<dyn CatalogLockPort>,
     metrics: Arc<Metrics>,
     /// Client-side deadline applied to every individual `ClickHouse` await.
     request_timeout: Duration,
@@ -139,8 +127,8 @@ impl std::fmt::Debug for ChCatalogStore {
 }
 
 impl ChCatalogStore {
-    /// Build a store from an existing `ClickHouse` client, lock port, and
-    /// metric inventory, then spawn the single background catalog-size refresh
+    /// Build a store from an existing `ClickHouse` client and metric
+    /// inventory, then spawn the single background catalog-size refresh
     /// worker.
     ///
     /// `cancel` is the gear's cancellation token
@@ -158,14 +146,12 @@ impl ChCatalogStore {
     #[must_use]
     pub fn new(
         client: clickhouse::Client,
-        lock_manager: Arc<dyn CatalogLockPort>,
         cancel: CancellationToken,
         metrics: Arc<Metrics>,
         request_timeout: Duration,
     ) -> Self {
         let store = Self {
             client,
-            lock_manager,
             metrics,
             request_timeout,
             cancel,
@@ -180,8 +166,8 @@ impl ChCatalogStore {
     /// Signal the background worker to run a catalog-size refresh off the
     /// request path.
     ///
-    /// `notify_one` coalesces a burst of concurrent `create` / `delete` calls
-    /// into at most one queued refresh — never one `count()` per mutation.
+    /// `notify_one` coalesces a burst of concurrent `create` calls into at
+    /// most one queued refresh — never one `count()` per mutation.
     fn request_catalog_size_refresh(&self) {
         self.refresh_signal.notify_one();
     }
@@ -222,14 +208,20 @@ impl ChCatalogStore {
         }
     }
 
-    /// Run a `SELECT count() FROM usage_type_catalog FINAL` and report the
-    /// result to the `uc_clickhouse_usage_type_catalog_size` gauge.
+    /// Count the distinct usage types and report the result to the
+    /// `uc_clickhouse_usage_type_catalog_size` gauge.
+    ///
+    /// `uniqExact(gts_id)` rather than `count()`: `gts_id` *is* the table's
+    /// whole sort key, so counting rows would count each unmerged duplicate
+    /// copy of a type separately and overstate the gauge. `uniqExact` is a
+    /// scan of one column with no merge-on-read, and this runs off the request
+    /// path on a small table.
     async fn refresh_catalog_size(&self) {
         #[cfg(test)]
         self.refresh_runs
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-        let sql = "SELECT count() FROM usage_type_catalog FINAL";
+        let sql = "SELECT uniqExact(gts_id) FROM usage_type_catalog";
         // Bounded with a bare `timeout` rather than `with_deadline`: a stalled
         // gauge refresh is not a request-path backend error, so it stays out of
         // the backend-error counter and is only logged.
@@ -257,14 +249,29 @@ impl ChCatalogStore {
     /// INSERT a single `UsageTypeRow` into `usage_type_catalog`.
     async fn insert_type_row(&self, row: &UsageTypeRow) -> Result<(), UsageCollectorPluginError> {
         let pool_start = std::time::Instant::now();
-        // `with_timeouts` bounds the `write` / `end` awaits below natively.
-        let mut insert = with_deadline(
-            &self.metrics,
+        let mut insert = configure_insert(
+            with_deadline(
+                &self.metrics,
+                self.request_timeout,
+                self.client.insert::<UsageTypeRow>("usage_type_catalog"),
+            )
+            .await?,
             self.request_timeout,
-            self.client.insert::<UsageTypeRow>("usage_type_catalog"),
-        )
-        .await?
-        .with_timeouts(Some(self.request_timeout), Some(self.request_timeout));
+            // Deliberately synchronous, independent of the record store's
+            // `async_insert` setting, and therefore a literal rather than a
+            // config-threaded field. `usage_type_catalog` is a control-plane
+            // table: writes come only from `create_usage_type`, types are never
+            // deleted, and the table is unpartitioned and tiny — so there is no
+            // concurrent insert stream for the server-side buffer to coalesce
+            // and no part count to reduce. Enabling it would add the
+            // buffer-flush wait to a request whose latency is directly
+            // observed, for nothing.
+            false,
+            // No insert dedup token: the catalog has no dedup window, and the
+            // create-type race it would guard is already resolved by the
+            // `ReplacingMergeTree` version on this table (see the module docs).
+            None,
+        );
         self.metrics
             .record_pool_acquire(pool_start.elapsed().as_secs_f64());
         insert
@@ -283,35 +290,85 @@ impl ChCatalogStore {
 #[async_trait]
 impl CatalogStore for ChCatalogStore {
     // @cpt-flow:cpt-cf-uc-ch-plugin-seq-create-type
-    /// Create a usage type under the exclusive per-`gts_id` coordination lock.
+    /// Create a usage type: version-resolved pre-existence read, then `INSERT`.
     ///
-    /// The lock is the same exclusive mutex `delete` and record ingest take,
-    /// so the pre-existence check and the `INSERT` are one atomic critical
-    /// section: two concurrent creates for the same `gts_id` serialize and the
-    /// loser observes the winner's row, returning either a silent absorb (same
-    /// payload) or [`UsageCollectorPluginError::UsageTypeAlreadyExists`].
+    /// The two statements are not one atomic section. Two concurrent creates
+    /// for the same `gts_id` can both pass the read and both insert; the
+    /// higher `version` (epoch microseconds) wins on both merge and read-time
+    /// resolution, so the
+    /// catalog converges to the later writer's payload and both callers get
+    /// `Ok`. Once the winner's row is visible, a later create sees it and
+    /// returns either a silent absorb (same payload) or
+    /// [`UsageCollectorPluginError::UsageTypeAlreadyExists`].
     async fn create(&self, usage_type: UsageType) -> Result<UsageType, UsageCollectorPluginError> {
-        let exclusive_guard = self
-            .lock_manager
-            .acquire_exclusive_for_create(usage_type.gts_id.as_ref())
-            .await?;
+        let gts_id_raw = usage_type.gts_id.as_ref().to_owned();
 
-        let result = self
-            .create_under_lock(usage_type, exclusive_guard.as_ref())
-            .await;
+        // 1. Pre-existence check: version-resolved read WHERE gts_id = ?.
+        // `gts_id` is the entire sort key, so the `WHERE` pins one logical row
+        // and a bare `LIMIT 1` over `version DESC` is the resolved copy.
+        let sql =
+            format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog WHERE gts_id = ?{LATEST_ONE}");
+        let existing: Option<UsageTypeRow> = {
+            with_deadline(
+                &self.metrics,
+                self.request_timeout,
+                self.client
+                    .query(&sql)
+                    .bind(gts_id_raw.as_str())
+                    .fetch_optional::<UsageTypeRow>(),
+            )
+            .await?
+        };
 
-        if let Err(e) = exclusive_guard.release().await {
-            tracing::warn!(error = %e, "failed to release catalog-create cluster lock");
-            if result.is_ok() {
-                return Err(e);
-            }
+        if let Some(row) = existing {
+            // 2-3. Compare kind and metadata_fields for idempotency absorb vs conflict.
+            let same_kind = row.kind == UsageTypeKindCode::from(usage_type.kind);
+            // BTreeSet<MetadataKey> is already sorted; compare against sorted stored Vec.
+            let mut stored_sorted = row.metadata_fields.clone();
+            stored_sorted.sort_unstable();
+            let incoming_sorted: Vec<String> = usage_type
+                .metadata_fields
+                .iter()
+                .map(|k| k.as_str().to_owned())
+                .collect();
+            return if same_kind && stored_sorted == incoming_sorted {
+                // Same payload already stored — silent absorb (SPI idempotency rule).
+                UsageType::try_from(row)
+            } else {
+                Err(UsageCollectorPluginError::UsageTypeAlreadyExists {
+                    gts_id: usage_type.gts_id,
+                })
+            };
         }
 
-        result
+        // 4. Absent → INSERT.
+        //
+        // Version scheme: epoch microseconds from `current_merge_version()` (the
+        // same helper Record Store uses for usage_records). Nothing serialises
+        // creates for one `gts_id`, so the version is what orders two racing
+        // inserts: read-time resolution keeps the higher one. Types are never
+        // deleted, so there is no earlier row a re-create would have to
+        // outrank.
+        let row = UsageTypeRow {
+            gts_id: gts_id_raw,
+            kind: usage_type.kind.into(),
+            metadata_fields: usage_type
+                .metadata_fields
+                .iter()
+                .map(|k| k.as_str().to_owned())
+                .collect(),
+            version: current_merge_version(),
+        };
+        self.insert_type_row(&row).await?;
+
+        // 5. Signal catalog-size refresh off the request path.
+        self.request_catalog_size_refresh();
+        Ok(usage_type)
     }
 
     async fn get(&self, gts_id: UsageTypeGtsId) -> Result<UsageType, UsageCollectorPluginError> {
-        let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
+        let sql =
+            format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog WHERE gts_id = ?{LATEST_ONE}");
         let row: Option<UsageTypeRow> = with_deadline(
             &self.metrics,
             self.request_timeout,
@@ -331,8 +388,20 @@ impl CatalogStore for ChCatalogStore {
     /// Keyset-paginated `usage_type_catalog` list, fixed-ordered by `gts_id`
     /// ascending. `query.order` is ignored (the catalog has one stable order).
     ///
-    /// All reads are `FINAL`-qualified. The extra look-ahead row detects a
-    /// following page without a separate `count(*)`.
+    /// Version resolution happens in an inner subquery and every caller
+    /// predicate is applied *outside* it. `kind` is both filterable and
+    /// keyset-safe, and two racing creates for one `gts_id` can store
+    /// different `kind`s under different `version`s, so a `kind` predicate
+    /// evaluated before resolution could retain a superseded row and hide the
+    /// winning one. Filtering after resolution avoids having to prove which
+    /// half of an opaque translated fragment is version-invariant, and keeps
+    /// the bind order identical to the emitted `?` order. The inner scan is a
+    /// whole-table dedup, which is affordable here precisely because the
+    /// catalog is small — the `uc_clickhouse_usage_type_catalog_size` gauge
+    /// tracks that assumption.
+    ///
+    /// The extra look-ahead row detects a following page without a separate
+    /// `count(*)`.
     async fn list(
         &self,
         query: &ODataQuery,
@@ -390,8 +459,12 @@ impl CatalogStore for ChCatalogStore {
         } else {
             format!("WHERE {} ", clauses.join(" AND "))
         };
+        // The inner query carries no caller predicate, so every `?` in the
+        // emitted text still comes from `where_clause` in `ctx` push order.
+        let resolve_latest = latest_by(&["gts_id"]);
         let sql = format!(
-            "SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL \
+            "SELECT {TYPE_COLUMNS} FROM \
+             (SELECT {TYPE_COLUMNS} FROM usage_type_catalog{resolve_latest}) \
              {where_clause}ORDER BY gts_id ASC LIMIT {}",
             limit.saturating_add(1),
         );
@@ -441,181 +514,23 @@ impl CatalogStore for ChCatalogStore {
     }
 
     // @cpt-flow:cpt-cf-uc-ch-plugin-seq-delete-type
-    // @cpt-constraint:cpt-cf-uc-ch-plugin-constraint-gts-lock-required
-    /// Delete a usage type by a real row removal under an exclusive lock.
+    /// Deleting a usage type is not implemented by this backend.
     ///
-    /// Follows DESIGN.md §3.6 "Delete Usage Type — Lock-Protected Verify".
-    /// The exclusive lock makes the reference-count probe authoritative.
-    ///
-    /// **Lease renew**: `ensure_still_held` (cluster `renew`) runs after the
-    /// reference probe and before the `DELETE`. Cluster lock drop is a no-op —
-    /// the lock is always released explicitly after the critical section.
+    /// `ClickHouse` has no foreign keys and this plugin has no mutual-exclusion
+    /// primitive, so a delete could not be ordered against concurrent
+    /// `create_usage_record(s)` calls referencing the same `gts_id` — any
+    /// reference-count check would be racy and a removed type could acquire
+    /// orphaned records. Usage types are append-only here. This returns
+    /// [`UsageCollectorPluginError::Internal`] with
+    /// [`DELETE_UNIMPLEMENTED_MSG`] and issues no SQL.
     async fn delete(&self, gts_id: UsageTypeGtsId) -> Result<(), UsageCollectorPluginError> {
-        let exclusive_guard = self
-            .lock_manager
-            .acquire_exclusive_for_delete(gts_id.as_ref())
-            .await?;
-
-        let result = self
-            .delete_under_lock(&gts_id, exclusive_guard.as_ref())
-            .await;
-
-        if let Err(e) = exclusive_guard.release().await {
-            tracing::warn!(error = %e, "failed to release catalog-delete cluster lock");
-            if result.is_ok() {
-                return Err(e);
-            }
-        }
-
-        result
-    }
-}
-
-impl ChCatalogStore {
-    /// Critical section of create while holding `exclusive_guard`.
-    async fn create_under_lock(
-        &self,
-        usage_type: UsageType,
-        exclusive_guard: &dyn LockGuardPort,
-    ) -> Result<UsageType, UsageCollectorPluginError> {
-        let gts_id_raw = usage_type.gts_id.as_ref().to_owned();
-
-        // 1. Pre-existence check: SELECT FINAL WHERE gts_id = ?.
-        let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let existing: Option<UsageTypeRow> = with_deadline(
-            &self.metrics,
-            self.request_timeout,
-            self.client
-                .query(&sql)
-                .bind(gts_id_raw.as_str())
-                .fetch_optional::<UsageTypeRow>(),
-        )
-        .await?;
-
-        if let Some(row) = existing {
-            // 2-3. Compare kind and metadata_fields for idempotency absorb vs conflict.
-            let same_kind = row.kind == UsageTypeKindCode::from(usage_type.kind);
-            // BTreeSet<MetadataKey> is already sorted; compare against sorted stored Vec.
-            let mut stored_sorted = row.metadata_fields.clone();
-            stored_sorted.sort_unstable();
-            let incoming_sorted: Vec<String> = usage_type
-                .metadata_fields
-                .iter()
-                .map(|k| k.as_str().to_owned())
-                .collect();
-            return if same_kind && stored_sorted == incoming_sorted {
-                // Same payload already stored — silent absorb (SPI idempotency rule).
-                UsageType::try_from(row)
-            } else {
-                Err(UsageCollectorPluginError::UsageTypeAlreadyExists {
-                    gts_id: usage_type.gts_id,
-                })
-            };
-        }
-
-        if let Err(e) = exclusive_guard.ensure_still_held().await {
-            self.metrics.inc_lock_manager_unavailable(LockMode::Create);
-            return Err(e);
-        }
-
-        // 4. Absent → INSERT.
-        //
-        // Version scheme: epoch microseconds from `current_merge_version()` (the
-        // same helper Record Store uses for usage_records). The exclusive lock
-        // serialises creates for one `gts_id`, so the version only has to order
-        // an insert against a *previous* row; `ReplacingMergeTree(version)`
-        // FINAL resolution keeps the higher one. Deletion is a real row removal
-        // (lightweight `DELETE FROM`, see [`Self::delete`]), so a re-create
-        // after a delete never has to outrank a leftover tombstone row.
-        let row = UsageTypeRow {
-            gts_id: gts_id_raw,
-            kind: usage_type.kind.into(),
-            metadata_fields: usage_type
-                .metadata_fields
-                .iter()
-                .map(|k| k.as_str().to_owned())
-                .collect(),
-            version: current_merge_version(),
-        };
-        self.insert_type_row(&row).await?;
-
-        // 5. Signal catalog-size refresh off the request path.
-        self.request_catalog_size_refresh();
-        Ok(usage_type)
-    }
-
-    /// Critical section of delete while holding `exclusive_guard`.
-    async fn delete_under_lock(
-        &self,
-        gts_id: &UsageTypeGtsId,
-        exclusive_guard: &dyn LockGuardPort,
-    ) -> Result<(), UsageCollectorPluginError> {
-        let sql = format!("SELECT {TYPE_COLUMNS} FROM usage_type_catalog FINAL WHERE gts_id = ?");
-        let existing: Option<UsageTypeRow> = with_deadline(
-            &self.metrics,
-            self.request_timeout,
-            self.client
-                .query(&sql)
-                .bind(gts_id.as_ref())
-                .fetch_optional::<UsageTypeRow>(),
-        )
-        .await?;
-
-        if existing.is_none() {
-            return Err(UsageCollectorPluginError::UsageTypeNotFound {
-                gts_id: gts_id.clone(),
-            });
-        }
-
-        let ref_sql = "SELECT count() FROM (SELECT 1 FROM usage_records FINAL WHERE gts_id = ? LIMIT ?) \
-             AS sub_ref";
-        let ref_count: u64 = with_deadline(
-            &self.metrics,
-            self.request_timeout,
-            self.client
-                .query(ref_sql)
-                .bind(gts_id.as_ref())
-                .bind(REF_COUNT_CAP)
-                .fetch_one::<u64>(),
-        )
-        .await?;
-
-        if ref_count > 0 {
-            self.metrics.inc_usage_type_referenced();
-            return Err(UsageCollectorPluginError::UsageTypeReferenced {
-                gts_id: gts_id.clone(),
-                sample_ref_count: ref_count.max(1),
-            });
-        }
-
-        if let Err(e) = exclusive_guard.ensure_still_held().await {
-            self.metrics.inc_lock_manager_unavailable(LockMode::Delete);
-            return Err(e);
-        }
-
-        // `lightweight_deletes_sync = 2` is stated explicitly rather than
-        // inherited: the removal must be visible to the very next read, because
-        // a re-`create` for this `gts_id` decides absorb-vs-`UsageTypeAlreadyExists`
-        // from a `FINAL` pre-existence check (see `create_under_lock`), and
-        // `create_usage_record` decides `UsageTypeNotFound` the same way. The
-        // server-side default is not ours to rely on — ClickHouse Cloud ships
-        // `1` and a settings profile can ship `0`, which returns from `DELETE`
-        // before the row stops being visible. A query-level setting overrides
-        // both, at the cost of waiting for the mutation on every replica.
-        let delete_sql = "DELETE FROM usage_type_catalog WHERE gts_id = ?";
-        with_deadline(
-            &self.metrics,
-            self.request_timeout,
-            self.client
-                .query(delete_sql)
-                .with_setting("lightweight_deletes_sync", "2")
-                .bind(gts_id.as_ref())
-                .execute(),
-        )
-        .await?;
-
-        self.request_catalog_size_refresh();
-        Ok(())
+        tracing::warn!(
+            gts_id = %gts_id.as_ref(),
+            "delete_usage_type rejected: not implemented by the ClickHouse plugin"
+        );
+        Err(UsageCollectorPluginError::internal(
+            DELETE_UNIMPLEMENTED_MSG,
+        ))
     }
 }
 

@@ -6,11 +6,92 @@ fn config_defaults_are_applied() {
     assert_eq!(cfg.vendor, "cyberfabric");
     assert_eq!(cfg.priority, 10);
     assert_eq!(cfg.request_timeout_secs, 30);
-    assert_eq!(cfg.lock_ttl_secs, 60);
-    assert_eq!(cfg.lock_timeout_secs, 5);
     assert_eq!(cfg.retention_period_secs, 365 * 86_400);
     assert!(cfg.database_url.expose().is_empty());
     assert!(!cfg.allow_insecure_http);
+    assert!(
+        cfg.async_insert,
+        "async inserts are on by default: the write path is one INSERT per \
+         request, so without server-side coalescing a request-shaped ingest \
+         stream writes one small part per record"
+    );
+}
+
+/// The escape hatch must actually be reachable from config. `serde(default,
+/// deny_unknown_fields)` means a typo'd key hard-fails rather than silently
+/// leaving the default on, so this pins the field name as much as the wiring.
+#[test]
+fn async_insert_can_be_disabled_from_config() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "async_insert": false }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    assert!(!cfg.async_insert);
+    cfg.validate()
+        .expect("disabling async inserts is a valid configuration");
+}
+
+/// `wait_for_async_insert = 1` charges the server-side buffer flush against the
+/// request budget, so too small a budget turns every insert into an
+/// intermittent timeout that reads as backend flakiness. Failing at startup
+/// with both values named is strictly better.
+#[test]
+fn validate_rejects_a_request_timeout_too_small_for_async_insert() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 1 }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.async_insert,
+        "the default must be what is under test here"
+    );
+    let err = cfg
+        .validate()
+        .expect_err("a 1s budget cannot absorb the async-insert buffer flush");
+    assert!(
+        err.contains("request_timeout_secs = 1"),
+        "the error must name the offending value: {err}"
+    );
+    assert!(
+        err.contains("async_insert"),
+        "the error must name the other half of the invariant so an operator \
+         can act on either: {err}"
+    );
+}
+
+/// The floor is scoped to the interaction — it must not tighten
+/// `request_timeout_secs` for deployments that have opted out of async inserts.
+#[test]
+fn validate_accepts_a_small_request_timeout_when_async_insert_is_disabled() {
+    let json = r#"{
+        "database_url": "https://u:p@h/db",
+        "request_timeout_secs": 1,
+        "async_insert": false
+    }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    cfg.validate()
+        .expect("the async-insert floor must not apply when async inserts are off");
+}
+
+/// The boundary is inclusive: exactly the floor is accepted.
+#[test]
+fn validate_accepts_the_async_insert_timeout_floor() {
+    let json = format!(
+        r#"{{ "database_url": "https://u:p@h/db", "request_timeout_secs": {MIN_ASYNC_INSERT_TIMEOUT_SECS} }}"#
+    );
+    let cfg: ClickHousePluginConfig = serde_json::from_str(&json).unwrap();
+    assert!(cfg.async_insert);
+    cfg.validate()
+        .expect("request_timeout_secs exactly at the floor must be accepted");
+}
+
+/// A zero timeout must keep its own clearer error rather than being absorbed by
+/// the async-insert floor check, which is why the two are ordered as they are.
+#[test]
+fn a_zero_request_timeout_reports_the_zero_error_not_the_async_insert_floor() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 0 }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    let err = cfg.validate().expect_err("zero is invalid");
+    assert_eq!(
+        err, "request_timeout_secs must be > 0",
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -75,61 +156,6 @@ fn client_deadline_saturates_instead_of_overflowing() {
         cfg.client_deadline(),
         std::time::Duration::from_secs(u64::MAX)
     );
-}
-
-#[test]
-fn validate_rejects_zero_lock_ttl() {
-    let json = r#"{ "database_url": "http://u:p@h/db", "lock_ttl_secs": 0 }"#;
-    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
-    assert!(cfg.validate().is_err());
-}
-
-/// The default pair must satisfy the invariant `validate` enforces — a stock
-/// config is not allowed to be a config the plugin refuses to start on.
-#[test]
-fn default_lock_ttl_exceeds_the_default_client_deadline() {
-    let default_cfg = ClickHousePluginConfig::default();
-    assert!(
-        default_cfg.lock_ttl_secs > default_cfg.client_deadline().as_secs(),
-        "default lock_ttl_secs ({}) must exceed the default client deadline ({}s)",
-        default_cfg.lock_ttl_secs,
-        default_cfg.client_deadline().as_secs()
-    );
-}
-
-/// A lock lease that a single `ClickHouse` round-trip can outlive makes the
-/// pre-write renew meaningless: the write it protects can expire the lease it
-/// was just handed. Rejected at config load rather than surfacing as sporadic
-/// `Transient` failures under load.
-#[test]
-fn validate_rejects_lock_ttl_at_or_below_the_client_deadline() {
-    // request_timeout 30 => client deadline 35; a 35s TTL is exactly the
-    // boundary case and must be rejected too (the relation is strict).
-    for ttl in [30_u64, 35] {
-        let json = format!(
-            r#"{{ "database_url": "https://u:p@h/db", "request_timeout_secs": 30, "lock_ttl_secs": {ttl} }}"#
-        );
-        let cfg: ClickHousePluginConfig = serde_json::from_str(&json).unwrap();
-        let err = cfg
-            .validate()
-            .expect_err("a lock TTL within one round-trip of the client deadline must be rejected");
-        assert!(
-            err.contains("lock_ttl_secs") && err.contains("client deadline"),
-            "the error must name both sides of the relation, got: {err}"
-        );
-    }
-
-    let json = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 30, "lock_ttl_secs": 36 }"#;
-    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
-    cfg.validate()
-        .expect("one second past the client deadline satisfies the relation");
-}
-
-#[test]
-fn validate_rejects_zero_lock_timeout() {
-    let json = r#"{ "database_url": "http://u:p@h/db", "lock_timeout_secs": 0 }"#;
-    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
-    assert!(cfg.validate().is_err());
 }
 
 #[test]

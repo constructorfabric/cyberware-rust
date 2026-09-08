@@ -22,9 +22,9 @@ use opentelemetry::{InstrumentationScope, KeyValue, global};
 /// `OpenTelemetry` instrumentation scope (meter name) for every plugin series.
 const SCOPE_NAME: &str = "uc.clickhouse";
 
-/// Seconds-valued duration histogram bucket boundaries for backend operations
-/// and cluster lock acquisition. Brackets the §1.2 p95 budgets with finer
-/// low-end resolution so client-side percentiles are comparable.
+/// Seconds-valued duration histogram bucket boundaries for backend operations.
+/// Brackets the §1.2 p95 budgets with finer low-end resolution so client-side
+/// percentiles are comparable.
 const DURATION_BOUNDARIES_SECS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
@@ -40,16 +40,12 @@ const BATCH_ROW_BOUNDARIES: &[f64] = &[1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.
 /// enumerated value sets from `DESIGN.md` §4 and prevents accidental
 /// high-cardinality labels from leaking in.
 pub mod label {
-    /// Label key for the insert / lock mode dimension.
+    /// Label key for the insert mode dimension.
     pub const MODE: &str = "mode";
     /// `mode` value: a single-row ingest.
     pub const MODE_SINGLE: &str = "single";
     /// `mode` value: a batch (multi-row) ingest.
     pub const MODE_BATCH: &str = "batch";
-    /// `mode` value: exclusive lock acquired on the create / ingest path.
-    pub const MODE_CREATE: &str = "create";
-    /// `mode` value: exclusive lock acquired on the catalog-delete path.
-    pub const MODE_DELETE: &str = "delete";
 
     /// Label key for the query-kind dimension.
     pub const QUERY_KIND: &str = "query_kind";
@@ -129,33 +125,6 @@ impl ErrorClass {
     }
 }
 
-/// Lock-mode dimension behind the `mode` label of
-/// `uc_clickhouse_lock_acquire_duration_seconds`,
-/// `uc_clickhouse_lock_contention_total`, and
-/// `uc_clickhouse_lock_manager_unavailable_total`.
-///
-/// Closed enum so an out-of-set mode is unrepresentable at a call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockMode {
-    /// Exclusive lock acquired on the create path — by `RecordStore` for
-    /// `create_usage_record`/`create_usage_records` and by `CatalogStore` for
-    /// `create_usage_type` (via `CatalogLockPort::acquire_exclusive_for_create`).
-    Create,
-    /// Exclusive lock acquired by `CatalogStore` on the
-    /// `delete_usage_type` path.
-    Delete,
-}
-
-impl LockMode {
-    /// The bounded `mode` label value for this lock mode.
-    pub(crate) const fn as_label(self) -> &'static str {
-        match self {
-            Self::Create => label::MODE_CREATE,
-            Self::Delete => label::MODE_DELETE,
-        }
-    }
-}
-
 /// The full `OpenTelemetry` metric inventory for the `ClickHouse` plugin.
 ///
 /// Built once via [`Metrics::new`] and shared through an `Arc<Metrics>`; the
@@ -175,9 +144,6 @@ pub struct Metrics {
     pool_acquire_duration: Histogram<f64>,
     /// `uc_clickhouse_batch_rows` — row count per batch write.
     batch_rows: Histogram<f64>,
-    /// `uc_clickhouse_lock_acquire_duration_seconds` — cluster lock
-    /// acquisition wait time, labelled by `mode`.
-    lock_acquire_duration: Histogram<f64>,
 
     // --- Counters ---
     /// `uc_clickhouse_dedup_absorbed_total`.
@@ -188,21 +154,10 @@ pub struct Metrics {
     compensation: Counter<u64>,
     /// `uc_clickhouse_backend_errors_total` — labelled by `error_category`.
     backend_error: Counter<u64>,
-    /// `uc_clickhouse_usage_type_referenced_total`.
-    usage_type_referenced: Counter<u64>,
     /// `uc_clickhouse_migration_failures_total`.
     migration_failure: Counter<u64>,
     /// `uc_clickhouse_query_requests_total` — labelled by `query_kind`.
     query_requests: Counter<u64>,
-    /// `uc_clickhouse_lock_contention_total` — incremented once per lock
-    /// acquisition that had to wait for a conflicting lock holder, labelled
-    /// by `mode`.
-    lock_contention: Counter<u64>,
-    /// `uc_clickhouse_lock_manager_unavailable_total` — incremented when
-    /// the cluster lock cannot be granted/released **and also** when a lease-renew
-    /// check (`ensure_still_held`) fails, making session loss observable via
-    /// metrics. Labelled by `mode`.
-    lock_manager_unavailable: Counter<u64>,
 
     // --- Synchronous gauges ---
     /// `uc_clickhouse_usage_type_catalog_size` — live catalog row count.
@@ -239,6 +194,11 @@ pub struct Metrics {
     //   legitimate incrementer is the periodic orphan-reconciliation worker,
     //   which is deferred (see `docs/features/0006-*`). The instrument is added
     //   back together with that worker.
+    //
+    // - No `uc_clickhouse_lock_*` series and no
+    //   `uc_clickhouse_usage_type_referenced_total`: the plugin has no
+    //   coordination lock and does not implement `delete_usage_type`, so
+    //   nothing could ever increment them.
 }
 
 impl Metrics {
@@ -289,11 +249,6 @@ impl Metrics {
             .with_description("Row count per batch write to `ClickHouse`")
             .with_boundaries(BATCH_ROW_BOUNDARIES.to_vec())
             .build();
-        let lock_acquire_duration = meter
-            .f64_histogram("uc_clickhouse_lock_acquire_duration_seconds")
-            .with_description("cluster exclusive lock acquisition wait time, by mode")
-            .with_boundaries(DURATION_BOUNDARIES_SECS.to_vec())
-            .build();
 
         let dedup_absorbed = meter
             .u64_counter("uc_clickhouse_dedup_absorbed_total")
@@ -311,12 +266,6 @@ impl Metrics {
             .u64_counter("uc_clickhouse_backend_errors_total")
             .with_description("`ClickHouse` errors, by SPI transient/internal classification")
             .build();
-        let usage_type_referenced = meter
-            .u64_counter("uc_clickhouse_usage_type_referenced_total")
-            .with_description(
-                "Delete rejections because live usage records still reference the type",
-            )
-            .build();
         let migration_failure = meter
             .u64_counter("uc_clickhouse_migration_failures_total")
             .with_description("Schema-migration failures at plugin startup")
@@ -325,18 +274,6 @@ impl Metrics {
             .u64_counter("uc_clickhouse_query_requests_total")
             .with_description(
                 "Query requests dispatched to `ClickHouse`, by kind (workload mix observable)",
-            )
-            .build();
-        let lock_contention = meter
-            .u64_counter("uc_clickhouse_lock_contention_total")
-            .with_description(
-                "cluster lock acquisitions that had to wait for a conflicting holder, by mode",
-            )
-            .build();
-        let lock_manager_unavailable = meter
-            .u64_counter("uc_clickhouse_lock_manager_unavailable_total")
-            .with_description(
-                "cluster lock grant/release failures and session-validity check failures, by mode",
             )
             .build();
         let usage_type_catalog_size = meter
@@ -354,16 +291,12 @@ impl Metrics {
             deactivate_duration,
             pool_acquire_duration,
             batch_rows,
-            lock_acquire_duration,
             dedup_absorbed,
             idempotency_conflict,
             compensation,
             backend_error,
-            usage_type_referenced,
             migration_failure,
             query_requests,
-            lock_contention,
-            lock_manager_unavailable,
             usage_type_catalog_size,
             ready,
         }
@@ -398,12 +331,6 @@ impl Metrics {
         self.batch_rows.record(n, &[]);
     }
 
-    /// Record a cluster lock-acquisition duration (seconds) for the given [`LockMode`].
-    pub(crate) fn record_lock_acquire(&self, mode: LockMode, secs: f64) {
-        self.lock_acquire_duration
-            .record(secs, &[KeyValue::new(label::MODE, mode.as_label())]);
-    }
-
     // --- Counter helpers ---
 
     /// Increment the silently-absorbed dedup retry counter.
@@ -427,11 +354,6 @@ impl Metrics {
             .add(1, &[KeyValue::new(label::ERROR_CATEGORY, class.as_label())]);
     }
 
-    /// Increment the usage-type-referenced (delete rejection) counter.
-    pub(crate) fn inc_usage_type_referenced(&self) {
-        self.usage_type_referenced.add(1, &[]);
-    }
-
     /// Increment the migration-failure counter.
     pub(crate) fn inc_migration_failure(&self) {
         self.migration_failure.add(1, &[]);
@@ -441,25 +363,6 @@ impl Metrics {
     pub(crate) fn inc_query_request(&self, kind: QueryKind) {
         self.query_requests
             .add(1, &[KeyValue::new(label::QUERY_KIND, kind.as_label())]);
-    }
-
-    /// Increment the lock-contention counter for the given [`LockMode`].
-    ///
-    /// Called by the cluster lock manager when a lock acquisition had to
-    /// wait for a conflicting holder.
-    pub(crate) fn inc_lock_contention(&self, mode: LockMode) {
-        self.lock_contention
-            .add(1, &[KeyValue::new(label::MODE, mode.as_label())]);
-    }
-
-    /// Increment the lock-manager-unavailable counter for the given [`LockMode`].
-    ///
-    /// Incremented both when the cluster lock cannot be granted/released and when a
-    /// session-validity check (`ensure_still_held`) fails — making session loss
-    /// observable as a counter increment under the same series.
-    pub(crate) fn inc_lock_manager_unavailable(&self, mode: LockMode) {
-        self.lock_manager_unavailable
-            .add(1, &[KeyValue::new(label::MODE, mode.as_label())]);
     }
 
     // --- Synchronous gauge setters ---
@@ -492,8 +395,6 @@ pub enum TimedOp {
     Query(QueryKind),
     /// `uc_clickhouse_deactivate_duration_seconds`.
     Deactivate,
-    /// `uc_clickhouse_lock_acquire_duration_seconds`, labelled by [`LockMode`].
-    LockAcquire(LockMode),
 }
 
 /// Records an operation-duration histogram on drop, so the duration is captured
@@ -528,7 +429,6 @@ impl Drop for OpDurationGuard {
         match self.op {
             TimedOp::Query(kind) => self.metrics.record_query(kind, secs),
             TimedOp::Deactivate => self.metrics.record_deactivate(secs),
-            TimedOp::LockAcquire(mode) => self.metrics.record_lock_acquire(mode, secs),
         }
     }
 }

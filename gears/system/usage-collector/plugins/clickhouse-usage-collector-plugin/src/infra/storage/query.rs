@@ -8,6 +8,7 @@
 
 pub mod aggregate;
 pub mod bind;
+pub mod dedup;
 pub mod keyset;
 pub mod translate;
 

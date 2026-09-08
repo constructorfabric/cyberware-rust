@@ -16,6 +16,14 @@
 //!   `DateTime64Micros` and converted by `fromUnixTimestamp64Micro(?)`.
 //! - String comparisons for `status` / `kind` are straightforward (`String`
 //!   bind).
+//! - A one-element `IN` list is emitted as `column = ?`, not `column IN (?)`.
+//!   The two are equivalent, but `ClickHouse` only treats a sorting-key prefix
+//!   column as *fixed* — which is what lets `list` read in key order and stop
+//!   at its `LIMIT` instead of sorting the whole tenant, and what switches key
+//!   pruning from generic exclusion search to binary search — when the
+//!   predicate is an equality. The gateway's authorization scope arrives as
+//!   `tenant_id in (<one tenant>)` on every request, so this is the hot path,
+//!   measured at ~11x fewer rows read on a paged list.
 
 use toolkit_odata::filter::{FilterField, FilterNode, FilterOp};
 
@@ -161,6 +169,14 @@ fn translate_filter<F: FilterField>(
                 .ok_or_else(|| format!("field not allowlisted: {}", field.name()))?;
             if values.is_empty() {
                 return Err("IN list must not be empty".to_owned());
+            }
+            // Single value: an equality, so the planner sees a fixed key
+            // column (see the module docs). Same bind, same semantics.
+            if let [value] = values.as_slice() {
+                let bind = odata_value_to_bind(value)?;
+                let placeholder = bind.placeholder();
+                ctx.push(bind);
+                return Ok(format!("{column} = {placeholder}"));
             }
             let placeholders = values
                 .iter()

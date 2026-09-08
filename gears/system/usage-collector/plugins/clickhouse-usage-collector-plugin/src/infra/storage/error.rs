@@ -172,12 +172,11 @@ pub fn tracked_ch_err(metrics: &Metrics, err: &ChError) -> UsageCollectorPluginE
 /// how the budget relates to the server-side one.
 ///
 /// Applied per await point rather than around a whole store operation on
-/// purpose: this plugin holds a cluster lock across `ClickHouse` I/O and
-/// releases it explicitly on every exit path (cluster `LockGuard` drop is a
-/// no-op). A deadline wrapped around the whole critical section would drop the
-/// future mid-flight, skipping that release and leaking the lock until its
-/// lease expired. An `Err` returned from here instead flows through the normal
-/// error path, where the release already happens.
+/// purpose: a store operation is several independent round-trips, and a
+/// deadline wrapped around all of them would drop the whole future mid-flight,
+/// discarding per-record outcomes a batch had already decided. Bounding each
+/// round-trip instead lets the `Err` flow through the normal error path, where
+/// the batch code fans it out to exactly the slots that depended on it.
 ///
 /// An expired deadline is counted as [`ErrorClass::Transient`] — the same class
 /// [`ChError::TimedOut`] gets — so the backend-error counter cannot disagree

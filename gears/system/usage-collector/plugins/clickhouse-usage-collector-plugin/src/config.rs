@@ -102,26 +102,90 @@ pub struct ClickHousePluginConfig {
     pub allow_insecure_http: bool,
     /// HTTP request timeout in seconds (applies to reads and writes).
     ///
-    /// Drives two distinct mechanisms: the `ClickHouse` server settings
-    /// `send_timeout` / `receive_timeout`, and — `CLIENT_DEADLINE_GRACE_SECS`
-    /// later — the client-side deadline from `Self::client_deadline`.
+    /// Drives three distinct mechanisms: the `ClickHouse` server settings
+    /// `send_timeout` / `receive_timeout`; the client-side deadline from
+    /// `Self::client_deadline`, `CLIENT_DEADLINE_GRACE_SECS` later; and — while
+    /// [`Self::async_insert`] is enabled — the budget an `INSERT` has to absorb
+    /// the server-side async-insert buffer flush, which is why [`Self::validate`]
+    /// enforces a floor of `MIN_ASYNC_INSERT_TIMEOUT_SECS` in that case.
     pub request_timeout_secs: u64,
-    /// Cluster distributed-lock lease TTL in seconds. Must exceed worst-case
-    /// create/delete critical-section latency (`ClickHouse` round-trips while the
-    /// lock is held). Renewed immediately before the mutating write.
+    /// Send **single-row** `usage_records` `INSERT`s with the `ClickHouse`
+    /// settings `async_insert = 1` and `wait_for_async_insert = 1`, applied
+    /// per-statement via `clickhouse::insert::Insert::with_setting` rather than
+    /// on the shared `Client`, so no `SELECT` is affected — not even the
+    /// table-metadata read the `clickhouse` crate performs inside
+    /// `Client::insert` itself, which runs before this setting is applied.
     ///
-    /// [`Self::validate`] enforces the floor that makes that renew meaningful:
-    /// `lock_ttl_secs` must be strictly greater than
-    /// [`Self::client_deadline`] (`request_timeout_secs` +
-    /// [`CLIENT_DEADLINE_GRACE_SECS`]), so the one `ClickHouse` round-trip
-    /// that follows the renew cannot outlive the lease it was just granted.
-    /// Multi-round-trip prefixes of the critical section are *not* covered by
-    /// that floor — they are covered by the renew itself, which fails closed
-    /// with `Transient` when the lease lapsed.
-    pub lock_ttl_secs: u64,
-    /// Maximum time to wait when acquiring the per-`gts_id` exclusive cluster
-    /// lock. On timeout the operation fails closed with `Transient`.
-    pub lock_timeout_secs: u64,
+    /// `async_insert = 1` moves part formation from the request into a
+    /// server-side buffer that coalesces concurrent inserts sharing one
+    /// (query, settings, format) triple into shared parts. That is the whole
+    /// point here: `create_usage_record` issues one `INSERT` per record, so a
+    /// request-shaped ingest stream otherwise writes one small part per request
+    /// and drives `ReplacingMergeTree` part count and merge pressure up. Every
+    /// such `INSERT` this plugin emits is identical in SQL text, settings, and
+    /// format, so the whole ingest stream lands in one queue.
+    ///
+    /// **Scope.** This setting governs the single-row path only. Multi-row
+    /// `usage_records` `INSERT`s — `create_usage_records` and the deactivation
+    /// cascade — stay synchronous whatever this says, because the async buffer
+    /// does not guarantee that one statement's rows become visible in a single
+    /// commit and both depend on that (the cascade's marker rows must flip
+    /// together). `usage_type_catalog` writes are likewise always synchronous:
+    /// that table is control-plane (written only by `create_usage_type`, never
+    /// deleted, unpartitioned, tens of rows), so there is no concurrent insert
+    /// stream for the buffer to coalesce and no part count to reduce. Nothing
+    /// is given up by either exclusion — a multi-row statement already carries
+    /// its rows in one part, and the part explosion this setting exists to fix
+    /// is specific to one-row-per-request writes.
+    ///
+    /// `wait_for_async_insert = 1` is pinned, not separately configurable.
+    /// Two properties depend on it:
+    ///
+    /// * **Durability ack.** With `0` the `INSERT` returns as soon as the row
+    ///   is buffered, so a server restart loses acknowledged usage records.
+    ///   This plugin is the system of record; it cannot answer `Ok` for a row
+    ///   that is not committed.
+    /// * **Read-your-writes.** `create_usage_record` reads (the dedup
+    ///   point-lookup) and then writes, and a retry of the same request must
+    ///   observe the earlier insert or it inserts a second time under an
+    ///   idempotency key already in use. Only `1` makes the row queryable by
+    ///   the time the call returns.
+    ///
+    /// The cost is latency: the `INSERT` blocks until the buffer flushes,
+    /// bounded by the server-side `async_insert_busy_timeout_ms` (adaptive on
+    /// `ClickHouse` 24.x+: `async_insert_busy_timeout_min_ms` 50ms →
+    /// `async_insert_busy_timeout_max_ms` 200ms) plus the part commit. That
+    /// budget is deliberately left to the server rather than mirrored into a
+    /// config field — it is a property of the cluster's whole insert workload,
+    /// not of this plugin, the server adapts it automatically, and a
+    /// plugin-pinned value would defeat that adaptation. An operator who must
+    /// pin it should do so in a `ClickHouse` settings profile for the plugin's
+    /// DB user, the same mechanism the README already recommends for bounding
+    /// read cost.
+    ///
+    /// Because the flush wait is charged against the request budget,
+    /// [`Self::validate`] requires
+    /// `request_timeout_secs >= MIN_ASYNC_INSERT_TIMEOUT_SECS` while this is
+    /// enabled.
+    ///
+    /// **Insert dedup token.** Every `usage_records` `INSERT` carries an
+    /// `insert_deduplication_token` (see `record_store::insert_dedup_token`),
+    /// and `configure_insert` adds `async_insert_deduplicate = 1` when this is
+    /// on. `ClickHouse` enforces the token on synchronous inserts against the
+    /// table's `non_replicated_deduplication_window`; for *asynchronous*
+    /// inserts it enforces it only on `Replicated*` engines. On the shipped
+    /// non-replicated table, therefore, a racing duplicate single-record
+    /// create is collapsed by `optimize_on_insert` when both land in one
+    /// flush and by the background merge otherwise — visible twice to
+    /// `list`/`aggregate` (which no longer resolve versions at read time) until
+    /// then, while `get` resolves it immediately. Batches and deactivation
+    /// markers are always synchronous and always engine-deduplicated.
+    ///
+    /// Set to `false` for the pre-async behaviour (one synchronous part write
+    /// per request) on a deployment whose `ClickHouse` version or settings
+    /// profile makes async inserts unavailable — or to make the engine-side
+    /// dedup of single-record creates deterministic.
+    pub async_insert: bool,
     /// `usage_records` retention window in seconds; rows older are deleted via
     /// `ClickHouse` TTL. Must be in `(0, MAX_RETENTION_SECS]`.
     pub retention_period_secs: u64,
@@ -137,11 +201,10 @@ impl Default for ClickHousePluginConfig {
             database_url: SecretFromEnv::default(),
             allow_insecure_http: false,
             request_timeout_secs: 30,
-            // Strictly above the default client deadline (30 + 5 = 35s) so a
-            // single ClickHouse round-trip taken right after a lease renew
-            // cannot outlive the lease; see `validate`.
-            lock_ttl_secs: 60,
-            lock_timeout_secs: 5,
+            // On by default: the write path is one INSERT per request, so
+            // without server-side coalescing a request-shaped ingest stream
+            // writes one small part per record.
+            async_insert: true,
             // Same window the migration DDL bakes in, so a config-less start
             // needs no `MODIFY TTL` reconciliation at startup.
             retention_period_secs: crate::infra::storage::pool::DEFAULT_RETENTION_SECS,
@@ -163,6 +226,21 @@ const MAX_RETENTION_SECS: u64 = 100 * 365 * 86_400;
 /// Grace added to the server-side timeout to form the client-side deadline
 /// (see [`ClickHousePluginConfig::client_deadline`]).
 pub(crate) const CLIENT_DEADLINE_GRACE_SECS: u64 = 5;
+
+/// Floor on `request_timeout_secs` while
+/// [`ClickHousePluginConfig::async_insert`] is enabled.
+///
+/// `wait_for_async_insert = 1` blocks the `INSERT` until the server flushes
+/// its async-insert buffer — up to `async_insert_busy_timeout_ms` (server
+/// default; adaptive 50-200ms on `ClickHouse` 24.x+) plus the part commit. A 1s
+/// server-side budget leaves under 800ms of headroom for the commit and
+/// surfaces under load as intermittent `Transient` insert timeouts, which read
+/// as backend flakiness rather than as the misconfiguration they are. Failing
+/// at startup with both values named is strictly better.
+///
+/// The default `request_timeout_secs` of 30 clears this by more than an order
+/// of magnitude; only a deliberately tiny configured budget trips it.
+pub(crate) const MIN_ASYNC_INSERT_TIMEOUT_SECS: u64 = 2;
 
 impl ClickHousePluginConfig {
     /// Client-side deadline for a single `ClickHouse` request.
@@ -193,8 +271,9 @@ impl ClickHousePluginConfig {
     ///
     /// Returns an error string for an empty `database_url`, one whose scheme is
     /// neither `http` nor `https`, a plaintext `http` `database_url` without
-    /// [`Self::allow_insecure_http`], a zero timeout, a `lock_ttl_secs` that
-    /// does not exceed [`Self::client_deadline`], a retention window outside
+    /// [`Self::allow_insecure_http`], a zero timeout, a
+    /// `request_timeout_secs` below `MIN_ASYNC_INSERT_TIMEOUT_SECS` while
+    /// [`Self::async_insert`] is enabled, a retention window outside
     /// `(0, MAX_RETENTION_SECS]`, or a blank `vendor`.
     pub fn validate(&self) -> Result<(), String> {
         if self.database_url.expose().trim().is_empty() {
@@ -219,20 +298,19 @@ impl ClickHousePluginConfig {
         if self.request_timeout_secs == 0 {
             return Err("request_timeout_secs must be > 0".to_owned());
         }
-        // Subsumes a `> 0` check: the client deadline is at least
-        // `CLIENT_DEADLINE_GRACE_SECS`, so a zero TTL fails here too.
-        if self.lock_ttl_secs <= self.client_deadline().as_secs() {
+        // Ordered after the zero check so a zero value keeps the clearer error.
+        // `wait_for_async_insert = 1` charges the server-side buffer flush
+        // against the request budget, so too small a budget turns every insert
+        // into an intermittent timeout that reads as backend flakiness.
+        if self.async_insert && self.request_timeout_secs < MIN_ASYNC_INSERT_TIMEOUT_SECS {
             return Err(format!(
-                "lock_ttl_secs ({}) must exceed the client deadline ({}s = request_timeout_secs \
-                 + {CLIENT_DEADLINE_GRACE_SECS}): a single ClickHouse round-trip inside the \
-                 coordination lock must not outlive its lease, otherwise the renew performed \
-                 immediately before a mutating write buys no headroom for that write",
-                self.lock_ttl_secs,
-                self.client_deadline().as_secs(),
+                "request_timeout_secs = {} is too small with async_insert = true: \
+                 wait_for_async_insert = 1 blocks each INSERT until the server flushes its \
+                 async-insert buffer (async_insert_busy_timeout_ms, server default), so the \
+                 request budget must be at least {MIN_ASYNC_INSERT_TIMEOUT_SECS}s; raise \
+                 request_timeout_secs or set async_insert = false",
+                self.request_timeout_secs
             ));
-        }
-        if self.lock_timeout_secs == 0 {
-            return Err("lock_timeout_secs must be > 0".to_owned());
         }
         if self.retention_period_secs == 0 {
             return Err("retention_period_secs must be > 0".to_owned());

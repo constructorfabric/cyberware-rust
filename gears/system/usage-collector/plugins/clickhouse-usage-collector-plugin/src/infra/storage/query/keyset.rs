@@ -27,7 +27,7 @@ use super::translate::SqlCtx;
 
 /// Reject any cursor whose direction is not forward (`"fwd"`).
 ///
-/// `FINAL`-qualified reads are ordered consistently, but only forward cursors
+/// Version-resolved reads are ordered consistently, but only forward cursors
 /// are minted in v1. A `"bwd"` cursor would be silently walked forward since
 /// the keyset operator is derived from the sort direction, not `cursor.d`.
 /// Reject it fail-closed until backward paging is implemented.
@@ -76,11 +76,20 @@ pub fn render_order_by(
     Ok(parts.join(", "))
 }
 
-/// Build a keyset predicate as a row-value tuple comparison.
+/// Build a keyset predicate as a row-value tuple comparison, led by an
+/// index-usable bound on the first ordering column.
 ///
-/// For an all-ascending order: `(c1, c2, …) > (?, ?, …)`.
-/// For an all-descending order: `(c1, c2, …) < (?, ?, …)`.
+/// For an all-ascending order: `c1 >= ? AND (c1, c2, …) > (?, ?, …)`.
+/// For an all-descending order: `c1 <= ? AND (c1, c2, …) < (?, ?, …)`.
 /// Mixed directions are unsupported (v1 limitation).
+///
+/// The leading bound is implied by the tuple comparison, so it changes no
+/// result; it exists because `ClickHouse`'s key analysis does not derive a
+/// range from a tuple comparison, so without it a deep page rescans the whole
+/// window and re-sorts it. `c1 >= ?` on a sorting-key column (`created_at`
+/// on the canonical order, `gts_id` on the catalog) is a plain range the
+/// primary index prunes on. The first cursor key is therefore bound **twice**,
+/// in text order: once for the bound, once inside the tuple.
 ///
 /// # Errors
 ///
@@ -108,16 +117,17 @@ pub fn keyset_predicate(
 
     let all_asc = order_pairs.iter().all(|(_, asc)| *asc);
     let all_desc = order_pairs.iter().all(|(_, asc)| !*asc);
-    let cmp = if all_asc {
-        ">"
+    let (cmp, bound_cmp) = if all_asc {
+        (">", ">=")
     } else if all_desc {
-        "<"
+        ("<", "<=")
     } else {
         return Err("mixed-direction keyset orders are unsupported in v1".to_owned());
     };
 
+    // Validate and convert every key first, so a bad cursor pushes no binds.
     let mut columns = Vec::with_capacity(order_pairs.len());
-    let mut placeholders = Vec::with_capacity(order_pairs.len());
+    let mut binds = Vec::with_capacity(order_pairs.len());
     for ((field, _), raw) in order_pairs.iter().zip(cursor_keys.iter()) {
         if !keyset_safe(field) {
             return Err(format!(
@@ -127,14 +137,28 @@ pub fn keyset_predicate(
         let column = col(field).ok_or_else(|| format!("keyset field not allowlisted: {field}"))?;
         let field_kind =
             kind(field).ok_or_else(|| format!("keyset field has no known kind: {field}"))?;
-        let bind = cursor_key_to_bind(field_kind, raw)?;
-        placeholders.push(bind.placeholder());
-        ctx.push(bind);
+        binds.push(cursor_key_to_bind(field_kind, raw)?);
         columns.push(column);
     }
 
+    // Leading bound: the first key is bound once here and again in the tuple,
+    // matching the left-to-right `?` order of the text below.
+    let lead_column = columns[0];
+    let lead_bind = binds[0].clone();
+    let lead_placeholder = lead_bind.placeholder();
+    ctx.push(lead_bind);
+
+    let placeholders: Vec<&'static str> = binds
+        .into_iter()
+        .map(|bind| {
+            let placeholder = bind.placeholder();
+            ctx.push(bind);
+            placeholder
+        })
+        .collect();
+
     Ok(format!(
-        "({}) {cmp} ({})",
+        "{lead_column} {bound_cmp} {lead_placeholder} AND ({}) {cmp} ({})",
         columns.join(", "),
         placeholders.join(", ")
     ))

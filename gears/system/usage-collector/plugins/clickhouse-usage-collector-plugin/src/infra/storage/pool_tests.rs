@@ -328,6 +328,53 @@ fn migration_sql_uses_create_table_if_not_exists() {
     );
 }
 
+/// The records table must be partitioned on the TTL column, and TTL must run in
+/// whole-partition mode.
+///
+/// Both halves are one decision: `PARTITION BY toYYYYMM(created_at)` is what
+/// gives TTL whole parts to drop and time-range reads partitions to prune, and
+/// `ttl_only_drop_parts = 1` is what stops expiry from rewriting a part's every
+/// column to delete rows out of it. Partitioning on any column other than the
+/// TTL column would leave expired rows scattered across every partition, so
+/// nothing could ever be dropped whole.
+#[test]
+fn migration_sql_partitions_records_on_the_ttl_column() {
+    // Comments are stripped first: this file's own prose discusses the clause
+    // at length, so asserting against the raw text would pass on the
+    // explanation alone even if the DDL had lost the clause.
+    let stripped = strip_line_comments(MIGRATION_SQL);
+    let ddl = stripped
+        .split("CREATE TABLE IF NOT EXISTS usage_records")
+        .last()
+        .expect("migration must declare usage_records")
+        .to_owned();
+    assert!(
+        ddl.contains("PARTITION BY toYYYYMM(created_at)"),
+        "usage_records must partition monthly on created_at, the TTL column"
+    );
+    assert!(
+        ddl.contains("SETTINGS ttl_only_drop_parts = 1"),
+        "usage_records TTL must drop whole partitions rather than rewriting parts"
+    );
+}
+
+/// A partition key naming a column the TTL clause does not use would silently
+/// cost the whole-partition drop; `usage_type_catalog` has no TTL and stays
+/// unpartitioned.
+#[test]
+fn migration_sql_leaves_the_catalog_unpartitioned() {
+    let stripped = strip_line_comments(MIGRATION_SQL);
+    let catalog = stripped
+        .split("CREATE TABLE IF NOT EXISTS usage_records")
+        .next()
+        .expect("migration must declare usage_type_catalog first")
+        .to_owned();
+    assert!(
+        !catalog.contains("PARTITION BY"),
+        "usage_type_catalog carries no TTL and no time column, so partitioning it buys nothing"
+    );
+}
+
 #[test]
 fn migration_sql_has_default_one_year_ttl() {
     assert!(
@@ -372,7 +419,7 @@ fn migration_sql_has_correct_order_by_for_records() {
     // The records table uses the 4-tuple dedup key as ORDER BY.
     let after_records = MIGRATION_SQL.split("usage_records").last().unwrap_or("");
     assert!(
-        after_records.contains("ORDER BY (tenant_id, gts_id, created_at, id)"),
+        after_records.contains("ORDER BY (gts_id, tenant_id, created_at, id)"),
         "usage_records must use the 4-tuple dedup key as ORDER BY"
     );
 }
@@ -437,6 +484,132 @@ async fn build_client_falls_back_to_inert_client_on_unparseable_url() {
 }
 
 // Live-ClickHouse integration tests are gated behind the `clickhouse` cargo feature.
+// ── retention_overshoots_partition ───────────────────────────────────────────
+
+/// The warning fires only where the overshoot is comparable to the window.
+///
+/// With `ttl_only_drop_parts = 1` a row outlives its window by up to one
+/// monthly partition span, so the threshold is two spans: above it the
+/// overshoot is a fraction of the window, below it a multiple of it.
+#[test]
+fn retention_overshoot_warns_only_for_short_windows() {
+    use super::retention_overshoots_partition;
+
+    assert!(
+        retention_overshoots_partition(7 * 86_400),
+        "a one-week window can be overshot several times over"
+    );
+    assert!(
+        retention_overshoots_partition(2 * 31 * 86_400 - 1),
+        "just under two partition spans still warns"
+    );
+    assert!(
+        !retention_overshoots_partition(2 * 31 * 86_400),
+        "two partition spans is the threshold, not past it"
+    );
+    assert!(
+        !retention_overshoots_partition(DEFAULT_RETENTION_SECS),
+        "the 1-year default overshoots by a few percent and must stay quiet"
+    );
+}
+
+// ── configure_insert ──────────────────────────────────────────────────────────
+//
+// The `clickhouse` crate panics if a setting is changed after the request has
+// started (i.e. after the first `write`), so the assertion in both tests below
+// is that the helper returns at all. It pins the ordering contract
+// `configure_insert`'s `# Panics` section documents; a future refactor that
+// moved the call after a `write` would abort the test rather than fail it.
+//
+// `with_validation(false)` matters: validation is on by default, and it makes
+// `Client::insert` issue a table-metadata round-trip that would hang or fail
+// against the unreachable port.
+
+/// Build an offline `Insert` handle. Port 1 is reserved and never bound, so no
+/// request can actually be issued.
+#[cfg(test)]
+async fn offline_insert()
+-> clickhouse::insert::Insert<crate::infra::storage::entity::UsageRecordRow> {
+    clickhouse::Client::default()
+        .with_url("http://127.0.0.1:1")
+        .with_validation(false)
+        .insert("usage_records")
+        .await
+        .expect("acquiring an Insert handle opens no socket")
+}
+
+#[tokio::test]
+async fn configure_insert_applies_settings_before_the_first_write() {
+    let insert = super::configure_insert(
+        offline_insert().await,
+        std::time::Duration::from_secs(5),
+        true,
+        Some("token"),
+    );
+    drop(insert);
+}
+
+/// The disabled arm must still yield a usable handle — it is the escape hatch
+/// for a deployment whose `ClickHouse` cannot do async inserts.
+#[tokio::test]
+async fn configure_insert_with_async_insert_disabled_applies_only_timeouts() {
+    let insert = super::configure_insert(
+        offline_insert().await,
+        std::time::Duration::from_secs(5),
+        false,
+        None,
+    );
+    drop(insert);
+}
+
+// ── insert dedup window ───────────────────────────────────────────────────────
+
+/// Fresh deployments get the window from the DDL itself. Comments are stripped
+/// first for the same reason as the partition test: this file's prose names the
+/// setting too.
+#[test]
+fn migration_sql_enables_the_insert_dedup_window() {
+    let stripped = strip_line_comments(MIGRATION_SQL);
+    let ddl = stripped
+        .split("CREATE TABLE IF NOT EXISTS usage_records")
+        .last()
+        .expect("migration must declare usage_records")
+        .to_owned();
+    assert!(
+        ddl.contains(&format!(
+            "non_replicated_deduplication_window = {}",
+            super::INSERT_DEDUP_WINDOW_BLOCKS
+        )),
+        "usage_records must keep an insert dedup window matching INSERT_DEDUP_WINDOW_BLOCKS \
+         so ensure_insert_dedup_window is a no-op on a fresh table: {ddl}"
+    );
+    assert!(
+        ddl.contains("SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window"),
+        "the window joins the existing SETTINGS clause rather than adding a second one: {ddl}"
+    );
+}
+
+/// The live `create_table_query` interleaves server defaults into `SETTINGS`;
+/// the parser must find the window wherever it sits in that list.
+#[test]
+fn parse_dedup_window_from_live_engine_full() {
+    let live = "CREATE TABLE default.usage_records (...) ENGINE = ReplacingMergeTree(version) \
+                PARTITION BY toYYYYMM(created_at) ORDER BY (gts_id, tenant_id, created_at, id) \
+                TTL created_at + toIntervalSecond(31536000) \
+                SETTINGS ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000, \
+                index_granularity = 8192";
+    assert_eq!(super::parse_dedup_window(live), Some(10_000));
+}
+
+/// A table provisioned before the setting existed reads back without it — the
+/// case `ensure_insert_dedup_window` retrofits.
+#[test]
+fn parse_dedup_window_returns_none_when_missing() {
+    let live = "CREATE TABLE default.usage_records (...) ENGINE = ReplacingMergeTree(version) \
+                SETTINGS ttl_only_drop_parts = 1, index_granularity = 8192";
+    assert_eq!(super::parse_dedup_window(live), None);
+}
+
 // Run with: cargo test -p cf-gears-clickhouse-usage-collector-plugin --features clickhouse
 #[cfg(feature = "clickhouse")]
 mod integration {
@@ -447,8 +620,9 @@ mod integration {
     use testcontainers::{GenericImage, ImageExt};
 
     use super::super::{
-        DEFAULT_RETENTION_SECS, apply_migrations, build_client, ensure_retention_ttl,
-        parse_endpoint, parse_ttl_seconds,
+        DEFAULT_RETENTION_SECS, INSERT_DEDUP_WINDOW_BLOCKS, apply_migrations, build_client,
+        ensure_insert_dedup_window, ensure_retention_ttl, parse_dedup_window, parse_endpoint,
+        parse_ttl_seconds,
     };
     use crate::config::ClickHousePluginConfig;
 
@@ -530,6 +704,26 @@ mod integration {
             .await
             .expect("migration must succeed against a live ClickHouse instance");
 
+        // The server accepted the partition key and stores it as the table's
+        // own metadata — not merely that our DDL text contained the clause.
+        let partition_key: String = client
+            .query(
+                "SELECT partition_key FROM system.tables \
+                 WHERE database = currentDatabase() AND name = 'usage_records'",
+            )
+            .fetch_one()
+            .await
+            .expect("partition_key must be readable");
+        assert!(
+            partition_key.contains("toYYYYMM(created_at)"),
+            "live usage_records must be partitioned monthly on created_at: {partition_key}"
+        );
+        let ddl_with_partition = live_create_sql(&client).await;
+        assert!(
+            ddl_with_partition.contains("ttl_only_drop_parts = 1"),
+            "live usage_records must keep whole-partition TTL mode: {ddl_with_partition}"
+        );
+
         // Matching seconds must still rewrite a legacy toDateTime TTL.
         client
             .query(&format!(
@@ -580,6 +774,41 @@ mod integration {
             .await
             .expect("ensure_retention_ttl must no-op when TTL already matches");
 
+        // The DDL carries the insert dedup window and the server stores it as
+        // table metadata.
+        assert_eq!(
+            parse_dedup_window(&create_sql),
+            Some(INSERT_DEDUP_WINDOW_BLOCKS),
+            "fresh usage_records must carry the insert dedup window: {create_sql}"
+        );
+        // A pre-existing table without it (simulated by turning it off) is
+        // retrofitted, and a second run is a no-op.
+        client
+            .query(
+                "ALTER TABLE usage_records MODIFY SETTING non_replicated_deduplication_window = 0",
+            )
+            .execute()
+            .await
+            .expect("forcing the window off must succeed");
+        let without = live_create_sql(&client).await;
+        assert_eq!(
+            parse_dedup_window(&without),
+            Some(0),
+            "precondition: live window must read back as 0: {without}"
+        );
+        ensure_insert_dedup_window(&client, cfg.client_deadline())
+            .await
+            .expect("ensure_insert_dedup_window must restore the window");
+        let restored = live_create_sql(&client).await;
+        assert_eq!(
+            parse_dedup_window(&restored),
+            Some(INSERT_DEDUP_WINDOW_BLOCKS),
+            "window must be restored: {restored}"
+        );
+        ensure_insert_dedup_window(&client, cfg.client_deadline())
+            .await
+            .expect("ensure_insert_dedup_window must no-op when already set");
+
         // A created_at after DateTime's 2106 ceiling must not expire immediately.
         client
             .query(
@@ -600,6 +829,12 @@ mod integration {
             .execute()
             .await
             .expect("MATERIALIZE TTL must succeed");
+        // `OPTIMIZE … FINAL` is merge-forcing DDL, unrelated to the `FINAL`
+        // read modifier the store no longer emits — forcing the merge is the
+        // only way to make TTL deletion observable in a test. The `FINAL` on
+        // the count below is likewise deliberate: this asserts TTL, not a
+        // store read path, so resolving with the engine keeps the check
+        // independent of how the store spells its own resolution.
         client
             .query("OPTIMIZE TABLE usage_records FINAL")
             .execute()

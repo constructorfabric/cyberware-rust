@@ -2,27 +2,21 @@
 // Shared across test binaries: not every binary uses every fixture, and these
 // fixtures panic on invalid test input by design.
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
-//! Shared `ClickHouse` + in-process cluster-lock test harness.
+//! Shared `ClickHouse` test harness.
 //!
-//! Starts a `ClickHouse` container, applies the embedded schema migration, and
-//! registers a linearizable `CasBasedDistributedLockBackend` for the
-//! `usage-collector` profile. Requires Docker for `ClickHouse` only.
+//! Starts a `ClickHouse` container and applies the embedded schema migration.
+//! Requires Docker for `ClickHouse`. There is no coordination backend to
+//! register: the plugin uses none.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use cluster::defaults::CasBasedDistributedLockBackend;
-use cluster_sdk::lock::DistributedLockBackend;
-use cluster_sdk::profile::ClusterProfile;
-use cluster_sdk::register_lock_backend;
 use rust_decimal::Decimal;
-use standalone_cluster_plugin::StandaloneCache;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
-use toolkit::client_hub::ClientHub;
 use uuid::Uuid;
 
 use usage_collector_sdk::{
@@ -30,25 +24,17 @@ use usage_collector_sdk::{
     UsageTypeGtsId, derive_usage_record_id,
 };
 
-use clickhouse_usage_collector_plugin::infra::coordination::lock_manager::{
-    LockManager, UsageCollectorProfile,
-};
 use clickhouse_usage_collector_plugin::infra::metrics::Metrics;
-use clickhouse_usage_collector_plugin::infra::storage::catalog_store::{
-    CatalogLockPort, ChCatalogStore,
-};
+use clickhouse_usage_collector_plugin::infra::storage::catalog_store::ChCatalogStore;
 use clickhouse_usage_collector_plugin::infra::storage::pool::{
-    apply_migrations, build_client, ensure_retention_ttl,
+    apply_migrations, build_client, ensure_insert_dedup_window, ensure_retention_ttl,
 };
 use clickhouse_usage_collector_plugin::infra::storage::record_store::ChRecordStore;
 
-/// Live testcontainer harness holding a `ClickHouse` container and a shared
-/// in-process cluster lock backend.
+/// Live testcontainer harness holding a `ClickHouse` container.
 pub struct ChHarness {
     /// Configured `ClickHouse` HTTP client (pointing at the test container port).
     pub client: clickhouse::Client,
-    /// Hub with the `usage-collector` lock backend registered.
-    pub hub: Arc<ClientHub>,
     /// Cancellation token for background workers spawned from this harness.
     pub cancel: CancellationToken,
     /// Keep `ClickHouse` container alive.
@@ -65,7 +51,7 @@ pub struct ChHarness {
 /// which rejects every connection arriving through the mapped host port.
 pub const CH_TEST_PASSWORD: &str = "ch_test_pw";
 
-/// Start `ClickHouse`, apply migrations, register the cluster lock backend.
+/// Start `ClickHouse` and apply migrations.
 pub async fn bring_up() -> anyhow::Result<ChHarness> {
     // No log-based wait strategy: this image sends the server log (including
     // "Ready for connections") to files under /var/log/clickhouse-server
@@ -83,9 +69,7 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
     let cfg: clickhouse_usage_collector_plugin::config::ClickHousePluginConfig =
         serde_json::from_str(&format!(
             r#"{{ "database_url": "http://default:{CH_TEST_PASSWORD}@127.0.0.1:{ch_port}/default",
-                  "allow_insecure_http": true,
-                  "lock_ttl_secs": 60,
-                  "lock_timeout_secs": 5 }}"#
+                  "allow_insecure_http": true }}"#
         ))
         .expect("valid test config json");
 
@@ -111,16 +95,11 @@ pub async fn bring_up() -> anyhow::Result<ChHarness> {
     }
 
     ensure_retention_ttl(&client, cfg.retention_period_secs, TEST_REQUEST_TIMEOUT).await?;
-
-    let hub = Arc::new(ClientHub::default());
-    let cache = StandaloneCache::new();
-    let backend = CasBasedDistributedLockBackend::new(cache)?;
-    register_lock_backend(&hub, UsageCollectorProfile::NAME, Arc::new(backend))?;
+    ensure_insert_dedup_window(&client, TEST_REQUEST_TIMEOUT).await?;
 
     let cancel = CancellationToken::new();
     Ok(ChHarness {
         client,
-        hub,
         cancel,
         _ch_container: ch_container,
     })
@@ -182,100 +161,68 @@ pub fn metrics() -> Arc<Metrics> {
 /// against a hang rather than something an assertion can trip over.
 pub const TEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Build a [`LockManager`] against the harness hub.
-#[must_use]
-pub fn lock_manager(hub: &Arc<ClientHub>) -> Arc<LockManager> {
-    lock_manager_with_timeout(hub, Duration::from_secs(5))
-}
-
-/// Same as [`lock_manager`], but with a caller-supplied acquire timeout.
-#[must_use]
-pub fn lock_manager_with_timeout(hub: &Arc<ClientHub>, timeout: Duration) -> Arc<LockManager> {
-    Arc::new(LockManager::new(
-        Arc::clone(hub),
-        Duration::from_secs(30),
-        timeout,
-        metrics(),
-    ))
-}
-
-/// Build a [`ChRecordStore`] with its own [`LockManager`] and metric handle.
+/// Build a [`ChRecordStore`] with its own metric handle.
 #[must_use]
 pub fn record_store(h: &ChHarness) -> ChRecordStore {
     record_store_over(h, h.client.clone())
 }
 
 /// Same as [`record_store`], but over a caller-supplied `ClickHouse` client
-/// (e.g. [`unreachable_client`]) while keeping the harness's live lock backend,
-/// so a call reaches its SQL instead of failing at lock acquisition.
-#[must_use]
-pub fn record_store_over(h: &ChHarness, client: clickhouse::Client) -> ChRecordStore {
-    ChRecordStore::new(
-        client,
-        lock_manager(&h.hub),
-        metrics(),
-        TEST_REQUEST_TIMEOUT,
-    )
-}
-
-/// Same as [`record_store`], but with a caller-supplied cluster lock backend
-/// registered for the `usage-collector` profile on its own hub, for driving the
-/// guard failure paths inside `create`'s critical section against a live
-/// `ClickHouse` client.
+/// (e.g. [`unreachable_client`]).
 ///
-/// `ChRecordStore` owns a concrete [`LockManager`], so the injection point is
-/// the cluster backend the manager resolves rather than a store-level port.
+/// `async_insert` is `true` — the production default — so this tier exercises
+/// the shipped write path, including its read-your-writes dependency on
+/// `wait_for_async_insert = 1`.
 #[must_use]
-pub fn record_store_with_lock_backend(
-    h: &ChHarness,
-    backend: Arc<dyn DistributedLockBackend>,
-) -> ChRecordStore {
-    let hub = Arc::new(ClientHub::default());
-    register_lock_backend(&hub, UsageCollectorProfile::NAME, backend)
-        .expect("register the caller-supplied lock backend");
-    ChRecordStore::new(
-        h.client.clone(),
-        lock_manager(&hub),
-        metrics(),
-        TEST_REQUEST_TIMEOUT,
-    )
+pub fn record_store_over(_h: &ChHarness, client: clickhouse::Client) -> ChRecordStore {
+    ChRecordStore::new(client, metrics(), TEST_REQUEST_TIMEOUT, true)
 }
 
-/// Build a [`ChCatalogStore`] with its own [`LockManager`] and metric handle.
+/// Same as [`record_store`], but with `async_insert = false`.
+///
+/// On the shipped non-replicated `ReplacingMergeTree`, `ClickHouse` enforces
+/// `insert_deduplication_token` on synchronous inserts only, so this is the
+/// tier that proves the engine-side dedup of racing single-record creates
+/// deterministically. The async tier relies on `optimize_on_insert` coalescing
+/// within one flush and on merges otherwise (see `config.rs`).
+#[must_use]
+pub fn record_store_sync(h: &ChHarness) -> ChRecordStore {
+    ChRecordStore::new(h.client.clone(), metrics(), TEST_REQUEST_TIMEOUT, false)
+}
+
+/// Stop background merges on `usage_records` for the rest of the container's
+/// life, so a test asserting "before any merge runs" is guaranteed rather than
+/// probable. Every harness gets its own container, so nothing else is affected.
+pub async fn stop_merges(h: &ChHarness) {
+    h.client
+        .query("SYSTEM STOP MERGES usage_records")
+        .execute()
+        .await
+        .expect("SYSTEM STOP MERGES must succeed");
+}
+
+/// Raw physical row count for one `id`, with no version resolution and no
+/// marker anti-join — what the engine actually stores.
+pub async fn raw_rows_for_id(h: &ChHarness, id: Uuid) -> u64 {
+    h.client
+        .query("SELECT count() FROM usage_records WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_one::<u64>()
+        .await
+        .expect("raw count must be readable")
+}
+
+/// Build a [`ChCatalogStore`] with its own metric handle.
 #[must_use]
 pub fn catalog_store(h: &ChHarness) -> ChCatalogStore {
     catalog_store_over(h, h.client.clone())
 }
 
 /// Same as [`catalog_store`], but over a caller-supplied `ClickHouse` client
-/// (e.g. [`unreachable_client`]) while keeping the harness's live lock backend.
+/// (e.g. [`unreachable_client`]).
 #[must_use]
 pub fn catalog_store_over(h: &ChHarness, client: clickhouse::Client) -> ChCatalogStore {
-    let lock_port: Arc<dyn CatalogLockPort> = lock_manager(&h.hub);
-    ChCatalogStore::new(
-        client,
-        lock_port,
-        h.cancel.clone(),
-        metrics(),
-        TEST_REQUEST_TIMEOUT,
-    )
-}
-
-/// Same as [`catalog_store`], but with a caller-supplied lock port, for driving
-/// the guard failure paths inside `delete`'s critical section against a live
-/// `ClickHouse` client.
-#[must_use]
-pub fn catalog_store_with_lock(
-    h: &ChHarness,
-    lock_port: Arc<dyn CatalogLockPort>,
-) -> ChCatalogStore {
-    ChCatalogStore::new(
-        h.client.clone(),
-        lock_port,
-        h.cancel.clone(),
-        metrics(),
-        TEST_REQUEST_TIMEOUT,
-    )
+    ChCatalogStore::new(client, h.cancel.clone(), metrics(), TEST_REQUEST_TIMEOUT)
 }
 
 /// A client pointed at a port with nothing listening, so every statement fails
@@ -292,7 +239,7 @@ pub fn unreachable_client() -> clickhouse::Client {
 /// carries `TTL created_at + INTERVAL retention_period_secs SECOND DELETE`
 /// (365 days by default), so a fixture timestamp older than the retention
 /// window makes every inserted row immediately TTL-expired — a background
-/// merge (or a `FINAL` read that triggers one) then drops it mid-test, and
+/// merge then drops it mid-test, and
 /// any reference/aggregation assertion fails depending on timing. A
 /// hardcoded epoch works until it ages past the window and then rots the
 /// whole suite.

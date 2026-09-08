@@ -2,7 +2,7 @@
 #![allow(clippy::panic)]
 #![cfg_attr(coverage_nightly, coverage(off))]
 
-use super::{ErrorClass, InsertMode, LockMode, Metrics, QueryKind, label};
+use super::{ErrorClass, InsertMode, Metrics, QueryKind, label};
 
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -167,60 +167,6 @@ async fn recording_helpers_emit_expected_series() {
     );
 }
 
-/// Lock instrument set emits expected series: acquire-duration histogram split
-/// by mode, contention counter split by mode, and unavailable counter.
-#[tokio::test]
-async fn lock_instruments_emit_expected_series() {
-    let (provider, exporter) = local_provider();
-    let metrics = Metrics::with_meter(&provider.meter(super::SCOPE_NAME));
-
-    // One shared and one exclusive acquire.
-    metrics.record_lock_acquire(LockMode::Create, 0.005);
-    metrics.record_lock_acquire(LockMode::Delete, 0.010);
-
-    // Contention: two shared contention events, one exclusive.
-    metrics.inc_lock_contention(LockMode::Create);
-    metrics.inc_lock_contention(LockMode::Create);
-    metrics.inc_lock_contention(LockMode::Delete);
-
-    // One unavailable event (shared — session loss on ensure_still_held).
-    metrics.inc_lock_manager_unavailable(LockMode::Create);
-
-    provider.force_flush().unwrap();
-
-    // Acquire-duration histogram: 2 observations total.
-    assert_eq!(
-        histogram_count(&exporter, "uc_clickhouse_lock_acquire_duration_seconds"),
-        2,
-    );
-
-    // Contention counter split by mode.
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_clickhouse_lock_contention_total",
-            label::MODE,
-            label::MODE_CREATE,
-        ),
-        2,
-    );
-    assert_eq!(
-        counter_sum_with_label(
-            &exporter,
-            "uc_clickhouse_lock_contention_total",
-            label::MODE,
-            label::MODE_DELETE,
-        ),
-        1,
-    );
-
-    // Unavailable counter.
-    assert_eq!(
-        counter_sum(&exporter, "uc_clickhouse_lock_manager_unavailable_total"),
-        1,
-    );
-}
-
 /// Smoke-checks [`Metrics::new`] (global provider path) plus value assertions
 /// for remaining helpers via the local in-memory seam.
 #[tokio::test]
@@ -243,7 +189,6 @@ async fn remaining_helpers_emit_expected_series() {
     metrics.inc_compensation();
     metrics.inc_compensation();
     metrics.inc_compensation();
-    metrics.inc_usage_type_referenced();
     metrics.inc_migration_failure();
     metrics.inc_query_request(QueryKind::Raw);
     metrics.inc_query_request(QueryKind::Raw);
@@ -259,10 +204,6 @@ async fn remaining_helpers_emit_expected_series() {
     assert_eq!(
         counter_sum(&exporter, "uc_clickhouse_compensations_total"),
         3,
-    );
-    assert_eq!(
-        counter_sum(&exporter, "uc_clickhouse_usage_type_referenced_total"),
-        1,
     );
     assert_eq!(
         counter_sum(&exporter, "uc_clickhouse_migration_failures_total"),

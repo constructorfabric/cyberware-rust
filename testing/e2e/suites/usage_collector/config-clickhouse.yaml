@@ -3,8 +3,9 @@
 # Sibling of config.yaml (TimescaleDB), colocated in this suite directory:
 # same tenants,
 # tokens, tree and API surface, so the same test bodies run unchanged against
-# either backend. Only the storage plugin — and the cluster gear it needs —
-# differ. Used only by `make e2e-usage-collector`, which builds a dedicated
+# either backend. Only the storage plugin differs (the ClickHouse plugin needs
+# no cluster gear). Used only by `make e2e-usage-collector`, which builds a
+# dedicated
 # binary per backend and starts the matching container. NOT part of
 # config/e2e-features.txt or the shared `make e2e-local` run.
 #
@@ -169,21 +170,6 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
-  # The ClickHouse plugin acquires a per-`gts_id` exclusive lock around both
-  # `create_usage_record(s)` and `delete_usage_type` (ClickHouse has no FKs, so
-  # referential integrity is application-emulated). It resolves that lock from
-  # the cluster gear under the fixed profile name `usage-collector`
-  # (`UsageCollectorProfile::NAME`), and every create/delete fails closed with a
-  # retryable `Transient` error if the profile is unbound — so this block is
-  # mandatory, not optional tuning. `lock:` is deliberately omitted: the cluster
-  # wiring then auto-wraps a linearizable CasBasedDistributedLockBackend over
-  # this profile's cache, which is what the plugin requires.
-  cluster:
-    config:
-      profiles:
-        usage-collector:
-          cache: { provider: standalone }
-
   # `vendor` is written out explicitly on BOTH the gear and the plugin. They
   # happen to share the same crate default today (`cyberfabric`); stating it
   # means a future default change in either crate cannot silently leave the
@@ -201,13 +187,9 @@ gears:
       # validate honours: it rejects a plaintext http:// database_url at
       # startup unless this is set, because the URL embeds credentials. The
       # test container serves no TLS. MUST NOT be set in production.
-      database_url: "http://default:ch_test_pw@127.0.0.1:__E2E_CH_PORT__/default"
+      database_url: "http://default:ch_test_pw@127.0.0.1:18123/default"
       allow_insecure_http: true
       request_timeout_secs: 30
-      # Must exceed the client deadline (request_timeout_secs + 5s = 35s), or
-      # ClickHousePluginConfig::validate rejects the config at startup.
-      lock_ttl_secs: 60
-      lock_timeout_secs: 5
       # 10 years. Long enough that the usage_records TTL can never drop test
       # rows mid-run. A convenience, not a DateTime ceiling: the clause is
       # `created_at + INTERVAL <n> SECOND` on DateTime64(6), so a 100-year

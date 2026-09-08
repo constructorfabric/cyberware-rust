@@ -1,23 +1,21 @@
 // Test modules using bare `panic!` opt in explicitly.
 #![allow(clippy::panic)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
 use usage_collector_sdk::{UsageCollectorPluginError, UsageRecord, UsageTypeGtsId};
 
 use super::{
-    AggregateNdjsonParser, ChRecordStore, err_for_partition, parse_aggregate_response,
-    prefer_dedup_row, record_dedup_key, row_dedup_key,
+    AggregateNdjsonParser, ChRecordStore, InsertKind, catalog_lookup_sql, err_for_slot,
+    insert_dedup_token, parse_aggregate_response, prefer_dedup_row, record_dedup_key,
+    row_dedup_key, split_by_catalog,
 };
 use crate::domain::ports::RecordStore;
-use crate::infra::coordination::lock_manager::LockGuardPort;
 use crate::infra::metrics::Metrics;
-use crate::infra::storage::catalog_store::CatalogLockPort;
 use crate::infra::storage::entity::{UsageRecordRow, UsageRecordStatusCode};
 use crate::infra::storage::mapper::{canonical_equal, version_higher_than};
 
@@ -225,8 +223,9 @@ fn dedup_key_excludes_id_and_includes_idempotency_key() {
 //
 // `ClickHouse` has no UNIQUE constraint, so rows written while the lookup was
 // keyed on `id` can leave two rows sharing a dedup key with different `id`s.
-// Both survive `FINAL`, so the lookup must choose between them deterministically
-// and in favour of the caller's own record.
+// Both survive version resolution (distinct `id`s are distinct sort keys), so
+// the lookup must choose between them deterministically and in favour of the
+// caller's own record.
 
 #[test]
 fn prefer_dedup_row_takes_the_only_candidate() {
@@ -274,21 +273,21 @@ fn prefer_dedup_row_falls_back_to_the_lowest_id() {
     );
 }
 
-// ── err_for_partition ─────────────────────────────────────────────────────────
+// ── err_for_slot ──────────────────────────────────────────────────────────────
 //
 // `UsageCollectorPluginError` is deliberately not `Clone`, so `create_batch`
-// rebuilds an equivalent value per variant to place in every slot of a failed
-// `gts_id` partition. A variant that loses its payload here would downgrade a
+// rebuilds an equivalent value per variant to place in every slot an error
+// covers. A variant that loses its payload here would downgrade a
 // caller-visible outcome (e.g. a retryable `Transient` becoming an opaque
 // `Internal`), so each arm is pinned.
 
 #[test]
-fn err_for_partition_preserves_transient_payload() {
+fn err_for_slot_preserves_transient_payload() {
     let src = UsageCollectorPluginError::Transient {
         detail: "backend unreachable".to_owned(),
         retry_after_seconds: Some(7),
     };
-    match err_for_partition(&src) {
+    match err_for_slot(&src) {
         UsageCollectorPluginError::Transient {
             detail,
             retry_after_seconds,
@@ -305,21 +304,21 @@ fn err_for_partition_preserves_transient_payload() {
 }
 
 #[test]
-fn err_for_partition_preserves_usage_type_not_found_gts_id() {
+fn err_for_slot_preserves_usage_type_not_found_gts_id() {
     let gts_id = UsageTypeGtsId::new(VCPU_GTS).unwrap();
     let src = UsageCollectorPluginError::UsageTypeNotFound {
         gts_id: gts_id.clone(),
     };
-    match err_for_partition(&src) {
+    match err_for_slot(&src) {
         UsageCollectorPluginError::UsageTypeNotFound { gts_id: got } => assert_eq!(got, gts_id),
         other => panic!("expected UsageTypeNotFound, got {other:?}"),
     }
 }
 
 #[test]
-fn err_for_partition_preserves_internal_message() {
+fn err_for_slot_preserves_internal_message() {
     let src = UsageCollectorPluginError::Internal("dedup lookup exploded".to_owned());
-    match err_for_partition(&src) {
+    match err_for_slot(&src) {
         UsageCollectorPluginError::Internal(msg) => assert_eq!(msg, "dedup lookup exploded"),
         other => panic!("expected Internal, got {other:?}"),
     }
@@ -328,13 +327,13 @@ fn err_for_partition_preserves_internal_message() {
 /// The enum is `#[non_exhaustive]`, so an unmodelled variant must still degrade
 /// to an `Internal` carrying the original text rather than being dropped.
 #[test]
-fn err_for_partition_falls_back_to_internal_for_other_variants() {
+fn err_for_slot_falls_back_to_internal_for_other_variants() {
     let src = UsageCollectorPluginError::IdempotencyConflict {
         idempotency_key: "idem-1".to_owned(),
         existing_id: Uuid::from_u128(7),
     };
     let rendered = src.to_string();
-    match err_for_partition(&src) {
+    match err_for_slot(&src) {
         UsageCollectorPluginError::Internal(msg) => assert_eq!(
             msg, rendered,
             "the fallback arm must carry the original error text"
@@ -368,161 +367,103 @@ fn metadata_filter_binds_key_and_every_value() {
     assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == "region"));
 }
 
-// ── Empty-input short circuits ────────────────────────────────────────────────
-
-// ── Lock stubs ────────────────────────────────────────────────────────────────
-
-/// Guard stub that always reports the lease as still held.
-struct GrantedGuard;
-
-#[async_trait]
-impl LockGuardPort for GrantedGuard {
-    async fn ensure_still_held(&self) -> Result<(), UsageCollectorPluginError> {
-        Ok(())
-    }
-
-    async fn release(self: Box<Self>) -> Result<(), UsageCollectorPluginError> {
-        Ok(())
-    }
-}
-
-/// Lock stub that always grants the exclusive lock immediately.
-struct AlwaysGrantLock;
-
-#[async_trait]
-impl CatalogLockPort for AlwaysGrantLock {
-    async fn acquire_exclusive_for_delete(
-        &self,
-        _gts_id: &str,
-    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
-        Ok(Box::new(GrantedGuard))
-    }
-
-    // Overridden explicitly rather than inherited from the trait default, so a
-    // create-path test asserts against this stub and not the default's
-    // delegation to `acquire_exclusive_for_delete`.
-    async fn acquire_exclusive_for_create(
-        &self,
-        _gts_id: &str,
-    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
-        Ok(Box::new(GrantedGuard))
-    }
-}
-
-/// Ordered log of `(gts_id, "acquire" | "release")` events shared by the
-/// recording lock stub and its guards.
-type LockEventLog = Arc<std::sync::Mutex<Vec<(String, &'static str)>>>;
-
-/// Guard stub that reports its release into a shared event log, tagged with the
-/// `gts_id` whose partition holds it.
-struct RecordingGuard {
-    gts_id: String,
-    events: LockEventLog,
-}
-
-#[async_trait]
-impl LockGuardPort for RecordingGuard {
-    async fn ensure_still_held(&self) -> Result<(), UsageCollectorPluginError> {
-        Ok(())
-    }
-
-    async fn release(self: Box<Self>) -> Result<(), UsageCollectorPluginError> {
-        self.events
-            .lock()
-            .unwrap()
-            .push((self.gts_id.clone(), "release"));
-        Ok(())
-    }
-}
-
-/// Lock stub that grants every `gts_id` but makes exactly one of them wait,
-/// simulating a partition queued behind a concurrent create or
-/// `delete_usage_type` holding that `gts_id`'s mutex.
+/// The version-invariant half of a caller `$filter` is translated into the
+/// inner scan and the `status` half above the resolution step, with the binds
+/// landing in that same order.
 ///
-/// Every acquire (once granted) and every release is appended to `events`, so a
-/// test can assert *when* each partition's lock was taken and given back.
-struct SlowForOneGtsIdLock {
-    slow_gts_id: &'static str,
-    delay: std::time::Duration,
-    events: LockEventLog,
+/// Bind order is the sharp edge: `ClickHouse` `?` is positional, and the inner
+/// `WHERE` precedes the outer one in the emitted text. Translating the outer
+/// half first would still produce valid SQL — with the tenant UUID bound to the
+/// status placeholder.
+#[test]
+fn push_split_filter_pushes_the_time_window_into_the_inner_scan() {
+    use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, ODataValue};
+    use usage_collector_sdk::UsageRecordFilterField;
+
+    use crate::infra::storage::query::translate::{SqlBind, SqlCtx};
+
+    let field =
+        |name: &str| UsageRecordFilterField::from_name(name).expect("field is on the schema");
+    let tenant = Uuid::from_u128(7);
+    let from =
+        chrono::DateTime::from_timestamp_micros(1_767_225_600_000_000).expect("timestamp in range");
+
+    // The shape the gateway sends: tenant + `[from, …)` window + status.
+    let node = FilterNode::and(vec![
+        FilterNode::binary(field("tenant_id"), FilterOp::Eq, ODataValue::Uuid(tenant)),
+        FilterNode::binary(
+            field("created_at"),
+            FilterOp::Ge,
+            ODataValue::DateTime(from),
+        ),
+        FilterNode::binary(
+            field("status"),
+            FilterOp::Eq,
+            ODataValue::String("active".to_owned()),
+        ),
+    ]);
+
+    // The metadata side-channel already occupies the inner context, exactly as
+    // it does at the call sites.
+    let mut inner_ctx = SqlCtx::new();
+    let mut inner_clauses = vec!["gts_id = ?".to_owned()];
+    let mut outer_ctx = SqlCtx::new();
+    let mut outer_clauses = vec!["status = 'active'".to_owned()];
+
+    ChRecordStore::push_split_filter(
+        &node,
+        &mut inner_ctx,
+        &mut inner_clauses,
+        &mut outer_ctx,
+        &mut outer_clauses,
+    )
+    .expect("filter translates");
+
+    assert_eq!(
+        inner_clauses,
+        vec![
+            "gts_id = ?".to_owned(),
+            "tenant_id = ?".to_owned(),
+            "created_at >= fromUnixTimestamp64Micro(?)".to_owned(),
+        ],
+        "tenant_id and created_at are key-prefix columns and must prune the scan"
+    );
+    assert_eq!(
+        outer_clauses,
+        vec!["status = 'active'".to_owned(), "status = ?".to_owned()],
+        "status must stay above the version-resolution step"
+    );
+
+    assert!(matches!(&inner_ctx.binds[0], SqlBind::Uuid(u) if *u == tenant));
+    assert!(matches!(
+        &inner_ctx.binds[1],
+        SqlBind::DateTime64Micros(1_767_225_600_000_000)
+    ));
+    assert_eq!(inner_ctx.binds.len(), 2);
+    assert_eq!(outer_ctx.binds.len(), 1);
+    assert!(matches!(&outer_ctx.binds[0], SqlBind::Str(s) if s == "active"));
 }
 
-#[async_trait]
-impl CatalogLockPort for SlowForOneGtsIdLock {
-    async fn acquire_exclusive_for_delete(
-        &self,
-        gts_id: &str,
-    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
-        self.acquire_exclusive_for_create(gts_id).await
-    }
+// ── Offline store ─────────────────────────────────────────────────────────────
 
-    async fn acquire_exclusive_for_create(
-        &self,
-        gts_id: &str,
-    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
-        if gts_id == self.slow_gts_id {
-            tokio::time::sleep(self.delay).await;
-        }
-        self.events
-            .lock()
-            .unwrap()
-            .push((gts_id.to_owned(), "acquire"));
-        Ok(Box::new(RecordingGuard {
-            gts_id: gts_id.to_owned(),
-            events: Arc::clone(&self.events),
-        }))
-    }
-}
-
-/// Lock stub that never grants the lock — the cluster lock manager being
-/// unavailable at acquisition time.
-struct AlwaysTransientLock;
-
-#[async_trait]
-impl CatalogLockPort for AlwaysTransientLock {
-    async fn acquire_exclusive_for_delete(
-        &self,
-        _gts_id: &str,
-    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::transient(
-            "cluster lock unavailable (test stub)",
-        ))
-    }
-
-    // See `AlwaysGrantLock`: overridden explicitly so the create path is
-    // exercised against this stub rather than the trait default.
-    async fn acquire_exclusive_for_create(
-        &self,
-        _gts_id: &str,
-    ) -> Result<Box<dyn LockGuardPort>, UsageCollectorPluginError> {
-        Err(UsageCollectorPluginError::transient(
-            "cluster lock unavailable (test stub)",
-        ))
-    }
-}
-
-/// Build a store over an offline client and a caller-chosen lock stub.
+/// Build a store over an offline client.
 ///
 /// Port 1 is reserved and never bound, so any query that is actually issued
 /// fails fast (connection refused) instead of blocking. The `clickhouse` crate's
 /// default address (`http://localhost:8123`) would let a real local server
 /// answer these "offline" tests.
-fn store_with_lock(lock: Arc<dyn CatalogLockPort>) -> ChRecordStore {
+fn offline_store() -> ChRecordStore {
     ChRecordStore::new(
         clickhouse::Client::default().with_url("http://127.0.0.1:1"),
-        lock,
         Arc::new(Metrics::new()),
         // Generous: every assertion here either short-circuits before I/O or
         // fails fast on connection refused, so the deadline is never what a
         // test observes.
         std::time::Duration::from_secs(30),
+        // Matches the production default, so the offline tier exercises the
+        // shipped configuration.
+        true,
     )
-}
-
-/// Build a store over an offline client. Both assertions below short-circuit
-/// before any I/O, so no server is required.
-fn offline_store() -> ChRecordStore {
-    store_with_lock(Arc::new(AlwaysGrantLock))
 }
 
 /// Build a `UsageRecord` matching [`make_row`]'s canonical fields.
@@ -556,14 +497,106 @@ fn make_record_for(gts_id: &str, id: Uuid, tenant_id: Uuid, created_at_micros: i
     }
 }
 
+// ── Empty-input short circuits ────────────────────────────────────────────────
+
 /// An all-absorbed / all-rejected batch leaves nothing to write; the insert must
 /// then be skipped rather than sending an empty INSERT to `ClickHouse`.
 #[tokio::test]
 async fn insert_records_with_no_rows_is_a_no_op() {
     offline_store()
-        .insert_records(&[], std::time::Instant::now())
+        .insert_records(&[], std::time::Instant::now(), InsertKind::Record)
         .await
         .expect("an empty row set must not touch the backend");
+}
+
+// ── insert_dedup_token ────────────────────────────────────────────────────────
+
+/// Two statements writing the same rows must dedup against each other whatever
+/// order the rows arrive in — a retried batch is not guaranteed to be composed
+/// in the same order — and a row repeated inside one statement must not change
+/// the token either.
+#[test]
+fn insert_dedup_token_is_order_insensitive_and_ignores_repeated_rows() {
+    let tenant = Uuid::from_u128(2);
+    let a = make_row(Uuid::from_u128(10), tenant, 1_700_000_000_000_000, 1);
+    let b = make_row(Uuid::from_u128(11), tenant, 1_700_000_000_000_001, 1);
+    let c = make_row(Uuid::from_u128(12), tenant, 1_700_000_000_000_002, 1);
+
+    let forward = insert_dedup_token(&[a.clone(), b.clone(), c.clone()], InsertKind::Record);
+    let reversed = insert_dedup_token(&[c.clone(), b.clone(), a.clone()], InsertKind::Record);
+    let repeated = insert_dedup_token(&[a.clone(), a.clone(), b.clone(), c], InsertKind::Record);
+    assert_eq!(forward, reversed, "row order must not enter the token");
+    assert_eq!(forward, repeated, "a repeated row must not enter the token");
+
+    let other = insert_dedup_token(&[a, b], InsertKind::Record);
+    assert_ne!(
+        forward, other,
+        "a different row set must produce a different token"
+    );
+}
+
+/// A single create and a batch containing only that record are the same write
+/// and must dedup against each other at the engine.
+#[test]
+fn insert_dedup_token_single_row_equals_batch_of_one() {
+    let row = make_row(
+        Uuid::from_u128(10),
+        Uuid::from_u128(2),
+        1_700_000_000_000_000,
+        1,
+    );
+    assert_eq!(
+        insert_dedup_token(std::slice::from_ref(&row), InsertKind::Record),
+        insert_dedup_token(&[row], InsertKind::Record),
+    );
+}
+
+/// A deactivation marker shares its source row's `id`, so without the kind
+/// discriminator a cascade issued inside the dedup window of the create that
+/// wrote those ids would be dropped as a retry of it.
+#[test]
+fn insert_dedup_token_discriminates_markers_from_records() {
+    let row = make_row(
+        Uuid::from_u128(10),
+        Uuid::from_u128(2),
+        1_700_000_000_000_000,
+        1,
+    );
+    let mut marker = row.clone();
+    marker.status = UsageRecordStatusCode::Inactive;
+    marker.version = row.version + 1;
+    assert_ne!(
+        insert_dedup_token(std::slice::from_ref(&row), InsertKind::Record),
+        insert_dedup_token(std::slice::from_ref(&marker), InsertKind::Marker),
+        "the same id under the two kinds must not share a token"
+    );
+    // Only `id` and `kind` enter the token: the payload, `status` and
+    // `version` do not, so a retried marker set with fresh versions still
+    // matches the one already written.
+    let mut retried = marker.clone();
+    retried.version += 5;
+    assert_eq!(
+        insert_dedup_token(std::slice::from_ref(&marker), InsertKind::Marker),
+        insert_dedup_token(std::slice::from_ref(&retried), InsertKind::Marker),
+    );
+}
+
+/// The token is a setting value on the wire; `ClickHouse` accepts any string,
+/// but a UUID keeps it fixed-width and free of characters that would need
+/// quoting in `system.query_log` queries.
+#[test]
+fn insert_dedup_token_is_a_uuid_string() {
+    let row = make_row(
+        Uuid::from_u128(10),
+        Uuid::from_u128(2),
+        1_700_000_000_000_000,
+        1,
+    );
+    let token = insert_dedup_token(&[row], InsertKind::Record);
+    assert!(
+        Uuid::parse_str(&token).is_ok(),
+        "token must be a UUID: {token}"
+    );
 }
 
 #[tokio::test]
@@ -687,71 +720,141 @@ fn conflicting_in_batch_duplicate_is_an_idempotency_conflict() {
     }
 }
 
-// ── Fail-closed create paths ──────────────────────────────────────────────────
+// ── Batch pipeline (no I/O) ───────────────────────────────────────────────────
 //
-// DESIGN.md §3.6 step 7: an unavailable coordination lock must never let a
-// create proceed unlocked. Both entry points are covered because they acquire
-// the lock independently.
+// `create_batch` is three statements around pure composition. The pure parts
+// are exercised here directly; the statements themselves are covered by the
+// feature-gated live suite.
 
-#[tokio::test]
-async fn create_returns_transient_when_the_lock_is_unavailable() {
-    let store = store_with_lock(Arc::new(AlwaysTransientLock));
-    let record = make_record(
-        Uuid::from_u128(1),
-        Uuid::from_u128(2),
-        1_700_000_000_000_000,
+const RAM_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.ram_gb.v1";
+
+/// One bound parameter per distinct usage type, in a deterministic order, and
+/// no caller-supplied identifier in the SQL text itself.
+#[test]
+fn catalog_lookup_sql_binds_one_str_per_distinct_gts_id() {
+    use std::collections::BTreeSet;
+
+    use crate::infra::storage::query::translate::SqlBind;
+
+    let gts_ids: BTreeSet<&str> = [VCPU_GTS, RAM_GTS, VCPU_GTS].into_iter().collect();
+    let (sql, ctx) = catalog_lookup_sql(&gts_ids);
+
+    assert_eq!(
+        sql,
+        "SELECT gts_id FROM usage_type_catalog WHERE gts_id IN (?, ?)"
     );
-
-    let err = store
-        .create(record)
-        .await
-        .expect_err("create must fail when the lock manager is unavailable");
-
+    assert_eq!(ctx.binds.len(), 2, "one bind per distinct gts_id");
+    // `BTreeSet` order: RAM_GTS sorts before VCPU_GTS.
+    assert!(matches!(&ctx.binds[0], SqlBind::Str(s) if s == RAM_GTS));
+    assert!(matches!(&ctx.binds[1], SqlBind::Str(s) if s == VCPU_GTS));
     assert!(
-        matches!(err, UsageCollectorPluginError::Transient { .. }),
-        "expected a retryable Transient, got {err:?}"
+        !sql.contains(VCPU_GTS),
+        "identifiers are bound, never inlined into the SQL text"
     );
 }
 
-#[tokio::test]
-async fn create_batch_reports_transient_per_record_when_the_lock_is_unavailable() {
-    let store = store_with_lock(Arc::new(AlwaysTransientLock));
+/// A missing usage type marks exactly the slots that reference it, at their
+/// own input positions, and hands every other record on to the dedup step.
+#[test]
+fn catalog_miss_marks_only_that_gts_ids_slots() {
+    let tenant_id = Uuid::from_u128(2);
     let records = vec![
-        make_record(
+        make_record_for(
+            RAM_GTS,
             Uuid::from_u128(1),
-            Uuid::from_u128(2),
+            tenant_id,
             1_700_000_000_000_000,
         ),
-        make_record(
+        make_record_for(
+            VCPU_GTS,
             Uuid::from_u128(3),
-            Uuid::from_u128(2),
+            tenant_id,
             1_700_000_000_000_001,
         ),
+        make_record_for(
+            RAM_GTS,
+            Uuid::from_u128(4),
+            tenant_id,
+            1_700_000_000_000_002,
+        ),
     ];
+    let known: HashSet<String> = [VCPU_GTS.to_owned()].into_iter().collect();
+    let mut outcomes = vec![None, None, None];
 
-    let outcomes = store
-        .create_batch(records)
-        .await
-        .expect("a denied lock is a per-record outcome, not a batch-level failure");
+    let passed = split_by_catalog(&records, &known, &mut outcomes);
 
-    assert_eq!(outcomes.len(), 2);
-    for outcome in outcomes {
-        match outcome {
-            Err(UsageCollectorPluginError::Transient { .. }) => {}
-            other => panic!("expected Transient per record, got {other:?}"),
+    assert_eq!(passed, vec![1], "only the registered type's record passes");
+    for idx in [0, 2] {
+        match &outcomes[idx] {
+            Some(Err(UsageCollectorPluginError::UsageTypeNotFound { gts_id })) => {
+                assert_eq!(gts_id.as_ref(), RAM_GTS, "slot {idx} names its own gts_id");
+            }
+            other => panic!("slot {idx} must be UsageTypeNotFound, got {other:?}"),
         }
+    }
+    assert!(
+        outcomes[1].is_none(),
+        "a passed slot is left for the dedup step to decide"
+    );
+}
+
+/// Composed rows get contiguous versions from the batch base; a record absorbed
+/// from storage composes no row and consumes no version; an identical in-batch
+/// duplicate shares its twin's row and slot list.
+#[test]
+fn compose_batch_assigns_contiguous_versions_and_skips_absorbed_rows() {
+    let tenant_id = Uuid::from_u128(8);
+    let base_micros = 1_700_000_000_000_000_i64;
+    let stored_id = Uuid::from_u128(7);
+    let records = vec![
+        make_record(Uuid::from_u128(1), tenant_id, base_micros + 1),
+        // Already stored: absorbed, composes nothing.
+        make_record(stored_id, tenant_id, base_micros),
+        make_record(Uuid::from_u128(3), tenant_id, base_micros + 3),
+        // Identical in-batch twin of the row above.
+        make_record(Uuid::from_u128(3), tenant_id, base_micros + 3),
+    ];
+    let stored = make_row(stored_id, tenant_id, base_micros, 1);
+    let existing: HashMap<_, _> = [(row_dedup_key(&stored), stored)].into_iter().collect();
+    let passed = vec![0, 1, 2, 3];
+    let mut outcomes = vec![None, None, None, None];
+
+    let (to_insert, row_slots) =
+        offline_store().compose_batch(&records, &passed, &existing, 1_000, &mut outcomes);
+
+    let versions: Vec<u64> = to_insert.iter().map(|r| r.version).collect();
+    assert_eq!(
+        versions,
+        vec![1_000, 1_001],
+        "one version per composed row, contiguous from the base"
+    );
+    assert_eq!(
+        row_slots,
+        vec![vec![0], vec![2, 3]],
+        "the twin hangs off its sibling's row rather than composing its own"
+    );
+    match &outcomes[1] {
+        Some(Ok(absorbed)) => assert_eq!(absorbed.id, stored_id, "absorbed from storage"),
+        other => panic!("slot 1 must be absorbed, got {other:?}"),
+    }
+    for idx in [0, 2, 3] {
+        assert!(
+            matches!(outcomes[idx], Some(Ok(_))),
+            "slot {idx} must be Ok, got {:?}",
+            outcomes[idx]
+        );
     }
 }
 
-/// A backend failure reached with the lock in hand is still a per-record
-/// outcome, never a batch-level `Err` that discards the whole submission.
+/// A backend failure on the batch's first read is still a per-record outcome,
+/// never a batch-level `Err` that discards the whole submission.
 ///
 /// The failure here comes from the unreachable server, so its classification
 /// is whatever the client reports for a refused connection; the contract under
 /// test is the per-record shape of the result, not the variant.
 #[tokio::test]
 async fn create_batch_reports_backend_failures_per_record() {
-    let store = store_with_lock(Arc::new(AlwaysGrantLock));
+    let store = offline_store();
     let records = vec![make_record(
         Uuid::from_u128(1),
         Uuid::from_u128(2),
@@ -771,68 +874,6 @@ async fn create_batch_reports_backend_failures_per_record() {
         )) => {}
         other => panic!("expected a per-record backend failure, got {other:?}"),
     }
-}
-
-/// Each `gts_id` partition owns its own lock for the length of its own critical
-/// section only, so a partition queued behind a contended `gts_id` must not
-/// delay any other partition's work.
-///
-/// `RAM_GTS` sorts before `VCPU_GTS`, so it is the *first* partition — the one
-/// whose lock the batch used to acquire before any other partition could start.
-/// Its acquisition is stalled here; `VCPU_GTS` must still acquire, run, and
-/// release inside that window. Both partitions then fail against the offline
-/// client, which is exactly what makes each release observable.
-#[tokio::test]
-async fn create_batch_does_not_block_a_partition_behind_another_partitions_lock() {
-    const RAM_GTS: &str = "gts.cf.core.uc.usage_record.v1~cf.compute._.ram_gb.v1";
-
-    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let store = store_with_lock(Arc::new(SlowForOneGtsIdLock {
-        slow_gts_id: RAM_GTS,
-        delay: std::time::Duration::from_millis(200),
-        events: Arc::clone(&events),
-    }));
-    let tenant_id = Uuid::from_u128(2);
-    let records = vec![
-        make_record_for(
-            RAM_GTS,
-            Uuid::from_u128(1),
-            tenant_id,
-            1_700_000_000_000_000,
-        ),
-        make_record_for(
-            VCPU_GTS,
-            Uuid::from_u128(3),
-            tenant_id,
-            1_700_000_000_000_001,
-        ),
-    ];
-
-    let outcomes = store
-        .create_batch(records)
-        .await
-        .expect("a contended partition is a per-record outcome, not a batch-level failure");
-    assert_eq!(outcomes.len(), 2, "one outcome per input record");
-
-    let log = events.lock().unwrap().clone();
-    let position = |gts_id: &str, event: &str| {
-        log.iter()
-            .position(|(g, e)| g == gts_id && *e == event)
-            .unwrap_or_else(|| panic!("no {event} recorded for {gts_id} in {log:?}"))
-    };
-
-    assert!(
-        position(VCPU_GTS, "release") < position(RAM_GTS, "acquire"),
-        "the uncontended partition must acquire, run and release its own lock while the \
-         contended partition is still waiting for its lock, got {log:?}"
-    );
-    for gts_id in [RAM_GTS, VCPU_GTS] {
-        assert!(
-            position(gts_id, "acquire") < position(gts_id, "release"),
-            "every partition lock must be released after its own critical section, got {log:?}"
-        );
-    }
-    assert_eq!(log.len(), 4, "exactly one acquire + release per partition");
 }
 
 /// The batch INSERT runs after the dedup SELECTs have already decided every
@@ -980,5 +1021,219 @@ fn aggregate_response_stream_parses_across_chunk_boundaries() {
     assert_eq!(
         buckets[1].value.as_ref().map(ToString::to_string),
         Some("2".to_owned())
+    );
+}
+
+// ── build_aggregate_sql / build_list_sql ──────────────────────────────────────
+
+/// The realistic scan clause set: `gts_id` is always pinned, and non-`SUM` ops
+/// add the `corrects_id` partition.
+fn inner() -> Vec<String> {
+    vec!["gts_id = ?".to_owned(), "corrects_id IS NULL".to_owned()]
+}
+
+/// The exact survivor predicate the aggregate must emit for [`inner`]: raw
+/// active rows whose id carries no marker, with the scan text repeated inside
+/// the marker subquery so it prunes on the same key range.
+const AGG_SURVIVORS: &str = "status = 'active' AND id NOT IN \
+     (SELECT id FROM usage_records WHERE gts_id = ? AND corrects_id IS NULL \
+     AND status = 'inactive')";
+
+/// The aggregate has no version-resolving level: no `GROUP BY` on the sort key,
+/// no `HAVING`, no `LIMIT 1 BY`, no `argMax`, and no nested `SELECT` other than
+/// the marker subquery. Deactivation is handled by the survivor predicate.
+#[test]
+fn aggregate_sql_is_a_single_level_scan_with_the_marker_anti_join() {
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &inner(), &[], "", "");
+    assert_eq!(
+        sql,
+        format!(
+            "SELECT SUM(value) AS agg FROM usage_records \
+             WHERE gts_id = ? AND corrects_id IS NULL AND {AGG_SURVIVORS}"
+        )
+    );
+    for forbidden in [
+        "HAVING",
+        "LIMIT 1 BY",
+        "argMax",
+        "GROUP BY gts_id",
+        "version",
+    ] {
+        assert!(
+            !sql.contains(forbidden),
+            "no resolution construct may remain (`{forbidden}`): {sql}"
+        );
+    }
+    assert_eq!(
+        sql.matches("SELECT").count(),
+        2,
+        "the marker subquery is the only nested SELECT: {sql}"
+    );
+}
+
+/// Every scan predicate is repeated verbatim inside the marker subquery, so the
+/// caller binds the scan values twice — the placeholder count pins that
+/// contract, and a scan clause with its own `?` must be doubled too.
+#[test]
+fn aggregate_sql_repeats_every_scan_predicate_inside_the_marker_subquery() {
+    let mut scan = inner();
+    scan.push("created_at >= fromUnixTimestamp64Micro(?)".to_owned());
+    scan.push("metadata[?] IN (?, ?)".to_owned());
+    let scan_placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, &[], "", "");
+    assert_eq!(
+        sql.matches('?').count(),
+        2 * scan_placeholders,
+        "scan binds are applied twice, once per copy of the scan text: {sql}"
+    );
+    let scan_text = scan.join(" AND ");
+    assert_eq!(
+        sql.matches(scan_text.as_str()).count(),
+        2,
+        "the scan text must appear as the scan predicate and inside the subquery: {sql}"
+    );
+}
+
+/// The `status`-naming half of `$filter` trails the survivor predicate in the
+/// same `WHERE`, so its binds come after both copies of the scan binds.
+#[test]
+fn aggregate_sql_appends_version_dependent_filters_after_the_survivor_predicate() {
+    let sql = ChRecordStore::build_aggregate_sql(
+        "SUM(value) AS agg",
+        &inner(),
+        &["status = ?".to_owned()],
+        " GROUP BY 1",
+        " LIMIT 100001",
+    );
+    assert!(
+        sql.contains(&format!(
+            "{AGG_SURVIVORS} AND status = ? GROUP BY 1 LIMIT 100001"
+        )),
+        "the trailing conjunct must follow the survivor predicate: {sql}"
+    );
+    assert_eq!(
+        sql.matches("WHERE").count(),
+        2,
+        "one WHERE for the query, one inside the marker subquery: {sql}"
+    );
+}
+
+/// The syntax-error guard stated as a property rather than as literal strings,
+/// across every combination of the branches that vary.
+#[test]
+fn aggregate_sql_never_emits_an_empty_clause_or_a_double_space() {
+    let outer_variants: [Vec<String>; 2] = [vec![], vec!["status = ?".to_owned()]];
+    let grouping_variants = [("", ""), (" GROUP BY 1", " LIMIT 100001")];
+
+    for outer in &outer_variants {
+        for (group_by, limit_clause) in grouping_variants {
+            let sql = ChRecordStore::build_aggregate_sql(
+                "SUM(value) AS agg",
+                &inner(),
+                outer,
+                group_by,
+                limit_clause,
+            );
+            let ctx = format!("outer={outer:?} group_by={group_by:?} sql={sql}");
+            assert!(!sql.contains("  "), "double space: {ctx}");
+            assert!(!sql.contains("WHERE )"), "empty WHERE before close: {ctx}");
+            assert!(!sql.contains("WHERE GROUP BY"), "empty WHERE: {ctx}");
+            assert!(!sql.contains("WHERE LIMIT"), "empty WHERE: {ctx}");
+            assert!(!sql.contains("AND AND"), "empty conjunct: {ctx}");
+            assert!(!sql.contains("AND GROUP BY"), "dangling AND: {ctx}");
+            assert!(!sql.ends_with("WHERE"), "trailing WHERE: {ctx}");
+            assert!(!sql.ends_with("AND"), "trailing AND: {ctx}");
+        }
+    }
+}
+
+/// The ungrouped shape (`dim_count == 0`) appends nothing after the survivor
+/// predicate. The gateway depends on this call producing exactly one bucket, so
+/// the text must not gain a stray clause that could filter it away.
+#[test]
+fn aggregate_sql_ungrouped_ends_at_the_survivor_predicate() {
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &inner(), &[], "", "");
+    assert!(
+        sql.ends_with("AND status = 'inactive')"),
+        "no grouping and no trailing filter means nothing follows: {sql}"
+    );
+}
+
+/// The scan keeps every version-invariant predicate, where it prunes.
+/// `tenant_id` and `created_at` reach `aggregate` only through `$filter`, and
+/// with `gts_id` they are the whole sort-key prefix.
+#[test]
+fn aggregate_sql_keeps_invariant_predicates_in_the_scan() {
+    let mut scan = inner();
+    scan.push("created_at >= fromUnixTimestamp64Micro(?)".to_owned());
+    let sql = ChRecordStore::build_aggregate_sql("SUM(value) AS agg", &scan, &[], "", "");
+    assert!(
+        sql.starts_with(
+            "SELECT SUM(value) AS agg FROM usage_records WHERE gts_id = ? AND corrects_id IS NULL \
+             AND created_at >= fromUnixTimestamp64Micro(?) AND status = 'active'"
+        ),
+        "invariant conjuncts belong on the scan, ahead of the survivor predicate: {sql}"
+    );
+}
+
+/// `list` is likewise single-level: no version sort, no `LIMIT 1 BY`, the
+/// caller's `ORDER BY` and look-ahead `LIMIT` applied once, after every
+/// predicate. Its survivor predicate keeps markers (they *are* the resolved
+/// inactive rows) and drops only the active rows a marker supersedes.
+#[test]
+fn list_sql_is_a_single_level_scan_with_the_resolved_survivors() {
+    let scan = vec!["gts_id = ?".to_owned()];
+    let sql = ChRecordStore::build_list_sql(&scan, &[], "created_at ASC, id ASC", 101);
+    assert_eq!(
+        sql,
+        format!(
+            "SELECT {} FROM usage_records WHERE gts_id = ? AND (status = 'inactive' OR id NOT IN \
+             (SELECT id FROM usage_records WHERE gts_id = ? AND status = 'inactive')) \
+             ORDER BY created_at ASC, id ASC LIMIT 101",
+            super::RECORD_COLUMNS
+        )
+    );
+    for forbidden in ["LIMIT 1 BY", "version DESC", "argMax", "GROUP BY"] {
+        assert!(
+            !sql.contains(forbidden),
+            "no resolution construct may remain (`{forbidden}`): {sql}"
+        );
+    }
+}
+
+/// Bind contract for `list`: scan binds twice, then the trailing binds (the
+/// `status` half of `$filter`, then the keyset tuple) in that order.
+#[test]
+fn list_sql_places_trailing_predicates_after_the_survivors_and_before_order_by() {
+    let scan = vec![
+        "gts_id = ?".to_owned(),
+        "tenant_id = ?".to_owned(),
+        "metadata[?] IN (?)".to_owned(),
+    ];
+    let outer = vec![
+        "status = ?".to_owned(),
+        "(created_at, id) > (fromUnixTimestamp64Micro(?), ?)".to_owned(),
+    ];
+    let sql = ChRecordStore::build_list_sql(&scan, &outer, "created_at ASC, id ASC", 51);
+    let scan_placeholders: usize = scan.iter().map(|c| c.matches('?').count()).sum();
+    let outer_placeholders: usize = outer.iter().map(|c| c.matches('?').count()).sum();
+    assert_eq!(
+        sql.matches('?').count(),
+        2 * scan_placeholders + outer_placeholders,
+        "scan binds twice, trailing binds once: {sql}"
+    );
+    assert!(
+        sql.contains(
+            "AND status = 'inactive')) AND status = ? \
+             AND (created_at, id) > (fromUnixTimestamp64Micro(?), ?) \
+             ORDER BY created_at ASC, id ASC LIMIT 51"
+        ),
+        "status half, then keyset, then ORDER BY / LIMIT: {sql}"
+    );
+    let subquery_start = sql.find("(SELECT id").expect("marker subquery present");
+    let keyset_start = sql.find("(created_at, id) >").expect("keyset present");
+    assert!(
+        keyset_start > subquery_start,
+        "the keyset predicate must follow the survivor predicate: {sql}"
     );
 }

@@ -46,34 +46,6 @@ async fn init_rejects_empty_database_url() {
 }
 
 #[tokio::test]
-async fn init_rejects_zero_lock_ttl() {
-    let provider = Arc::new(StaticConfig(json!({
-        "config": {
-            "database_url": "https://user:pass@ch:8123/usage",
-            "lock_ttl_secs": 0
-        }
-    })));
-
-    let ctx = GearCtx::new(
-        "clickhouse-usage-collector-plugin",
-        Uuid::from_u128(2),
-        provider,
-        Arc::new(ClientHub::default()),
-        CancellationToken::new(),
-    );
-
-    let err = ClickHouseUsageCollectorPlugin
-        .init(&ctx)
-        .await
-        .expect_err("zero lock_ttl_secs must be rejected");
-
-    assert!(
-        err.to_string().contains("lock_ttl_secs"),
-        "expected lock_ttl_secs validation error, got: {err}"
-    );
-}
-
-#[tokio::test]
 async fn init_rejects_plaintext_http_database_url_without_override() {
     let provider = Arc::new(StaticConfig(json!({
         "config": {
