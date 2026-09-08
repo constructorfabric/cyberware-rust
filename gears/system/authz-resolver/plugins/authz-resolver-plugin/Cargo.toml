@@ -1,0 +1,125 @@
+[package]
+name = "cf-gears-authz-resolver-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "AuthZ resolver plugin (PDP) resolving decisions and constraints from the RBAC gear"
+repository.workspace = true
+keywords = ["constructorfabric", "cf-gears", "authorization"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "authz_resolver_plugin"
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-shear]
+# `rbac` is reached only through the `deps = [... rbac ...]` argument of
+# `#[toolkit::gear]`, which the macro turns into a `::rbac` import to force-link
+# the gear's inventory registration. cargo-shear's expansion does not see it and
+# reports the dependency as unused; removing it fails the build with
+# `unresolved import rbac` (verified), so the finding is a false positive.
+ignored = ["rbac"]
+
+
+[dependencies]
+# Constructor Fabric SDKs / runtime
+toolkit.workspace = true
+toolkit-macros.workspace = true
+toolkit-gts.workspace = true
+toolkit-security.workspace = true
+toolkit-canonical-errors.workspace = true
+toolkit-odata.workspace = true
+authz-resolver-sdk.workspace = true
+tenant-resolver-sdk.workspace = true
+resource-group-sdk.workspace = true
+# Full gear crates for the `deps = [types_registry, authz_resolver, rbac,
+# tenant_resolver, resource_group]` gear-macro arg: the macro re-exports
+# `::<crate>` to force-link each dependency gear's inventory registration, so the
+# crates (not just the SDKs) must be direct deps.
+authz-resolver = { workspace = true }
+tenant-resolver = { workspace = true }
+resource-group = { workspace = true }
+types-registry = { workspace = true }
+rbac = { workspace = true }
+# Production build links the registry SDK WITHOUT `test-util` — that feature
+# (the `testing` module) is pulled in only for tests, via the dev-dependency
+# below and the `test-support` feature, so it never ships in production.
+types-registry-sdk.workspace = true
+
+# UUID for request builders and test fakes
+uuid.workspace = true
+
+# LRU cache for hierarchy reads
+lru.workspace = true
+
+# Tokio sync primitives for singleflight (already pulled in via tokio
+# workspace dep transitively, but listed here for clarity).
+tokio = { workspace = true, features = ["sync"] }
+
+# In-tree SDKs
+rbac-sdk.workspace = true
+
+# Error handling
+anyhow.workspace = true
+
+# Async
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# OpenTelemetry metrics (design §9). Instruments are pulled from the global
+# meter provider installed by the host; a no-op until an exporter is wired.
+opentelemetry = { workspace = true, features = ["metrics"] }
+# SDK is only needed for the in-memory test harness — gated behind
+# `test-support` via `dep:opentelemetry_sdk` so it never ships in production.
+opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"], optional = true }
+
+[dev-dependencies]
+chrono.workspace = true
+# `tests/rbac_scope_provenance_integration.rs` stands up a real
+# `PermissionEvaluator` over stub repositories. Since the RBAC repo traits
+# take the executor as `<C: DBRunner>`, the stubs must name that bound and
+# the evaluator needs a `DBProvider` — both from `toolkit-db`. `sqlite` is
+# for the in-memory provider the stubs never actually query.
+toolkit-db = { workspace = true, features = ["sqlite"] }
+# `test-util` (the SDK's `testing` module, e.g. `make_test_type_schema`) is
+# needed by `src/test_support` whenever it compiles under `cfg(test)`. Cargo
+# unions dev-dependency features into the lib during `cargo test`, so the
+# crate's own unit + integration tests see it; production builds do not.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+secrecy.workspace = true
+serde_json.workspace = true
+# YAML parsing for the config tests. `serde-saphyr` (not the deprecated
+# `serde_yaml`) is the workspace standard and is what `toolkit`'s config
+# loader actually uses, so the tests exercise the production parser.
+serde-saphyr.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-util.workspace = true
+# tracing-subscriber captures `tracing::info!` events for assertion, in
+# `tests/orchestration_audit.rs` and in `src/domain/audit_emitter_tests.rs` —
+# `AuditEmitter::emit` returns `()`, so the subscriber is the only place its
+# behaviour is observable. Inherits the workspace version/default features and
+# adds `registry` + `std` for the test subscriber.
+tracing-subscriber = { workspace = true, features = ["registry", "std"] }
+# Self dev-dependency so the integration tests under `tests/` get the
+# `test-support` fakes. Same shape as the `rbac` gear's own manifest: a
+# `path = "."` entry, not a workspace alias (no other crate depends on
+# this plugin yet, so the workspace needs no alias for it).
+authz-resolver-plugin = { package = "cf-gears-authz-resolver-plugin", path = ".", features = ["test-support"] }
+
+[features]
+default = []
+# Downstream crates that pull in `src/test_support` (the in-memory fakes)
+# enable this; it must also turn on the registry SDK's `test-util` because
+# the registry fake depends on the SDK's `testing` module, and pull in the
+# OTel SDK for the in-memory metrics harness.
+test-support = ["types-registry-sdk/test-util", "dep:opentelemetry_sdk"]

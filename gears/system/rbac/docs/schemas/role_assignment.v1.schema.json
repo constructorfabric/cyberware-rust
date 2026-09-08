@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.cf.core.rbac.role_assignment.v1~",
+  "title": "RBAC Role Assignment",
+  "description": "RBAC role assignment: Principal + Role + Scope triplet",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "role_definition_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "principal_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "principal_type": {
+      "type": "string",
+      "enum": ["User", "Group", "ServicePrincipal"]
+    },
+    "scope": {
+      "$ref": "#/definitions/scope"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_by": {
+      "type": "string",
+      "minLength": 1
+    },
+    "principal_name": {
+      "description": "Read-path decoration, not part of the persisted row: display name of the principal, resolved by the RBAC gear from account management or the resource-group module. Display-only — absent on write payloads, and absent on a read whenever resolution did not produce a name (deleted principal, service principal, principal outside the lookup tenant, caller without user-read, or an unavailable upstream). No length bound: the value is owned by the upstream gear.",
+      "type": "string"
+    },
+    "created_by_name": {
+      "description": "Read-path decoration, not part of the persisted row: display name of the author, with the same resolution and same absence semantics as principal_name, plus absent for a machine author and for rows created before the author's kind was stored.",
+      "type": "string"
+    },
+    "role_definition_name": {
+      "description": "Read-path decoration, not part of the persisted row: display name of the granted role definition, resolved from RBAC's own role_definitions table. Absent when the referenced definition was deleted inside the FK-restrict race window or the local read failed.",
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "scope": {
+      "type": "string",
+      "oneOf": [
+        { "const": "/" },
+        {
+          "pattern": "^/tenants/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        },
+        {
+          "pattern": "^/tenants/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/resourceGroups/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        }
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "role_definition_id",
+    "principal_id",
+    "principal_type",
+    "scope",
+    "created_at",
+    "updated_at",
+    "created_by"
+  ]
+}

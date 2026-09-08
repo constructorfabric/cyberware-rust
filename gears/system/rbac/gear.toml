@@ -1,0 +1,7 @@
+[gear]
+name = "RBAC"
+description = "Role definitions, role assignments, and permission evaluation for platform authorization."
+category = "core-functionality"
+is_plugin = false
+has_plugins = false
+has_extension_point = false

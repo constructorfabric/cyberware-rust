@@ -819,7 +819,7 @@ gears:
     database:
       server: "postgres_main"        # platform DB provider reference
     config:
-      vendor: "virtuozzo"            # selects the value-store plugin by GTS vendor (default: "virtuozzo")
+      vendor: "constructorfabric"    # selects the value-store plugin by GTS vendor (default: "constructorfabric")
       hierarchy:
         ancestor_cache_ttl_secs: 300 # ancestor-chain cache TTL (> 0)
       reaper:

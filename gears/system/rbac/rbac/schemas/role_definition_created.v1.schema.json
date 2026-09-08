@@ -1,0 +1,8 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "gts://gts.cf.core.events.event.v1~cf.core.rbac.role_definition_created.v1~",
+  "$comment": "v2-deferred — registered when Event Manager contract lands",
+  "title": "RBAC RoleDefinitionCreated Event (placeholder)",
+  "description": "Placeholder event schema for the RoleDefinitionCreated domain event. Not registered with types-registry in v1.",
+  "type": "object"
+}

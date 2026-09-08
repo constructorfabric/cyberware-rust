@@ -7,9 +7,11 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use toolkit_gts::gts_id;
 
-#[derive(Debug, Clone, Deserialize)]
+// `Default` is derived now that every field's default is its type's default —
+// the seller predicate deliberately starts empty (see `seller_tenant_types`),
+// so there is nothing left for a hand-written impl to say.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BssLedgerConfig {
     /// Background-job cadences (tie-out, period-open). Defaults to daily.
@@ -34,12 +36,24 @@ pub struct BssLedgerConfig {
     /// touched-invoice ceiling.
     #[serde(default)]
     pub payments: PaymentsConfig,
-    /// Chained GTS tenant-type ids whose tenants own a billing ledger
-    /// ("sellers"). Provisioning rejects a target whose type is not in this set
-    /// (the §4.12 seller predicate, owned by the ledger — NOT an AM tenant-type
-    /// trait, since GTS mandates closed trait schemas). Defaults to
-    /// partner + platform; organization (buyer/leaf) is excluded.
-    #[serde(default = "default_seller_tenant_types")]
+    /// Tenant types whose tenants own a billing ledger ("sellers").
+    /// Provisioning rejects a target whose type is not matched here (the §4.12
+    /// seller predicate, owned by the ledger — NOT an AM tenant-type trait,
+    /// since GTS mandates closed trait schemas).
+    ///
+    /// **Required; there is deliberately no default.** Tenant-type identifiers
+    /// are deployment-specific — a catalogue is registered by whoever operates
+    /// the platform — so any built-in list would name one product and silently
+    /// reject every seller on every other. An empty list is rejected by
+    /// [`BssLedgerConfig::validate`] at `init()` rather than degrading into
+    /// "no tenant owns a ledger" at the first provisioning request.
+    ///
+    /// Each entry is either a concrete chained type id
+    /// (`gts.cf.core.am.tenant_type.v1~<vendor>.<pkg>.<ns>.<type>.v1~`) or a
+    /// family wildcard ending in `*` (`gts.cf.core.am.tenant_type.v1~*` — every
+    /// registered tenant type owns a ledger). Shapes are checked at `validate`;
+    /// matching is [`seller_guard`](crate::infra::seller_guard).
+    #[serde(default)]
     pub seller_tenant_types: Vec<String>,
     /// Register event-type schemas + build producers. Default OFF: bss-ledger is
     /// the platform's first event producer and the GTS event-type model is
@@ -48,28 +62,6 @@ pub struct BssLedgerConfig {
     /// type). Re-enable once event-broker models event types correctly.
     #[serde(default)]
     pub events_enabled: bool,
-}
-
-impl Default for BssLedgerConfig {
-    fn default() -> Self {
-        Self {
-            jobs: JobsConfig::default(),
-            recognition: RecognitionConfig::default(),
-            fx: FxConfig::default(),
-            recon: ReconConfig::default(),
-            payments: PaymentsConfig::default(),
-            seller_tenant_types: default_seller_tenant_types(),
-            events_enabled: false,
-        }
-    }
-}
-
-/// Default seller (ledger-owner) tenant types: partner + platform.
-fn default_seller_tenant_types() -> Vec<String> {
-    vec![
-        gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.partner.v1~").to_owned(),
-        gts_id!("cf.core.am.tenant_type.v1~vz.ams.tenants.platform.v1~").to_owned(),
-    ]
 }
 
 /// Tick cadences for the gear's `RunnableCapability` background jobs.
@@ -149,6 +141,95 @@ pub enum ConfigError {
         min: u64,
         reason: &'static str,
     },
+    /// A field carries deployment-specific identifiers, so the gear ships no
+    /// default and cannot start until the deployment supplies one.
+    #[error("config: {field} must be set ({reason})")]
+    Required {
+        field: &'static str,
+        reason: &'static str,
+    },
+    /// An entry is neither a concrete GTS type id nor a family wildcard.
+    #[error(
+        "config: {field} entry {value:?} must be a GTS type id ending in `~` \
+         or a family wildcard ending in `*`, and must start with `gts.`"
+    )]
+    InvalidGtsPattern { field: &'static str, value: String },
+}
+
+impl BssLedgerConfig {
+    /// Validate the whole gear configuration: this struct's own required
+    /// fields, then every sub-config. `init()` calls exactly this, so a
+    /// sub-config added later cannot be left unvalidated by omission.
+    ///
+    /// # Errors
+    /// * [`ConfigError::Required`] — `seller_tenant_types` is empty. The gear
+    ///   ships no default because tenant-type identifiers belong to the
+    ///   deployment's catalogue; without the list every provisioning request
+    ///   would be rejected as "not a ledger owner", which reads like a bug
+    ///   rather than a missing setting.
+    /// * [`ConfigError::InvalidGtsPattern`] — an entry is neither a concrete
+    ///   GTS type id (`…~`) nor a family wildcard (`…*`). Entries are matched
+    ///   literally at provisioning time and nothing else validates them, so a
+    ///   typo would otherwise surface only as a rejected seller.
+    /// * whatever the sub-config validators return.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.seller_tenant_types.is_empty() {
+            return Err(ConfigError::Required {
+                field: "seller_tenant_types",
+                reason: "tenant-type ids are deployment-specific; \
+                         see the gear README for the expected shape",
+            });
+        }
+        for entry in &self.seller_tenant_types {
+            validate_tenant_type_pattern("seller_tenant_types", entry)?;
+        }
+
+        self.jobs.validate()?;
+        self.recognition.validate()?;
+        self.fx.validate()?;
+        self.recon.validate()?;
+        self.payments.validate()
+    }
+}
+
+/// Accept a concrete chained GTS **type** id (`gts.….v1~`) or a family
+/// wildcard (`gts.….*`), delegating the grammar to the platform parser
+/// (`GtsOps::parse_id`, which handles both forms) rather than re-deriving it
+/// from string suffixes here.
+///
+/// Two rules on top of "it parses":
+/// * it must be anchored under the GTS prefix, so a stray plain string cannot
+///   pass as an identifier;
+/// * a wildcard must keep at least one segment before `*`. The bare form
+///   ("every type of every vendor owns a ledger") is never a deliberate seller
+///   predicate — the same one-segment floor RBAC enforces on permission
+///   targets.
+fn validate_tenant_type_pattern(field: &'static str, entry: &str) -> Result<(), ConfigError> {
+    let invalid = || ConfigError::InvalidGtsPattern {
+        field,
+        value: entry.to_owned(),
+    };
+
+    let Some(body) = entry.strip_prefix(toolkit_gts::GTS_ID_PREFIX) else {
+        return Err(invalid());
+    };
+    let parsed = gts::GtsOps::parse_id(entry);
+    if !parsed.ok {
+        return Err(invalid());
+    }
+    if parsed.is_wildcard {
+        // `body` is what follows the prefix; a lone `*` is the bare wildcard.
+        if body.trim_end_matches('*').is_empty() {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    // A concrete entry must be a TYPE id (trailing `~`): tenant types are
+    // registered as type schemas, and an instance id here would never match.
+    if parsed.is_type == Some(true) {
+        return Ok(());
+    }
+    Err(invalid())
 }
 
 impl JobsConfig {
@@ -388,6 +469,15 @@ impl FxConfig {
         if self.revaluation_run_tick_secs == 0 {
             return Err(ConfigError::MustBePositive {
                 field: "fx.revaluation_run_tick_secs",
+            });
+        }
+        // Matched literally against the vendor a `RateProviderPluginSpecV1`
+        // instance advertises; a blank value silently matches nothing and
+        // surfaces as "no source plugins registered" on the first sync tick.
+        if self.provider_vendor.trim().is_empty() {
+            return Err(ConfigError::Required {
+                field: "fx.provider_vendor",
+                reason: "matched literally against the rate-provider plugin's advertised vendor",
             });
         }
         Ok(())

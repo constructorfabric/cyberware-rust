@@ -455,14 +455,25 @@ gears:
   #
   bss-ledger:
     # Gear-specific database (SQLite for E2E, like the other user gears; the
-    # gear ships dual PG/SQLite migrations). No config block needed — the
-    # defaults (events_enabled=false, seller_tenant_types=partner+platform)
-    # are correct for E2E. `fx.provider_vendor` also defaults to "cf.bss", the
-    # same default the core `bss-rate-provider` gear advertises as its `vendor`,
-    # so the commented FX example above lines up without further edits.
+    # gear ships dual PG/SQLite migrations).
     database:
       server: "sqlite_users"
       file: "bss_ledger.db"
+    config:
+      # REQUIRED — the gear ships no default here on purpose: tenant-type ids
+      # belong to whoever operates the platform, so a built-in list would name
+      # one product. Startup fails if this is missing or malformed.
+      #
+      # E2E takes the family wildcard: the stand registers no tenant-type
+      # catalogue, so enumerating concrete ids would only encode ids nothing
+      # resolves. A real deployment lists the seller types explicitly instead
+      # (see the gear README) and leaves its buyer/leaf types out.
+      seller_tenant_types:
+        - "gts.cf.core.am.tenant_type.v1~*"
+      # Everything else keeps its default: events_enabled=false, and
+      # fx.provider_vendor="cf.bss" — the same value the core
+      # `bss-rate-provider` gear advertises as its `vendor`, so the commented
+      # FX example above lines up without further edits.
 
   bss-pricing:
     # Gear-specific database (SQLite for E2E, like the other user gears; the

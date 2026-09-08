@@ -68,6 +68,9 @@ use mini_chat::infra::plugins::static_model_policy as _;
 #[cfg(feature = "chat-engine")]
 use chat_engine as _;
 
+#[cfg(feature = "rbac")]
+use rbac as _;
+
 // === Example Features ===
 
 #[cfg(feature = "users-info-example")]

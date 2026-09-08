@@ -1,0 +1,193 @@
+[package]
+name = "cf-gears-rbac"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "RBAC gear: role definitions, role assignments, and permission evaluation"
+repository.workspace = true
+keywords = ["constructorfabric", "cf-gears", "rbac"]
+categories = ["web-programming"]
+metadata.docs.rs.all-features = true
+# `build.rs` validates that the vendored entity-schema JSON
+# (`schemas/*.v1.schema.json`) `$id` fields match the canonical Rust
+# constants in `src/module.rs` (`ROLE_DEFINITION_GTS_ID`, etc.).
+# Without it a stale schema $id surfaces only at platform startup, when
+# `register_schemas` runs; the build-time check turns the drift into a
+# compile error.
+build = "build.rs"
+
+[lib]
+name = "rbac"
+
+[lints]
+workspace = true
+
+[build-dependencies]
+# `build.rs` parses the vendored GTS schema files at compile time to
+# assert the `$id` field matches the canonical constant defined in
+# `src/module.rs`. Drift used to be a runtime
+# `register_schemas` failure; the build-time check catches it before
+# anything ships.
+serde_json = { workspace = true }
+
+[features]
+# Exposes the `MockPolicyEnforcer`, `AcceptAllPermissionCatalog`,
+# `InMemoryPermissionCatalog`, `AcceptAllTargetTypeValidator`, and
+# `DenyAllTargetTypeValidator` test doubles. Automatically enabled for
+# `cargo test` via the self-referencing `dev-dependencies` entry below.
+# MUST stay opt-in for any production consumer — gating these mocks is
+# what prevents a typo in module wiring from silently disabling RBAC.
+test-support = ["dep:opentelemetry_sdk"]
+
+[dev-dependencies]
+# Re-imports the crate under test with the `test-support` feature
+# enabled so integration tests in `tests/` can construct the `_mock`
+# modules' types. Standard Rust idiom for "library exposes test
+# doubles to its own integration tests without leaking them into the
+# release artifact." Cargo unifies the two graph edges (the lib build
+# under test + the dev-dep reference) into a single compilation with
+# `test-support = on`.
+rbac = { package = "cf-gears-rbac", path = ".", features = ["test-support"] }
+
+# Enable sea-orm backend drivers for the test binary; `pg` for testcontainers
+# Postgres tests, `sqlite` for the missing-dep tests that open `sqlite::memory:`.
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+# Postgres-backed integration tests are `#[ignore]` by default; run them via
+# `cargo test -p cf-gears-rbac -- --ignored`.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+# Pinned database image tags — the workspace's single source of truth
+# (docs/TESTING.md 4.4). `cargo xtask check-test-container-pins` rejects a
+# fixture that builds a database container any other way.
+test-containers = { workspace = true }
+# `sqlx` for raw SQL execution in tests (information_schema, EXPLAIN,
+# constraint probes). `chrono` feature needed for `timestamptz` extraction.
+sqlx = { workspace = true, features = ["chrono", "uuid"] }
+# `tower::ServiceExt` provides `.oneshot(...)` for router unit tests.
+tower = { workspace = true }
+# `test-util` feature exposes `MockTypesRegistryClient` and `make_test_instance`
+# used by `TypesRegistryPermissionCatalog` unit tests.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# Validates a fully decorated read payload against the vendored entity
+# schemas registered with GTS — `additionalProperties: false` there makes any
+# unlisted read-path field a rejected payload.
+jsonschema = { workspace = true }
+
+[dependencies]
+# SDK contract published in ClientHub
+rbac-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+
+# Spawned inventory-gauge refresher (RBAC has no serve() loop):
+# tokio::spawn + tokio::time::interval + tokio::select! need rt/time/macros.
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+# `join_all` fans the per-entry `assignable_scopes` checks out to the
+# tenant resolver concurrently (see `role_definition::service`).
+futures = { workspace = true }
+
+# `chrono` needs the `serde` feature so `DateTime<Utc>` round-trips on entity timestamps.
+chrono = { workspace = true, features = ["serde"] }
+
+# Persistence stack. Postgres is the canonical production backend;
+# SQLite is enabled for fast Docker-less smoke tests and embedded
+# demos. `sqlx-postgres` activates sea-orm's `sqlx-dep` feature so
+# the `constraint_name` helpers in `infra/storage/role_*_repo.rs`
+# can pattern-match on `sea_orm::sqlx::Error::Database(_)` for
+# Postgres. The SQLite path falls back to error-message string
+# parsing (see the helpers in those repos).
+#
+# **SQLite is NOT recommended for production rbac.** The Postgres
+# migration drops several GIN / `pg_trgm` / `text_pattern_ops`
+# indexes when running on SQLite, so `LIKE` filtering degrades to
+# O(n) scans. Use SQLite for tests, dev, and embedded demos only.
+sea-orm = { workspace = true, features = ["sqlx-postgres", "sqlx-sqlite"] }
+sea-orm-migration = { workspace = true }
+
+# toolkit core + DB + security + macros.
+toolkit = { workspace = true }
+# Required as a direct dep by the `#[resource_error(...)]` macro
+# expansion (see `src/api/rest/error.rs`).
+toolkit-canonical-errors = { workspace = true }
+# `pg` + `sqlite` features activate the `DbError::Sqlx` variant used by
+# the redacted-diagnostic ladder in `src/infra/error_conv.rs`. Matches
+# `account-management`'s deps; consistent with the `sqlx-postgres` /
+# `sqlx-sqlite` features rbac already activates on `sea-orm`.
+toolkit-db = { workspace = true, features = ["pg", "sqlite"] }
+# `#[derive(Scopable)]` for entity security profile declarations.
+toolkit-db-macros = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-security = { workspace = true }
+
+# Upstream ClientHub contracts resolved at `init()` time.
+tenant-resolver-sdk = { workspace = true }
+resource-group-sdk = { workspace = true }
+# Display-name reads for `User` principals on role-assignment responses.
+# SDK ONLY — RBAC must NOT add `account_management` to its gear `deps`:
+# AM declares `deps = [authz_resolver, ...]` and the authz resolver
+# consumes RBAC, so the edge would close a dependency cycle. The client is
+# therefore resolved lazily from ClientHub at first use and its absence
+# degrades to "no names" (see `infra/am_user_name_reader.rs`).
+account-management-sdk = { workspace = true }
+# Declarations only (no gear implementation, no ClientHub call): the built-in
+# role catalog re-exports the Usage Collector's resource-type consts so the
+# Usage Emitter grant cannot drift from what the collector's PEP enforces.
+usage-collector-sdk = { workspace = true }
+# The types-registry *contract*. Production code imports the client trait and
+# its models from here, not from the `types-registry` gear crate below: the
+# gear crate only re-exports these same items, and depending on an
+# implementation for its contract is the wrong direction — every other
+# consumer in the workspace uses the SDK.
+types-registry-sdk = { workspace = true }
+# Full gear crates for the `deps = [types_registry, tenant_resolver, resource_group]`
+# gear-macro arg: the macro re-exports `::<crate>` to force-link each dependency
+# gear's inventory registration, so the crates (not just the SDKs) must be direct deps.
+tenant-resolver = { workspace = true }
+resource-group = { workspace = true }
+types-registry = { workspace = true }
+# `gts_instance!` macro + `AuthzPermissionV1`. The macro's emitted code
+# references the `gts` crate directly.
+toolkit-gts = { workspace = true }
+gts = { workspace = true }
+
+arc-swap = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+# Cursor pagination uses base64url-encoded opaque cursors from
+# `toolkit_odata`; the catalog endpoint encodes an id-only cursor with
+# `base64` (plain, unsigned — matches every other module).
+base64 = { workspace = true }
+inventory = { workspace = true }
+# `parking_lot` preferred over std's RwLock — no poisoning semantics.
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# NFKC normalisation of role names before the
+# `fold_to_ascii_skeleton` lookalike fold. Without NFKC, compatibility
+# decompositions (math-bold `\u{1D40E}`, fullwidth `\u{FF2F}`, etc.)
+# bypass the per-codepoint fold table and reach storage as-is. NFKC
+# collapses them onto plain ASCII first; the fold table then handles
+# the residual Greek/Cyrillic single-codepoint cases.
+unicode-normalization = { workspace = true }
+# `permission_evaluator::assignment_applies` increments
+# `rbac_unknown_scope_variants_total` via `opentelemetry::global::meter_with_scope`
+# from the silent-deny fallthrough arm. The counter is lazy
+# (`OnceLock`) and degrades to a no-op when no `MeterProvider` is
+# installed, so this dep does not change runtime behaviour for
+# deployments without metrics export.
+opentelemetry = { workspace = true, features = ["metrics"] }
+# SDK is only needed for the in-memory test harness — gated behind
+# `test-support` via `dep:opentelemetry_sdk` so it never ships in production.
+opentelemetry_sdk = { workspace = true, features = [
+  "metrics",
+  "testing",
+], optional = true }
+# `utoipa` powers the OpenAPI document published at `/openapi.json`.
+utoipa = { workspace = true }
+uuid = { workspace = true }
