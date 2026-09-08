@@ -26,6 +26,7 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
   - [5.5 P1 — Secret Types](#55-p1--secret-types)
   - [5.6 P1 — Deprovisioning Lifecycle](#56-p1--deprovisioning-lifecycle)
   - [5.7 P2 — Planned](#57-p2--planned)
+  - [5.8 P1 — Credential Records and Secret Values](#58-p1--credential-records-and-secret-values)
 - [6. Non-Functional Requirements](#6-non-functional-requirements)
   - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
 - [7. Public Library Interfaces](#7-public-library-interfaces)
@@ -122,6 +123,14 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 **Role**: Authenticated user managing secrets for their tenant. Creates, updates, and deletes secrets. Configures sharing mode to control descendant access. **Needs**: CRUD operations on secrets within their own tenant namespace. Ability to share secrets with descendants or keep them private.
 <!-- cpt-cf-id-content -->
 
+#### Integration Administrator
+
+**ID**: `cpt-cf-credstore-actor-integrations-admin`
+
+<!-- cpt-cf-id-content -->
+**Role**: Configures a tenant's integrations (SMTP, provider keys, webhooks): creates and rotates credentials, retargets and disables them, and reads the catalogue. **Needs**: Read access to the credential catalogue and to a record's metadata; ability to create and replace credential records and to rotate their values under precondition control. Does not need the plaintext of the credentials being managed.
+<!-- cpt-cf-id-content -->
+
 ### 2.2 System Actors
 
 #### Outbound API Gateway (OAGW)
@@ -130,6 +139,14 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 
 <!-- cpt-cf-id-content -->
 **Role**: Service that proxies outbound API calls to external services. Retrieves secrets on behalf of tenants by constructing a SecurityContext for the target tenant. Primary consumer of hierarchical secret resolution.
+<!-- cpt-cf-id-content -->
+
+#### Integration Application
+
+**ID**: `cpt-cf-credstore-actor-integration-app`
+
+<!-- cpt-cf-id-content -->
+**Role**: A platform service (mail sender, billing connector) that reads the values of the credentials assigned to it, one by one or as its whole set, in the tenant it acts for. Never enumerates the catalogue.
 <!-- cpt-cf-id-content -->
 
 #### Platform Gear
@@ -190,8 +207,9 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 - Automatic secret rotation (type-level rotation traits are advisory only)
 - Cross-tenant secret transfer (secrets cannot change ownership)
 - Unauthenticated or untrusted client access (all access requires platform authentication via SecurityContext)
-- Secret listing or search operations (only retrieval by known reference)
-- Granular per-secret ACLs beyond the sharing modes (e.g., "share with tenants A, B, C only" or sharing outside the hierarchy)
+- Full-text search over secret values or references (retrieval remains by known reference, or by the allowlisted metadata filter of the bulk value read)
+- Secret values returned through the credential listing (the listing surface is metadata-only by construction, regardless of the caller's grants)
+- Granular per-secret ACLs naming specific tenants (e.g., "share with tenants A, B, C only") or sharing outside the tenant hierarchy
 - Hierarchical or policy logic in backend plugins (plugins are pure value stores)
 - MySQL as a metadata database
 
@@ -206,6 +224,8 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 <!-- cpt-cf-id-content -->
 The system **MUST** allow a tenant to store a secret with a reference (key), a value, and a sharing mode. Two write operations exist: a create-only operation that fails with a conflict when a secret of the same sharing class already exists, and a precondition-guarded update of an existing secret (see the optimistic-concurrency requirement) that fails with a conflict when the target does not exist — an update never creates. For `tenant` and `shared` modes a write updates the single non-private secret for `(tenant, reference)`; for `private` mode each owner has an independent secret under `(tenant, reference, owner)`. A private secret and a tenant/shared secret with the same reference coexist; a write of one sharing class **MUST NOT** affect the other. Changing a secret between `private` and `tenant`/`shared` is rejected as an unsupported transition.
 
+**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the capability — a guarded write of a value under a reference, with private and tenant/shared coexisting and an immutable transition rule — still holds, but the *shape* changes. Record creation and value writing become separate requests (`cpt-cf-credstore-fr-write-credential-record`, `cpt-cf-credstore-fr-read-secret`), so there is no longer a create operation that carries a value, and "an update never creates" applies to the value sub-resource rather than to the record, whose write is a create-or-replace guarded by `If-None-Match` / `If-Match`.
+
 **Rationale**: Core capability — tenants manage their own credentials; the coexistence rule makes private and team secrets independent under common names. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
@@ -216,6 +236,8 @@ The system **MUST** allow a tenant to store a secret with a reference (key), a v
 <!-- cpt-cf-id-content -->
 The system **MUST** allow a caller to retrieve the decrypted value of an accessible secret by reference, together with access metadata: owning tenant, sharing mode, whether the secret was inherited from an ancestor, and its version. Only fully provisioned (`active`) secrets are visible. Not-found and inaccessible are indistinguishable in the response (a single not-found surface).
 
+**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the capability and the single not-found surface still hold, but the value moves to its own address (`cpt-cf-credstore-fr-read-secret`) and the metadata becomes independently readable without it (`cpt-cf-credstore-fr-get-credential`), so "value together with metadata" is no longer the only way to obtain either half.
+
 **Rationale**: Consumers need the value plus enough metadata to understand inheritance and support concurrency control. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`, `cpt-cf-credstore-actor-oagw`
 <!-- cpt-cf-id-content -->
 
@@ -225,6 +247,8 @@ The system **MUST** allow a caller to retrieve the decrypted value of an accessi
 
 <!-- cpt-cf-id-content -->
 The system **MUST** allow a tenant to delete their own secret by reference (own-tenant only; the private class targets the caller's own private secret). Descendants using a shared secret lose access immediately upon deletion. Deleting a missing backend value is not an error (idempotent delete).
+
+**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): revocation semantics are unchanged, but the deletion addresses the credential **record** (removing its value with it), and a tenant that wants to disable an inherited credential without deleting anything of its own uses suppression instead (`cpt-cf-credstore-fr-suppression`).
 
 **Rationale**: Tenants must be able to revoke credentials reliably. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -320,6 +344,16 @@ Authorization, sharing-mode enforcement, and hierarchy logic **MUST** live exclu
 **Rationale**: Prevents inconsistent authorization behavior across backends; keeps backends trivially simple. **Actors**: `cpt-cf-credstore-actor-platform-gear`, `cpt-cf-credstore-actor-backend`
 <!-- cpt-cf-id-content -->
 
+#### Authorization Action Split
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-authz-action-split`
+
+<!-- cpt-cf-id-content -->
+Authorization **MUST** distinguish six actions: listing records, reading one record, writing a record, reading a value, writing a value, and deleting a credential. The previous single read action **MUST NOT** be accepted as a synonym for any of the metadata actions; policies granting it **MUST** be re-issued.
+
+**Rationale**: Enumerating entries, reading a record's metadata, and reading a secret value have different blast radius and must be separately grantable; an ambiguous grant would defeat that separation. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
+<!-- cpt-cf-id-content -->
+
 ### 5.4 P1 — Reliability & Concurrency
 
 #### Crash-Safe Write Lifecycle
@@ -385,6 +419,108 @@ The system **MUST** provide at least one production-grade value-store plugin (ex
 **Rationale**: The in-memory static plugin is suitable for development and testing only (values do not survive process restart). **Actors**: `cpt-cf-credstore-actor-backend`
 <!-- cpt-cf-id-content -->
 
+### 5.8 P1 — Credential Records and Secret Values
+
+#### Credential Record and Secret Value Split
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-credential-record`
+
+<!-- cpt-cf-id-content -->
+The system **MUST** address a credential as a **record** whose representation contains metadata only — reference, owning tenant, sharing mode, type, category, version, expiry, and inheritance status — and never the secret value. The secret value **MUST** be a separate addressable sub-resource of that record.
+
+**Rationale**: A metadata surface cannot leak a value it structurally does not contain; separating the two makes a value-blind administrator role possible. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-platform-gear`
+<!-- cpt-cf-id-content -->
+
+#### List Credential Records
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-list-credentials`
+
+<!-- cpt-cf-id-content -->
+The system **MUST** allow an authorized caller to list the credential records effectively visible to its tenant, paginated, ordered deterministically, and **never carrying secret values regardless of the caller's grants**. The listing **MUST** follow the platform cursor-pagination contract: an opaque cursor, a `limit`, and OData `$filter`/`$orderby` restricted to an allowlist of indexed fields, with no total count. Listing **MUST** require its own authorization action, distinct from reading a single record.
+
+**Rationale**: Integration administrators need a catalogue view without turning it into a value-disclosure or enumeration primitive. **Actors**: `cpt-cf-credstore-actor-integrations-admin`
+<!-- cpt-cf-id-content -->
+
+#### Get Credential Record
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-get-credential`
+
+<!-- cpt-cf-id-content -->
+The system **MUST** allow an authorized caller to read one credential record by reference, applying hierarchical resolution, without disclosing the value. The response **MUST** carry the strong optimistic-concurrency validator for the caller's own record, so that a caller entitled to write but not to read values can still perform a guarded write. A record that does not resolve or is inaccessible **MUST** be indistinguishable in the response.
+
+**Rationale**: A value-blind writer still needs a CAS validator to rotate or replace a record safely. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-platform-gear`
+<!-- cpt-cf-id-content -->
+
+#### Write Credential Record
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-write-credential-record`
+
+<!-- cpt-cf-id-content -->
+The system **MUST** allow creating and replacing a credential record without touching its value, guarded by a caller-supplied precondition: create-only, guarded replace, or explicit last-writer-wins. The secret type **MUST** remain immutable. A record **MAY** exist without a value; such a record **MUST NOT** resolve for value reads and **MUST NOT** hide a value inherited from an ancestor. Creating a record together with its value in a single request is explicitly **not** provided.
+
+**Rationale**: Splitting the record from the value lets metadata (sharing, category, expiry) be edited without ever touching the secret backend; the value-less state must stay well-defined rather than becoming an unfenced hazard. **Actors**: `cpt-cf-credstore-actor-integrations-admin`
+<!-- cpt-cf-id-content -->
+
+#### Read Secret Value
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-read-secret`
+
+<!-- cpt-cf-id-content -->
+The system **MUST** allow an authorized caller to read the value of a credential resolved through the tenant hierarchy, at an address distinct from the record, with caching disabled and one audit record per returned value.
+
+**Rationale**: Value disclosure is its own privilege with its own auditable, throttleable path, separate from reading or listing metadata. **Actors**: `cpt-cf-credstore-actor-integration-app`, `cpt-cf-credstore-actor-oagw`, `cpt-cf-credstore-actor-platform-gear`
+<!-- cpt-cf-id-content -->
+
+#### Bulk Read Secret Values
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-bulk-read-secrets`
+
+<!-- cpt-cf-id-content -->
+The system **MUST** allow an authorized caller to read the values of several credentials in one request, selected either by an explicit list of references or by a filter over the allowlisted metadata fields. The selection **MUST NOT** be able to exceed what the caller may read one by one: each item **MUST** be authorized individually. The response **MUST NOT** be paginated and **MUST NOT** be continuable. The number of returned items **MUST** be capped; exceeding the cap **MUST** fail the request rather than truncate the result. Per-item refusal **MUST** be indistinguishable from per-item absence.
+
+**Rationale**: Applications commonly need their whole credential set in one round-trip; disclosure must stay bounded by the caller's own grant, a hard cap, and the absence of pagination, rather than becoming a walkable catalogue dump. **Actors**: `cpt-cf-credstore-actor-integration-app`
+<!-- cpt-cf-id-content -->
+
+#### Secret Category
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-secret-category`
+
+<!-- cpt-cf-id-content -->
+Each credential record **MAY** carry a **category**, an operator-chosen label drawn from a closed registry, usable as an authorization attribute so that an application can be granted the values of one category only. Changing a category changes who may read the value, therefore it **MUST** require the record-write action and **MUST** bump the record version. A category outside the registry **MUST** be rejected.
+
+**Rationale**: Category-scoped grants are what makes "all my SMTP secrets" servable without widening an application's entitlement beyond its own credentials. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
+<!-- cpt-cf-id-content -->
+
+#### Inheritance Status
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-inheritance-status`
+
+<!-- cpt-cf-id-content -->
+Every record representation **MUST** state its relationship to the ancestor chain: owned by the requesting tenant, inherited from an ancestor, or owning a record that overrides an ancestor's shared credential. The status is metadata, not secret material, and **MUST** be available to callers holding only metadata actions.
+
+**Rationale**: An integration administrator must be able to tell "mine" from "inherited" from the catalogue alone, without ever reading a value. **Actors**: `cpt-cf-credstore-actor-integrations-admin`
+<!-- cpt-cf-id-content -->
+
+#### Tenant-Level Suppression
+
+#### Override Type Consistency
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-override-type-consistency`
+
+<!-- cpt-cf-id-content -->
+When a tenant creates a credential record for a reference that currently resolves to an ancestor's `shared` credential, the new record **MUST** carry the same secret type as the credential it overrides; a differing type **MUST** be rejected as a conflict. Consuming applications address a credential by reference and rely on its type to know the shape of the value, so a local override of a different type would break them without any change on their side. The rule applies only at creation: the type is immutable afterwards, and a reference that resolves to nothing may be created with any registered type.
+
+**Rationale**: The secret type is the contract between the credential and the application that reads it; a tenant must not be able to break that contract unilaterally by shadowing a credential with an incompatible one. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
+<!-- cpt-cf-id-content -->
+
+- [ ] `p2` - **ID**: `cpt-cf-credstore-fr-suppression`
+
+<!-- cpt-cf-id-content -->
+The system **SHOULD** allow a tenant to declare that a credential is disabled for it even when an ancestor publishes one, so that value reads in that tenant and its descendants resolve as absent while the ancestor's credential is untouched.
+
+**Rationale**: Descendants need a way to opt out of an inherited credential without deleting or shadowing it at the ancestor's expense. **Actors**: `cpt-cf-credstore-actor-integrations-admin`
+<!-- cpt-cf-id-content -->
+
 ## 6. Non-Functional Requirements
 
 ### 6.1 Gear-Specific NFRs
@@ -394,7 +530,7 @@ The system **MUST** provide at least one production-grade value-store plugin (ex
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-confidentiality`
 
 <!-- cpt-cf-id-content -->
-Secret values **MUST NOT** appear in logs, error messages, or debug output at any level (gear, plugin, transport), **MUST NOT** be cacheable by intermediaries, and **MUST NOT** be silently corrupted (non-UTF-8 values are rejected on the string transport rather than lossily decoded). Secret memory is zeroized on drop.
+Secret values **MUST NOT** appear in logs, error messages, or debug output at any level (gear, plugin, transport), **MUST NOT** be cacheable by intermediaries, and **MUST NOT** be silently corrupted (non-UTF-8 values are rejected on the string transport rather than lossily decoded). Secret memory is zeroized on drop. Metadata surfaces (the credential record, its listing, and any catalogue view) **MUST NOT** be able to carry a secret value; the restriction is a structural property of the resource, not a convention enforced by review. Every value returned to a caller **MUST** be attributable to a subject and an operation in the audit trail.
 
 **Threshold**: Zero plaintext secret values in any log output **Rationale**: Secrets are the most sensitive data in the platform. **Architecture Allocation**: See DESIGN.md §3.2 for the implementation approach
 <!-- cpt-cf-id-content -->
@@ -404,7 +540,7 @@ Secret values **MUST NOT** appear in logs, error messages, or debug output at an
 - [ ] `p1` - **ID**: `cpt-cf-credstore-nfr-tenant-isolation`
 
 <!-- cpt-cf-id-content -->
-No operation may read or modify secret metadata outside the caller's PDP-authorized tenant scope; enforcement happens at the data layer on every query. Inaccessible secrets are indistinguishable from non-existent ones (anti-enumeration).
+No operation may read or modify secret metadata outside the caller's PDP-authorized tenant scope; enforcement happens at the data layer on every query. Inaccessible secrets are indistinguishable from non-existent ones (anti-enumeration). This equivalence **MUST** hold per item inside a bulk response, not only for point reads.
 
 **Threshold**: Zero cross-tenant reads/writes outside the authorized scope **Rationale**: Multi-tenant platform guarantee. **Architecture Allocation**: PDP scope + data-layer clamps; see DESIGN.md §3.1
 <!-- cpt-cf-id-content -->
@@ -428,7 +564,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - [ ] `p1` - **ID**: `cpt-cf-credstore-interface-client`
 
 <!-- cpt-cf-id-content -->
-**Type**: Rust trait (async) **Stability**: stable **Description**: Public API for platform gears. Registered in ClientHub without scope. Operations: `get` (hierarchical read returning value + metadata: owning tenant, sharing, inherited flag, version, secret type, expiry), `put`/`create` (precondition-guarded update / create-only) plus typed-options variants accepting write options (secret type, expiry), `delete` (precondition-guarded). Hierarchical resolution is internal to the gear. **Breaking Change Policy**: Major version bump required
+**Type**: Rust trait (async) **Stability**: stable **Description**: Public API for platform gears. Registered in ClientHub without scope. Operations: `get` (hierarchical read returning value + metadata: owning tenant, sharing, inherited flag, version, secret type, expiry), `put`/`create` (precondition-guarded update / create-only) plus typed-options variants accepting write options (secret type, expiry), `delete` (precondition-guarded), `metadata` (point read of one credential record, value-free), `list_metadata` (paginated, deterministically ordered listing of credential records, value-free), `read_secrets` (bulk read of values for an explicit set of references or a metadata filter, capped and non-paginated). Creating a credential record and setting its value are separate calls; no single operation does both. Hierarchical resolution is internal to the gear. **Breaking Change Policy**: Major version bump required
 <!-- cpt-cf-id-content -->
 
 #### CredStorePluginClientV1
@@ -668,6 +804,52 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - **Crash mid-delete**: the reaper finishes the saga within the configured timeout
 <!-- cpt-cf-id-content -->
 
+#### UC-009: Integration Administrator Configures a Tenant's SMTP Without Seeing Credentials
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-usecase-admin-configure-without-value`
+
+<!-- cpt-cf-id-content -->
+**Actor**: `cpt-cf-credstore-actor-integrations-admin`
+
+**Preconditions**:
+- Administrator holds the list-records, read-record, and write-record actions in their tenant, but not read-value
+- A partner ancestor publishes a `shared` SMTP credential
+
+**Main Flow**:
+1. Administrator lists the tenant's credential catalogue and sees the SMTP entry marked as inherited from the partner
+2. Administrator creates their own record for the same reference (create-only record write), then sets its value (a separate value write) — two calls, no value ever read
+3. Administrator reads the record to obtain its current version validator, then rotates the value with a guarded write using that validator
+4. At no point does the administrator call the value-read address
+
+**Postconditions**:
+- The tenant has its own SMTP credential, rotated under concurrency control, without the administrator ever seeing a plaintext value
+
+**Alternative Flows**:
+- **Administrator attempts to read the value**: refused; the response is identical to requesting a reference that does not exist
+<!-- cpt-cf-id-content -->
+
+#### UC-010: Mail Service Fetches Its Whole Credential Set in One Call
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-usecase-bulk-fetch-own-set`
+
+<!-- cpt-cf-id-content -->
+**Actor**: `cpt-cf-credstore-actor-integration-app`
+
+**Preconditions**:
+- The application is authorized to read values of category `email-sender` only, in the tenant it acts for
+
+**Main Flow**:
+1. Application issues one bulk read request selecting category `email-sender`
+2. The system resolves and authorizes each matching credential individually and returns all of them in one response, each item stating whether its value is the tenant's own or inherited from an ancestor
+3. Credentials of other categories are not evaluated and do not appear in the result
+
+**Postconditions**:
+- The application has its full SMTP credential set from a single round-trip, scoped exactly to its own grant
+
+**Alternative Flows**:
+- **Selection would match more items than the cap allows**: the request fails outright; the result is never truncated
+<!-- cpt-cf-id-content -->
+
 ## 9. Acceptance Criteria
 
 - [ ] Tenant can store, retrieve, and delete secrets via both ClientHub and REST API
@@ -682,6 +864,16 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - [ ] Secret values never appear in log output or metric labels; non-UTF-8 values are rejected on the REST transport, not corrupted
 - [ ] Secret types: a write violating the type's `allow_sharing`, `value_schema`, size/format, or expiry traits is rejected with a stable reason; the type is immutable, defaults to `generic`, and is returned in metadata; expired secrets resolve as not-found and are reaped
 - [ ] Deprovisioning: a deleted secret stops resolving atomically at delete start; partial delete failures self-heal via retry or reaper; the reference conflicts (retryably) until cleanup completes
+- [ ] Credential records never carry a secret value; the value is a separate sub-resource of the record
+- [ ] Listing returns credential records only, paginated per the platform cursor contract, filterable and orderable only on allowlisted indexed fields, with no total count, and requires its own authorization action
+- [ ] A single credential record can be read by reference without disclosing its value, carrying the current version validator; an inaccessible or non-resolving record is indistinguishable in the response
+- [ ] A credential record can be created or replaced under a create-only, guarded-replace, or last-writer-wins precondition without touching its value; the secret type never changes; a record without a value neither resolves for value reads nor hides an inherited value
+- [ ] A credential's value can be read at its own address, hierarchically resolved, with caching disabled and one audit record per value returned
+- [ ] Several credential values can be read in one request by explicit references or an allowlisted metadata filter; each item is authorized individually, the response is never paginated or continuable, and exceeding the cap fails the request rather than truncating it; a refused item is indistinguishable from a missing one
+- [ ] Authorization distinguishes six actions — list records, read one record, write a record, read a value, write a value, delete — and no policy grants value access as a side effect of a metadata grant
+- [ ] A credential's category is drawn from a closed registry, changing it requires the record-write action and bumps the version, and it can gate which application may read the value
+- [ ] Every credential record states whether it is owned, inherited, or an override of an ancestor's shared credential, and this status is readable with metadata-only access
+- [ ] `p2` A tenant can suppress an inherited credential so it resolves as absent locally and for its descendants, without altering the ancestor's credential
 
 ## 10. Dependencies
 
@@ -693,6 +885,8 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 | Database (PostgreSQL / SQLite) | Gear-owned secret metadata (`credstore_secrets`) | `p1` |
 | Value-store plugin | Per-tenant secret value persistence (`static-credstore-plugin` for dev/test; production vault plugin planned) | `p1` |
 | OAGW | Primary consumer of hierarchical secret retrieval (uses the SDK client) | `p1` |
+| PDP policy re-issuance | Existing `read` grants must be re-issued under the six-action split (list records, read record, write record, read value, write value, delete) before the split ships | `p1` |
+| Database indexes on `category`, secret type, and reference | The bulk filtered secret read depends on indexes over the allowlisted metadata fields; without them the filter is a sequential scan | `p1` |
 
 ## 11. Assumptions
 
@@ -702,6 +896,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - The PDP is the sole authorization authority; there is no local policy cache (policy freshness over availability)
 - Consumers provisioning infrastructure from secrets at startup (e.g., mini-chat → OAGW upstreams) tolerate missing secrets by degrading per-provider rather than failing boot
 - OAGW is a ToolKit gear that uses the standard CredStore SDK client (all access flows through Gear → Plugin)
+- The secret category registry is a closed set maintained by the platform, not defined ad hoc by individual tenants
 
 ## 12. Risks
 
@@ -716,13 +911,14 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 
 ## 13. Open Questions
 
-- **Batch retrieval**: should `get` support multiple references per call for OAGW efficiency? (Single-query resolution makes this cheap on the metadata side.)
-- **P2/Future — Human vs service access**: should human users be restricted to metadata-only for inherited shared secrets while service accounts can read values?
+- ~~**Batch retrieval**: should `get` support multiple references per call?~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): a dedicated, non-paginated bulk address selected either by an explicit reference list or by a filter over allowlisted metadata fields, authorized per item and capped by cardinality (`cpt-cf-credstore-fr-bulk-read-secrets`).
+- ~~**P2/Future — Human vs service access**: should human users be restricted to metadata-only?~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) and `cpt-cf-credstore-fr-authz-action-split`: the restriction is expressed by granting metadata actions without the value-read action, and applies to any principal kind rather than being derived from whether the subject is human.
 - **P2/Future — Audit trails**: structured audit events (actor, tenant, outcome — never values) to a tamper-evident platform sink.
-- **P2/Future — Metadata list endpoint**: a values-free list becomes cheap with gear-owned metadata; must be reconciled with the anti-enumeration stance and per-type authorization.
+- ~~**P2/Future — Metadata list endpoint**~~ **Partially answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), which fixes that a listing exists and can never carry values (`cpt-cf-credstore-fr-list-credentials`). **Still open**: how the listing coexists with the no-projection PEP contract described in DESIGN §4.4, i.e. how a flat tenant predicate is applied to a collection read whose rows deliberately include ancestors. A dedicated ADR is required before the endpoint is designed.
+- **Still open — one item per reference**: the listing reduces several rows of one reference (own plus ancestors) to the single one a value read would resolve. Nothing in the platform does row reduction inside cursor pagination today, so the page-boundary semantics need to be settled in the same ADR.
 
 ## 14. Traceability
 
 - **Design**: [DESIGN.md](./DESIGN.md)
-- **ADRs**: [ADR/](./ADR/) — [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md), [ADR-0003 value-fingerprint fence](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md)
+- **ADRs**: [ADR/](./ADR/) — [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md), [ADR-0003 value-fingerprint fence](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md), [ADR-0004 credential record and secret value as separate resources](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) (`proposed`), [ADR-0005 upward-rooted collection read](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) (`proposed`)
 - **Features**: features/ (planned)

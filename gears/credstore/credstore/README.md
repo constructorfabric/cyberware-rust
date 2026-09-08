@@ -5,10 +5,12 @@ database, enforces authorization in SQL, resolves secrets hierarchically across
 the tenant tree, and stores the secret **value** in a backend plugin discovered
 via the types registry.
 
-> Design: the [technical design](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/DESIGN.md) is the baseline; the shipped
-> implementation is described in the [design addendum](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/DESIGN-ADDENDUM.md)
-> (stateful gear, `credstore_secrets` table, PDP-scope authz, versioning/ETag,
-> write saga).
+> Design: the [technical design](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/DESIGN.md) is the baseline; the decision to
+> ship a stateful gear (`credstore_secrets` table, PDP-scope authz,
+> versioning/ETag, write saga) instead of the original stateless design is
+> recorded in [ADR-0001](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0001-cpt-cf-credstore-adr-stateful-gear.md);
+> the addendum document that used to carry this history was folded into that
+> ADR and removed (see git history for its prior content).
 
 ## Overview
 
@@ -35,6 +37,17 @@ The `cf-gears-credstore` module provides:
 This module depends on `types-registry`, `tenant-resolver`, and `authz-resolver`,
 and **requires a database**. The secret value is stored in a plugin (e.g.
 `cf-gears-static-credstore-plugin`, or an OpenBao-backed plugin).
+
+**Planned direction (not yet implemented).** [ADR-0004](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)
+and [ADR-0005](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md)
+(both `proposed`) split the credential record and its secret value into two
+addressable resources, add a metadata listing (upward-rooted through the
+tenant hierarchy, never carrying values) and a capped bulk value read, and
+split the single `read` PDP action into six (`list_meta`, `read_meta`,
+`write_meta`, `read_value`, `write_value`, `delete`). Under that model,
+creating a credential with its value is no longer a single request — a bare
+record and its value are written separately, with no atomicity between the
+two calls.
 
 ## Usage
 

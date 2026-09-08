@@ -101,15 +101,24 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 
 | Requirement | Design Response |
 |-------------|-----------------|
-| `cpt-cf-credstore-fr-put-secret` | Write saga: insert `provisioning` metadata row → plugin `put` (value only) → mark `active`; overwrite ordering follows the precondition kind — version validator claims the metadata CAS before `plugin.put`, `If-Match: *` is backend-first then version bump (§6.2) |
-| `cpt-cf-credstore-fr-get-secret` | Single SQL resolution over the ancestor chain, then one plugin `get` for the winning row |
-| `cpt-cf-credstore-fr-delete-secret` | Deprovisioning saga: mark `deprovisioning` → backend delete → row delete (§6.3) |
+| `cpt-cf-credstore-fr-put-secret` | Write saga: insert `provisioning` metadata row → plugin `put` (value only) → mark `active`; overwrite ordering follows the precondition kind — version validator claims the metadata CAS before `plugin.put`, `If-Match: *` is backend-first then version bump (§6.2). **Superseded in part** by ADR-0004: the REST form (a single `POST` carrying record and value) is replaced by two requests (§4.3) |
+| `cpt-cf-credstore-fr-get-secret` | Single SQL resolution over the ancestor chain, then one plugin `get` for the winning row. **Superseded in part** by ADR-0004: the value moves to `GET .../secret`, independent of the metadata read (§4.3) |
+| `cpt-cf-credstore-fr-delete-secret` | Deprovisioning saga: mark `deprovisioning` → backend delete → row delete (§6.3). **Superseded in part** by ADR-0004: `DELETE` addresses the credential record (value included), not a standalone secret (§4.3) |
 | `cpt-cf-credstore-fr-tenant-scoping` | Gear derives tenant from `SecurityContext.subject_tenant_id()`; own-tenant gate + SecureORM scope clamp |
 | `cpt-cf-credstore-fr-sharing-modes` | `sharing` column in the gear metadata table; partial unique indexes let private and tenant/shared coexist under one reference |
 | `cpt-cf-credstore-fr-authz-pdp` | PDP `AccessScope` per operation (`read`/`write`/`delete` on the secret GTS resource type), enforced in SQL; fail-closed |
 | `cpt-cf-credstore-fr-optimistic-concurrency` | Monotonic `version` column; `GET` returns a strong generation-bound `ETag` (`"<id>.<version>"`, §4.10); `PUT`/`DELETE` require `If-Match` (a validator or `*`) |
 | `cpt-cf-credstore-fr-secret-types` | GTS-based secret types with enforceable traits (§5) |
 | `cpt-cf-credstore-fr-deprovisioning` | `deprovisioning` status + compensating delete saga swept by the reaper (§6.3) |
+| `cpt-cf-credstore-fr-credential-record` | Resource split (ADR-0004): the `credentials` collection item carries metadata only; the secret value lives at the `secret` sub-resource address, never on the record (§4.1, §4.3) |
+| `cpt-cf-credstore-fr-list-credentials` | Upward-rooted collection read (ADR-0005): ancestor chain from tenant-resolver, tenant dimension as a PDP gate rather than a SQL clamp, `category`/`type`/`sharing`/`reference` as SQL clamps, reference-boundary cursor over reduced rows (§4.4, §4.6, §4.7) |
+| `cpt-cf-credstore-fr-get-credential` | `GET /credentials/{ref}`: hierarchical resolution of the record without the value; carries the strong `ETag` so a value-blind caller can still perform a guarded write (§4.3) |
+| `cpt-cf-credstore-fr-write-credential-record` | `PUT /credentials/{ref}` create-or-replace of the record only (`If-None-Match`/`If-Match`); type stays immutable; a record may legally exist without a value (§4.1, §4.3) |
+| `cpt-cf-credstore-fr-read-secret` | `GET /credentials/{ref}/secret`: value-only sub-resource, `Cache-Control: no-store`, one audit record per returned value (§4.3) |
+| `cpt-cf-credstore-fr-bulk-read-secrets` | `POST /credentials:read-secrets`: explicit-references or scoped `$filter` selector, per-item authorization and fence verification, hard cap enforced by fetching `cap + 1` rows with `TOO_MANY_MATCHES` instead of truncation, no pagination (§4.3, §4.6) |
+| `cpt-cf-credstore-fr-authz-action-split` | PDP actions split into `list_meta` / `read_meta` / `write_meta` / `read_value` / `write_value` / `delete`; no action is accepted as a synonym for the previous single `read` (§4.3, §4.4) |
+| `cpt-cf-credstore-fr-secret-category` | `category` column, validated against a closed registry (and a type's `allowed_categories`, §5.2) on record write; changing it requires `write_meta` and bumps `version` (§4.1, §5.4) |
+| `cpt-cf-credstore-fr-inheritance-status` | `inheritance` (own / inherited / overridden) computed at resolution/reduction time from the ancestor-chain walk; never a filterable or orderable column (§4.1, §4.4) |
 
 #### NFR Allocation
 
@@ -126,6 +135,8 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 | `cpt-cf-credstore-adr-stateful-gear` | Stateful gear, value-only backend: the gear owns the `credstore_secrets` metadata table (identity, sharing, ownership, lifecycle status, version); the backend plugin stores only the value ([ADR-0001](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md)) |
 | `cpt-cf-credstore-adr-deprovisioning-saga` | Delete is a saga symmetric to provisioning: a `deprovisioning` status holds the unique name until backend cleanup completes; stuck rows are swept by the reaper ([ADR-0002](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md)) |
 | `cpt-cf-credstore-adr-value-fingerprint-fence` | Value-fingerprint fence + generation-bound ETag: the gear stamps `value_fp = HMAC(fence_key, value)` in the same write as `sharing` and verifies it on read (fail-closed 404 on mismatch), and binds the strong ETag to `<row-id>.<version>`; closes the crosswise-PUT cross-tenant disclosure and the recreate ABA lost-update ([ADR-0003](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md)) |
+| `cpt-cf-credstore-adr-secret-value-exposure` | **Proposed.** Credential record and secret value become separate resources: the record (`credentials` collection) never carries a value, the value is a sub-resource with its own address, and bulk value reads use a capped, non-paginated selector ([ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)) |
+| `cpt-cf-credstore-adr-upward-collection-read` | **Proposed.** The credential-record collection is rooted at the caller's tenant and reads upward only; the tenant dimension of PDP scope gates the caller's own tenant rather than clamping rows in SQL, so inherited rows survive ([ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md)) |
 
 ### 1.3 Architecture Layers
 
@@ -183,7 +194,7 @@ The following capabilities are explicitly out of scope:
 - **Direct end-user access**: unauthenticated or untrusted client access is out of scope.
 - **Secret templates or composition**: dynamic secret generation or derivation is out of scope.
 - **Hierarchical resolution in backends**: plugins are pure per-tenant value stores — all hierarchy, sharing, and policy logic lives in the gear.
-- **Secret discovery / search**: listing or searching secrets is out of scope for v1.
+- **Secret discovery / search**: full-text search over values or references stays out of scope. A metadata listing is **no longer** a non-goal: it is required by `cpt-cf-credstore-fr-list-credentials` and designed in [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md); it is upward-rooted, never carries values, and never enumerates descendants.
 - **MySQL support**: migrations target PostgreSQL and SQLite; MySQL fails fast with a typed error.
 
 ## 3. Principles & Constraints
@@ -248,6 +259,9 @@ All trait-boundary and REST errors follow the platform canonical error model ([A
 | `WritePrecondition` | Parsed `If-Match`, mandatory on update/delete: `Exists` (`*`, explicit last-writer-wins) or `Version { id, version }` (quoted `"<id>.<version>"`, generation-bound). |
 | `GetSecretResponse` | SDK read result: `{ value, id, owner_tenant_id, sharing, is_inherited, version }`; `(id, version)` is the strong-validator pair. |
 | `SecretType` | Catalog-resolved secret type binding the enforceable traits (§5); immutable per secret. |
+| `CredentialRecord` (planned, ADR-0004) | The addressable **metadata** resource: reference, owner tenant, sharing, type, `category`, version, expiry, `inheritance` — structurally never the value. Identified by `SecretRef` in the `credentials` collection (§4.3); the secret value is a separate sub-resource of it, not a field on it. |
+| `Category` (planned, `cpt-cf-credstore-fr-secret-category`) | Operator-chosen label drawn from a closed registry, attached to a `CredentialRecord`; usable as a PDP attribute predicate (§4.4) so an application can be granted values of one category only. Changing it requires the `write_meta` action and bumps `version` (§5.2, §5.4). |
+| `InheritanceStatus` (planned, `cpt-cf-credstore-fr-inheritance-status`) | Enum: `Own`, `Inherited`, `Overridden` (a tenant's own record shadows an ancestor's `shared` record under the same reference). `Suppressed` is a P2 addition (§6.1) that would win resolution without altering the ancestor. Computed at resolution/reduction time, never a stored or filterable column (§4.4). |
 
 **Relationships & uniqueness**:
 
@@ -264,6 +278,13 @@ All trait-boundary and REST errors follow the platform canonical error model ([A
 | `shared` | The owning tenant **and** all its descendants (including through isolation barriers) | Yes |
 
 `sharing` is a **visibility** mode (who may read the secret), not a quota/limit that composes as `min(parent, child)`; resolution picks the closest accessible secret up the ancestor chain, which is how a child tenant *shadows* a parent's `shared` secret under the same reference.
+
+**Record without a value (planned, ADR-0004).** Splitting creation into a record write and a value write (§4.3) makes "a record exists but has no value yet" a legal, defined state rather than a transient artifact of a crashed write:
+
+- It **does not resolve** for a value read — a `GET .../secret` on it is the ordinary not-found.
+- It **does not shadow** an ancestor: an inherited `shared` value from a parent keeps resolving for the tenant and its descendants exactly as if the value-less record did not exist. A half-finished create must not silently break inheritance that was working before it started.
+- It is **distinct from `value_fp IS NULL`** (§4.10, out-of-band seeding): that case already has a value in the backend and is only missing its fingerprint, served on trust until backfilled; a record without a value has no backend value at all, so there is nothing to serve on trust.
+- It is **not swept by the reaper** as a stuck write (§6.1, §6.4): the second request may legitimately arrive much later than any saga timeout, so this resting state must not be confused with a crashed `provisioning` row.
 
 ### 4.2 Component Model
 
@@ -340,6 +361,8 @@ Production value-store backends (external secret vault, OS keychain, KMS-backed 
 
 **Design rationale**: the plugin returns **no metadata** — sharing, ownership, inheritance, and version all come from the gear's metadata row resolved *before* the backend is touched. This keeps every policy decision in one place and backends trivially simple.
 
+**Planned (ADR-0004, `cpt-cf-credstore-adr-secret-value-exposure`).** `CredStoreClientV1` gains record/value-split methods (`read_record`/`list_records`/`write_record`, plus a bulk `read_secrets`) re-pointed at the addresses in §4.3.1; `get`, `put` and `delete` keep their names and are re-pointed at the value sub-resource and the record respectively. New methods ship with default "unsupported" implementations so existing implementors and test doubles keep compiling (Backward Compatibility, ADR-0004).
+
 #### 4.3.1 REST API (Gear)
 
 Routes are registered under `/credstore/v1` (served behind the platform API gear under its public prefix, e.g. `/cf/credstore/v1/...`). All routes are authenticated; errors use the canonical `Problem` envelope.
@@ -403,6 +426,36 @@ The machine-readable API is generated from the handlers: the platform-wide OpenA
 | 503 | `ServiceUnavailable` | PDP evaluation failure, types-registry outage / stored secret type unresolvable (§5.4), no storage plugin registered (with stable detail, no `retry_after`), backend outage (with `Retry-After` when hinted) |
 | 500 | `Internal` | Invariant violations, non-UTF-8 stored value on `GET` (binary written via the SDK cannot cross the JSON transport); diagnostic stripped from the wire |
 
+#### 4.3.2 REST API — Planned Credential Surface (ADR-0004)
+
+> Decision: [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) (`cpt-cf-credstore-adr-secret-value-exposure`), **status: proposed**. Supersedes the `/credstore/v1/secrets/*` surface above per the Backward Compatibility table in the ADR: the entity URL stops returning the value and starts returning the credential record. `{ref}` stays the caller-chosen `SecretRef` — never the row UUID, which is a generation id kept out of every response body so the `ETag` remains the one CAS validator source.
+
+| Address | PDP action | Success | Key headers | Preconditions |
+|---|---|---|---|---|
+| `GET /credstore/v1/credentials` | `list_meta` | `200` | none — value-free by construction | OData `$filter`/`$orderby` on an indexed allowlist (§4.7), opaque cursor, `limit`; no total count |
+| `GET /credstore/v1/credentials/{ref}` | `read_meta` | `200` | `ETag` (the CAS validator source, D4 of the ADR) | — |
+| `PUT /credstore/v1/credentials/{ref}` | `write_meta` | `201` create, `204` replace | `Location` on create | `If-None-Match: *` (create-only, 412 if present), `If-Match: "<id>.<version>"` (guarded replace, 409 on mismatch), or `If-Match: *` (last-writer-wins) |
+| `DELETE /credstore/v1/credentials/{ref}` | `delete` | `204` | — | `If-Match` mandatory |
+| `GET /credstore/v1/credentials/{ref}/secret` | `read_value` | `200` | `Cache-Control: no-store`; audited | — |
+| `PUT /credstore/v1/credentials/{ref}/secret` | `write_value` | `204` | — | `If-Match` mandatory; the validator is read from the record, not from the value |
+| `POST /credstore/v1/credentials:read-secrets` | `read_value`, evaluated per item | `200` | `Cache-Control: no-store` | selector-based, capped, no precondition (see below) |
+| `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression` | `write_meta` (P2, not yet designed in full) | — | — | — |
+
+**No `PATCH`, no `POST` on the collection.** Each resource has exactly one write verb, `PUT`; the intent of a write is carried by its precondition rather than by the verb. A partial-update verb would let a client change one field of a record (e.g. `sharing`) without ever holding the whole thing — precisely how an expiry gets dropped unnoticed by a `sharing` edit. `PUT` on the record is a whole-value replace of the mutable metadata: fields absent from the body reset to their defaults, exactly as today's value `PUT` already clears an omitted `expires_at`. `PUT` with `If-None-Match: *` already expresses create-only and keeps the write idempotent, which is what removes the need for a collection-level `POST`. The record's `type` stays immutable regardless of which precondition is used.
+
+**No single-request create of a record with a value.** Creating a credential is two requests:
+
+```
+PUT /credstore/v1/credentials/smtp-default        If-None-Match: *   → 201
+PUT /credstore/v1/credentials/smtp-default/secret If-Match: *        → 204
+```
+
+This is an accepted cost of the resource split, not an oversight (§4.1): between the two requests the record exists without a value, which is a legal state, and the gear provides no atomicity across the two requests — a client that abandons the sequence leaves an empty record behind.
+
+**Bulk secret read** (`POST /credstore/v1/credentials:read-secrets`, `cpt-cf-credstore-fr-bulk-read-secrets`). The body carries exactly one selector: an explicit `references` list, or a `$filter` query parameter (platform OData syntax) over `category`, `type` and `reference` with `eq`/`in` — every filterable field backed by an index (§4.7). There is no `limit`, `cursor`, `$orderby` or `$top`, and the response is a flat per-reference outcome list, never a `Page<T>`. A selector matching more than the configured cap (proposed: 25) fails the whole request with `400 TOO_MANY_MATCHES` rather than truncating; the cap is enforced by fetching `cap + 1` candidate rows, never by a `COUNT` query. Every returned value is independently re-verified against its row's fingerprint (§4.10); a per-item refusal, miss, suppression or fence mismatch all report the same `not_found` outcome (anti-enumeration) and never abort the rest of the batch.
+
+**Suppression (P2, `cpt-cf-credstore-fr-suppression`, not yet designed in full).** If adopted, `POST`/`DELETE /credentials/{ref}/suppression` lets a tenant declare an ancestor's credential disabled for itself even though the ancestor still publishes it; it attaches to the record rather than to the value, and — like the rest of this surface — is not designed beyond what this paragraph and §6.1 state.
+
 ### 4.4 External Interfaces & Protocols
 
 #### PDP (authz-resolver)
@@ -413,13 +466,28 @@ The machine-readable API is generated from the handlers: the platform-wide OpenA
 
 Every operation calls `PolicyEnforcer.access_scope_with(ctx, resource, action, …)` **once**, with the `owner_tenant_id` PEP property and `action ∈ {read, write, delete}`. The `resource` is always the secret's **full concrete type** — including `generic` (`…secret.v1~cf.core.credstore.generic.v1~`) — so policies can target any type without a separate base-type gate (§5.4). The type is known before the evaluation via a prefetch (post-resolution on read, post-lookup on overwrite/delete, from the requested/default type on create) followed by a types-registry resolution of the stored `secret_type_uuid` to its GTS type id (§5.4); the returned `AccessScope` is enforced in SQL. Enforcement is fail-closed: `Denied`/`CompileFailed` → 403 (404 on read, anti-enumeration), `EvaluationFailed` → 503.
 
-**No PDP capabilities / no projection tables**: the gear advertises no PEP capabilities, so the PDP hands it pre-expanded, flat tenant predicates (`Eq`/`In` on `owner_tenant_id`) and resolves any subtree grant on its own side — the standard no-projection scenarios ([AUTHZ_USAGE_SCENARIOS](../../../docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md) S09–S11). This is sufficient by construction: every credstore operation is a point operation addressed in the caller's own tenant (there is no LIST, and writes never cross the tenant boundary), so the gear-side question is always "does the scope admit this one tenant" — never "expand this subtree". A structured `InTenantSubtree` predicate reaching the gear would be a capability-contract breach and fails closed. Consequently credstore projects no `tenant_closure` and has no co-location requirement on the Account Management database; downward hierarchy knowledge stays entirely in the PDP, and upward hierarchy knowledge comes from the Tenant Resolver gear (below).
+**No PDP capabilities / no downward projection tables**: the gear advertises no PEP capabilities, so the PDP hands it pre-expanded, flat tenant predicates (`Eq`/`In` on `owner_tenant_id`) and resolves any subtree grant on its own side — the standard no-projection scenarios ([AUTHZ_USAGE_SCENARIOS](../../../docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md) S09–S11). What this rules out is **downward** expansion: the gear has no closure table to enumerate a subtree, so a structured `InTenantSubtree` predicate reaching it is a capability-contract breach and fails closed — unchanged by the collection read below.
+
+**Upward-rooted collection read** ([ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md), `cpt-cf-credstore-adr-upward-collection-read`, status: proposed): the credential-record collection (§4.3.2, `cpt-cf-credstore-fr-list-credentials`) does not break the no-projection premise, because it never expands downward either. It is rooted at the caller's tenant and spans only that tenant and its ancestor chain — the same chain already fetched from the Tenant Resolver for every point read (below), never from descendants. So "there is no LIST" is restated precisely as **"there is no downward listing"**.
+
+For that collection, the flat tenant predicate is applied as a **gate** on the caller's own tenant, not as a SQL clamp on `owner_tenant_id`. The reason is precise, not just "it would drop rows": a PDP scope that respects isolation barriers excludes a barrier tenant's ancestors **by construction**, so a clamp built from such a scope would zero out the inherited half of the catalogue for exactly the tenants sitting behind a barrier — even though their applications keep receiving that inherited value from the point read (`cpt-cf-credstore-fr-hierarchical-resolve`), via the same barrier-bypassing ancestor-chain lookup described below. Clamping the tenant dimension would therefore make the listing lie about what the point read actually returns. The SQL query instead selects candidate rows across the whole ancestor chain under the same visibility rules the point read uses (private/tenant/shared, §4.1), and the PDP decision gates the **request** — "does the scope admit the caller's own tenant" — exactly as it does for a point read, so one authorization path serves both reads and a change to visibility rules cannot apply to one and miss the other. Attribute predicates drawn from the same scope — `category`, `type`, `sharing`, `reference` — **are** applied as ordinary SQL clamps (§4.7); only the tenant dimension is a gate rather than a clamp, and that asymmetry is deliberate, not an inconsistency to "fix" by adding a clamp.
+
+Cross-tenant listing itself is still not provided: a parent that needs a descendant's catalogue acts in that tenant's context (§4.5), exactly as it already does for a point read (`cpt-cf-credstore-fr-service-retrieve`). Consequently credstore still projects no `tenant_closure`, requires no co-location with the Account Management database, and declares no new PEP capability for the collection; downward hierarchy knowledge stays entirely in the PDP, and upward hierarchy knowledge comes from the Tenant Resolver gear (below).
 
 #### Tenant hierarchy (tenant-resolver)
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-design-interface-tenant-resolver`
 
 The gear fetches the requesting tenant's ancestor chain (self first, root last) with `BarrierMode::Ignore`: a `shared` secret is inherited by **all** descendants, including through `self_managed` (isolation-barrier) boundaries — publishing as `shared` is the owner's explicit sharing decision, and whether a caller may read at all is the PDP's decision, not the chain's. The chain carries no caller-specific data and is cached in-process with a TTL (`hierarchy.ancestor_cache_ttl_secs`, default 300 s) and LRU eviction.
+
+**Why the barrier is bypassed here, and only here** ([ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md), `cpt-cf-credstore-adr-upward-collection-read`, status: proposed). Building an inheritance chain requires knowing **all** ancestors, so this ancestor-chain lookup is the single place in the gear that looks past an isolation barrier — deliberate, valid behaviour, not an oversight. A `self_managed` barrier isolates *management*, not previously published data: it stops a parent from administering a customer that runs its own subtree, but it does not retract a `shared` credential the parent already published downward — `cpt-cf-credstore-fr-hierarchical-resolve` states that consequence as a requirement (inheritance across `self_managed` boundaries). Four invariants keep the bypass narrow:
+
+- it reads **ancestor identifiers only** — which of an ancestor's rows are then visible is still decided by the ordinary visibility rules, which admit `shared` rows and nothing else from an ancestor; `tenant` and `private` rows never leave their own tenant, barrier or not;
+- it grants **no authority** — access is still decided by the PDP gate on the caller's own tenant, and role inheritance *into* a barrier tenant continues to respect barriers, so a parent still cannot manage or read inside a `self_managed` customer;
+- it never traverses **downward** — the bypass makes ancestors visible to a descendant, never a subtree visible to an ancestor;
+- it is confined to **one call site**, this ancestor-chain lookup, so the exception stays reviewable rather than becoming an ambient property of the gear.
+
+In one sentence: data flows down through the barrier; authority does not.
 
 #### Secret-type resolution & plugin discovery (types-registry)
 
@@ -489,6 +557,71 @@ The full step-by-step sequence, failure handling, and the overwrite path are des
 
 #### Delete (deprovisioning saga) — see §6.3
 
+#### Credential listing (planned, ADR-0005)
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-seq-list-credentials`
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant GW as credstore
+    participant TR as tenant-resolver
+    participant DB as credstore_secrets
+    participant GTS as types-registry
+    participant PDP as authz-resolver
+
+    C->>GW: list(ctx, filter, orderby, cursor, limit)
+    GW->>TR: ancestor_chain(tenant) [cached, barriers ignored]
+    TR-->>GW: [self, parent, ..., root]
+    GW->>PDP: access_scope(list_meta, …)
+    PDP-->>GW: AccessScope (flat tenant predicate)
+    GW->>DB: scope_includes_tenant(caller tenant)?
+    GW->>DB: candidate rows across chain, reference ASC, id ASC — no tenant clamp; category/type/sharing/reference as SQL clamps
+    DB-->>GW: candidate rows, page extended to the end of the last reference group
+    GW->>GTS: get_type_schema_by_uuid per distinct secret_type_uuid on the page [client TTL cache]
+    GTS-->>GW: type ids + effective traits
+    GW->>PDP: access_scope(read_meta, per distinct type present)
+    PDP-->>GW: per-type AccessScope
+    GW-->>C: reduced items (own/inherited/overridden winner per reference) + next_cursor
+```
+
+The ancestor-chain fetch is the same `BarrierMode::Ignore` lookup as the point read (§4.4): for a tenant sitting behind an isolation barrier, this is exactly what makes its ancestors' `shared` rows candidates for the listing at all — data crosses the barrier, authority still does not, since the PDP gate below still targets only the caller's own tenant.
+
+**Reduction and the cursor boundary.** Candidate rows are fetched across the ancestor chain under the point-read visibility rules (§4.1), sorted `reference ASC, id ASC`. Because the sort leads with `reference`, all rows of one reference are contiguous, so a page is extended to the end of the reference group it lands in, reduction picks one winner per group (`inheritance`: own/inherited/overridden), and the cursor always sits on a reference boundary — no winner can be split across pages (ADR-0005). Rows of a type the caller's scope does not admit are dropped after the query and the cursor still advances past them, so `items.len()` may be smaller than `limit`; clients treat `next_cursor`, not the item count, as the "more pages" signal, matching Account Management's own metadata listing.
+
+#### Bulk secret read (planned, ADR-0004)
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-seq-bulk-read-secrets`
+
+```mermaid
+sequenceDiagram
+    participant C as Consumer
+    participant GW as credstore
+    participant TR as tenant-resolver
+    participant DB as credstore_secrets
+    participant GTS as types-registry
+    participant PDP as authz-resolver
+    participant P as Plugin
+
+    C->>GW: read_secrets(ctx, references | filter)
+    GW->>TR: ancestor_chain(tenant) [cached, barriers ignored]
+    TR-->>GW: [self, parent, ..., root]
+    GW->>DB: resolve candidates for up to cap+1 references — one query, own-tenant gate only
+    DB-->>GW: rows (>cap ⇒ 400 TOO_MANY_MATCHES, no COUNT query)
+    loop per resolved item
+        GW->>GTS: get_type_schema_by_uuid(secret_type_uuid) [client TTL cache]
+        GW->>PDP: access_scope(read_value, concrete type)
+        PDP-->>GW: AccessScope
+        GW->>DB: scope_includes_tenant(caller tenant)? and item visible?
+        GW->>P: get(owner_tenant, key, owner?) — value only
+        P-->>GW: SecretValue
+        GW->>GW: verify value_fp (§4.10); mismatch ⇒ outcome "not_found"
+    end
+    GW-->>C: 200, per-item {outcome, secret?, credential?}, no cursor
+```
+
+**No pagination, per-item outcome.** Each item is authorized (`read_value`) and fenced independently; a refusal, a miss, a suppression and a fence mismatch all surface as the same `not_found` outcome and never abort the rest of the batch (§4.3.2). The response carries `returned` (the length of `items`) and the configured `cap`, never a cursor — the selector cannot be paginated through.
+
 ### 4.7 Database schemas & tables
 
 The gear owns one table, `credstore_secrets` (migration `m0001_initial_schema`; raw per-backend SQL to preserve `CHECK` and partial-index semantics; PostgreSQL and SQLite; MySQL fails fast):
@@ -520,6 +653,19 @@ CREATE INDEX idx_credstore_expiry  ON credstore_secrets (expires_at) WHERE expir
 ```
 
 Created by the single `m0001_initial_schema` migration (§8). The table is a `Scopable` SecureORM entity — PDP scope clamps are applied to every query, which is what makes authorization enforceable in SQL.
+
+**Planned: `m0002` (ADR-0004, ADR-0005).** The `category` field (`cpt-cf-credstore-fr-secret-category`) and the filter/order allowlist behind the credential-record collection and the bulk secret read (§4.3.2, §4.4) require an additive migration on top of `m0001_initial_schema`, adding at least:
+
+```sql
+ALTER TABLE credstore_secrets ADD COLUMN category TEXT NULL;  -- closed registry, validated at the domain layer (§5.2)
+CREATE INDEX idx_credstore_category ON credstore_secrets (category);
+CREATE INDEX idx_credstore_type     ON credstore_secrets (secret_type_uuid);
+CREATE INDEX idx_credstore_owner    ON credstore_secrets (owner_id);
+```
+
+The exact column and index list is finalized with the migration; the ones above are the minimum the allowlist rule below requires.
+
+**Current index gaps (before `m0002`).** As of `m0001_initial_schema`, `created_at` carries no index at all; neither `secret_type_uuid` nor `owner_id` is indexed on its own — the only index touching either column at all is `idx_credstore_lookup (reference, tenant_id, status)`, which names neither; `category` does not exist yet. `updated_at` is indexed only for **non-active** rows (`idx_credstore_pending (updated_at) WHERE status <> 2`), so it is unusable for filtering or ordering **active** rows — precisely the rows a listing or a bulk selector cares about. The platform rule that OData `$filter`/`$orderby` may only name indexed fields (ADR-0004, ADR-0005) is enforced by review today; there is no automatic check that a newly allowlisted field is actually indexed.
 
 ### 4.8 Deployment Topology
 
@@ -594,6 +740,7 @@ The type of a secret is chosen at creation (REST field `type`: the secret type's
 | `expirable` | bool | Whether secrets of this type may carry `expires_at` (else 400, `EXPIRY_NOT_SUPPORTED_FOR_TYPE`; a past expiry is `EXPIRY_IN_THE_PAST`); expired secrets resolve as 404 (read-time SQL filter) and are moved into the deprovisioning saga by the reaper (§6.4). |
 | `rotation_period_secs` | integer (optional, advisory) | Recommended rotation cadence; metadata-only — rotation automation stays a non-goal. |
 | `utf8_only` | bool | Whether the value must be valid UTF-8 (400, `VALUE_NOT_UTF8`; only `generic` currently allows binary, reachable via the SDK). |
+| `allowed_categories` (planned, `cpt-cf-credstore-fr-secret-category`) | list of category labels (optional) | Closed allowlist of the `category` values (§4.1) permitted on records of this type. A record write naming a category outside both this list and the platform category registry is rejected (400). Absent ⇒ any registry category is allowed. |
 
 Trait values resolve through the GTS chain merge (`effective_traits`): leaf-declared values win, ancestors fill the rest — the base type declares generic values for every trait, so a derived type only states what it restricts. Traits are enforced in the gear domain layer at well-defined points (§5.4); plugins remain trait-agnostic value stores.
 
@@ -624,6 +771,7 @@ Adding a **built-in** type (shipped with the platform, with a short REST name) =
 4. **Read**: rows with `expires_at <= now` are filtered out in the resolution SQL (404); `type` (and `expires_at`, when set) are returned in response metadata.
 5. **Authorization**: a **single** PDP evaluation per operation targets the secret's **full concrete GTS type** — including `generic` — as returned by the type resolution (step 1). Its `AccessScope` is enforced in SQL and its gate must include the **caller's** tenant (hierarchical visibility of inherited/shared secrets is decided by the resolver, not the PDP). Denial surfaces as the anti-enumeration 404 on read and 403 on write/delete; a PDP outage is 503. Every type (incl. `generic` and custom types) reaches the PDP, so a per-type policy can be added with no credstore change. On read the PDP is consulted only for a secret that resolves (a missing secret is a 404 without a PDP or registry call).
 6. **Reaper**: each tick first flips expired `active` rows into the ordinary deprovisioning saga (`mark_expired_deprovisioning`), which then cleans the backend value and releases the reference via the pending sweep (§6.4). The reaper never resolves types — sweeping is type-agnostic.
+7. **Category** (planned, record write only, ADR-0004): the `category` field is validated against the platform category registry and, when the type declares `allowed_categories` (§5.2), against that closed list — a violation is 400. Because changing a record's category changes which application may read its value through a category-scoped grant (and, under the bulk selector, which credentials appear in that application's result), a category change requires the `write_meta` action and bumps `version` like any other metadata edit (§4.3.2, `cpt-cf-credstore-fr-secret-category`).
 
 ### 5.5 Storage & API Changes
 
@@ -652,8 +800,13 @@ Adding a **built-in** type (shipped with the platform, with a short REST name) =
 | `provisioning` | 1 | no | yes | yes (after `provisioning_timeout_secs`) |
 | `active` | 2 | **yes** | yes | no |
 | `deprovisioning` | 3 | no | yes | yes (after `deprovisioning_timeout_secs`) |
+| `declared, no value` (planned, ADR-0004) | — | no | yes | **no** |
 
 Only `active` rows are returned by `resolve_for_get`; a secret therefore becomes visible atomically at saga commit and invisible atomically at delete start.
+
+**Declared, no value (planned, ADR-0004).** A record created by `PUT /credentials/{ref}` before its value is ever written (§4.1, §4.3.2) is a distinct, deliberately long-lived resting state, not a mid-saga step. It differs from `provisioning` in exactly the property the reaper cares about: `provisioning` is always mid-saga and bounded by `provisioning_timeout_secs`, so a row stuck there past that timeout is by definition a crashed write and safe to reap; a `declared, no value` record has no saga in flight and no timeout applies to it, because its value `PUT` may legitimately arrive much later than any saga timeout, or never. The stuck-`provisioning` sweep (§6.4) MUST NOT reap `declared, no value` rows. It is also distinct from the existing `value_fp IS NULL` out-of-band-seeding case (§4.10): that row already has a value in the backend and is only missing its fingerprint, served on trust until backfilled; a `declared, no value` row has no backend value at all. Neither state resolves for a value read, and neither hides a `shared` value inherited from an ancestor under the same reference (§4.1).
+
+**Suppression (P2, `cpt-cf-credstore-fr-suppression`, not yet designed in full).** If adopted, suppression is a separate per-record state — not a value and not a deletion — that a tenant sets on its own record to declare an ancestor's credential disabled for itself. A suppressed record wins hierarchical resolution at that tenant and its descendants (§4.1): value reads there resolve as not-found, while the ancestor's record and value are left untouched.
 
 ### 6.2 Provisioning Saga
 
@@ -726,7 +879,7 @@ Errors are logged, never propagated — the reaper must survive transient DB or 
 **Decision**: PDP `AccessScope` + SecureORM clamps instead of coarse `Secrets:Read`/`Secrets:Write` permission checks.
 
 - ✅ Real tenant isolation enforced at the data layer, consistent with platform RBAC/PDP
-- ✅ No projection tables: subtree grants arrive pre-expanded from the PDP, sufficient for a point-operation-only API
+- ✅ No projection tables: subtree grants arrive pre-expanded from the PDP. This remains sufficient once the collection read is upward-rooted ([ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md)): the gear never expands a subtree, so no `tenant_closure` projection and no co-location with the Account Management database are required
 - ❌ Every operation pays a PDP evaluation (timed as a dependency metric; 503 on PDP outage — fail-closed)
 
 #### Three-tier sharing model (not RBAC/ABAC per secret)
@@ -789,10 +942,10 @@ Future schema changes are additive migrations on top. **Backward compatibility**
 
 ## 9. Open Questions
 
-1. **Batch retrieval** (from PRD): should `get` support batch retrieval (multiple references in one call) for OAGW efficiency? Design impact: `POST /secrets/batch`; single resolution query already amortizes well.
-2. **Human vs service access** (P2, from PRD): restrict human users to metadata-only for inherited shared secrets while service accounts read values?
+1. ~~**Batch retrieval**~~ **Answered** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): a dedicated, non-paginated bulk address (`cpt-cf-credstore-fr-bulk-read-secrets`), selected by an explicit reference list or by a filter over allowlisted metadata fields, authorized and fence-verified per item, capped by cardinality.
+2. ~~**Human vs service access**~~ **Answered** by `cpt-cf-credstore-fr-authz-action-split`: the restriction is expressed by granting metadata actions without the value-read action, and it applies to any principal kind rather than being derived from whether the subject is human.
 3. **Audit trail** (P2, from PRD): emit structured audit events (actor, tenant, outcome — never values) to a platform audit sink.
-4. **List/metadata endpoint** (P2): a metadata-only list (no values) becomes cheap with local metadata; interacts with the anti-enumeration stance and per-type authorization — needs a dedicated design pass.
+4. ~~**List/metadata endpoint**~~ **Answered** by [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md): upward-rooted collection, tenant dimension as a gate rather than a SQL clamp, per-type authorization with post-query drops, and a cursor pinned to reference boundaries. **Still open**: the reference-boundary reduction is the platform's first row-reducing cursor pagination, so its page-boundary behaviour needs its own test suite before the endpoint ships.
 
 (The former "dynamic type descriptors" question is resolved: types are registry-driven per §5, with the fail-closed semantics of §5.4.)
 
@@ -848,6 +1001,22 @@ Domain → canonical (wire) mapping (`sdk_error_mapping`, pinned by tests):
 
 Plugin-layer `CredStoreError`s are normalized by `map_plugin_err`; a plugin returning `UnsupportedTransition` or `InvalidSecretRef` is a contract violation surfaced as `Internal`.
 
+**Planned: listing and bulk-read reason codes (ADR-0004, ADR-0005).** `GET /credentials` and `POST /credentials:read-secrets` (§4.3.2) reuse the platform's standard OData/cursor-pagination reason codes (`guidelines/DNA/REST/PAGINATION.md`) rather than defining their own:
+
+| Reason code | Canonical category | HTTP | Scenario |
+|-------------|--------------------|------|----------|
+| `INVALID_FILTER` | `InvalidArgument` | 400 | Malformed `$filter` expression |
+| `INVALID_ORDERBY_FIELD` | `InvalidArgument` | 400 | `$orderby` names a field outside the indexed allowlist (§4.7) |
+| `INVALID_CURSOR` | `InvalidArgument` | 400 | Opaque cursor is malformed or fails to decode |
+| `INVALID_LIMIT` | `InvalidArgument` | 400 | `limit` outside the accepted range |
+| `ORDER_MISMATCH` | `InvalidArgument` | 400 | `$orderby` on a later page does not match the order the cursor was minted with |
+| `FILTER_MISMATCH` | `InvalidArgument` | 400 | `$filter` on a later page does not match the filter the cursor was minted with |
+| `ORDER_WITH_CURSOR` | `InvalidArgument` | 400 | `$orderby` supplied together with a cursor (order is fixed at the first page) |
+| `FILTER_TOO_LONG` | `InvalidArgument` | 400 | `$filter` expression exceeds the platform length limit |
+| `FILTER_TOO_COMPLEX` | `InvalidArgument` | 400 | `$filter` expression exceeds the platform complexity limit |
+| `TOO_MANY_MATCHES` | `InvalidArgument` | 400 | Bulk-read selector matches more than the configured cap (proposed: 25); the client narrows the selector rather than the gear truncating the result (ADR-0004) |
+| `TYPE_MISMATCH_WITH_INHERITED` | `Aborted` | 409 | A record is created for a reference that currently resolves to an ancestor's `shared` credential, but names a different secret type (`cpt-cf-credstore-fr-override-type-consistency`) |
+
 ### Observability
 
 Typed OpenTelemetry metrics via `CredStoreMetricsPort`:
@@ -862,5 +1031,6 @@ Typed OpenTelemetry metrics via `CredStoreMetricsPort`:
 ## 11. Traceability
 
 - **PRD**: [PRD.md](./PRD.md)
-- **ADRs**: [ADR/](./ADR/) — [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md), [ADR-0003 value-fingerprint fence](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md)
+- **ADRs**: [ADR/](./ADR/) — [ADR-0001 stateful gear](./ADR/0001-cpt-cf-credstore-adr-stateful-gear.md), [ADR-0002 deprovisioning saga](./ADR/0002-cpt-cf-credstore-adr-deprovisioning-saga.md), [ADR-0003 value-fingerprint fence](./ADR/0003-cpt-cf-credstore-adr-value-fingerprint-fence.md), [ADR-0004 credential record / secret value split](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) (proposed), [ADR-0005 upward-rooted collection read](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) (proposed)
+- **Requirements added by ADR-0004 / ADR-0005** (PRD §5.8): `cpt-cf-credstore-fr-credential-record`, `-fr-list-credentials`, `-fr-get-credential`, `-fr-write-credential-record`, `-fr-read-secret`, `-fr-bulk-read-secrets`, `-fr-authz-action-split`, `-fr-secret-category`, `-fr-inheritance-status`; `-fr-suppression` (P2)
 - **Features**: features/ (planned)

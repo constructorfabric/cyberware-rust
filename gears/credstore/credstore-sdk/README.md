@@ -15,6 +15,17 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
 - **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`GetSecretResponse`** — Domain models
 - **`CredStoreError`** — Error types for all operations
 - **`CredStorePluginSpecV1`** — GTS schema for plugin registration
+- Planned (ADR-0004), not yet implemented — additional `CredStoreClientV1`
+  contracts for the upcoming credential/secret split:
+  - `metadata` — point read of a credential record's metadata only, without
+    its value; also the source of the `ETag` a value-blind writer needs
+  - `list_metadata` — listing of credential records; never carries values,
+    regardless of the caller's grants
+  - `read_secrets` — bulk read of secret values for a bounded selection,
+    capped and non-paginated
+
+  These methods will ship with default "unsupported" implementations, so
+  existing trait implementors and test doubles keep compiling unchanged.
 
 ## Usage
 

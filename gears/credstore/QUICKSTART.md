@@ -27,6 +27,8 @@ gears:
 
 ## Examples
 
+The examples below are the **current** surface — everything here works today.
+
 ### Store a Secret
 
 ```bash
@@ -82,3 +84,99 @@ curl -s -X DELETE "http://127.0.0.1:8087/cf/credstore/v1/secrets/partner-openai-
 Response: **204 No Content** (`If-Match` is mandatory here too: an `ETag` for a guarded delete, `*` to delete whatever is there)
 
 For additional endpoints, see <http://127.0.0.1:8087/cf/docs>.
+
+## Planned surface (ADR-0004 / ADR-0005)
+
+The examples in this section describe a **proposed** direction — [ADR-0004](docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)
+and [ADR-0005](docs/ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md) —
+and are **not implemented**. Nothing below will work against the server today;
+the current surface is `/credstore/v1/secrets…`, shown above. Under the
+proposed model a credential record and its secret value become separate
+resources, addressed under `/credstore/v1/credentials…`.
+
+> **Creating a credential becomes two requests, with no atomicity between
+> them:** first the record (`PUT .../credentials/{ref}`), then its value
+> (`PUT .../credentials/{ref}/secret`). A client that stops after the first
+> call leaves a value-less record behind; that state is legal and does not
+> shadow an inherited value.
+
+**List credential records** — demonstrates the new metadata listing, bounded
+with `limit` and filtered with the platform `$filter` syntax; the response
+never carries a value. Requires the `list_meta` PDP action.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0005
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?limit=20&\$filter=category+eq+'email-sender'" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Get one credential record** — demonstrates the point metadata read; the
+response carries no value but does carry the `ETag`, which a value-blind
+caller uses as the CAS validator for a later write. Requires the `read_meta`
+PDP action.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0004
+curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
+  -H "Authorization: Bearer $TOKEN"
+# → 200, body has no "value" field; response carries an ETag header
+```
+
+**Read the secret value** — demonstrates the value read moved to its own
+sub-resource address, distinct from the record. Requires the `read_value`
+PDP action.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0004
+curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key/secret" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Rotate the value** — demonstrates a guarded value write, keyed off the
+`ETag` obtained from the record read above. Requires the `write_value` PDP
+action.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0004
+curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key/secret" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H 'If-Match: "<etag-from-get>"' \
+  -d '{"value": "sk-def456"}'
+```
+
+**Create a record (no value yet)** — demonstrates create-only semantics on
+the record resource, the first of the two calls a new credential needs.
+Requires the `write_meta` PDP action.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0004
+curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H 'If-None-Match: *' \
+  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.secret.v1~cf.core.credstore.basic_auth.v1~"}'
+```
+
+**Bulk read secret values, explicit selector** — demonstrates the bounded,
+non-paginated bulk read with a request body naming exact references.
+Requires the `read_value` PDP action, evaluated per item.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0004
+curl -s -X POST "http://127.0.0.1:8087/cf/credstore/v1/credentials:read-secrets" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"references": ["smtp-default", "stripe-key", "webhook-signing"]}'
+```
+
+**Bulk read secret values, filtered selector** — demonstrates the same bulk
+read scoped by `$filter` on an indexed metadata field instead of an explicit
+list; still capped, still per-item authorized. Requires the `read_value` PDP
+action, evaluated per item.
+
+```text
+# NOT IMPLEMENTED — planned, ADR-0004
+curl -s -X POST "http://127.0.0.1:8087/cf/credstore/v1/credentials:read-secrets?\$filter=category+eq+'email-sender'" \
+  -H "Authorization: Bearer $TOKEN"
+```
