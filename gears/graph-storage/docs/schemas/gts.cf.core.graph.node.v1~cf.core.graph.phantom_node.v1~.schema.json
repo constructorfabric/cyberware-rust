@@ -1,0 +1,12 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.phantom_node.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Placeholder created by the gear for an edge endpoint whose node has not been ingested. Never authored by a producer, never derived from.",
+  "x-gts-final": true,
+  "x-gts-traits": { "family": "phantom", "scope_managed": false, "emit_events": false },
+  "type": "object",
+  "allOf": [
+    { "$ref": "gts://gts.cf.core.graph.node.v1~" },
+    { "type": "object", "properties": { "payload": { "type": "object", "maxProperties": 0 } } }
+  ]
+}

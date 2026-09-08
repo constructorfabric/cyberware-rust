@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-oagw-sdk"
 description = "SDK for the OpenAPI Gateway: API traits, models, and error definitions"
-version = "0.5.10"
+version = "0.5.11"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

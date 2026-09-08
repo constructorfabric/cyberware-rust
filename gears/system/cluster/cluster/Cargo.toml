@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-cluster"
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -106,8 +106,8 @@ tokio = { workspace = true, features = ["macros"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 rand = { workspace = true }
-cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin", version = "0.2.2" }
-cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", version = "0.4.0" }
+cf-gears-standalone-cluster-plugin = { path = "../plugins/standalone-cluster-plugin", version = "0.2.3" }
+cf-postgres-cluster-plugin = { path = "../plugins/postgres-cluster-plugin", version = "0.4.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `fence_retention: 1h` in operator YAML (DESIGN.md). Taken

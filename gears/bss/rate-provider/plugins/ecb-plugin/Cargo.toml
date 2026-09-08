@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-bss-rate-provider-ecb-plugin"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 description = "BSS FX rate-provider ECB source plugin: fetches ECB daily reference rates and registers as a RateProviderV1 plugin instance"

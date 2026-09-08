@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-system-sdk-directory"
-version = "0.1.45"
+version = "0.1.46"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

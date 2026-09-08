@@ -31,4 +31,4 @@ toolkit-gts = { workspace = true }
 toolkit = { workspace = true }
 
 # Model Registry SDK: the GTS `ModelInfoV1` carried in `ProviderCallCtx`
-model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.1.6", path = "../../model-registry/model-registry-sdk" }
+model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.1.7", path = "../../model-registry/model-registry-sdk" }

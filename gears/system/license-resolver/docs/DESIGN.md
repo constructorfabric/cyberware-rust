@@ -51,9 +51,9 @@ request are instances of registered GTS types derived from the licensing base ty
 (`gts.cf.core.lic.subj.v1~` / `…res.v1~`) — a module that wants license enforcement registers its derived Subject and
 Resource types (its published licensing surface) and *projects* the licensing-relevant slice of its domain objects
 into them; this module owns only the base types and MAY provide helpers for registering the well-known
-`SecurityContext` subjects (`user`, `tenant`). Inside the contract objects,
-identity is the domain GTS type (always present) plus an optional instance id — a well-known name or a UUID; without
-the id the check targets the whole resource type (e.g. on a `POST`, before any instance exists). The gateway validates
+`SecurityContext` subjects (`user`, `tenant`). Inside the contract objects, identity is the GTS type id of that
+contract (always present) plus an optional instance id — a well-known name or a UUID; without the id the check targets
+the whole resource type (e.g. on a `POST`, before any instance exists). The gateway validates
 every request against the registered contracts (schemas + admitted subject types) before delegating; what the
 properties *mean* and what is *licensable* remain the backend licensing service's concern. Because the resolver
 performs no writes and holds no state, it is stateless and side-effect-free; the behavioral guarantees that shape the
@@ -69,8 +69,8 @@ Requirements from PRD that significantly influence architecture decisions.
 | Requirement                                           | Design Response                                                                                                                                                                                                                                                                                                                                                                                                               |
 |-------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `cpt-cf-license-resolver-fr-is-licensed-check`        | A single `is_licensed` method on the public `LicenseResolverClient` contract (`cpt-cf-license-resolver-component-sdk-contract`); the main-module gateway (`cpt-cf-license-resolver-component-main-gateway`) realizes it by delegating to the selected plugin.                                                                                                                                                                 |
-| `cpt-cf-license-resolver-fr-subject-identity`         | The Subject is an instance of a derived Subject contract type (§3.1): domain GTS type (required) + optional id + schematized `metadata`; carried into the check and propagated to the plugin.                                                                                                                                                                                                                                 |
-| `cpt-cf-license-resolver-fr-resource-identity`        | The Resource is an instance of a derived Resource contract type (§3.1): domain GTS type (required) + optional instance id + schematized `metadata`; without the id the check targets the whole type, with it a specific resource; principle `cpt-cf-license-resolver-principle-gts-typed-resource-identity`.                                                                                                                  |
+| `cpt-cf-license-resolver-fr-subject-identity`         | The Subject is an instance of a derived Subject contract type (§3.1): contract GTS type (required) + optional id + schematized `metadata`; carried into the check and propagated to the plugin.                                                                                                                                                                                                                                 |
+| `cpt-cf-license-resolver-fr-resource-identity`        | The Resource is an instance of a derived Resource contract type (§3.1): contract GTS type (required) + optional instance id + schematized `metadata`; without the id the check targets the whole type, with it a specific resource; principle `cpt-cf-license-resolver-principle-gts-typed-resource-identity`.                                                                                                                  |
 | `cpt-cf-license-resolver-fr-contract-registration`    | Licensing base types owned by this module, defined in its SDK contract crate (§3.1, §3.2); a module that wants license enforcement registers its derived Subject and Resource types in the types registry — its published licensing surface; this module MAY provide helpers for registering the well-known `SecurityContext` subjects (`user`, `tenant`); principle `cpt-cf-license-resolver-principle-validated-contracts`. |
 | `cpt-cf-license-resolver-fr-contract-discoverability` | Derived contract types are enumerable from the types registry by derivation from the base types (§3.1); no resolver API is involved — discoverability is registry-native.                                                                                                                                                                                                                                                     |
 | `cpt-cf-license-resolver-fr-request-validation`       | Gateway validation pipeline (§3.2, §3.6): structural (contract schemas, identity invariants) + compatibility (`admitted_subjects` trait) ahead of delegation; failures map to `InvalidRequest` (§3.3), never to a not-granted decision.                                                                                                                                                                                       |
@@ -91,7 +91,7 @@ Requirements from PRD that significantly influence architecture decisions.
 
 | ADR ID                                                  | Decision Summary                                                                                                                                                                                                                                                          |
 |---------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `cpt-cf-license-resolver-adr-gts-resource-identity`     | Inside the contract objects, subject/resource identity is the domain GTS type (required) plus an optional instance id (name or UUID) — without the id the check targets a whole resource type (e.g. on `POST`); how an id-less check is answered is the backend's policy. |
+| `cpt-cf-license-resolver-adr-gts-resource-identity`     | Inside the contract objects, subject/resource identity is the contract GTS type (required) plus an optional instance id (name or UUID) — without the id the check targets a whole resource type (e.g. on `POST`); how an id-less check is answered is the backend's policy. |
 | `cpt-cf-license-resolver-adr-typed-licensing-contracts` | Subject/Resource shapes are registered, versioned GTS types derived from the licensing base types; the gateway validates every request against the registered contracts (fail-closed) before delegation; metadata is schematized but semantically opaque to the engine.   |
 | `cpt-cf-license-resolver-adr-plugin-delegation`         | No resolver-owned store; backend discovered via types-registry and selected by vendor + priority, failing closed when none matches.                                                                                                                                       |
 
@@ -160,11 +160,11 @@ to a subject" is a catalog/query concern, so there is no list operation and no p
 
 - [ ] `p2` - **ID**: `cpt-cf-license-resolver-principle-gts-typed-resource-identity`
 
-Inside the Subject/Resource contract objects, identity is the domain GTS type (`GtsTypeId`, `…type.v1~`, always
-present) plus an optional instance id — a stable well-known name or a UUID. Without the id the check targets
-the whole resource type; with it, a specific instance. The domain types are externally owned: the resolver references
-them and validates their presence/form, while which types are licensable — and how an id-less check is answered — is
-the backend licensing service's policy.
+Inside the Subject/Resource contract objects, identity is the GTS type id of the derived contract the object
+instantiates (`GtsTypeId`, always present) plus an optional instance id — a stable well-known name or a UUID. Without
+the id the check targets the whole resource type; with it, a specific instance. The resolver resolves the contract
+schema from that type and validates conformance, while which resources are licensable — and how an id-less check is
+answered — is the backend licensing service's policy.
 
 **ADRs**: `cpt-cf-license-resolver-adr-gts-resource-identity`
 
@@ -235,10 +235,10 @@ Rust **value objects** (the SDK models passed in and out of a check).
 
 | Entity                | Description                                                                                                                                                                                                                                                                                                                                           |
 |-----------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Licensing Contract    | The durable domain entity: a registered, versioned GTS type derived from a licensing base type, with identity (its GTS type id) and its own version + compatibility lifecycle. Defines a Subject or Resource shape — required domain `type`, optional `id`, a `metadata` schema; a Resource contract also declares its `admitted_subjects`. Lives in the types registry; the value objects below are its instances (base/derived schemas detailed under *Licensing base types* / *Derived types*). |
-| `LicenseCheckRequest` | The single input to a check — bundles the `subject` and `resource` contract objects and `context`; the contract's growth surface (new inputs are added as fields, not new parameters).                                                                                                                                                                |
-| `Subject`             | An instance of a derived Subject contract type (base `gts.cf.core.lic.subj.v1~`): domain GTS type (required), optional id, `metadata` conforming to the contract schema. Polymorphic — a tenant, a user, or any future subject type; not restricted to tenants.                                                                                       |
-| `Resource`            | An instance of a derived Resource contract type (base `gts.cf.core.lic.res.v1~`): domain GTS type (required), optional instance id, `metadata` conforming to the contract schema. Without the id the check targets the whole resource type; with it, a specific resource. Passed to the backend plugin unchanged.                                     |
+| Licensing Contract    | The durable domain entity: a registered, versioned GTS type derived from a licensing base type, with identity (its GTS type id) and its own version + compatibility lifecycle. Defines a Subject or Resource shape — required contract `type`, optional `id`, a `metadata` schema; a Resource contract also declares its `admitted_subjects`. Lives in the types registry; the value objects below are its instances (base/derived schemas detailed under *Licensing base types* / *Derived types*). |
+| `LicenseCheckRequest` | The single input to a check — bundles `subject`, `resource` and `context`; the contract's growth surface.                                                                                                                                                                                                                                             |
+| `Subject`             | An instance of a derived Subject contract type (base `gts.cf.core.lic.subj.v1~`): contract GTS type (required), optional id, `metadata` conforming to the contract schema. Polymorphic — a tenant, a user, or any future subject type; not restricted to tenants.                                                                                       |
+| `Resource`            | An instance of a derived Resource contract type (base `gts.cf.core.lic.res.v1~`): contract GTS type (required), optional instance id, `metadata` conforming to the contract schema. Without the id the check targets the whole resource type; with it, a specific resource. Passed to the backend plugin unchanged.                                     |
 | `LicenseCheckContext` | The request's tenant context — the tenant isolation scope, which the caller derives from its `SecurityContext` (as authz-resolver does). Minimal today (tenant scope); the extension point for future contextual evaluation semantics (e.g. whether hierarchy traversal is allowed), mirroring how authz models such cases.                           |
 | `LicenseDecision`     | The check result: a `granted` boolean plus a `diagnostics` map (string → JSON) of non-authoritative debug info about how the decision was reached (e.g. backend id, matched grant, denial cause). Carrying minimal grant metadata (e.g. status) is a possible future enrichment (PRD §13 open question; DESIGN §4), not part of the current decision. |
 
@@ -248,7 +248,7 @@ Rust **value objects** (the SDK models passed in and out of a check).
 
 | Field      | Type                               | Notes                                                       |
 |------------|------------------------------------|-------------------------------------------------------------|
-| `type`     | GTS type id, **required**          | The subject's domain type (e.g. a user type)                |
+| `type`     | GTS type id, **required**          | The derived Subject contract this object instantiates       |
 | `id`       | optional — UUID or well-known name | Absent for type-level subjects                              |
 | `metadata` | object                             | Subject properties, conforming to the derived type's schema |
 
@@ -256,17 +256,17 @@ Rust **value objects** (the SDK models passed in and out of a check).
 
 | Field                       | Type                               | Notes                                                                                       |
 |-----------------------------|------------------------------------|---------------------------------------------------------------------------------------------|
-| `type`                      | GTS type id, **required**          | The resource's domain type                                                                  |
+| `type`                      | GTS type id, **required**          | The derived Resource contract this object instantiates                                      |
 | `id`                        | optional — UUID or well-known name | Absent = whole-type check (e.g. on `POST`); how it is answered is the backend's policy      |
 | `metadata`                  | object                             | Resource properties, conforming to the derived type's schema                                |
-| *trait* `admitted_subjects` | set of Subject contract types      | The `gts.cf.core.lic.subj.v1~*` types this Resource may be checked against (`x-gts-traits`) |
+| *trait* `admitted_subjects` | set of Subject contract types      | The `gts.cf.core.lic.subj.v1~*` types this Resource may be checked against (`x-gts-traits`). A derived Resource type **MUST** declare it: an empty list admits no subject at all, so a contract that omits it inherits the base's `[]` and rejects every check |
 
 **Derived types — a Gear's licensing surface** (example, LLM gateway):
 
 - Subject `gts.cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~` — `metadata: { category: string }`
 - Resource `gts.cf.core.lic.res.v1~cf.genai.llm_gateway.model_usage.v1~` —
   `metadata: { model_vendor: string, model_name: string }`,
-  `admitted_subjects: [gts.cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~*]`
+  `admitted_subjects: [gts.cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~]`
 
 Because all contracts derive from the base types, querying the registry for everything under
 `gts.cf.core.lic.subj.v1~` / `…res.v1~` yields the complete licensing surface of a platform — every check, every
@@ -274,9 +274,9 @@ Subject/Resource pair, every property available for rules — with no surroundin
 licenses per-model writes rules over `model_vendor`/`model_name`; one that does not, ignores those fields. Same Gear,
 same contract, different licensing models.
 
-**Identity forms inside a contract object** — the domain GTS type is always present; the instance id is optional:
+**Identity forms inside a contract object** — the contract GTS type is always present; the instance id is optional:
 
-- Whole resource type (no instance id): type only, e.g. `gts.cf.<pkg>.content.v1~` — asks whether the subject is
+- Whole resource type (no instance id): the contract type only — asks whether the subject is
   entitled to resources of this type as a class; typically gating creation (e.g. a `POST`), where the resource does not
   exist yet so there is no id to pass. What a type-level grant means is the backend's definition; a caller that needs a
   pre-creation check distinguished from other type-level checks signals it via a `metadata` property of its contract
@@ -293,10 +293,20 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
   the `LicenseCheckContext` (tenant scope); `LicenseDecision` is its output.
 - Base types are owned by this module's SDK; the derived Subject and Resource contract types are registered by the
   module that wants license enforcement (this module MAY provide helpers for registering the well-known
-  `SecurityContext` subjects, `user`/`tenant`); the domain types
-  referenced inside (`type` fields) are owned by external modules — the resolver validates contract conformance but
-  never defines domain types or decides licensability (the backend licensing service does).
+  `SecurityContext` subjects, `user`/`tenant`); the `type` field names that derived contract — the resolver resolves its
+  schema, validates conformance, and never defines domain types or decides licensability (the backend licensing service
+  does).
 - There is intentionally NO `Page<T>` and NO `LicensedResource` entity — the resolver does not list or enumerate.
+
+**Envelope evolution** — two deliberately different unknown-field policies:
+
+- `Subject` / `Resource` **reject** unknown fields: their top-level shape is closed by the published base schema
+  (`additionalProperties: false`). The strictness is protective — were unknown keys ignored, a mistyped `id` key would
+  be silently dropped and a specific-instance check would widen into a whole-type one.
+- `LicenseCheckRequest` / `LicenseCheckContext` / `LicenseDecision` **ignore** unknown fields, so an older reader stays
+  able to read a payload written by a newer SDK wherever the envelope crosses a serialized boundary. The envelope is
+  safe to grow only with fields whose silent drop cannot grant more than the writer intended; a field that restricts the
+  grant is a new contract version, not an optional field.
 
 ### 3.2 Component Model
 
@@ -344,7 +354,7 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
   discovery, selection, delegation, and fail-closed error mapping.
 - **Responsibility scope**: Implements `LicenseResolverClient`; receives a `LicenseCheckRequest`, scopes by its
   `context` (tenant), **validates the request against the registered contracts** — structural (contract schemas,
-  domain-type presence) and compatibility (`admitted_subjects` trait), with schemas resolved from the types registry
+  contract-type presence) and compatibility (`admitted_subjects` trait), with schemas resolved from the types registry
   and cached — then discovers plugin instances via the plugin GTS spec, selects one by vendor + priority (memoizing the
   selection), resolves the scoped plugin client via ClientHub, propagates the `LicenseCheckRequest` unchanged,
   delegates the `is_licensed` check, and maps validation and plugin/registry failures to the canonical
@@ -366,7 +376,7 @@ Both fields are forwarded to the backend plugin unchanged; it interprets them to
   shared plugin trait so backends are swappable without caller changes.
 - **Responsibility scope**: Registers its GTS instance (vendor + priority metadata) and a scoped client; receives only
   requests that conform to a registered contract; owns the catalog of licensable resource types and grant semantics
-  (interpreting the contract objects' domain type and optional id — without the id, a whole-type check whose answer is
+  (interpreting the contract objects' contract type and optional id — without the id, a whole-type check whose answer is
   the backend's policy; with the id, a specific resource); MAY evaluate the forwarded contract `metadata` to apply
   attribute/constraint-based licensing (region, model, …); holds/queries grant facts; and answers the delegated
   `is_licensed` check for the given subject within the tenant isolation scope carried in `request.context`.
@@ -387,7 +397,7 @@ The module exposes one public client trait and requires one plugin trait, descri
 
 **Public client — `LicenseResolverClient`** (realizes PRD `cpt-cf-license-resolver-interface-client`): exposes the
 single method `is_licensed(request: LicenseCheckRequest) -> LicenseDecision`. `LicenseCheckRequest` bundles `subject`
-and `resource` — instances of registered derived licensing contract types, each carrying the domain GTS type
+and `resource` — instances of registered derived licensing contract types, each carrying its contract GTS type
 (required), an optional id, and schematized `metadata` (shape-validated, semantically uninterpreted, forwarded to the
 plugin) — and `context` (a `LicenseCheckContext` carrying the tenant scope). The caller builds `context` from its
 `SecurityContext`, exactly as authz-resolver's `PolicyEnforcer` builds an `EvaluationRequest` — the resolver method
@@ -409,13 +419,13 @@ each variant to a canonical RFC-9457 error (`Problem`) — the table below — b
 handle it its own way. Canonical categories and their GTS error type ids come from the platform error catalog
 (`toolkit-canonical-errors`).
 
-| Variant                      | Meaning                                                                                                                | Default canonical error — GTS error type id                                            |
-|------------------------------|------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
-| `Unauthorized`               | Caller/subject not permitted to perform the check                                                                      | `PermissionDenied` — `gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~`     |
-| `InvalidRequest(violations)` | Request does not conform to its registered contracts (schema mismatch, missing domain type, subject type not admitted) | `InvalidArgument` — `gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~`       |
-| `NoPluginAvailable`          | No backend plugin matches the resource type / vendor                                                                   | `Internal` — `gts.cf.core.errors.err.v1~cf.core.err.internal.v1~`                      |
-| `ServiceUnavailable(reason)` | Selected backend unreachable or erroring                                                                               | `ServiceUnavailable` — `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~` |
-| `Internal(reason)`           | Unexpected internal failure                                                                                            | `Internal` — `gts.cf.core.errors.err.v1~cf.core.err.internal.v1~`                      |
+| Variant                      | Meaning                                                                                                                  | Default canonical error — GTS error type id                                            |
+|------------------------------|--------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| `Unauthorized`               | Caller/subject not permitted to perform the check                                                                        | `PermissionDenied` — `gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~`     |
+| `InvalidRequest(violations)` | Request does not conform to its registered contracts (schema mismatch, missing contract type, subject type not admitted) | `InvalidArgument` — `gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~`       |
+| `NoPluginAvailable`          | No backend plugin registered                                                                                             | `Internal` — `gts.cf.core.errors.err.v1~cf.core.err.internal.v1~`                      |
+| `ServiceUnavailable(reason)` | Selected backend unreachable or erroring                                                                                 | `ServiceUnavailable` — `gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~` |
+| `Internal(reason)`           | Unexpected internal failure                                                                                              | `Internal` — `gts.cf.core.errors.err.v1~cf.core.err.internal.v1~`                      |
 
 A negative result is **not** an error — it is `LicenseDecision { granted: false }`. The error enum covers only
 "cannot-determine" conditions; on any of them the caller fails closed (treats the outcome as not-granted). A contract
@@ -505,8 +515,11 @@ infrastructure, datastore, or network topology of its own.
 ## 4. Additional context
 
 **Telemetry**: The resolver's own telemetry surface is minimal — a check counter, a boundary latency histogram, and a
-validation-failure counter. Dimension them only by bounded labels (the contract type, the domain type, selected vendor,
-decision outcome, violation kind); never label by instance ids or `metadata` values (unbounded cardinality). Boundary
+validation-failure counter. Dimension them only by bounded labels (the contract type, selected vendor,
+decision outcome, violation kind); never label by instance ids or `metadata` values (unbounded cardinality). Each label
+value comes from a closed set: the violation kind collapses every reason outside the resolver's own vocabulary into
+`other`, so a backend cannot widen the label space, and the latency histogram carries no label at all — the target
+covers the whole surface, and a per-contract breakdown belongs in the span. Boundary
 latency excludes plugin compute to support NFR `cpt-cf-license-resolver-nfr-read-latency`. (Backend plugins' own
 telemetry is their concern.)
 

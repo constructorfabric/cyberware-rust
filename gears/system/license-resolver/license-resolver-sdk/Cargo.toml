@@ -1,0 +1,34 @@
+[package]
+name = "cf-gears-license-resolver-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for license_resolver gear: is_licensed check API, licensing contract base types, plugin spec"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "licensing"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "license_resolver_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+# GTS types
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+
+# ToolKit dependencies
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }

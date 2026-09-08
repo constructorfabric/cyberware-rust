@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-types-registry-sdk"
-version = "0.3.6"
+version = "0.3.7"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

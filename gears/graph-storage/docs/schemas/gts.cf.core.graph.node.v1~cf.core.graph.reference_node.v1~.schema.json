@@ -1,0 +1,33 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Projection of a managed object owned elsewhere. Requires source-qualified canonical identity so identical native identifiers from different sources stay distinct.",
+  "x-gts-abstract": true,
+  "x-gts-traits": { "family": "reference", "scope_managed": true },
+  "type": "object",
+  "allOf": [
+    { "$ref": "gts://gts.cf.core.graph.node.v1~" },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "object",
+              "description": "Canonical identity of the referenced object.",
+              "properties": {
+                "system": { "type": "string", "minLength": 1, "description": "Owning gear or external system." },
+                "kind": { "type": "string", "minLength": 1, "description": "Object kind within that system." },
+                "native_id": { "type": "string", "minLength": 1, "description": "Identifier as the owning system spells it." }
+              },
+              "required": ["system", "kind", "native_id"]
+            }
+          },
+          "required": ["source"]
+        }
+      },
+      "required": ["payload"]
+    }
+  ]
+}

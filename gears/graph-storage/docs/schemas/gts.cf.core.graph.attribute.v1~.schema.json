@@ -1,0 +1,16 @@
+{
+  "$id": "gts://gts.cf.core.graph.attribute.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Base attribute type: a reusable schema fragment embedded inside a node's or edge's payload at a pointer the embedding type declares. It is not a graph element -- it has no row, no identity and no lifetime of its own, so it carries no envelope: it is created, updated and deleted with the element embedding it, and its tenant, timestamps and acting subject are the embedding element's, reported once on that element's API envelope. Who asserted the fragment's content, and when, is domain data rather than envelope data, because it may differ from who wrote the element -- see the provenance type. Declares no traits schema -- index, full-text and vector paths are JSON pointers rooted at the instance, so only the embedding node or edge type knows where the fragment sits and can declare paths into it.",
+  "x-gts-abstract": true,
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "type": {
+      "description": "GTS identifier of this fragment's attribute type. Producer-authored, like type on a node or an edge, so a payload can be read without resolving the embedding schema. Optional: the pointer the embedding type declares is what selects the schema to validate against, and it remains authoritative when the two disagree.",
+      "type": "string",
+      "format": "gts-type-id",
+      "x-gts-ref": "gts.cf.core.graph.attribute.v1~"
+    }
+  }
+}

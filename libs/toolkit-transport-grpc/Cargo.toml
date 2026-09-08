@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-transport-grpc"
-version = "0.7.5"
+version = "0.7.6"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

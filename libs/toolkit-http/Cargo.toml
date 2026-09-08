@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-http"
-version = "0.6.14"
+version = "0.6.15"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

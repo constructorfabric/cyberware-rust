@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-file-parser"
-version = "0.1.40"
+version = "0.1.41"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -29,7 +29,7 @@ magika = ["dep:magika", "dep:ort", "dep:tokio-util"]
 
 [dependencies]
 # Local dependencies
-file-parser-sdk = { package = "cf-gears-file-parser-sdk", version = "0.2.0", path = "../file-parser-sdk" }
+file-parser-sdk = { package = "cf-gears-file-parser-sdk", version = "0.2.1", path = "../file-parser-sdk" }
 
 # Core dependencies
 anyhow = { workspace = true }

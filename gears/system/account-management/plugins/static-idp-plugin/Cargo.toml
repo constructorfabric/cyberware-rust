@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-static-idp-plugin"
-version = "0.1.12"
+version = "0.1.13"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -20,8 +20,8 @@ workspace = true
 # Consumed SDK trait boundaries are `CanonicalError` (ADR 0005).
 toolkit-canonical-errors = { workspace = true }
 # Local dependencies
-account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.6.2", path = "../../account-management-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.6", path = "../../../types-registry/types-registry-sdk" }
+account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.7.0", path = "../../account-management-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.7", path = "../../../types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 
 # ToolKit dependencies

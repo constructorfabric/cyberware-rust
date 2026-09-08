@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-bss-rate-provider"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 description = "BSS FX rate-provider core gear: discovers + composes source plugins and registers the composite as a RateProviderV1 plugin the ledger resolves"

@@ -671,9 +671,25 @@ async fn a_follower_pump_mints_one_subscription_per_renewal_interval() {
         .await
         .expect("the second candidate follows");
 
-    // Two `elect`s, two subscriptions, both attached.
-    let settled = fixture.gear.subscriptions.len();
-    assert_eq!(settled, 2, "one subscription per `elect`, and no more yet");
+    // Both `elect`s attach one subscription each. Poll for the pair rather than
+    // reading the count once: `elect` can return to the caller before its pump has
+    // registered the server-side subscription, so an immediate read may race the
+    // second attach (the growth half below polls for the same reason). Require *at
+    // least* two: the follower's first renewal can land before the poll first
+    // observes the pair, so an overshoot to three is legitimate here - the leak
+    // itself is what the growth assertion below pins down.
+    let settled = tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            let len = fixture.gear.subscriptions.len();
+            if len >= 2 {
+                return len;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both subscriptions should attach within the event timeout");
+    assert!(settled >= 2, "one subscription per `elect`: got {settled}");
 
     // Eight nominal intervals of observation against a floor of three: the pump's
     // cadence is a real timer, so on a saturated CI box (this runs under the whole

@@ -1,0 +1,95 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Base graph node: the producer-authored part of a node, and the only part a producer may extend. The gear-assigned envelope -- tenant, timestamps, acting subjects, soft-delete tombstone and graph revision -- is not in this type: it is described by the API schema, because it has no meaning for an instance registered statically in the types-registry and because a producer can neither supply nor extend it.",
+  "x-gts-abstract": true,
+  "x-gts-traits-schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "family": {
+        "type": "string",
+        "enum": [
+          "owned",
+          "reference",
+          "phantom"
+        ],
+        "description": "Storage semantics of the node."
+      },
+      "scope_managed": {
+        "type": "boolean",
+        "default": true,
+        "description": "Whether rows of this type participate in producer-scoped replacement re-sync."
+      },
+      "emit_events": {
+        "type": "boolean",
+        "default": false,
+        "description": "Whether CREATE/UPDATE/DELETE events are published for this type."
+      },
+      "index": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "format": "json-pointer"
+        },
+        "default": [],
+        "description": "Payload paths backed by a JSONB index and admissible in $filter."
+      },
+      "full_text_search": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "format": "json-pointer"
+        },
+        "default": [],
+        "description": "Paths composed into the node tsvector."
+      },
+      "vector_search": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "format": "json-pointer"
+        },
+        "default": [],
+        "description": "Paths composed into the embedding input."
+      }
+    },
+    "required": [
+      "family"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "node_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Producer-supplied stable key, unique per tenant -- the same value the node_key column stores and the ingest DTO carries. Producer-authored: it is how a producer addresses the same node on a later re-sync and how an edge names an endpoint whose node has not been ingested yet. It is a domain key, not a GTS instance identifier and not a gear-generated id; the gear's own row id and the API envelope are elsewhere."
+    },
+    "type": {
+      "type": "string",
+      "format": "gts-type-id",
+      "x-gts-ref": "gts.cf.core.graph.node.v1~",
+      "description": "The node's registered GTS type."
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "Display name."
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Typed attributes; derived types refine this member."
+    },
+    "content": {
+      "type": "string",
+      "description": "Long-form text; chunked and indexed, bounded by content_max_bytes."
+    }
+  },
+  "required": [
+    "node_key",
+    "type"
+  ]
+}

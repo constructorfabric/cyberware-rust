@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-bss-ledger-sdk"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 license.workspace = true
 description = "BSS Billing Ledger SDK: infrastructure-free contract for ClientHub consumers"

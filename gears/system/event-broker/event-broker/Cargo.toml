@@ -23,7 +23,7 @@ workspace = true
 # the resolved type schema from `types-registry-sdk`, and the DTO shapes the API
 # reports from its own SDK - projecting a schema onto one of those shapes is
 # broker-side work and lives here.
-event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.0", path = "../event-broker-sdk" }
+event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.1", path = "../event-broker-sdk" }
 gts = { workspace = true }
 types-registry-sdk = { workspace = true }
 

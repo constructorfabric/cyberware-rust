@@ -1,7 +1,7 @@
 [package]
 name = "cf-chat-engine"
 description = "Chat Engine module: multi-tenant conversational infrastructure with plugin-driven backends"
-version = "0.3.2"
+version = "0.3.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -28,7 +28,7 @@ default = []
 k8s = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
-chat-engine-sdk = { package = "cf-chat-engine-sdk", version = "0.1.0", path = "../chat-engine-sdk" }
+chat-engine-sdk = { package = "cf-chat-engine-sdk", version = "0.1.1", path = "../chat-engine-sdk" }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
