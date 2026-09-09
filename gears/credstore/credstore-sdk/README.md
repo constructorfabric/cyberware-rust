@@ -22,7 +22,12 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
   - `list_metadata` — listing of credential records; never carries values,
     regardless of the caller's grants
   - `read_secrets` — bulk read of secret values for a bounded selection,
-    capped and non-paginated
+    capped and non-paginated. Exactly one of two selectors per call, matching
+    the REST contract one-for-one: an explicit list of references, or a filter
+    over allowlisted metadata fields using membership operators only
+    (`eq` / `in`). There is no third shape, and no prefix or ordered operator
+    over `reference` — see ADR-0004 for why that one is withheld rather than
+    pending
 
   These methods will ship with default "unsupported" implementations, so
   existing trait implementors and test doubles keep compiling unchanged.
