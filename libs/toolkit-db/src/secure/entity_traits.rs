@@ -15,8 +15,8 @@ use sea_orm::EntityTrait;
 /// ```rust,ignore
 /// impl ScopableEntity for user::Entity {
 ///     // The property-to-column mapping, written once. `resolve_property`
-///     // and `scope_columns` are two views of this table, provided by the
-///     // trait, so they cannot describe different sets.
+///     // and `scope_columns` read it (see `ScopeProperties`) and cannot be
+///     // implemented per entity, so they cannot describe different sets.
 ///     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
 ///         ("owner_tenant_id", user::Column::TenantId),
 ///         ("id", user::Column::Id),
@@ -138,10 +138,10 @@ pub trait ScopableEntity: EntityTrait {
     /// column that property means.
     ///
     /// The single place the mapping is written.
-    /// [`resolve_property`](Self::resolve_property) looks one property up in
-    /// it, [`scope_columns`](Self::scope_columns) lists its columns, and both
-    /// are provided by this trait, so the lookup and the list cannot describe
-    /// different sets.
+    /// [`ScopeProperties::resolve_property`] looks one property up in it and
+    /// [`ScopeProperties::scope_columns`] lists its columns. Neither can be
+    /// implemented per entity — see [`ScopeProperties`] — so the lookup and the
+    /// list cannot describe different sets.
     ///
     /// Usually the tenant, resource and owner columns plus any `pep_prop(...)`
     /// columns, keyed by property name. Two entries may name one column.
@@ -161,16 +161,41 @@ pub trait ScopableEntity: EntityTrait {
     ///
     /// An unrestricted entity declares an empty table.
     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)];
+}
 
+/// The two ways to read [`ScopableEntity::SCOPE_PROPERTIES`]: look one property
+/// up, or list the columns.
+///
+/// Separate from [`ScopableEntity`] on purpose. The blanket implementation
+/// below covers every scopable entity, so an entity **cannot** provide its own
+/// version of either method: coherence rejects a second implementation
+/// (`E0119`). That is what makes "the lookup and the list describe one set" an
+/// invariant of the type system rather than a convention — the reason this
+/// trait exists at all is that when both were overridable methods of
+/// `ScopableEntity`, a hand-written entity could and did make them disagree
+/// (issue #4726).
+///
+/// Callers get it for free with `E: ScopableEntity`; the trait only has to be
+/// in scope:
+///
+/// ```rust,ignore
+/// use toolkit_db::secure::{ScopableEntity, ScopeProperties};
+///
+/// fn column_for<E: ScopableEntity>(property: &str) -> Option<E::Column> {
+///     E::resolve_property(property)
+/// }
+/// ```
+pub trait ScopeProperties: ScopableEntity {
     /// Resolve an authorization property name to a database column.
     ///
     /// Maps PEP property names (e.g. `"owner_tenant_id"`) to `SeaORM` columns
     /// so the scope condition builder can translate `AccessScope` constraints
-    /// into SQL `WHERE` clauses. A property the entity does not declare
-    /// resolves to `None`, which the compiler treats as fail-closed.
+    /// into SQL `WHERE` clauses.
     ///
-    /// Provided over [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES). Declare the
-    /// table rather than overriding this.
+    /// A property the entity does not declare resolves to `None`. That is a
+    /// runtime answer, not a compile-time guarantee: it is on the caller to
+    /// treat it as deny. The compilers of this crate's own callers do so by
+    /// dropping the constraint and falling to `WHERE false`.
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column> {
         Self::SCOPE_PROPERTIES
@@ -180,7 +205,7 @@ pub trait ScopableEntity: EntityTrait {
     }
 
     /// The columns a scope predicate can be compiled against: the columns of
-    /// [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES), in declaration order.
+    /// [`ScopableEntity::SCOPE_PROPERTIES`], in declaration order.
     ///
     /// [`resolve_property`](Self::resolve_property) answers for one property
     /// and cannot be enumerated, and the SQL/PGQ graph declaration needs the
@@ -188,9 +213,6 @@ pub trait ScopableEntity: EntityTrait {
     /// cannot be filtered on inside `MATCH` (`docs/arch/secure-orm/ADR/0002`,
     /// Policy 3), and an element whose set is empty is refused up front rather
     /// than compiling to a deny-all traversal (Policy 2).
-    ///
-    /// Provided, like `resolve_property`. Declare the table rather than
-    /// overriding this.
     #[must_use]
     fn scope_columns() -> Vec<Self::Column> {
         Self::SCOPE_PROPERTIES
@@ -200,10 +222,16 @@ pub trait ScopableEntity: EntityTrait {
     }
 }
 
+/// Every scopable entity, and no room for a second implementation.
+///
+/// `tests/ui/fail/scope_properties_cannot_be_overridden.rs` pins that: an
+/// entity trying to supply its own `resolve_property` fails to compile.
+impl<E: ScopableEntity> ScopeProperties for E {}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::ScopableEntity;
+    use super::{ScopableEntity, ScopeProperties};
     use sea_orm::IdenStatic as _;
     use toolkit_security::access_scope::pep_properties;
 

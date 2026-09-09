@@ -6,7 +6,7 @@
 //! be scoped is refused, and a label cannot be shared.
 
 use super::pgq::{Endpoint, GraphDeclaration, PropertyGraph, VertexOf};
-use crate::secure::{ScopableEntity, ScopeError};
+use crate::secure::{ScopeError, ScopeProperties};
 
 /// A vertex with the usual tenant/resource dimensions.
 mod node {
@@ -446,7 +446,7 @@ fn the_derive_enumerates_custom_pep_properties() {
         impl ActiveModelBehavior for ActiveModel {}
     }
 
-    let names: Vec<&str> = <derived::Entity as ScopableEntity>::scope_columns()
+    let names: Vec<&str> = <derived::Entity as ScopeProperties>::scope_columns()
         .iter()
         .map(sea_orm::IdenStatic::as_str)
         .collect();

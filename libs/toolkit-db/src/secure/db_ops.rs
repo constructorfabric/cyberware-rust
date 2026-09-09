@@ -8,8 +8,8 @@ use std::marker::PhantomData;
 use crate::secure::cond::build_scope_condition;
 use crate::secure::error::ScopeError;
 use crate::secure::{
-    AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, Scoped, SeaOrmRunner, SecureEntityExt,
-    Unscoped,
+    AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeProperties, Scoped, SeaOrmRunner,
+    SecureEntityExt, Unscoped,
 };
 
 /// Convert a `sea_orm::Value` to a [`ScopeValue`] for comparison with scope filter values.
@@ -78,7 +78,7 @@ where
     'next_constraint: for constraint in scope.constraints() {
         // AND over filters within this constraint.
         for filter in constraint.filters() {
-            let Some(col) = <A::Entity as ScopableEntity>::resolve_property(filter.property())
+            let Some(col) = <A::Entity as ScopeProperties>::resolve_property(filter.property())
             else {
                 // Unknown property → this constraint fails (fail-closed).
                 continue 'next_constraint;

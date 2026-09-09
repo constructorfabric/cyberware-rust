@@ -1,7 +1,7 @@
 use sea_orm::sea_query::{Alias, Query, SelectStatement};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, IdenStatic, sea_query::Expr};
 
-use crate::secure::{AccessScope, ScopableEntity, ScopeError};
+use crate::secure::{AccessScope, ScopableEntity, ScopeError, ScopeProperties};
 use toolkit_security::access_scope::{
     ScopeConstraint, ScopeFilter, ScopeValue, rg_tables, tenant_tables,
 };

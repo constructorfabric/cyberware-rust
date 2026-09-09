@@ -1,0 +1,9 @@
+error[E0119]: conflicting implementations of trait `ScopeProperties` for type `test_entity::Entity`
+  --> tests/ui/fail/scope_properties_cannot_be_overridden.rs:58:1
+   |
+58 | impl ScopeProperties for Entity {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: conflicting implementation in crate `toolkit_db`:
+           - impl<E> ScopeProperties for E
+             where E: ScopableEntity;
