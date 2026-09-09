@@ -456,7 +456,7 @@ The system **MUST** allow an authorized caller to read one credential record by 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-write-credential-record`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow creating and replacing a credential record without touching its value, guarded by a caller-supplied precondition: create-only, guarded replace, or explicit last-writer-wins. The secret type **MUST** remain immutable. A record **MAY** exist without a value; such a record **MUST NOT** resolve for value reads and **MUST NOT** hide a value inherited from an ancestor. Creating a record together with its value in a single request is explicitly **not** provided.
+The system **MUST** allow creating and replacing a credential record without touching its value, guarded by a caller-supplied precondition: create-only, guarded replace, or explicit last-writer-wins. The secret type **MUST** remain immutable. A record **MAY** exist without a value; such a record **MUST** carry a distinct persisted lifecycle state, **MUST NOT** be a candidate for value resolution, and **MUST NOT** hide a value inherited from an ancestor — so a value read of that reference returns the ancestor's value when the chain offers one, and not-found only when it does not. Creating a record together with its value in a single request is explicitly **not** provided.
 
 **Rationale**: Splitting the record from the value lets metadata (sharing, category, expiry) be edited without ever touching the secret backend; the value-less state must stay well-defined rather than becoming an unfenced hazard. **Actors**: `cpt-cf-credstore-actor-integrations-admin`
 <!-- cpt-cf-id-content -->
