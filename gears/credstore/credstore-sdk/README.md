@@ -27,6 +27,14 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
   These methods will ship with default "unsupported" implementations, so
   existing trait implementors and test doubles keep compiling unchanged.
 
+  `get`, `put` and `delete` keep their names and are re-pointed at the value
+  sub-resource and the record. **`create` does not survive as it is:** it
+  takes a value, and creating a record with its value in one call is exactly
+  what the split removes. It becomes either a convenience wrapper that issues
+  both writes and documents its own non-atomicity, or it is dropped in favour
+  of a record write followed by a value write — the choice is open, and
+  whichever way it goes, a caller that used `create` changes shape.
+
 ## Usage
 
 A `ToolKit` consumer normally obtains `CredStoreClientV1` from `ClientHub`. The SDK

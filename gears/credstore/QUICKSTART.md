@@ -99,6 +99,12 @@ resources, addressed under `/credstore/v1/credentials…`.
 > (`PUT .../credentials/{ref}/secret`). A client that stops after the first
 > call leaves a value-less record behind; that state is legal and does not
 > shadow an inherited value.
+>
+> The second request needs a precondition, and the first supplies it: record
+> creation returns the `ETag`, and a value write's precondition is evaluated
+> against the *record's* validator, because a record and its value share one
+> version. So the flow is genuinely two requests — no metadata `GET` in
+> between to fetch a validator.
 
 **List credential records** — demonstrates the new metadata listing, bounded
 with `limit` and filtered with the platform `$filter` syntax; the response
@@ -133,15 +139,19 @@ curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key/se
 ```
 
 **Rotate the value** — demonstrates a guarded value write, keyed off the
-`ETag` obtained from the record read above. Requires the `write_value` PDP
-action.
+`ETag` of the **record** (from the record read above, or from the `201` of
+record creation below). The value sub-resource has no validator of its own:
+a record and its value share one version, so the record's `ETag` is what a
+value write is checked against. Requires the `write_value` PDP action, and
+notably not `read_value` — this is the write a value-blind configurator
+performs.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
 curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key/secret" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -H 'If-Match: "<etag-from-get>"' \
+  -H 'If-Match: "<etag-of-the-record>"' \
   -d '{"value": "sk-def456"}'
 ```
 
@@ -155,7 +165,12 @@ curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H 'If-None-Match: *' \
+  -i \
   -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.secret.v1~cf.core.credstore.basic_auth.v1~"}'
+
+# 201 Created
+# Location: /cf/credstore/v1/credentials/partner-openai-key
+# ETag: "7f3a…-…-…c1.1"     <- the validator the value write below needs
 ```
 
 **Bulk read secret values, explicit selector** — demonstrates the bounded,

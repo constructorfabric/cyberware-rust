@@ -105,10 +105,10 @@ The deciding arguments are D8 (metadata surfaces cannot carry a value because th
 |---|---|---|---|
 | `GET /credstore/v1/credentials` | credential records (metadata), paginated | `list_meta` | value-free by construction; OData filter/order per `guidelines/DNA/REST/PAGINATION.md` |
 | `GET /credstore/v1/credentials/{ref}` | one credential record (metadata) | `read_meta` | carries the `ETag` — the CAS validator source (D4); `ETag` only for the tenant's own row |
-| `PUT /credstore/v1/credentials/{ref}` | — (201 on create, 204 on replace) | `write_meta` | create-or-replace of the **record only**: sharing, type, category, expiry. Preconditions carry the intent: `If-None-Match: *` create-only, `If-Match: "<etag>"` guarded replace, `If-Match: *` last-writer-wins |
+| `PUT /credstore/v1/credentials/{ref}` | — (201 on create with `ETag`, 204 on replace) | `write_meta` | create-or-replace of the **record only**: sharing, type, category, expiry. Preconditions carry the intent: `If-None-Match: *` create-only, `If-Match: "<etag>"` guarded replace, `If-Match: *` last-writer-wins |
 | `DELETE /credstore/v1/credentials/{ref}` | — (204) | `delete` | `If-Match` required; releases the reference |
 | `GET /credstore/v1/credentials/{ref}/secret` | the value + the record | `read_value` | `Cache-Control: no-store`; audited |
-| `PUT /credstore/v1/credentials/{ref}/secret` | — (204) | `write_value` | rotation; `If-Match` required, validator taken from the record |
+| `PUT /credstore/v1/credentials/{ref}/secret` | — (204) | `write_value` | set or rotate; `If-Match` required and evaluated against the **record's** validator (see below); never creates a record |
 | `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection | `read_value`, per item | bulk; see below |
 
 Suppression (the "disabled here" tombstone, if adopted) attaches to the record: `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression`.
@@ -151,11 +151,15 @@ PUT /credstore/v1/credentials/smtp-default        If-None-Match: *   → 201
 PUT /credstore/v1/credentials/smtp-default/secret If-Match: *        → 204
 ```
 
+**What a value-write precondition is compared against.** The value sub-resource has no validator of its own, because a record and its value share one `version` — a value write bumps it exactly as a record write does. A precondition on `PUT …/{ref}/secret` is therefore evaluated against the **record's** validator, the same `"<id>.<version>"` the record's `ETag` carries.
+
+This is a deliberate deviation from RFC 9110, which evaluates a precondition against the target resource's own current representation, and it is stated rather than left to be inferred: read the other way, `If-Match` on a value that has never been written would be evaluated against an absent representation and could not succeed, which would make the first of the two writes above unexpressible. The record's `ETag` exists from the moment the record is created — which is why record creation returns it, rather than making the client insert a metadata `GET` between the two calls — so a guarded first value write is available immediately, and `If-Match: *` on the sub-resource means "the record must exist". A value write against a reference with no record is a 404, not a create: the record is the thing that gets created, and only by its own `PUT`.
+
 Between them the record exists **without a value**, so that state has to be legal and defined rather than transient:
 
-- **A value-less record does not resolve and does not shadow.** A read of its secret is the canonical 404, and — critically — it does **not** hide an inherited value from an ancestor. A half-finished create in a child tenant must not silently break inheritance that was working before it started.
-- **It is a distinct state, not "unfenced".** Today a `NULL` value fingerprint means "seeded out of band, serve on trust". A declared-but-empty record has no value at all, so the two cases must be told apart explicitly — by a lifecycle state on the record, not by the nullability of the fingerprint.
-- **The reaper must not sweep it.** The provisioning status stops being a transient saga step and becomes a legitimate resting state, so the sweep that today cleans stuck `provisioning` rows must exclude records that are deliberately empty. Otherwise a slow operator loses their record between the two calls.
+- **A value-less record does not resolve and does not shadow.** A read of its secret is the canonical 404, and — critically — it does **not** hide an inherited value from an ancestor. A half-finished create in a child tenant must not silently break inheritance that was working before it started. This is the one rule with a claim on a *second* surface: the collection read reduces a reference's rows to the one a value read would resolve, so its reduction has to skip a `declared` local row in favour of a resolvable inherited one, or the listing would report the empty local record while the point read serves the ancestor's value ([ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md) "Reducing a reference to one item").
+- **It is a distinct state, not "unfenced", and it is stored.** Today a `NULL` value fingerprint means "seeded out of band, serve on trust". A declared-but-empty record has no value at all, so the two cases must be told apart explicitly — by a lifecycle state on the record, not by the nullability of the fingerprint. Concretely: a fourth `status`, `declared`, widening the `CHECK (status IN (1, 2, 3))` the initial schema carries. Naming the state without giving it a column would leave every predicate that has to distinguish it — resolution, the reaper sweep, the collection read — resting on application logic over a value the metadata row does not hold; DESIGN §6.1 sets those predicates out. It is deliberately *not* a new nullable marker: `status` is already the lifecycle column, and the sweep and resolution filters that must exclude the state are already written against it, so they need no change at all.
+- **The reaper must not sweep it.** With `declared` as its own status this falls out rather than being enforced: the sweep selects `provisioning` rows past their timeout, and a `declared` record is not one. Had the state been folded into `provisioning`, the sweep would have needed a timeout exception for a record whose value write may legitimately arrive days later — or never — and a slow operator would lose their record between the two calls.
 - **Atomicity moves to the client.** The gear no longer guarantees "either both parts exist or neither"; a client that abandons the sequence leaves an empty record behind. The value write remains crash-safe on its own (backend write plus fingerprint stamp in one saga), so what is lost is only the coupling between the two requests.
 - **The UI consequence is real**: an administrator who creates a credential in a console sees a two-step flow, and the console must either drive both calls or show the record as incomplete.
 
@@ -185,6 +189,7 @@ Rules, all of which follow from D6:
 - **Hard cap with an explicit failure, never truncation.** Above the cap (proposed: 25) the request fails with `400 TOO_MANY_MATCHES` and the client is expected to narrow the selector. Truncation would both hide credentials from a legitimate caller and turn the endpoint into a drip.
 - **The response is not a `Page<T>`.** No `items`/`page_info` envelope, no `next_cursor` — the type is a flat per-reference result list, so nothing in the contract suggests the result can be continued.
 - **Per-item outcome under HTTP 200.** Not-resolved, out-of-scope, suppressed and fence-mismatch all report the same "not found" outcome per item (D3), and a failing item never aborts the batch.
+- **The two selectors differ in what a refused item may say.** With the **explicit** selector the response carries one item per reference the caller supplied, "not found" included: echoing a name back to whoever just sent it discloses nothing. With the **filtered** selector a refused row must be **omitted entirely** rather than reported as a "not found" item, because its `reference` was never in the caller's hands — the filter found it, and naming it would turn a value endpoint into an oracle for names the caller may not read. The consequence is that the filtered form's item count is not a fixed function of the request, which is the same property the collection read already has (ADR-0005 "Pagination over a reduced result") and the reason neither surface reports a total.
 - **Per-item fence.** Every returned value is verified against its row fingerprint (ADR-0003).
 - **`Cache-Control: no-store`**, one audit record per value actually returned, and its own gateway rate-limit rule on its own path.
 - **The cap is enforced by fetching `cap + 1`, never by counting.** No `COUNT` query is issued: if a `cap + 1`-th row comes back, the request fails; otherwise the rows fetched are the answer. This matches the platform rule against counting queries and keeps the check one indexed read.
@@ -192,8 +197,8 @@ Rules, all of which follow from D6:
 One response shape serves both selectors — a per-item outcome, and the record alongside each value so the caller can see whether it got its own or an inherited credential:
 
 ```jsonc
-POST /credstore/v1/credentials:read-secrets
-{ "select": { "category": ["email-sender"] } }
+POST /credstore/v1/credentials:read-secrets?$filter=category eq 'email-sender'
+// empty body — the filtered selector travels in the query, per the two forms above
 
 200 OK
 Cache-Control: no-store
@@ -226,7 +231,7 @@ Cache-Control: no-store
 ### Consequences
 
 - Metadata can never carry a value, because the value is not part of the metadata resource. The invariant is structural, so it cannot be reintroduced by an incautious DTO change.
-- Every exposure class is a distinct path, so route policies, rate limits and audit selectors are expressible without body inspection (D5), and `/credentials/*/secret` is a single glob for "everything that discloses".
+- Every exposure class is a distinct path, so route policies, rate limits and audit selectors are expressible without body inspection (D5). What that does **not** buy is a single glob: `/credentials/*/secret` matches the value sub-resource but not `POST /credentials:read-secrets`, which discloses values from a path with no `secret` segment. Gateway rate-limit and audit rules must therefore name both addresses explicitly; a rule written as one glob silently leaves the bulk route unthrottled and unaudited, which is the more dangerous of the two.
 - A value-blind administrator rotates by reading the record for its `ETag` and writing the sub-resource; it never touches an address that returns a secret (D4).
 - The frequent "give me my whole credential set" pattern is served in one call, with disclosure bounded by the caller's own grant, a cap, and the absence of pagination (D6).
 - The list item and the point record share one schema, which is what clients expect and what generated SDKs can type.
@@ -274,7 +279,7 @@ Compatibility is recorded here, not optimized for (D1).
 ### Security
 
 - **Assets and adversary.** The asset is the plaintext credential. The adversary of record is an over-granted or compromised principal inside the platform — a tenant user, an application token, a stolen bearer. Two goals are addressed: learning *which* credentials exist (reconnaissance) and obtaining *many* values in one action (exfiltration).
-- **Attack surface delta.** Metadata addresses widen only the reconnaissance surface, deliberately, because the catalogue is a product requirement, and each is gated by its own action. Exactly two addresses can disclose a value, both under `/credentials/*/secret*`-shaped paths, both audited and separately throttled.
+- **Attack surface delta.** Metadata addresses widen only the reconnaissance surface, deliberately, because the catalogue is a product requirement, and each is gated by its own action. Exactly two addresses can disclose a value — `GET /credentials/{ref}/secret` and `POST /credentials:read-secrets` — and both must be audited and separately throttled. They do **not** share a path prefix: see the note above on why one glob does not cover them.
 - **Reconnaissance containment.** Every refusal is the canonical 404, byte-identical to absence, including per item in a bulk response. Timing is not equalized; that is a pre-existing, accepted property of the gear (a resolved credential consults the PDP and the registry, a missing one does not — DESIGN §5.4).
 - **Exfiltration containment.** No response can exceed the caller's own read scope, none is paginated, and the bulk endpoint fails rather than truncates above its cap. The worst case for a compromised application token is "the credentials that token was already entitled to read", which is the same bound as with N point reads, reached faster.
 - **Per-option risk** is analyzed inline below; the two material risks are values on the paginated collection (unbounded, walkable disclosure) and a header-driven opt-in (invisible to path-based policy and to access logs).
@@ -298,7 +303,7 @@ Compatibility is recorded here, not optimized for (D1).
 ### Operations
 
 - **Rate limiting.** Gateway route policies match paths, which is why exposure classes are separate paths: value reads get stricter rules than catalogue reads, and the bulk address gets its own.
-- **Audit.** One record per value returned, on both value addresses. Metadata reads are not audited per record; the collection read may be sampled if volume warrants.
+- **Audit.** One record per value returned, on both value addresses (`GET /credentials/{ref}/secret` and `POST /credentials:read-secrets` — named, not globbed). Metadata reads are not audited per record; the collection read may be sampled if volume warrants.
 - **Metrics.** Bulk selector kind and result size distribution, per-item refusal counts by cause, cap rejections. Existing read-outcome and fence metrics extend unchanged.
 - **Runbook.** A spike of `TOO_MANY_MATCHES` or of per-item refusals is the operator-visible signal of a misbehaving or probing client.
 - **No new infrastructure.**
@@ -342,7 +347,7 @@ Compatibility is recorded here, not optimized for (D1).
 
 ## Revisit Triggers
 
-- A caller needs more credentials per request than the cap can serve, or needs a selector richer than category, type and reference prefix.
+- A caller needs more credentials per request than the cap can serve, or needs a selector richer than `eq`/`in` over category, type and reference — prefix or range matching on `reference` is the likely first ask, and it is out of the grammar above on purpose, because a prefix scan over names is the enumeration primitive this ADR exists to withhold.
 - The gateway gains query-aware or header-aware route policies, which would remove the main argument against a flag-based opt-in (B2, B3).
 - Audit starts deriving "value read" from response bodies rather than from the operation, which would remove the second argument.
 - The metadata collection acquires a use case that genuinely needs values inline; that would reopen B5 and require a new answer to walkability.
@@ -413,9 +418,9 @@ Evaluated in its strongest form: the item returns metadata by default and the va
 ## Traceability
 
 - Requirements (shipped): `cpt-cf-credstore-fr-get-secret`, `cpt-cf-credstore-fr-put-secret`, `cpt-cf-credstore-fr-delete-secret`, `cpt-cf-credstore-fr-optimistic-concurrency`, `cpt-cf-credstore-fr-service-retrieve`, `cpt-cf-credstore-nfr-confidentiality`, `cpt-cf-credstore-nfr-tenant-isolation`.
-- Requirements (proposed by the same project, to be added to the PRD): `-fr-list-credentials`, `-fr-get-credential`, `-fr-write-credential-metadata`, `-fr-read-secret`, `-fr-bulk-read-secrets`, `-fr-authz-action-split`.
+- Requirements (proposed by the same project, added to the PRD in §5.8): `-fr-credential-record`, `-fr-list-credentials`, `-fr-get-credential`, `-fr-write-credential-record`, `-fr-read-secret`, `-fr-write-secret`, `-fr-bulk-read-secrets`, `-fr-authz-action-split`, `-fr-secret-category`, `-fr-inheritance-status`, `-fr-override-type-consistency`; `-fr-suppression` (p2).
 - Builds on [ADR-0003](0003-cpt-cf-credstore-adr-value-fingerprint-fence.md): the fence runs per returned value, including per item in a bulk read.
-- Depends on lifting the PRD non-goal "secret listing or search operations" and on the companion ADR for the collection read under the no-projection PEP contract (DESIGN §4.4).
+- Depends on the companion ADR for the collection read under the no-projection PEP contract ([ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md)). The PRD non-goal it needed lifted is already narrowed in this change: listing credential records is in scope, and only full-text search over names or values remains a non-goal.
 - Pagination and filtering of the credential collection follow `guidelines/DNA/REST/PAGINATION.md`; the bulk secret read deliberately opts out of the cursor machinery while keeping the platform `$filter`, following `POST /usage-collector/v1/records/aggregate` (`gears/system/usage-collector/usage-collector/src/api/rest/routes/usage_records.rs:121-147`) as the precedent for "OData filter, no pagination, non-`Page` response".
 - Answers the open questions recorded in `PRD.md:717` / `DESIGN.md:790` (batch retrieval) and the value-exposure half of `PRD.md:720` / `DESIGN.md:793` (metadata list vs anti-enumeration).
 - `$`-prefixed parameters must be declared through `OperationBuilderODataExt` (`libs/toolkit/src/api/operation_builder.rs:447`) to satisfy the external `cargo-gears` lint `de0802_use_odata_ext`; `limit` and `cursor` have no helper and are declared manually where they apply.

@@ -12,6 +12,7 @@ date: 2026-09-08
 - [Decision Outcome](#decision-outcome)
   - [Barriers are deliberately bypassed for the ancestor chain](#barriers-are-deliberately-bypassed-for-the-ancestor-chain)
   - [How authorization applies to a collection](#how-authorization-applies-to-a-collection)
+  - [Reducing a reference to one item](#reducing-a-reference-to-one-item)
   - [Pagination over a reduced result](#pagination-over-a-reduced-result)
   - [What stays out of the filter](#what-stays-out-of-the-filter)
   - [Consequences](#consequences)
@@ -83,9 +84,17 @@ The point read already works this way, and the collection reuses it verbatim (D3
 1. The ancestor chain is fetched from the Tenant Resolver with barriers ignored, for the reasons and under the invariants set out above.
 2. The SQL query is not tenant-clamped. It selects candidate rows restricted to that chain, with the same visibility rules the point read applies: in the caller's own tenant, private rows owned by the caller plus tenant and shared rows; in ancestors, shared rows only.
 3. The PDP decision gates the **request**: the returned scope must admit the caller's own tenant. Hierarchical visibility is decided by the resolver, not by the PDP — which is precisely what lets an inherited entry appear at all.
-4. Attribute predicates from the same scope — category, type, sharing, reference — **are** applied as SQL clamps. Only the tenant dimension is a gate rather than a clamp.
-5. The concrete secret type of each row is resolved and authorized per distinct type present in the page; rows of a type the caller has no grant for are dropped after the query, and the page continues with its cursor unchanged. Account Management's metadata listing already behaves this way and documents that a short page is expected.
-6. A structured `InTenantSubtree` predicate reaching the gear still fails closed, unchanged from today.
+4. **A caller the gate refuses gets an empty page, not a refusal**, and that is a deliberate choice with a cost worth stating. The argument against it is sound in the abstract: an empty page ought to mean "authorized, nothing here", and collapsing "you may not list" into it makes an operator unable to tell a missing grant from an unconfigured tenant. The argument for it is that this gear has no operation-level evaluation to refuse *from*. The PDP resource is the secret's resolved concrete type, so a scope exists only once rows have been read and their types resolved, and the gate runs once per distinct type present on the page. A caller with no grant at all and a tenant with an empty catalogue are therefore indistinguishable **by construction**, not by policy: in the second case no type is present, so no evaluation happens and there is nothing to deny. Returning `AccessDenied` would require evaluating `list_meta` against the secret *base* type before the query — a resource this gear deliberately does not authorize against today (DESIGN §5.4: the concrete type is the only PDP resource, so a policy can target any type without a base-type gate). That is a real design change, not a status-code change, and it is recorded as a revisit trigger rather than smuggled in here.
+5. Attribute predicates from the same scope — category, type, sharing, reference — **are** applied as SQL clamps. Only the tenant dimension is a gate rather than a clamp.
+6. The concrete secret type of each row is resolved and authorized per distinct type present in the page; rows of a type the caller has no grant for are dropped after the query, and the page continues with its cursor unchanged. Account Management's metadata listing already behaves this way and documents that a short page is expected.
+7. A structured `InTenantSubtree` predicate reaching the gear still fails closed, unchanged from today.
+
+### Reducing a reference to one item
+
+One item per reference, and it must be the row a value read of that reference would resolve — otherwise the catalogue and the point read disagree, which is the one failure a catalogue cannot recover from. Two rules, in this order:
+
+1. **Only resolvable rows compete.** A `declared` record — created but with no value yet ([ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md), DESIGN §6.1) — does not resolve and does not shadow, so it must not win the reduction while a resolvable inherited row exists under the same reference. Getting this wrong is not cosmetic: the listing would show the caller's own empty record precisely when the point read is serving the ancestor's value, i.e. it would report "configured here" for a credential that is in fact inherited. A reference whose *only* row is `declared` still appears, with its state, because an administrator mid-configuration needs to see it.
+2. **Among resolvable rows, nearest wins**, and `private` beats non-`private` at the same depth — the same two-phase priority `resolve_for_get` applies, reused rather than restated, so a change to visibility rules cannot apply to one read and miss the other (D3).
 
 ### Pagination over a reduced result
 
@@ -118,8 +127,9 @@ Every field offered for filtering or ordering must be backed by an index. Today 
 - E2E: a tenant behind an isolation barrier still sees its ancestors' `shared` entries in the listing, with the inherited status set, and can read their values.
 - E2E: the same barrier tenant sees no `tenant`-scoped or `private` row belonging to an ancestor.
 - E2E: a parent holding a subtree grant cannot list, read or write inside a barrier descendant — data crosses the barrier downward, authority does not.
-- E2E: a caller whose scope does not admit its own tenant receives an empty page rather than a refusal, and no row from any other tenant ever appears.
+- E2E: a caller whose scope does not admit its own tenant receives an empty page rather than a refusal — the deliberate choice recorded in step 4, and the reason this criterion is written as an assertion about the *rows* rather than about the status: no row from any other tenant ever appears, whatever the status.
 - E2E: a reference whose rows exist in three tenants of one chain yields exactly one item, and a page boundary placed inside that group still yields exactly one item across the two pages.
+- E2E: a reference with a `declared` row in the caller's tenant and a resolvable `shared` row in an ancestor yields the **inherited** item, matching what a value read of that reference returns; the same reference with no ancestor row yields the `declared` item with its state visible.
 - E2E: rows of a type the caller cannot read are absent while `next_cursor` still advances, and paging to exhaustion visits every readable reference exactly once.
 - E2E: `$filter` on `inheritance` is rejected as an unsupported field; `$filter` on `owner_tenant_id` works.
 - Unit: the field-to-column mapping refuses to order by a non-orderable field, and the tiebreaker is the row primary key.
@@ -157,6 +167,7 @@ Every field offered for filtering or ordering must be backed by an index. Today 
 
 ## Revisit Triggers
 
+- Operators cannot tell a missing `list_meta` grant from an empty catalogue and it costs support time. Closing that needs an operation-level evaluation against the secret base type, which today is not a PDP resource this gear authorizes against — see step 4 of "How authorization applies to a collection".
 - A product need appears for a parent to review its descendants' catalogues in one response, rather than by acting in each child's context.
 - The PDP starts sending structured subtree predicates to gears as a matter of course, which would make the capability declaration cheaper than the act-as pattern.
 - Row-reducing pagination proves fragile in practice; the fallback is an own-rows-only listing plus a separate point read per inherited reference.
