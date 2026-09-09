@@ -31,7 +31,8 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
   - [5.2 Type Traits](#52-type-traits)
   - [5.3 Built-in Type Catalog (Registry Seeds)](#53-built-in-type-catalog-registry-seeds)
   - [5.4 Enforcement Points](#54-enforcement-points)
-  - [5.5 Storage & API Changes](#55-storage--api-changes)
+  - [5.5 Category Registry (planned, ADR-0004)](#55-category-registry-planned-adr-0004)
+  - [5.6 Storage & API Changes](#56-storage--api-changes)
 - [6. Secret Lifecycle & Sagas](#6-secret-lifecycle--sagas)
   - [6.1 Status Model](#61-status-model)
   - [6.2 Provisioning Saga](#62-provisioning-saga)
@@ -389,7 +390,7 @@ The machine-readable API is generated from the handlers: the platform-wide OpenA
 }
 ```
 
-**Update Secret Request (`PUT`)** — same body without `reference`. `sharing` values: `"private"`, `"tenant"` (default), `"shared"`. `type` (optional): the secret type's **full GTS type id** (§5.5), built-in or custom; defaults to the generic type. `expires_at` (optional, RFC 3339) for expirable types.
+**Update Secret Request (`PUT`)** — same body without `reference`. `sharing` values: `"private"`, `"tenant"` (default), `"shared"`. `type` (optional): the secret type's **full GTS type id** (§5.6), built-in or custom; defaults to the generic type. `expires_at` (optional, RFC 3339) for expirable types.
 
 **Field notes**:
 
@@ -779,9 +780,55 @@ Adding a **built-in** type (shipped with the platform, with a short REST name) =
 4. **Read**: rows with `expires_at <= now` are filtered out in the resolution SQL (404); `type` (and `expires_at`, when set) are returned in response metadata.
 5. **Authorization**: a **single** PDP evaluation per operation targets the secret's **full concrete GTS type** — including `generic` — as returned by the type resolution (step 1). Its `AccessScope` is enforced in SQL and its gate must include the **caller's** tenant (hierarchical visibility of inherited/shared secrets is decided by the resolver, not the PDP). Denial surfaces as the anti-enumeration 404 on read and 403 on write/delete; a PDP outage is 503. Every type (incl. `generic` and custom types) reaches the PDP, so a per-type policy can be added with no credstore change. On read the PDP is consulted only for a secret that resolves (a missing secret is a 404 without a PDP or registry call).
 6. **Reaper**: each tick first flips expired `active` rows into the ordinary deprovisioning saga (`mark_expired_deprovisioning`), which then cleans the backend value and releases the reference via the pending sweep (§6.4). The reaper never resolves types — sweeping is type-agnostic.
-7. **Category** (planned, record write only, ADR-0004): the `category` field is validated against the platform category registry and, when the type declares `allowed_categories` (§5.2), against that closed list — a violation is 400. Because changing a record's category changes which application may read its value through a category-scoped grant (and, under the bulk selector, which credentials appear in that application's result), a category change requires the `write_meta` action and bumps `version` like any other metadata edit (§4.3.2, `cpt-cf-credstore-fr-secret-category`). **The category must also match the credential this record overrides**, when the reference currently resolves to an ancestor's `shared` credential (`cpt-cf-credstore-fr-override-category-consistency`, the exact parallel of the type rule above): the write resolves the reference upward, which it must do anyway, and refuses a differing category as a conflict. This is enforced here rather than assumed, because §4.4's `category` clamp is only cheap if a reference's category is constant across its chain. The one path this check cannot cover is an ancestor changing or recreating its own credential, which no upward read can validate against descendants; §4.4 therefore reads the winner back rather than trusting the clamp, and the reaper raises a metric when it finds a chain with mixed categories.
+7. **Category** (planned, record write only, ADR-0004): the `category` field is validated against the registered category instances (§5.5) — a name that is not registered, or whose instance is `deprecated`, is refused and, when the type declares `allowed_categories` (§5.2), against that closed list — a violation is 400. Because changing a record's category changes which application may read its value through a category-scoped grant (and, under the bulk selector, which credentials appear in that application's result), a category change requires the `write_meta` action and bumps `version` like any other metadata edit (§4.3.2, `cpt-cf-credstore-fr-secret-category`). **The category must also match the credential this record overrides**, when the reference currently resolves to an ancestor's `shared` credential (`cpt-cf-credstore-fr-override-category-consistency`, the exact parallel of the type rule above): the write resolves the reference upward, which it must do anyway, and refuses a differing category as a conflict. This is enforced here rather than assumed, because §4.4's `category` clamp is only cheap if a reference's category is constant across its chain. The one path this check cannot cover is an ancestor changing or recreating its own credential, which no upward read can validate against descendants; §4.4 therefore reads the winner back rather than trusting the clamp, and the reaper raises a metric when it finds a chain with mixed categories.
 
-### 5.5 Storage & API Changes
+### 5.5 Category Registry (planned, ADR-0004)
+
+The category vocabulary lives in types-registry, as **instances** of one GTS type. Not a gear-config key, and not a table in this gear: the label is named by two independent parties, the write path here *and* the author of the PDP policy that grants it, and the policy author sits in the authorization engine. A vocabulary only this gear can see cannot be offered as a dropdown or validated when the policy is written. types-registry is the platform's registry and this gear already calls `list_instances` against it to select its backend plugin, so this adds no dependency and inherits that call's failure mode (registry unreachable ⇒ fail closed, 503).
+
+**Type**: `gts.cf.core.credstore.category.v1~`. Its instances carry a short `name` — the string that goes in the `category` column, in a `$filter`, and in a policy constraint — plus a human description and a lifecycle flag:
+
+```jsonc
+// gts.cf.core.credstore.category.v1~cf.core.credstore.email_sender.v1
+{ "name": "email-sender",
+  "title": "Outbound email",
+  "description": "SMTP and mail-API credentials an outbound mail service may read.",
+  "state": "active" }
+```
+
+```jsonc
+// gts.cf.core.credstore.category.v1~cf.core.credstore.payments.v1
+{ "name": "payments",
+  "title": "Payment processing",
+  "description": "Payment-gateway keys. Separated from every other category so a mail service's grant can never reach them.",
+  "state": "active" }
+```
+
+```jsonc
+// gts.cf.core.credstore.category.v1~cf.core.credstore.branding.v1
+{ "name": "branding",
+  "title": "Branding and content",
+  "description": "Non-secret-shaped tenant content served through the credential store (slogans, asset tokens).",
+  "state": "active" }
+```
+
+```jsonc
+// gts.cf.core.credstore.category.v1~cf.core.credstore.smtp.v1
+{ "name": "smtp",
+  "title": "SMTP (deprecated)",
+  "description": "Superseded by `email-sender`. Kept registered so existing records keep resolving.",
+  "state": "deprecated" }
+```
+
+**Who registers them**: the platform operator, by seeding instances — the same per-deployment seed path types-registry already uses for the operator-controlled platform-root tenant type (§10). A tenant cannot, because instance registration is not a tenant operation, which is what makes the PRD's "closed set maintained by the platform, not defined ad hoc by individual tenants" true by construction rather than by convention.
+
+**Why instances rather than one type per category**: a type per category would put the full GTS id in the column, in every `$filter` and in every policy constraint, and would make the vocabulary a set of schemas rather than a set of values. An instance is a registered *value* with a short name, which is what a label is.
+
+**Lifecycle, and the direction that actually bites.** Registering a category before any policy grants it is harmless: records may carry it and no one may read them, which is a closed refusal. The dangerous direction is removal — a record keeps a label whose registration is gone while policies keep referencing the string. types-registry cannot see this gear's rows, so only this gear could check it, and it would have to check on every deletion. So **categories are not deleted, they are deprecated**: `state: "deprecated"` keeps existing records resolving and existing policies working, while a record write naming a deprecated category is refused. The reaper's consistency scan (§6.4) additionally reports records whose category is not registered at all, which is the only way a label can go stale once removal is off the table.
+
+**Relationship to `allowed_categories` (§5.2)**: two gates, not one. This registry says which names exist; the type trait says which of them are legal on records of that type. A record write checks both, and both speak the same short names.
+
+### 5.6 Storage & API Changes
 
 - `credstore_secrets` carries `secret_type_uuid UUID NOT NULL DEFAULT '<generic v5 uuid>'` — the deterministic v5 UUID of the type's GTS id (`GtsID::to_uuid`, pinned as `credstore_sdk::GENERIC_TYPE_UUID_STR`), like AM's `tenants.tenant_type_uuid` — and `expires_at TIMESTAMPTZ NULL`, plus the partial expiry-sweep index (§4.7, §8). The stored UUID is opaque to the storage layer; only the type resolution interprets it.
 - REST: optional `type` (the secret type's full GTS type id) and `expires_at` (RFC 3339) on `POST`/`PUT`; `GET` metadata returns `type` (the resolved full GTS type id) and `expires_at`.
@@ -877,7 +924,7 @@ The gear's lifecycle entry (`serve`) runs a cancellable loop on `reaper.tick_sec
 3. **Backend reconciliation**: issue a best-effort `plugin.delete` for every stale row (closing the orphaned-value debt of §6.2); `NotFound` counts as success.
 4. **Remove rows**: `provisioning` rows unconditionally (the reference must not stay wedged); `deprovisioning` rows only after a successful backend delete — otherwise the row (and the name it holds) waits for the next tick. Counts → `provisioning_reaped` / `deprovisioning_reaped`. The asymmetry is deliberate: a `deprovisioning` row must hold the name until the backend is clean (releasing it early could let this saga's lagging delete erase a successor's value), while keeping a `provisioning` row on a failed backend delete would wedge the reference for as long as the backend stays unreachable. The cost is a possible orphaned backend value with no metadata row when step 3 fails for a reaped `provisioning` row — it is never readable (resolution requires a row) and is overwritten by the next create of the same reference; the accepted tradeoff mirrors §6.2's no-retry orphan.
 5. **Refresh inventory gauges** (row counts per status).
-6. **Category-consistency scan** (planned, ADR-0005): find references whose rows carry more than one `category` within a chain and raise a metric per finding. The write path refuses such a write (§5.4), so a finding means the one path a write cannot check — an ancestor changed or recreated its own credential — and the catalogue's `category` clamp is only as selective as this invariant is true. The scan detects, it does not repair: which category is the right one is an operator's decision, not the reaper's. Correctness does not wait for it, because §4.4 authorizes the reduced winner rather than trusting the clamp.
+6. **Category-consistency scan** (planned, ADR-0005): find references whose rows carry more than one `category` within a chain and raise a metric per finding. The write path refuses such a write (§5.4), so a finding means the one path a write cannot check — an ancestor changed or recreated its own credential — and the catalogue's `category` clamp is only as selective as this invariant is true. The same pass reports records whose category is not a registered instance at all (§5.5) — since a registration is deprecated rather than deleted, that can only happen through direct data manipulation, which is exactly why it is worth reporting. The scan detects, it does not repair: which category is the right one is an operator's decision, not the reaper's. Correctness does not wait for it, because §4.4 authorizes the reduced winner rather than trusting the clamp.
 
 Errors are logged, never propagated — the reaper must survive transient DB or plugin outages.
 
@@ -987,6 +1034,7 @@ Following the ToolKit plugin pattern:
 - Plugin spec: `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`
 - Secret resource type: `gts.cf.core.credstore.secret.v1~` (= `SECRET_RESOURCE_TYPE`, the PDP resource type; registered with an empty property set — authorization needs only the type id)
 - Secret types: derived from the secret base type — built-ins `gts.cf.core.credstore.secret.v1~cf.core.credstore.<name>.v1~` (one seed per catalog entry, traits as `x-gts-traits`), plus any custom registered descendant; §5
+- Category type (planned, ADR-0004): `gts.cf.core.credstore.category.v1~` — the **source of truth for the category vocabulary**. Each category is an *instance* of this type, not a type of its own, so the vocabulary is enumerated the same way the gear already enumerates backend plugins: `list_instances` with the type-id prefix as the pattern (`infra/plugin_select.rs` does exactly this for `CredStorePluginSpecV1`). §5.5
 
 ### Configuration
 

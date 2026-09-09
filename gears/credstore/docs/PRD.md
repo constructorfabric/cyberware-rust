@@ -496,7 +496,7 @@ The system **MUST** allow an authorized caller to read the values of several cre
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-secret-category`
 
 <!-- cpt-cf-id-content -->
-Each credential record **MAY** carry a **category**, an operator-chosen label drawn from a closed registry, usable as an authorization attribute so that an application can be granted the values of one category only. Changing a category changes who may read the value, therefore it **MUST** require the record-write action and **MUST** bump the record version. A category outside the registry **MUST** be rejected.
+Each credential record **MAY** carry a **category**, an operator-chosen label drawn from a closed registry, usable as an authorization attribute so that an application can be granted the values of one category only. The registry's **source of truth MUST be the platform types registry**, as registered instances of a category type, so that the vocabulary is enumerable by everyone who has to name it — this gear on a write, and the author of the policy that grants it. A label that is not registered, or whose registration is marked deprecated, **MUST** be refused on a record write. Registrations **MUST NOT** be removable while records may still carry them: a category leaves service by being marked deprecated, which keeps existing records resolving and existing policies valid while refusing new writes. Changing a category changes who may read the value, therefore it **MUST** require the record-write action and **MUST** bump the record version. A category outside the registry **MUST** be rejected.
 
 **Rationale**: Category-scoped grants are what makes "all my SMTP secrets" servable without widening an application's entitlement beyond its own credentials. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
 <!-- cpt-cf-id-content -->
@@ -920,7 +920,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - The PDP is the sole authorization authority; there is no local policy cache (policy freshness over availability)
 - Consumers provisioning infrastructure from secrets at startup (e.g., mini-chat → OAGW upstreams) tolerate missing secrets by degrading per-provider rather than failing boot
 - OAGW is a ToolKit gear that uses the standard CredStore SDK client (all access flows through Gear → Plugin)
-- The secret category registry is a closed set maintained by the platform, not defined ad hoc by individual tenants
+- The secret category registry is a closed set maintained by the platform, not defined ad hoc by individual tenants — enforced by where it lives rather than by convention, since registering an instance in the platform types registry is not a tenant operation
 
 ## 12. Risks
 
