@@ -880,6 +880,14 @@ Only `active` rows are returned by `resolve_for_get`; a secret therefore becomes
 
 It is also distinct from the existing `value_fp IS NULL` out-of-band-seeding case (§4.10), and the two behave **oppositely** on a value read: a seeded row is `active` and has a backend value, so it resolves and is served on trust until its fingerprint is backfilled; a `declared` row has no backend value at all, is not `active`, and is never a resolution candidate. The non-shadowing rule (§4.1) belongs to the `declared` row alone, and only because it never competes: a seeded row *does* shadow an ancestor's `shared` value, legitimately, being both nearer and resolvable — which is ordinary resolution, not an exception. Stating it as "neither state shadows" would be wrong about the seeded half.
 
+**How a record reaches it: one insert, no saga.** A record write touches the metadata table and nothing else — there is no backend value to write, so there is nothing to compensate and no intermediate state to pass through. `PUT /credentials/{ref}` with `If-None-Match: *` therefore inserts directly at `status = 4`, without the `provisioning` step the value-carrying create needs (§6.2). That is what makes the two incomplete outcomes distinguishable, and the distinction is the whole reason this status exists:
+
+| What happened | Status left behind | Reaped |
+|---|---|---|
+| The record write succeeded, the value write never came | `declared` (4) | no — no timeout applies, the value `PUT` may arrive much later or never |
+| The record write itself failed midway | nothing — a single insert either commits or does not | n/a |
+| A value-carrying create crashed between its metadata insert and its backend write | `provisioning` (1) | yes, past `provisioning_timeout_secs` — a row stuck there is by definition a crashed write |
+
 **It is a fourth `status`, not an inference.** `status = 4`, widening the `CHECK (status IN (1, 2, 3))` of `m0001_initial_schema`, and *not* derived from `value_fp IS NULL`, which already means "seeded out of band, fingerprint pending" and would conflate a deliberately empty record with a legacy row whose backend value must resolve on trust. Making it a stored status is what keeps every predicate that has to distinguish the two expressible in SQL rather than in application logic:
 
 | Predicate | Today | With `declared` |
