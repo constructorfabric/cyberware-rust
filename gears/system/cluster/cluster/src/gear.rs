@@ -98,11 +98,32 @@ impl Default for ClusterGear {
 impl ClusterGear {
     /// Assembles the provider registry from the backend plugins linked into this
     /// build; future plugins add a `with_*_provider` line here.
+    ///
+    /// The two Redis lines are what make `provider: redis` resolvable at all.
+    /// They are separate registrations rather than one, because the SDK keeps the
+    /// cache and lock provider traits independent: a profile may bind
+    /// `lock: { provider: redis }` over a cache on another backend entirely
+    /// (redis-cluster-plugin/docs/DESIGN.md §3.5), and the standalone
+    /// `RedisLockPlugin` behind `RedisLockProvider` opens its own pool for
+    /// exactly that shape.
+    ///
+    /// Note what is deliberately *not* here: no Redis leader-election provider.
+    /// It is the SDK default over the Redis cache
+    /// (§7), and since that cache normally declares `EventuallyConsistent`, a
+    /// profile binding `cache: { provider: redis }` and omitting
+    /// `leader_election` **fails startup** until the operator either routes
+    /// leader election elsewhere or opts in via `provider: default` plus
+    /// `allow_weak_consistency` (Phase 1's [`DEFAULT_PROVIDER`] sentinel). That
+    /// is the honest declaration doing its job, not a missing registration.
+    ///
+    /// [`DEFAULT_PROVIDER`]: crate::DEFAULT_PROVIDER
     fn provider_registry() -> ProviderRegistry {
         ProviderRegistry::new()
             .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider))
             .with_cache_provider(Arc::new(postgres_cluster_plugin::PostgresCacheProvider))
             .with_lock_provider(Arc::new(postgres_cluster_plugin::PostgresLockProvider))
+            .with_cache_provider(Arc::new(redis_cluster_plugin::RedisCacheProvider))
+            .with_lock_provider(Arc::new(redis_cluster_plugin::RedisLockProvider))
     }
 
     /// The profile index, or an error naming the lifecycle violation.

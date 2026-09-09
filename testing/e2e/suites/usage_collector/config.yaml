@@ -173,17 +173,17 @@ gears:
       priority: 100
 
   # `vendor` is written out explicitly on BOTH the gear and the plugin. They
-  # happen to share the same crate default today (`cyberfabric`); stating it
+  # happen to share the same crate default today (`constructorfabric`); stating it
   # means a future default change in either crate cannot silently leave the
   # gear with no storage plugin bound — a failure that would otherwise surface
   # only on the first dispatch, not at startup.
   usage-collector:
     config:
-      vendor: "cyberfabric"
+      vendor: "constructorfabric"
 
   timescaledb-usage-collector-plugin:
     config:
-      vendor: "cyberfabric"
+      vendor: "constructorfabric"
       priority: 10
       # sslmode=disable is the deliberate opt-out build_pool honours; the test
       # container serves no TLS, and a DSN with no explicit sslmode is upgraded

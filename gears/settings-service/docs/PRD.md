@@ -1,3 +1,6 @@
+Created:  2026-07-20 by Virtuozzo International GmbH
+Updated:  2026-08-30 by Virtuozzo International GmbH
+
 # PRD — Settings Service
 
 
@@ -977,4 +980,3 @@ Links to related specification artifacts.
 - **Design**: [DESIGN.md](./DESIGN.md) — TBD, not yet authored for this gear
 - **ADRs**: [ADR/](./ADR/) — TBD, not yet authored for this gear
 - **Features**: [features/](./features/) — TBD, not yet authored for this gear
-

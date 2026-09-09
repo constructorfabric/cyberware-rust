@@ -98,9 +98,9 @@ fn hub_with_registry_and_plugin(
 async fn get_plugin_resolves_then_caches_resolved_instance() {
     let instance_id = test_instance_id();
     let (hub, registry) =
-        hub_with_counting_registry_and_plugin(&instance_id, "cyberfabric", MockPlugin::arc());
+        hub_with_counting_registry_and_plugin(&instance_id, "constructorfabric", MockPlugin::arc());
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
     let p1 = svc.get_plugin().await.unwrap();
     let p2 = svc.get_plugin().await.unwrap();
 
@@ -127,7 +127,7 @@ async fn get_plugin_retries_resolution_on_each_call_when_registry_fails() {
         Arc::new(MockTypesRegistryClient::new().with_list_error(canonical_internal("unavailable")));
     hub.register::<dyn TypesRegistryClient>(registry.clone() as Arc<dyn TypesRegistryClient>);
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
 
     let err = svc.get_plugin().await.err().expect("expected Err");
     assert!(
@@ -148,7 +148,7 @@ async fn get_plugin_retries_resolution_on_each_call_when_registry_fails() {
 // `TypesRegistryUnavailable` from the explicit hub.get map_err.
 #[tokio::test]
 async fn get_plugin_returns_registry_unavailable_when_hub_empty() {
-    let svc = Service::new(empty_hub(), "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(empty_hub(), "constructorfabric".into(), dummy_enforcer());
     let err = svc.get_plugin().await.err().expect("expected Err");
     assert!(
         matches!(err, DomainError::TypesRegistryUnavailable(_)),
@@ -166,7 +166,7 @@ async fn get_plugin_returns_plugin_not_found_when_no_instances() {
     let registry: Arc<dyn TypesRegistryClient> = Arc::new(MockTypesRegistryClient::new());
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
     let err = svc.get_plugin().await.err().expect("expected Err");
     assert!(
         matches!(err, DomainError::PluginNotFound { .. }),
@@ -185,7 +185,7 @@ async fn get_plugin_returns_plugin_not_found_when_vendor_mismatch() {
         Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
     let err = svc.get_plugin().await.err().expect("expected Err");
     assert!(
         matches!(err, DomainError::PluginNotFound { .. }),
@@ -207,7 +207,7 @@ async fn get_plugin_returns_invalid_when_content_malformed() {
         Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
     let err = svc.get_plugin().await.err().expect("expected Err");
     assert!(
         matches!(err, DomainError::InvalidPluginInstance { .. }),
@@ -224,12 +224,15 @@ async fn get_plugin_returns_invalid_when_content_malformed() {
 async fn get_plugin_returns_unavailable_when_scoped_slot_empty() {
     let instance_id = test_instance_id();
     let hub = Arc::new(ClientHub::default());
-    let instance = make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
+    let instance = make_test_instance(
+        &instance_id,
+        plugin_content(&instance_id, "constructorfabric"),
+    );
     let registry: Arc<dyn TypesRegistryClient> =
         Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
     hub.register::<dyn TypesRegistryClient>(registry);
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
     let err = svc.get_plugin().await.err().expect("expected Err");
     assert!(
         matches!(err, DomainError::PluginUnavailable { .. }),
@@ -247,9 +250,9 @@ async fn get_plugin_returns_unavailable_when_scoped_slot_empty() {
 async fn binding_is_monotonic_until_selector_reset() {
     let instance_id = test_instance_id();
     let (hub, registry) =
-        hub_with_counting_registry_and_plugin(&instance_id, "cyberfabric", MockPlugin::arc());
+        hub_with_counting_registry_and_plugin(&instance_id, "constructorfabric", MockPlugin::arc());
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
 
     // Two warm dispatches reuse the cached binding (monotonic).
     let _ = svc.get_plugin().await.unwrap();
@@ -279,9 +282,9 @@ async fn binding_is_monotonic_until_selector_reset() {
 #[tokio::test]
 async fn get_plugin_returns_registered_scoped_handle() {
     let instance_id = test_instance_id();
-    let hub = hub_with_registry_and_plugin(&instance_id, "cyberfabric", MockPlugin::arc());
+    let hub = hub_with_registry_and_plugin(&instance_id, "constructorfabric", MockPlugin::arc());
 
-    let svc = Service::new(hub, "cyberfabric".into(), dummy_enforcer());
+    let svc = Service::new(hub, "constructorfabric".into(), dummy_enforcer());
     let resolved = svc.get_plugin().await;
     assert!(
         resolved.is_ok(),
@@ -516,8 +519,10 @@ mod create_usage_type_tests {
     fn hub_with(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<ClientHub> {
         let hub = Arc::new(ClientHub::default());
         let instance_id = test_instance_id_for(suffix);
-        let instance =
-            make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
+        let instance = make_test_instance(
+            &instance_id,
+            plugin_content(&instance_id, "constructorfabric"),
+        );
         let registry: Arc<dyn TypesRegistryClient> =
             Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
         hub.register::<dyn TypesRegistryClient>(registry);
@@ -543,7 +548,7 @@ mod create_usage_type_tests {
         let hub = hub_with(plugin, suffix);
         let resolver = CountingAllowAllResolver::new();
         let enforcer = enforcer_for(resolver);
-        Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".into(), enforcer))
     }
 
     /// Build a service wired with a deny-by-default PDP plus the supplied
@@ -553,7 +558,7 @@ mod create_usage_type_tests {
         let hub = hub_with(plugin, suffix);
         let resolver = Arc::new(DenyAllResolver);
         let enforcer = enforcer_for(resolver);
-        Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".into(), enforcer))
     }
 
     // ── happy path: counter prefix ──────────────────────────────────────────
@@ -1079,8 +1084,10 @@ mod catalog_dispatch_tests {
     fn hub_with(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<ClientHub> {
         let hub = Arc::new(ClientHub::default());
         let instance_id = test_instance_id_for(suffix);
-        let instance =
-            make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
+        let instance = make_test_instance(
+            &instance_id,
+            plugin_content(&instance_id, "constructorfabric"),
+        );
         let registry: Arc<dyn TypesRegistryClient> =
             Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
         hub.register::<dyn TypesRegistryClient>(registry);
@@ -1104,14 +1111,14 @@ mod catalog_dispatch_tests {
         let hub = hub_with(plugin, suffix);
         let resolver = CountingAllowAllResolver::new();
         let enforcer = enforcer_for(resolver);
-        Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".into(), enforcer))
     }
 
     fn service_with_deny(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
         let hub = hub_with(plugin, suffix);
         let resolver = Arc::new(DenyAllResolver);
         let enforcer = enforcer_for(resolver);
-        Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".into(), enforcer))
     }
 
     fn service_with_unreachable_pdp(
@@ -1121,7 +1128,7 @@ mod catalog_dispatch_tests {
         let hub = hub_with(plugin, suffix);
         Arc::new(Service::new(
             hub,
-            "cyberfabric".into(),
+            "constructorfabric".into(),
             super::dummy_enforcer(),
         ))
     }
@@ -1669,8 +1676,10 @@ mod deactivate_usage_record_tests {
     fn hub_with(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<ClientHub> {
         let hub = Arc::new(ClientHub::default());
         let instance_id = test_instance_id_for(suffix);
-        let instance =
-            make_test_instance(&instance_id, plugin_content(&instance_id, "cyberfabric"));
+        let instance = make_test_instance(
+            &instance_id,
+            plugin_content(&instance_id, "constructorfabric"),
+        );
         let registry: Arc<dyn TypesRegistryClient> =
             Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
         hub.register::<dyn TypesRegistryClient>(registry);
@@ -1693,13 +1702,13 @@ mod deactivate_usage_record_tests {
     fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
         let hub = hub_with(plugin, suffix);
         let enforcer = enforcer_for(CountingTenantPermitResolver::new());
-        Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".into(), enforcer))
     }
 
     fn service_with_deny(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
         let hub = hub_with(plugin, suffix);
         let enforcer = enforcer_for(Arc::new(DenyAllResolver));
-        Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".into(), enforcer))
     }
 
     fn service_with_unreachable_pdp(
@@ -1708,7 +1717,7 @@ mod deactivate_usage_record_tests {
     ) -> Arc<Service> {
         let hub = hub_with(plugin, suffix);
         let enforcer = enforcer_for(Arc::new(UnreachableResolver));
-        Arc::new(Service::new(hub, "cyberfabric".into(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".into(), enforcer))
     }
 
     // ── Happy path: plugin `Ok(())` propagates ────────────────────────
@@ -2272,12 +2281,12 @@ mod pdp_dedup_tests {
         let hub = hub_with_plugin(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.pdp_dedup.deny_projection.records.v1",
-            "cyberfabric",
+            "constructorfabric",
         );
         let enforcer = enforcer_for(Arc::new(DenyOneResourceResolver {
             deny_resource_id: "rsc-DENY".to_owned(),
         }));
-        let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+        let service = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
 
         let results = service
             .create_usage_records(&authenticated_ctx(), input)
@@ -2995,10 +3004,10 @@ mod get_usage_record_tests {
         let hub = hub_with_plugin(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.usage_collector.get_record.prefetch_not_found.v1",
-            "cyberfabric",
+            "constructorfabric",
         );
         let enforcer = enforcer_for(Arc::new(DenyAllResolver));
-        let svc = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+        let svc = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), target)
@@ -3026,10 +3035,10 @@ mod get_usage_record_tests {
         let hub = hub_with_plugin(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.usage_collector.get_record.pdp_deny.v1",
-            "cyberfabric",
+            "constructorfabric",
         );
         let enforcer = enforcer_for(Arc::new(DenyAllResolver));
-        let svc = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+        let svc = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), target)
@@ -3058,10 +3067,10 @@ mod get_usage_record_tests {
         let hub = hub_with_plugin(
             Arc::clone(&plugin) as Arc<dyn UsageCollectorPluginV1>,
             "test.usage_collector.get_record.pdp_unreachable.v1",
-            "cyberfabric",
+            "constructorfabric",
         );
         let enforcer = enforcer_for(Arc::new(UnreachableResolver));
-        let svc = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+        let svc = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
 
         let err = svc
             .get_usage_record(&authenticated_ctx(), target)
@@ -3380,9 +3389,9 @@ mod create_usage_record_path_tests {
     /// `not_programmed` `Internal` (distinct from the expected
     /// `Authorization` envelope) and fails the test loudly.
     fn service_with_deny(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
-        let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
+        let hub = hub_with_plugin(plugin, suffix, "constructorfabric");
         let enforcer = enforcer_for(Arc::new(DenyAllResolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer))
     }
 
     /// PDP deny ⇒ `Authorization` envelope, **no** catalog / semantics /
@@ -4020,14 +4029,14 @@ mod aggregate_op_kind_enforcement_tests {
         let hub = hub_with_plugin(
             Arc::clone(plugin) as Arc<dyn UsageCollectorPluginV1>,
             suffix,
-            "cyberfabric",
+            "constructorfabric",
         );
         let resolver = CountingPermitResolver::new(
             pep_properties::OWNER_TENANT_ID,
             Uuid::from_u128(2).to_string(),
         );
         let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer))
     }
 
     fn bounded_window() -> toolkit_odata::ODataQuery {

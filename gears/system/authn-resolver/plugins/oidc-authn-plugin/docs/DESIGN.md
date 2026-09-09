@@ -1,4 +1,5 @@
-Created:  2026-04-09 by Diffora
+Created:  2026-04-09 by Virtuozzo International GmbH
+Updated:  2026-07-24 by Virtuozzo International GmbH
 
 # Technical Design — OIDC AuthN Resolver Plugin
 

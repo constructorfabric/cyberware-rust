@@ -473,7 +473,7 @@ where
         T: toolkit_odata::filter::FilterField,
     {
         use std::fmt::Write as _;
-        use toolkit_odata::filter::FieldKind;
+        use toolkit_odata::filter::FilterOp;
 
         let mut filter = self
             .spec
@@ -486,21 +486,24 @@ where
             let name = field.name().to_owned();
             let kind = field.kind();
 
-            let ops: Vec<String> = match kind {
-                FieldKind::String => vec!["eq", "ne", "contains", "startswith", "endswith", "in"],
-                FieldKind::Uuid => vec!["eq", "ne", "in"],
-                FieldKind::Bool => vec!["eq", "ne"],
-                FieldKind::I64
-                | FieldKind::F64
-                | FieldKind::Decimal
-                | FieldKind::DateTimeUtc
-                | FieldKind::Date
-                | FieldKind::Time => {
-                    vec!["eq", "ne", "gt", "ge", "lt", "le", "in"]
-                }
-            }
+            // Published straight from the parser's own table, so the contract
+            // cannot promise an operator the parser refuses, or hide one it
+            // accepts.
+            let ops: Vec<String> = [
+                FilterOp::Eq,
+                FilterOp::Ne,
+                FilterOp::Gt,
+                FilterOp::Ge,
+                FilterOp::Lt,
+                FilterOp::Le,
+                FilterOp::Contains,
+                FilterOp::StartsWith,
+                FilterOp::EndsWith,
+                FilterOp::In,
+            ]
             .into_iter()
-            .map(String::from)
+            .filter(|op| kind.allows(*op))
+            .map(|op| op.to_string())
             .collect();
 
             _ = write!(description, "\n- {}: {}", name, ops.join("|"));

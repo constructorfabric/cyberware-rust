@@ -1,4 +1,6 @@
 use sea_orm_migration::prelude::*;
+
+use super::support::drop_column;
 use sea_orm_migration::sea_orm::ConnectionTrait;
 
 #[derive(DeriveMigrationName)]
@@ -61,7 +63,6 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let conn = manager.get_connection();
         for column in [
             "line",
             "original_line",
@@ -71,16 +72,7 @@ impl MigrationTrait for Migration {
             "start_side",
             "subject_type",
         ] {
-            // The table may already be gone: `review_comments_006`'s own
-            // `down()` runs in the same reverse pass and name-ordering puts it
-            // after this one.
-            let sql = format!("ALTER TABLE gm_review_comments DROP COLUMN {column};");
-            if let Err(e) = conn.execute_unprepared(&sql).await {
-                let message = e.to_string();
-                if !message.contains("no such table") {
-                    return Err(e);
-                }
-            }
+            drop_column(manager, "gm_review_comments", column).await?;
         }
         Ok(())
     }

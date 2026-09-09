@@ -35,12 +35,13 @@ use uuid::Uuid;
 
 use crate::config::TypesRegistryConfig;
 use crate::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use crate::domain::admission::worker::{WorkerError, run_operation};
+use crate::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use crate::domain::admission::{Accepted, OperationDispatch, SubmitRequest};
 use crate::domain::enums::{
     EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
 };
 use crate::domain::policy::RegistrationPolicy;
+use crate::domain::ports::metrics::AdmissionMetrics;
 use crate::domain::ports::{
     CurrentDocument, CurrentInstanceValue, CurrentTypeSchemaRow, Stores, snapshot_read,
 };
@@ -174,6 +175,8 @@ pub struct RegistryService {
     config: TypesRegistryConfig,
     dispatch: Arc<dyn OperationDispatch>,
     admission_mode: AdmissionMode,
+    /// The admission instruments (T16).
+    metrics: Arc<dyn AdmissionMetrics>,
 }
 
 impl RegistryService {
@@ -188,6 +191,7 @@ impl RegistryService {
         config: TypesRegistryConfig,
         dispatch: Arc<dyn OperationDispatch>,
         admission_mode: AdmissionMode,
+        metrics: Arc<dyn AdmissionMetrics>,
     ) -> Self {
         Self {
             db,
@@ -196,6 +200,7 @@ impl RegistryService {
             config,
             dispatch,
             admission_mode,
+            metrics,
         }
     }
 
@@ -234,6 +239,7 @@ impl RegistryService {
             &AcceptanceContext {
                 policy: &self.policy,
                 config: &self.config,
+                metrics: &self.metrics,
             },
             &self.dispatch,
             request,
@@ -257,9 +263,13 @@ impl RegistryService {
                 &self.stores,
                 &worker,
                 &Self::scope(),
+                Tuning {
+                    limits: &self.config.limits,
+                    worker: &self.config.worker,
+                    metrics: &self.metrics,
+                },
                 accepted.operation_id,
                 now,
-                self.config.worker,
             )
             .await?;
             // A pass that returns `Ok` leaves the operation `completed`, whether it

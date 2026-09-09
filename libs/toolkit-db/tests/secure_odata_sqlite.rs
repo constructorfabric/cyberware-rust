@@ -60,6 +60,9 @@ impl ScopableEntity for ent::Entity {
             _ => None,
         }
     }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![ent::Column::TenantId]
+    }
 }
 
 struct CreateSecureOdataTest;

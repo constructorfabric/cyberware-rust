@@ -1,4 +1,6 @@
 use sea_orm_migration::prelude::*;
+
+use super::support::drop_column;
 use sea_orm_migration::sea_orm::ConnectionTrait;
 
 #[derive(DeriveMigrationName)]
@@ -40,18 +42,8 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let conn = manager.get_connection();
         for table in ["gm_issues", "gm_pull_requests"] {
-            // The table may already be gone: the CREATE TABLE migrations' own
-            // `down()` runs in the same reverse pass, and name-ordering puts
-            // them after this one.
-            let sql = format!("ALTER TABLE {table} DROP COLUMN author_json;");
-            if let Err(e) = conn.execute_unprepared(&sql).await {
-                let message = e.to_string();
-                if !message.contains("no such table") {
-                    return Err(e);
-                }
-            }
+            drop_column(manager, table, "author_json").await?;
         }
         Ok(())
     }

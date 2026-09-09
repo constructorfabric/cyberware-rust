@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Pricing — Bundles & Marketplace Composition (Design, Slice 8) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ./01-foundation.md | Owners: BSS Product Catalog team -->
 

@@ -4,6 +4,9 @@ date: 2026-07-09
 decision-makers: "BSS Product Catalog team"
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # ADR-0001: Canonical Price-Row Scope Key — Extend the Manifest Key Additively
 
 <!-- toc -->

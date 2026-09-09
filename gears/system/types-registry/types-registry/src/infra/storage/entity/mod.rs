@@ -1,7 +1,7 @@
 //! `SeaORM` entity models for the managed-state schema — one file per table, each
 //! a mirror of its `CREATE TABLE` in `docs/database.sql`.
 //!
-//! All nine tables the migration creates have an entity here. `instance` and
+//! Every table the migration creates has an entity here. `instance` and
 //! `instance_revision` arrived with Registered Instances (T10) rather than with
 //! the migration, on the rule that an entity with no reader is code the compiler
 //! cannot check against the DDL — which is exactly the drift these mirrors exist
@@ -25,6 +25,7 @@ pub mod enums;
 // mirror, so each is named after its table and the table is
 // `types_registry__entity`. Renaming the file would put the mirror out of step
 // with the schema it exists to track.
+pub mod coordination_state;
 pub mod dependency;
 #[allow(clippy::module_inception)]
 pub mod entity;

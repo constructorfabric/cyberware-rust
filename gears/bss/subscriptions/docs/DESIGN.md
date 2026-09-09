@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — End-to-End Lifecycle — Technical Design (canonical index) -->
 <!-- Related: ./PRD.md, ./SEAMS.md, ./DECISIONS.md, ./ADR/, ./design/ | Owners: BSS Subscriptions team -->
 

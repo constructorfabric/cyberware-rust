@@ -34,6 +34,10 @@ use sea_orm::EntityTrait;
 ///             _ => None,
 ///         }
 ///     }
+///     fn scope_columns() -> Vec<Self::Column> {
+///         // Exactly the columns resolve_property can return.
+///         vec![user::Column::TenantId, user::Column::Id]
+///     }
 /// }
 /// ```
 ///
@@ -152,4 +156,22 @@ pub trait ScopableEntity: EntityTrait {
     /// Manual implementors must provide all property arms explicitly.
     #[must_use]
     fn resolve_property(property: &str) -> Option<Self::Column>;
+
+    /// The columns a scope predicate can be compiled against: the same set
+    /// [`resolve_property`](Self::resolve_property) can return, as a list.
+    ///
+    /// `resolve_property` maps one property name to a column and cannot be
+    /// enumerated. The SQL/PGQ graph declaration needs the whole set: a scope
+    /// column left out of an element's `PROPERTIES` list cannot be filtered on
+    /// inside `MATCH` (`docs/arch/secure-orm/ADR/0002`, Policy 3), and an
+    /// element whose set is empty is refused up front instead of compiling to a
+    /// deny-all traversal (Policy 2).
+    ///
+    /// Usually `tenant_col`, `resource_col` and `owner_col` plus any
+    /// `pep_prop(...)` columns. `type_col` is not part of it: no property name
+    /// resolves to it, so no scope can address it. `#[derive(Scopable)]`
+    /// generates this and `resolve_property` from the same attributes; a manual
+    /// implementation must keep the two in step.
+    #[must_use]
+    fn scope_columns() -> Vec<Self::Column>;
 }

@@ -14,6 +14,9 @@ refs:
   - bss/prd/PRD-tariffs-pricing-logic-202604011200
 ---
 
+Created:  2026-07-03 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # PRD — Product & SKU Management
 
 > **Provenance (2026-07-16):** vendored from `constructorfabric/gears-rust` PR **#4177**
@@ -1662,4 +1665,3 @@ Absence of a monetization-model marker on a SKU is **intentional**, not a missin
 ---
 
 *Child artifacts: ADR(s) for versioning/snapshot strategy and lifecycle/deprecation modeling; the gear's DESIGN (`gears/bss/products/docs/DESIGN.md`, pending) for entity schemas, APIs, events, and read-model design; STORY documents per scope item. The §4.1 registry↔commercial decomposition is recorded in the manifest §4.1 Decomposition (BSS realization) note, not a separate ADR.*
-

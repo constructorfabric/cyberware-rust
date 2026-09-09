@@ -110,6 +110,9 @@ impl ScopableEntity for ent::Entity {
             _ => None,
         }
     }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![ent::Column::TenantId, ent::Column::Id]
+    }
 }
 
 async fn smoke_secure_tx(db: toolkit_db::Db) -> Result<()> {

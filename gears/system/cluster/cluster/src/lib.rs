@@ -66,7 +66,7 @@ mod config;
 mod domain;
 mod gear;
 
-pub use config::{BackendBinding, ClusterConfig, ProfileConfig, SecretRef};
+pub use config::{BackendBinding, ClusterConfig, DEFAULT_PROVIDER, ProfileConfig, SecretRef};
 pub use domain::health::{ClusterReadiness, READINESS_PROBE_BUDGET};
 pub use domain::local_client::LocalClusterClient;
 pub use domain::provider::ProviderRegistry;

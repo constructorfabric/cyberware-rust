@@ -30,6 +30,8 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Admission metrics use ToolKit's global meter provider.
+opentelemetry = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -63,6 +65,8 @@ toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-utils = { workspace = true }
+# Derives the default metric prefix from the gear name.
+heck = { workspace = true }
 
 [features]
 # Gates the container-backed PostgreSQL / MySQL migration tests
@@ -86,4 +90,10 @@ testcontainers = { workspace = true }
 test-containers = { workspace = true }
 # `Router::oneshot` for the REST contract tests (T9).
 tower = { workspace = true }
+# In-memory exporter for metric contract tests.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# Captures span and event fields in unit tests.
+tracing-test = { workspace = true }
+# Captures admission spans in integration tests.
+tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }

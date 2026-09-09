@@ -2,6 +2,10 @@
 status: accepted
 date: 2026-07-08
 ---
+
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-07 by Virtuozzo International GmbH
+
 # ADR-0003: Value-Fingerprint Fence for the Metadata/Value Dual Write
 
 <!-- toc -->

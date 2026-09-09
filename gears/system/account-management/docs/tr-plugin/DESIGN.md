@@ -1,4 +1,4 @@
-Created: 2026-04-21 by Diffora
+Created:  2026-04-21 by Virtuozzo International GmbH
 
 # Technical Design — Tenant Resolver Plugin (AM-backed)
 

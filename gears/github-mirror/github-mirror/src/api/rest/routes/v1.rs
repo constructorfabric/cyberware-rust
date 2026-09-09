@@ -4,7 +4,10 @@
 
 use axum::Router;
 use axum::http::StatusCode;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
+
+use crate::infra::storage::odata_mapper::{CommitFileField, RepoField, ReviewThreadField};
 
 use crate::api::rest::routes::{API_TAG, License};
 use crate::api::rest::{dto, handlers};
@@ -42,6 +45,7 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
             StatusCode::OK,
             "Paginated list of mirrored repositories",
         )
+        .with_odata_filter::<RepoField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -92,6 +96,7 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
             StatusCode::OK,
             "Paginated list of mirrored commit files",
         )
+        .with_odata_filter::<CommitFileField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -118,6 +123,7 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
             StatusCode::OK,
             "Paginated list of mirrored review threads",
         )
+        .with_odata_filter::<ReviewThreadField>()
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)

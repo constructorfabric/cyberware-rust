@@ -1,4 +1,6 @@
 use sea_orm_migration::prelude::*;
+
+use super::support::drop_column;
 use sea_orm_migration::sea_orm::ConnectionTrait;
 
 #[derive(DeriveMigrationName)]
@@ -59,7 +61,6 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let conn = manager.get_connection();
         let columns = [
             "author_login",
             "assignees_json",
@@ -69,23 +70,9 @@ impl MigrationTrait for Migration {
         ];
         for table in ["gm_issues", "gm_pull_requests"] {
             for column in columns {
-                drop_column(conn, table, column).await?;
+                drop_column(manager, table, column).await?;
             }
         }
-        drop_column(conn, "gm_pull_requests", "requested_reviewers_json").await
+        drop_column(manager, "gm_pull_requests", "requested_reviewers_json").await
     }
-}
-
-/// Drop one column, tolerating a table the reverse pass already removed:
-/// the CREATE TABLE migrations' own `down()` runs in the same pass, and
-/// name-ordering puts them after this one.
-async fn drop_column(conn: &impl ConnectionTrait, table: &str, column: &str) -> Result<(), DbErr> {
-    let sql = format!("ALTER TABLE {table} DROP COLUMN {column};");
-    if let Err(e) = conn.execute_unprepared(&sql).await {
-        let message = e.to_string();
-        if !message.contains("no such table") {
-            return Err(e);
-        }
-    }
-    Ok(())
 }

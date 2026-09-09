@@ -283,6 +283,10 @@ impl ScopableEntity for resource::Entity {
             _ => None,
         }
     }
+
+    fn scope_columns() -> Vec<resource::Column> {
+        vec![resource::Column::TenantId, resource::Column::Id]
+    }
 }
 
 macro_rules! unrestricted_entity {
@@ -304,6 +308,10 @@ macro_rules! unrestricted_entity {
 
             fn type_col() -> Option<$column> {
                 None
+            }
+
+            fn scope_columns() -> Vec<$column> {
+                Vec::new()
             }
 
             fn resolve_property(_property: &str) -> Option<$column> {

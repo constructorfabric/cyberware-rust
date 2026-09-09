@@ -20,11 +20,6 @@
 //! | 7 ADR-0015 major-0 quarantine | **T18** — it needs the reference extractor |
 //! | 8 canonicalize, fingerprint, idempotency | here |
 //!
-//! Step 7 is a gap by dependency: it refuses a stable candidate whose base, `$ref`
-//! or `x-gts-ref` targets include a major-0 identifier, and the extractor that
-//! finds those targets is T13's. A `TODO` marks its position between steps 6 and 8,
-//! so it lands as an insertion rather than a reordering.
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -44,6 +39,7 @@ use super::{Accepted, OperationDispatch, Precondition, SubmitRequest};
 use crate::config::TypesRegistryConfig;
 use crate::domain::enums::{OperationKind, OwnershipScope, Plane};
 use crate::domain::policy::{PolicyRefusal, RegistrationPolicy};
+use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage};
 use crate::domain::ports::{NewOperation, NewOperationItem, OperationRow, Stores};
 
 /// Largest `Idempotency-Key` the column accepts (`varchar(255)`).
@@ -129,6 +125,41 @@ pub enum AcceptanceError {
     Db(#[from] DbError),
 }
 
+impl AcceptanceError {
+    /// The stable machine reason this refusal is counted and logged under.
+    #[must_use]
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::MissingIdempotencyKey => "missing_idempotency_key",
+            Self::IdempotencyKeyTooLong { .. } => "idempotency_key_too_long",
+            Self::EmptyBatch => "empty_batch",
+            Self::BatchTooLarge { .. } => "batch_too_large",
+            Self::InvalidIdentifier { .. } => "invalid_identifier",
+            Self::DuplicateCandidate { .. } => "duplicate_candidate",
+            Self::PolicyRefused(_) => "policy_refused",
+            Self::ExplicitUuidTail { .. } => "explicit_uuid_tail",
+            Self::InstanceVersionProfile { .. } => "instance_version_profile",
+            Self::MissingDialect { .. } => "missing_dialect",
+            Self::UnsupportedDialect { .. } => "unsupported_dialect",
+            Self::ConflictingDialect { .. } => "conflicting_dialect",
+            Self::MissingContent { .. } => "missing_content",
+            Self::AuthoredDocumentTooLarge { .. } => "authored_document_too_large",
+            Self::ForceNotPermitted { .. } => "force_not_permitted",
+            Self::ForceHasNothingToWaive { .. } => "force_has_nothing_to_waive",
+            Self::ForceCompatibilityUnavailable { .. } => "force_compatibility_unavailable",
+            Self::MinorTypeSchemaRevision { .. } => "minor_type_schema_revision",
+            Self::ZeroPrecondition { .. } => "zero_precondition",
+            Self::NegativePrecondition { .. } => "negative_precondition",
+            Self::UnsupportedOperationKind => "unsupported_operation_kind",
+            Self::DryRunNotAccepted => "dry_run_not_accepted",
+            Self::FingerprintConflict { .. } => "fingerprint_conflict",
+            Self::Dispatch(_) => "dispatch_failure",
+            Self::Storage(_) => "storage_failure",
+            Self::Db(_) => "database_failure",
+        }
+    }
+}
+
 /// Wrapper so [`PolicyRefusal`] — which is a value, not an error — can be a
 /// `#[source]` without implementing `Error` in the policy module.
 #[domain_model]
@@ -142,6 +173,8 @@ pub struct PolicyRefusalError(pub PolicyRefusal);
 pub struct AcceptanceContext<'a> {
     pub policy: &'a RegistrationPolicy,
     pub config: &'a TypesRegistryConfig,
+    /// Admission metrics.
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
 /// A validated request: everything the transaction needs, and nothing that would
@@ -340,10 +373,7 @@ pub fn validate(
             });
         }
 
-        // TODO(T18): step 7, the ADR-0015 quarantine — refuse a stable candidate
-        // whose immediate base, `$ref` or `x-gts-ref` targets include a major-0
-        // identifier. It needs T13's reference extractor, so it slots in here
-        // rather than being reordered in later.
+        // TODO(T18): enforce ADR-0015 quarantine for major-0 bases and `$ref` targets.
 
         // --- step 8: canonicalize ----------------------------------------
         let canonical = canonical_text(content);
@@ -410,6 +440,38 @@ pub fn validate(
 /// Any [`AcceptanceError`], including [`AcceptanceError::FingerprintConflict`]
 /// for a key already bound to a different request.
 pub async fn accept(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<AcceptanceError>,
+    scope: &AccessScope,
+    ctx: &AcceptanceContext<'_>,
+    dispatch: &Arc<dyn OperationDispatch>,
+    request: &SubmitRequest,
+    now: OffsetDateTime,
+) -> Result<Accepted, AcceptanceError> {
+    let accepted = accept_inner(stores, db, scope, ctx, dispatch, request, now).await;
+    // Count at the shared exit so every refusal is covered.
+    if let Err(error) = &accepted {
+        let reason = error.reason();
+        ctx.metrics.refused(RefusalStage::Acceptance, reason);
+        // The `warn` is for client refusals only.
+        let infrastructure = matches!(
+            error,
+            AcceptanceError::Storage(_) | AcceptanceError::Db(_) | AcceptanceError::Dispatch(_)
+        );
+        if !infrastructure {
+            tracing::warn!(
+                reason,
+                candidates = request.candidates.len(),
+                %error,
+                "types_registry refused a submission"
+            );
+        }
+    }
+    accepted
+}
+
+/// [`accept`]'s body.
+async fn accept_inner(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<AcceptanceError>,
     scope: &AccessScope,

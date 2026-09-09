@@ -106,6 +106,45 @@ async fn workflow_jobs_are_listed_for_their_run_in_the_github_envelope() {
 }
 
 #[tokio::test]
+async fn step_fields_outside_the_typed_ones_still_reach_the_caller() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    service
+        .upsert_workflow_job(
+            &ctx,
+            "acme",
+            "widget",
+            job_record(
+                4,
+                72,
+                "build",
+                Some(
+                    r#"[{"name":"Checkout","number":1,"status":"completed","conclusion":"success","unmodeled":{"id":7},"duration_ms":1234}]"#,
+                ),
+            ),
+        )
+        .await
+        .expect("job seed must succeed");
+
+    let router = router_for(service, ctx);
+    let json = body_json(get(router, "/repos/acme/widget/actions/runs/72/jobs").await).await;
+    let step = &json["jobs"][0]["steps"][0];
+
+    assert_eq!(step["name"], "Checkout", "{step:?}");
+    assert_eq!(step["number"], 1);
+    assert_eq!(step["conclusion"], "success");
+    assert_eq!(
+        step["unmodeled"]["id"], 7,
+        "a field the mirror does not model must survive: {step:?}"
+    );
+    assert_eq!(step["duration_ms"], 1234, "{step:?}");
+}
+
+#[tokio::test]
 async fn workflow_jobs_of_unknown_repository_return_404() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;

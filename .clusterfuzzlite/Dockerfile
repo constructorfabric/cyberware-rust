@@ -1,5 +1,5 @@
 # Copyright 2026 CyberFabric Foundation
-# Copyright 2026 Constructro Fabric Foundation
+# Copyright 2026 Constructor Fabric Foundation
 # SPDX-License-Identifier: Apache-2.0
 
 FROM gcr.io/oss-fuzz-base/base-builder-rust

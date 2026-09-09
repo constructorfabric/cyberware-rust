@@ -11,7 +11,7 @@ use super::*;
 fn serde_default_applies_default_vendor() {
     let cfg: UsageCollectorConfig = serde_json::from_str("{}").unwrap();
     assert_eq!(
-        cfg.vendor, "cyberfabric",
+        cfg.vendor, "constructorfabric",
         "serde(default) must use Default impl"
     );
 }

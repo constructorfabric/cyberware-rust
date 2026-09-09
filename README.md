@@ -121,7 +121,7 @@ cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml --moc
 
 # Core server configuration (global section)
 server:
-  home_dir: "~/.cfgears
+  home_dir: "~/.cf-gears"
 
 # Database configuration (global section)
 database:
@@ -133,7 +133,7 @@ database:
 logging:
   default:
     console_level: info
-    file: "logs/cfgears.log"
+    file: "logs/cf-gears.log"
     file_level: warn
     max_age_days: 28
     max_backups: 3
@@ -181,7 +181,7 @@ See **[Security Overview §9 — Cryptographic Stack & FIPS-140-3](docs/security
 
 # Global server configuration
 server:
-  home_dir: "~/.cfgears"
+  home_dir: "~/.cf-gears"
 
 # Database configuration
 database:

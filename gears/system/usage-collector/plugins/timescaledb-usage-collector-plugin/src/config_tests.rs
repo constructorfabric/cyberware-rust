@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn config_defaults_are_applied() {
     let cfg: TimescaleDbPluginConfig = serde_json::from_str("{}").unwrap();
-    assert_eq!(cfg.vendor, "cyberfabric");
+    assert_eq!(cfg.vendor, "constructorfabric");
     assert_eq!(cfg.priority, 10);
     assert_eq!(cfg.pool_size_min, 2);
     assert_eq!(cfg.pool_size_max, 16);

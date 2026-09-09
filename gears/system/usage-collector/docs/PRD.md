@@ -1,3 +1,6 @@
+Created:  2026-02-25 by Virtuozzo International GmbH
+Updated:  2026-08-21 by Virtuozzo International GmbH
+
 # PRD — Usage Collector
 
 <!-- toc -->

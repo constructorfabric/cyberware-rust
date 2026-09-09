@@ -82,7 +82,7 @@ This ADR does not decide the enforced mode itself or the comparison baseline (AD
 
 ## Decision Outcome
 
-Chosen option: **an unstable profile keyed on major 0 in the identifier.** A managed Type Schema whose own last segment carries major 0 evolves without the enforced compatibility check of ADR-0003, and no entity outside that profile may depend on one.
+Chosen option: **an unstable profile keyed on major 0 in the identifier.** A managed Type Schema whose own last segment carries major 0 evolves without the enforced compatibility check of ADR-0003, and no stable schema may include one in its resolution closure or derive from one.
 
 ### What major 0 exempts, and what it does not
 
@@ -102,29 +102,24 @@ Nothing else about the relation reaches a v0 entity either: ADR-0003 records the
 
 ### The quarantine rule
 
-**A managed entity whose own last segment carries major 1 or higher MUST NOT reference or derive from an entity whose last segment carries major 0.** The rule applies to each **direct** edge:
+**A managed Type Schema whose own last segment carries major 1 or higher MUST NOT include an entity whose last segment carries major 0 in its resolution closure or derive from one.** The rule applies to:
 
 * a `$ref` target;
-* the immediate derivation base;
-* an `x-gts-ref` that **names an entity**.
+* the immediate derivation base.
 
-GTS §9.6 also permits an `x-gts-ref` that names no entity. `gts.*` constrains a field to contain some valid identifier; relative JSON pointers such as `/$id` and `./properties/id` address the holder's document. They are outside the rule. A stable entity may therefore contain a runtime value naming an unstable entity: the value is validated where used and does not redefine what its holder accepts.
+`x-gts-ref` is outside this rule because it validates an Instance value without resolving or inlining the named entity. This includes exact and patterned major-0 identifiers, `gts.*`, and relative JSON pointers. None creates a dependency or guarantee over the target.
 
-The whole resolution closure follows by induction. Any transitive path to v0 must contain a stable entity with a direct edge to v0, which admission refuses. ADR-0003 uses the same argument shape to derive a whole-history guarantee from candidate-versus-baseline checks.
+The whole resolution closure follows by induction. Any transitive path to v0 must contain a stable entity with a direct resolution-bearing dependency on v0, which admission refuses. ADR-0003 uses the same argument shape to derive a whole-history guarantee from candidate-versus-baseline checks.
 
-The induction's base case holds because **no registry predates the rule**. The release that introduces the quarantine check is the release that first persists a managed entity at all, so at enablement there is no stored edge to inherit and nothing to grandfather — the property the rule maintains starts out true rather than being asserted over existing state. Two consequences worth naming: an implementation MUST NOT enable the rule against a registry populated by a build that had the storage but not the check, since those edges were admitted under no rule at all; and a later release that re-establishes the rule over an existing registry has to demonstrate the base case rather than assume it, for which the check run once over stored edges is the obvious instrument.
+The induction's base case holds because **no registry predates the rule**. The release that introduces the quarantine check is the release that first persists a managed entity at all, so at enablement there is no admitted dependency to inherit and nothing to grandfather — the property the rule maintains starts out true rather than being asserted over existing state. Two consequences worth naming: an implementation MUST NOT enable the rule against a registry populated by a build that had the storage but not the check, since those dependencies were admitted under no rule at all; and a later release that re-establishes the rule over an existing registry has to demonstrate the base case rather than assume it, for which a check over stored dependencies is the obvious instrument.
 
 Without quarantine, the profile leaks. A `$ref` floats, so reshaping unstable `address.v0~` can redefine the accepted-instance set of stable `customer.v1~` that references it — **without any authored revision of `customer.v1~`**. DESIGN §1.1 recomputes its current-state projection when the dependency advances.
 
 ADR-0005 dependent revalidation only proves that `customer.v1~` remains *valid*. It does not prove compatibility with what that type accepted yesterday. One owner could therefore withdraw another owner's guarantee, the opposite of localized responsibility.
 
-The rule needs no new machinery or state. Admission already has the direct edges: immediate derivation base, `$ref` targets, and entity-naming `x-gts-ref` targets. The target major comes from:
+The rule needs no new machinery or state. Admission reads the immediate derivation base from the candidate identifier and extracts `$ref` targets from its content. The target major is present in each target identifier, so no target document has to be loaded for the quarantine decision.
 
-* the identifier itself;
-* the longest valid identifier prefix when the value is a pattern;
-* nowhere when `x-gts-ref` names no entity, leaving nothing to check.
-
-This is a static property of the submission, checked beside ADR-0014's dialect profile. ADR-0011's closed boundary makes it well-posed: every target named by a managed document is Managed and its identifier is platform-interpretable.
+This is a static property of the submission, checked beside ADR-0014's dialect profile. ADR-0011's closed boundary makes it well-posed: every resolution-bearing target named by a managed document is Managed and its identifier is platform-interpretable.
 
 The relation is one-way and that is deliberate. An unstable type **MAY** build on a stable one — weaker on stronger is sound, and it is the normal case, since a new type under development usually derives from a published base. Only stronger-on-weaker is refused.
 
@@ -180,7 +175,7 @@ Three limits are stated here so that they are not discovered later.
 ### Consequences
 
 * An author with an unsettled contract keeps one identifier and one Registry Reference across any number of breaking reshapes, and pays a single re-point at graduation instead of one per reshape.
-* Admission acquires one comparison over the candidate's direct references, placed beside ADR-0014's dialect check. It reads a wider edge set — `x-gts-ref` targets are quarantined here and excluded from the dialect check, which never inlines them — and a cheaper one, since a major is readable from an identifier and no target document has to be loaded.
+* Admission compares the candidate's immediate derivation base and `$ref` targets against the quarantine beside ADR-0014's dialect check. A major is readable from an identifier, so no target document has to be loaded.
 * The managed **Instance** identity profile acquires a third narrowing, so its last segment carries no explicit UUID tail, no minor version, and no major 0. On a Type Schema identifier the second is not refused anywhere; ADR-0004 admits a minor under every prefix.
 * A v0 reshape can still be refused, by dependent revalidation, when a derived type would stop satisfying its base. This is derivation compatibility doing its job and is not a defect of the profile.
 * No storage change, no migration, and no new operation.
@@ -196,8 +191,8 @@ This decision is confirmed when:
 * a v0 derived Type Schema that violates its base chain is rejected, proving derivation compatibility is not waived;
 * a v0 Type Schema candidate declaring a dialect other than Draft-07 is rejected, proving ADR-0014 is not waived;
 * a `v0.2~` candidate is admitted without any compatibility check against `v0.1~`, while opening major 0 at `v0.1~`, admitting `v0.2~` over a missing `v0.1~`, and revising `v0.1~` at all are each rejected — proving the exemption reaches the check and not the contiguity or immutability rules;
-* admission rejects a v1 Type Schema carrying a `$ref` or `x-gts-ref` to a v0 target, and rejects a v1 identifier deriving from a v0 base, with diagnostics naming the offending member of the closure;
-* admission admits a v1 Type Schema whose `x-gts-ref` is `gts.*` or a relative JSON pointer, since neither names an entity — the documented bound of this rule — while one whose `x-gts-ref` names a v0 entity, exactly or as the valid prefix of a pattern, is rejected;
+* admission rejects a v1 Type Schema carrying a `$ref` to a v0 target, and rejects a v1 identifier deriving from a v0 base, with diagnostics naming the offending reference;
+* admission admits a v1 Type Schema whose `x-gts-ref` names a v0 entity exactly or through a pattern, as well as one using `gts.*` or a relative JSON pointer, proving that instance-value constraints are outside quarantine;
 * admission accepts a v0 Type Schema that references and derives from v1 targets, proving the quarantine relation is one-way;
 * a v0 reshape that would leave a v0 derived type no longer satisfying its base is refused by dependent revalidation;
 * registration of a managed registered Instance whose own last segment carries major 0 is rejected;

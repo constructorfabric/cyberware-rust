@@ -1,4 +1,5 @@
-Created:  2026-03-30 by Virtuozzo
+Created:  2026-03-30 by Virtuozzo International GmbH
+Updated:  2026-08-17 by Virtuozzo International GmbH
 
 # PRD - Account Management (AM)
 

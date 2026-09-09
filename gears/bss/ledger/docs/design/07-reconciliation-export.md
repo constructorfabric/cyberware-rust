@@ -1,3 +1,6 @@
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-07 by Virtuozzo International GmbH
+
 <!-- migration-note: converted from the legacy Virtuozzo design format to the gears-sdlc design-slice layout (cpt-* sub-IDs, CDSL flows/algos/states). Original preserved unchanged at vhp-architecture: docs/bss/design/DESIGN-billing-ledger-balances-202606091200/07-DESIGN-billing-ledger-reconciliation-export-202606091800.md. Confluence metadata preserved below. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — Reconciliation & ERP Export (Design, Slice 7) -->
 <!-- Related: Slices 1-6 | Upstream: Slices 1-6 (posted facts, caches, per-slice tie-out contributions, alarm catalog), Payments (PSP settlement) | Downstream: ERP/GL (external), Finance/Revenue Assurance -->

@@ -227,19 +227,8 @@ pub fn register_routes(
         .error_413(openapi)
         .error_415(openapi)
         .error_422(openapi)
-        // `require_registry` answers 503 where no database is bound
-        // (`no-db.yaml`, `--mock`); inline admission also answers 503 with
-        // `Retry-After` when the family-lock budget expires. Both arms are
-        // declared, not merely enforced — including the header, which the
-        // status alone would leave out of the generated contract. It is
-        // optional because only the family-lock arm carries it.
+        // An unbound database is a deployment state, so this 503 has no `Retry-After`.
         .error_503(openapi)
-        .response_header(ResponseHeaderSpec::new(
-            "Retry-After",
-            "Suggested delay in seconds before repeating the submission under the same \
-             Idempotency-Key; present where the family-lock budget expired",
-            ResponseHeaderType::Integer,
-        ))
         .register(router, openapi);
 
     // GET /types-registry/v2/operations/{operation_id} — poll an operation

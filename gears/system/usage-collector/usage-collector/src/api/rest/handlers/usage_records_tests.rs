@@ -46,7 +46,7 @@ fn service_with_sentinel_pdp() -> (Arc<Service>, Arc<CountingUnreachableResolver
     let hub = Arc::new(ClientHub::new());
     let resolver = CountingUnreachableResolver::new();
     let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+    let service = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
     (service, resolver)
 }
 
@@ -280,11 +280,11 @@ async fn deactivate_with_unreachable_pdp_surfaces_503() {
     let hub = crate::domain::test_support::hub_with_plugin(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.deactivate.unreachable_pdp.v1",
-        "cyberfabric",
+        "constructorfabric",
     );
     let resolver = CountingUnreachableResolver::new();
     let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+    let service = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
 
     let response = handle_deactivate_usage_record(
         Extension(authenticated_ctx()),
@@ -1015,11 +1015,11 @@ async fn get_with_unreachable_pdp_surfaces_503() {
     let hub = crate::domain::test_support::hub_with_plugin(
         Arc::clone(&plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
         "test.handler.get_record.unreachable_pdp.v1",
-        "cyberfabric",
+        "constructorfabric",
     );
     let resolver = CountingUnreachableResolver::new();
     let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+    let service = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
 
     let response = handle_get_usage_record(
         Extension(authenticated_ctx()),
@@ -2038,21 +2038,21 @@ mod handle_list_usage_records_tests {
         let hub = Arc::new(ClientHub::new());
         let resolver = CountingUnreachableResolver::new();
         let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer))
     }
 
     fn service_with_permit_plugin(plugin: &Arc<HappyPathPlugin>, suffix: &str) -> Arc<Service> {
         let hub = hub_with_plugin(
             Arc::clone(plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
             suffix,
-            "cyberfabric",
+            "constructorfabric",
         );
         let resolver = CountingPermitResolver::new(
             pep_properties::OWNER_TENANT_ID,
             Uuid::from_u128(2).to_string(),
         );
         let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer))
     }
 
     #[tokio::test]
@@ -2282,21 +2282,21 @@ mod handle_query_aggregated_usage_records_tests {
         let hub = Arc::new(ClientHub::new());
         let resolver = CountingUnreachableResolver::new();
         let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer))
     }
 
     fn service_with_permit_plugin(plugin: &Arc<HappyPathPlugin>, suffix: &str) -> Arc<Service> {
         let hub = hub_with_plugin(
             Arc::clone(plugin) as Arc<dyn usage_collector_sdk::UsageCollectorPluginV1>,
             suffix,
-            "cyberfabric",
+            "constructorfabric",
         );
         let resolver = CountingPermitResolver::new(
             pep_properties::OWNER_TENANT_ID,
             Uuid::from_u128(2).to_string(),
         );
         let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-        Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+        Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer))
     }
 
     fn sum_no_group() -> QueryAggregatedUsageRecordsRequest {

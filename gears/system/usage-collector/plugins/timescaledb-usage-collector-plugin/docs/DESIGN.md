@@ -1,3 +1,6 @@
+Created:  2026-07-20 by Virtuozzo International GmbH
+Updated:  2026-07-20 by Virtuozzo International GmbH
+
 # Technical Design — TimescaleDB Usage Collector Storage Plugin
 
 <!-- toc -->

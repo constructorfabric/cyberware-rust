@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
-keywords = ["cyberfabric", "cyberfabric-modules"]
+keywords = ["constructorfabric", "cf-gears"]
 categories = ["artificial-intelligence"]
 
 [package.metadata.docs.rs]

@@ -1,3 +1,6 @@
+Created:  2026-08-11 by Virtuozzo International GmbH
+Updated:  2026-09-01 by Virtuozzo International GmbH
+
 # Technical Design — Infrastructure Resource Manager (IRM)
 
 <!-- toc -->

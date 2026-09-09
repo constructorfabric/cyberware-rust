@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Usage Ingestion & Normalization (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: OSS Metering, Subscriptions | Downstream: 13-q-store-attribution, rating-core | Owners: BSS Rating team -->
 

@@ -1,3 +1,6 @@
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-07 by Virtuozzo International GmbH
+
 <!-- migration-note: converted from the legacy Virtuozzo DESIGN slice format to the gears-sdlc design-slice layout (cpt-* sub-IDs, CDSL flows/algos/states). Original preserved unchanged at vhp-architecture: docs/bss/design/DESIGN-billing-ledger-balances-202606091200/01a-DESIGN-billing-ledger-invoice-posting-202606091200.md.. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — Invoice-posting handler (Design, Slice 1) -->
 <!-- Related: 01-repository-foundation.md (Repository-foundation component model), PRD.md | Upstream: PRD Billing Ledger & Balances, the Repository-foundation | Downstream: payments-allocation, adjustments-notes-refunds, asc606-recognition, fx-multicurrency, reconciliation-export, audit-immutability-observability (sibling feature slices) -->

@@ -1,3 +1,6 @@
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-07 by Virtuozzo International GmbH
+
 <!-- migration-note: converted from the legacy Virtuozzo DESIGN slice format to the gears-sdlc design-slice layout (cpt-* sub-IDs, CDSL flows/algos/states). Original preserved unchanged at vhp-architecture: docs/bss/design/DESIGN-billing-ledger-balances-202606091200/02-DESIGN-billing-ledger-audit-immutability-observability-202606091700.md.. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — Audit, Immutability & Observability (Design, Slice 6) -->
 <!-- Related: 01-repository-foundation.md (Repository-foundation component model), PRD.md | Upstream: Slices 1-5/7 (emit alarms + posted facts) | Downstream: reconciliation-export (Slice 7), Finance/Audit consumers -->

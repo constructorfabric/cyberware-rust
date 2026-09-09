@@ -121,27 +121,17 @@ pub fn allow_all() -> AccessScope {
     AccessScope::allow_all()
 }
 
-/// Test entry point with the documented worker defaults. Production has no
-/// default-configured worker path: it must pass the deployment settings.
-pub async fn run_operation(
-    stores: &Arc<dyn types_registry::domain::ports::Stores>,
-    db: &DBProvider<types_registry::domain::admission::worker::WorkerError>,
-    scope: &AccessScope,
-    operation_id: uuid::Uuid,
-    now: time::OffsetDateTime,
-) -> Result<
-    types_registry::domain::admission::worker::OperationOutcome,
-    types_registry::domain::admission::worker::WorkerError,
-> {
-    types_registry::domain::admission::worker::run_operation(
-        stores,
-        db,
-        scope,
-        operation_id,
-        now,
-        types_registry::config::WorkerSettings::default(),
-    )
-    .await
+#[must_use]
+pub fn metrics() -> std::sync::Arc<dyn types_registry::domain::ports::metrics::AdmissionMetrics> {
+    std::sync::Arc::new(types_registry::domain::ports::metrics::NoopMetrics)
+}
+
+pub fn limits() -> types_registry::config::Limits {
+    types_registry::config::Limits::default()
+}
+
+pub fn worker_settings() -> types_registry::config::WorkerSettings {
+    types_registry::config::WorkerSettings::default()
 }
 
 // ---------------------------------------------------------------------------
@@ -348,13 +338,14 @@ use async_trait::async_trait;
 use toolkit_db::DbTx;
 use toolkit_db::secure::ScopeError;
 use types_registry::domain::admission::fingerprint::ScopeHash;
-use types_registry::domain::enums::{EntityKind, OwnershipScope};
+use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use types_registry::domain::family::FamilyKey;
 use types_registry::domain::ports::{
-    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentTypeSchemaRow,
-    DependencyClosure, DependencyStore, EntityRow, EntityStore, InstanceStore, NewCurrentInstance,
-    NewCurrentTypeSchema, NewEntity, NewInstanceRevision, NewOperation, NewOperationItem,
-    NewRevision, OperationItemRow, OperationRow, OperationStore, TypeSchemaStore, VersionFamilyRow,
+    CurrentDocument, CurrentInstanceRow, CurrentInstanceValue, CurrentSchemaCas,
+    CurrentTypeSchemaRow, DependencyClosure, DependencyStore, EntityRow, EntityStore,
+    EntityWriteOrderStore, InstanceStore, NewCurrentInstance, NewCurrentTypeSchema, NewEntity,
+    NewInstanceRevision, NewOperation, NewOperationItem, NewRevision, OperationItemRow,
+    OperationRow, OperationStore, ReverseImpact, TypeSchemaStore, VersionFamilyRow,
     VersionFamilyStore,
 };
 
@@ -368,13 +359,15 @@ use types_registry::domain::ports::{
 /// protocol* a test is making a claim about, and the name is that claim.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PausePoint {
+    /// Immediately before the commit's first statement claims `entity_write_order`.
+    BeforeEntityWriteOrderClaim,
     /// Between `commit_revision`'s entity read and both of its concurrency
     /// branches: the window the `unchanged` re-read and the compare-and-swap exist
     /// to close.
     CurrentDocuments,
-    /// Inside `commit_creation`, with the family row taken and the three family
-    /// rules not yet asked — the window the family advisory lock exists to close.
+    /// After creation takes the family row but before checking its rules.
     CreateOrGet,
+    RevisionEntityRead,
 }
 
 /// Every port forwarded to the real adapter, with one call held on a channel.
@@ -385,6 +378,10 @@ pub enum PausePoint {
 pub struct PausingStores {
     inner: Arc<dyn types_registry::domain::ports::Stores>,
     at: PausePoint,
+    /// Which call of `at` to hold on: 1 is the first.
+    nth: usize,
+    /// How many calls of `at` have been seen.
+    seen: std::sync::atomic::AtomicUsize,
     /// Sent once, when the pass reaches the pause point.
     reached: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Awaited once, before that call returns.
@@ -402,11 +399,26 @@ impl PausingStores {
         tokio::sync::oneshot::Receiver<()>,
         tokio::sync::oneshot::Sender<()>,
     ) {
+        Self::new_at_occurrence(at, 1)
+    }
+
+    /// Like [`Self::new`], but pause at the `nth` matching call.
+    #[must_use]
+    pub fn new_at_occurrence(
+        at: PausePoint,
+        nth: usize,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
         let decorated = Arc::new(Self {
             inner: stores(),
             at,
+            nth,
+            seen: std::sync::atomic::AtomicUsize::new(0),
             reached: tokio::sync::Mutex::new(Some(reached_tx)),
             resume: tokio::sync::Mutex::new(Some(resume_rx)),
         });
@@ -420,6 +432,9 @@ impl PausingStores {
         if at != self.at {
             return;
         }
+        if self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 != self.nth {
+            return;
+        }
         let reached = self.reached.lock().await.take();
         let resume = self.resume.lock().await.take();
         if let Some(reached) = reached {
@@ -430,6 +445,19 @@ impl PausingStores {
         if let Some(resume) = resume {
             resume.await.expect("the test must always resume the pass");
         }
+    }
+}
+
+#[async_trait]
+impl EntityWriteOrderStore for PausingStores {
+    async fn claim_entity_write_order(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        now: OffsetDateTime,
+    ) -> Result<(), ScopeError> {
+        self.pause(PausePoint::BeforeEntityWriteOrderClaim).await;
+        self.inner.claim_entity_write_order(tx, scope, now).await
     }
 }
 
@@ -461,7 +489,17 @@ impl EntityStore for PausingStores {
         scope: &AccessScope,
         gts_id: &str,
     ) -> Result<Option<EntityRow>, ScopeError> {
+        self.pause(PausePoint::RevisionEntityRead).await;
         self.inner.find_by_gts_id(tx, scope, gts_id).await
+    }
+
+    async fn find_by_gts_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_ids: &[String],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_ids(tx, scope, gts_ids).await
     }
 
     async fn find_by_gts_uuid(
@@ -518,6 +556,15 @@ impl TypeSchemaStore for PausingStores {
         Ok(out)
     }
 
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        self.inner.current_schemas(tx, scope, entity_ids).await
+    }
+
     async fn find_current_schema(
         &self,
         tx: &DbTx<'_>,
@@ -550,8 +597,11 @@ impl TypeSchemaStore for PausingStores {
         tx: &DbTx<'_>,
         scope: &AccessScope,
         new: NewCurrentTypeSchema,
+        expected: CurrentSchemaCas,
     ) -> Result<bool, ScopeError> {
-        self.inner.update_current_schema(tx, scope, new).await
+        self.inner
+            .update_current_schema(tx, scope, new, expected)
+            .await
     }
 }
 
@@ -724,5 +774,779 @@ impl DependencyStore for PausingStores {
         roots: &[String],
     ) -> Result<DependencyClosure, ScopeError> {
         self.inner.closure(tx, scope, roots).await
+    }
+
+    async fn reverse_impact(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[i64],
+        write_set_bound: usize,
+    ) -> Result<ReverseImpact, ScopeError> {
+        self.inner
+            .reverse_impact(tx, scope, roots, write_set_bound)
+            .await
+    }
+
+    async fn replace_outgoing(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        from_entity_id: i64,
+        edges: &[(DependencyKind, i64)],
+    ) -> Result<(), ScopeError> {
+        self.inner
+            .replace_outgoing(tx, scope, from_entity_id, edges)
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A commit that announces when it reaches the serialization point
+// ---------------------------------------------------------------------------
+
+/// Real adapter wrapper that signals entry into `claim_entity_write_order`.
+pub struct ClaimSignallingStores {
+    inner: Arc<dyn types_registry::domain::ports::Stores>,
+    entered: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl ClaimSignallingStores {
+    /// The decorated ports and a receiver that fires when the claim is entered.
+    #[must_use]
+    pub fn new() -> (Arc<Self>, tokio::sync::oneshot::Receiver<()>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Arc::new(Self {
+                inner: stores(),
+                entered: tokio::sync::Mutex::new(Some(tx)),
+            }),
+            rx,
+        )
+    }
+}
+
+#[async_trait]
+impl EntityWriteOrderStore for ClaimSignallingStores {
+    async fn claim_entity_write_order(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        now: OffsetDateTime,
+    ) -> Result<(), ScopeError> {
+        if let Some(entered) = self.entered.lock().await.take() {
+            // Dropped only if the test gave up, which is its own failure to report.
+            entered.send(()).ok();
+        }
+        self.inner.claim_entity_write_order(tx, scope, now).await
+    }
+}
+
+#[async_trait]
+impl VersionFamilyStore for ClaimSignallingStores {
+    async fn create_or_get(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        family_key: &FamilyKey,
+        ownership_scope: OwnershipScope,
+        owner_tenant_id: Option<Uuid>,
+        now: OffsetDateTime,
+    ) -> Result<(VersionFamilyRow, bool), ScopeError> {
+        let out = self
+            .inner
+            .create_or_get(tx, scope, family_key, ownership_scope, owner_tenant_id, now)
+            .await?;
+        Ok(out)
+    }
+}
+
+#[async_trait]
+impl EntityStore for ClaimSignallingStores {
+    async fn find_by_gts_id(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_id: &str,
+    ) -> Result<Option<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_id(tx, scope, gts_id).await
+    }
+
+    async fn find_by_gts_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_ids: &[String],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_ids(tx, scope, gts_ids).await
+    }
+
+    async fn find_by_gts_uuid(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_uuid: Uuid,
+    ) -> Result<Option<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_uuid(tx, scope, gts_uuid).await
+    }
+
+    async fn kind_in_family(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        family_id: i64,
+    ) -> Result<Option<EntityKind>, ScopeError> {
+        self.inner.kind_in_family(tx, scope, family_id).await
+    }
+
+    async fn insert_entity(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewEntity,
+    ) -> Result<Option<EntityRow>, ScopeError> {
+        self.inner.insert_entity(tx, scope, new).await
+    }
+
+    async fn compare_and_swap_version(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+        expected_resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<Option<i64>, ScopeError> {
+        self.inner
+            .compare_and_swap_version(tx, scope, entity_id, expected_resource_version, now)
+            .await
+    }
+}
+
+#[async_trait]
+impl TypeSchemaStore for ClaimSignallingStores {
+    async fn current_documents(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentDocument>, ScopeError> {
+        let out = self.inner.current_documents(tx, scope, entity_ids).await?;
+        Ok(out)
+    }
+
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        self.inner.current_schemas(tx, scope, entity_ids).await
+    }
+
+    async fn find_current_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError> {
+        self.inner.find_current_schema(tx, scope, entity_id).await
+    }
+
+    async fn insert_schema_revision(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewRevision,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_schema_revision(tx, scope, new).await
+    }
+
+    async fn insert_current_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentTypeSchema,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_current_schema(tx, scope, new).await
+    }
+
+    async fn update_current_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentTypeSchema,
+        expected: CurrentSchemaCas,
+    ) -> Result<bool, ScopeError> {
+        self.inner
+            .update_current_schema(tx, scope, new, expected)
+            .await
+    }
+}
+
+#[async_trait]
+impl InstanceStore for ClaimSignallingStores {
+    async fn current_values(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentInstanceValue>, ScopeError> {
+        self.inner.current_values(tx, scope, entity_ids).await
+    }
+
+    async fn find_current_instance(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<CurrentInstanceRow>, ScopeError> {
+        self.inner.find_current_instance(tx, scope, entity_id).await
+    }
+
+    async fn insert_instance_revision(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewInstanceRevision,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_instance_revision(tx, scope, new).await
+    }
+
+    async fn insert_current_instance(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentInstance,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_current_instance(tx, scope, new).await
+    }
+
+    async fn update_current_instance(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentInstance,
+    ) -> Result<bool, ScopeError> {
+        self.inner.update_current_instance(tx, scope, new).await
+    }
+}
+
+#[async_trait]
+impl OperationStore for ClaimSignallingStores {
+    async fn find_by_idempotency(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        idempotency_scope_hash: &ScopeHash,
+        idempotency_key: &str,
+    ) -> Result<Option<OperationRow>, ScopeError> {
+        self.inner
+            .find_by_idempotency(tx, scope, idempotency_scope_hash, idempotency_key)
+            .await
+    }
+
+    async fn find_by_id(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<OperationRow>, ScopeError> {
+        self.inner.find_by_id(tx, scope, id).await
+    }
+
+    async fn insert_operation(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewOperation,
+    ) -> Result<OperationRow, ScopeError> {
+        self.inner.insert_operation(tx, scope, new).await
+    }
+
+    async fn insert_items(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        parent: &OperationRow,
+        items: &[NewOperationItem],
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_items(tx, scope, parent, items).await
+    }
+
+    async fn find_items(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        operation_id: Uuid,
+    ) -> Result<Vec<OperationItemRow>, ScopeError> {
+        self.inner.find_items(tx, scope, operation_id).await
+    }
+
+    async fn mark_running(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner.mark_running(tx, scope, id, now).await
+    }
+
+    async fn mark_completed(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner.mark_completed(tx, scope, id, now).await
+    }
+
+    async fn mark_item_succeeded(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        item_id: i64,
+        revision_no: i32,
+        resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner
+            .mark_item_succeeded(tx, scope, item_id, revision_no, resource_version, now)
+            .await
+    }
+
+    async fn mark_item_unchanged(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        item_id: i64,
+        resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner
+            .mark_item_unchanged(tx, scope, item_id, resource_version, now)
+            .await
+    }
+
+    async fn mark_item_failed(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        item_id: i64,
+        error_payload: String,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner
+            .mark_item_failed(tx, scope, item_id, error_payload, now)
+            .await
+    }
+}
+
+#[async_trait]
+impl DependencyStore for ClaimSignallingStores {
+    async fn closure(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[String],
+    ) -> Result<DependencyClosure, ScopeError> {
+        let out = self.inner.closure(tx, scope, roots).await?;
+        Ok(out)
+    }
+
+    async fn reverse_impact(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[i64],
+        write_set_bound: usize,
+    ) -> Result<ReverseImpact, ScopeError> {
+        self.inner
+            .reverse_impact(tx, scope, roots, write_set_bound)
+            .await
+    }
+
+    async fn replace_outgoing(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        from_entity_id: i64,
+        edges: &[(DependencyKind, i64)],
+    ) -> Result<(), ScopeError> {
+        self.inner
+            .replace_outgoing(tx, scope, from_entity_id, edges)
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A current-state write that loses its compare-and-swap
+// ---------------------------------------------------------------------------
+
+/// Real adapter wrapper that injects one current-schema CAS miss.
+pub struct CasMissStores {
+    inner: Arc<dyn types_registry::domain::ports::Stores>,
+    refuse_for_entity_id: i64,
+}
+
+impl CasMissStores {
+    /// Inject a CAS miss for `refuse_for_entity_id`.
+    #[must_use]
+    pub fn new(refuse_for_entity_id: i64) -> Arc<Self> {
+        Arc::new(Self {
+            inner: stores(),
+            refuse_for_entity_id,
+        })
+    }
+}
+
+#[async_trait]
+impl EntityWriteOrderStore for CasMissStores {
+    async fn claim_entity_write_order(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        now: OffsetDateTime,
+    ) -> Result<(), ScopeError> {
+        self.inner.claim_entity_write_order(tx, scope, now).await
+    }
+}
+
+#[async_trait]
+impl VersionFamilyStore for CasMissStores {
+    async fn create_or_get(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        family_key: &FamilyKey,
+        ownership_scope: OwnershipScope,
+        owner_tenant_id: Option<Uuid>,
+        now: OffsetDateTime,
+    ) -> Result<(VersionFamilyRow, bool), ScopeError> {
+        self.inner
+            .create_or_get(tx, scope, family_key, ownership_scope, owner_tenant_id, now)
+            .await
+    }
+}
+
+#[async_trait]
+impl EntityStore for CasMissStores {
+    async fn find_by_gts_id(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_id: &str,
+    ) -> Result<Option<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_id(tx, scope, gts_id).await
+    }
+
+    async fn find_by_gts_ids(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_ids: &[String],
+    ) -> Result<Vec<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_ids(tx, scope, gts_ids).await
+    }
+
+    async fn find_by_gts_uuid(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        gts_uuid: Uuid,
+    ) -> Result<Option<EntityRow>, ScopeError> {
+        self.inner.find_by_gts_uuid(tx, scope, gts_uuid).await
+    }
+
+    async fn kind_in_family(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        family_id: i64,
+    ) -> Result<Option<EntityKind>, ScopeError> {
+        self.inner.kind_in_family(tx, scope, family_id).await
+    }
+
+    async fn insert_entity(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewEntity,
+    ) -> Result<Option<EntityRow>, ScopeError> {
+        self.inner.insert_entity(tx, scope, new).await
+    }
+
+    async fn compare_and_swap_version(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+        expected_resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<Option<i64>, ScopeError> {
+        self.inner
+            .compare_and_swap_version(tx, scope, entity_id, expected_resource_version, now)
+            .await
+    }
+}
+
+#[async_trait]
+impl TypeSchemaStore for CasMissStores {
+    async fn current_documents(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentDocument>, ScopeError> {
+        self.inner.current_documents(tx, scope, entity_ids).await
+    }
+
+    async fn current_schemas(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentTypeSchemaRow>, ScopeError> {
+        self.inner.current_schemas(tx, scope, entity_ids).await
+    }
+
+    async fn find_current_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<CurrentTypeSchemaRow>, ScopeError> {
+        self.inner.find_current_schema(tx, scope, entity_id).await
+    }
+
+    async fn insert_schema_revision(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewRevision,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_schema_revision(tx, scope, new).await
+    }
+
+    async fn insert_current_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentTypeSchema,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_current_schema(tx, scope, new).await
+    }
+
+    async fn update_current_schema(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentTypeSchema,
+        expected: CurrentSchemaCas,
+    ) -> Result<bool, ScopeError> {
+        if new.entity_id == self.refuse_for_entity_id {
+            // Simulate the projection moving after its token was captured.
+            return Ok(false);
+        }
+        self.inner
+            .update_current_schema(tx, scope, new, expected)
+            .await
+    }
+}
+
+#[async_trait]
+impl InstanceStore for CasMissStores {
+    async fn current_values(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_ids: &[i64],
+    ) -> Result<Vec<CurrentInstanceValue>, ScopeError> {
+        self.inner.current_values(tx, scope, entity_ids).await
+    }
+
+    async fn find_current_instance(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        entity_id: i64,
+    ) -> Result<Option<CurrentInstanceRow>, ScopeError> {
+        self.inner.find_current_instance(tx, scope, entity_id).await
+    }
+
+    async fn insert_instance_revision(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewInstanceRevision,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_instance_revision(tx, scope, new).await
+    }
+
+    async fn insert_current_instance(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentInstance,
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_current_instance(tx, scope, new).await
+    }
+
+    async fn update_current_instance(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewCurrentInstance,
+    ) -> Result<bool, ScopeError> {
+        self.inner.update_current_instance(tx, scope, new).await
+    }
+}
+
+#[async_trait]
+impl OperationStore for CasMissStores {
+    async fn find_by_idempotency(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        idempotency_scope_hash: &ScopeHash,
+        idempotency_key: &str,
+    ) -> Result<Option<OperationRow>, ScopeError> {
+        self.inner
+            .find_by_idempotency(tx, scope, idempotency_scope_hash, idempotency_key)
+            .await
+    }
+
+    async fn find_by_id(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<OperationRow>, ScopeError> {
+        self.inner.find_by_id(tx, scope, id).await
+    }
+
+    async fn insert_operation(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        new: NewOperation,
+    ) -> Result<OperationRow, ScopeError> {
+        self.inner.insert_operation(tx, scope, new).await
+    }
+
+    async fn insert_items(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        parent: &OperationRow,
+        items: &[NewOperationItem],
+    ) -> Result<(), ScopeError> {
+        self.inner.insert_items(tx, scope, parent, items).await
+    }
+
+    async fn find_items(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        operation_id: Uuid,
+    ) -> Result<Vec<OperationItemRow>, ScopeError> {
+        self.inner.find_items(tx, scope, operation_id).await
+    }
+
+    async fn mark_running(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner.mark_running(tx, scope, id, now).await
+    }
+
+    async fn mark_completed(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner.mark_completed(tx, scope, id, now).await
+    }
+
+    async fn mark_item_succeeded(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        item_id: i64,
+        revision_no: i32,
+        resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner
+            .mark_item_succeeded(tx, scope, item_id, revision_no, resource_version, now)
+            .await
+    }
+
+    async fn mark_item_unchanged(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        item_id: i64,
+        resource_version: i64,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner
+            .mark_item_unchanged(tx, scope, item_id, resource_version, now)
+            .await
+    }
+
+    async fn mark_item_failed(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        item_id: i64,
+        error_payload: String,
+        now: OffsetDateTime,
+    ) -> Result<bool, ScopeError> {
+        self.inner
+            .mark_item_failed(tx, scope, item_id, error_payload, now)
+            .await
+    }
+}
+
+#[async_trait]
+impl DependencyStore for CasMissStores {
+    async fn closure(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[String],
+    ) -> Result<DependencyClosure, ScopeError> {
+        self.inner.closure(tx, scope, roots).await
+    }
+
+    async fn reverse_impact(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        roots: &[i64],
+        write_set_bound: usize,
+    ) -> Result<ReverseImpact, ScopeError> {
+        self.inner
+            .reverse_impact(tx, scope, roots, write_set_bound)
+            .await
+    }
+
+    async fn replace_outgoing(
+        &self,
+        tx: &DbTx<'_>,
+        scope: &AccessScope,
+        from_entity_id: i64,
+        edges: &[(DependencyKind, i64)],
+    ) -> Result<(), ScopeError> {
+        self.inner
+            .replace_outgoing(tx, scope, from_entity_id, edges)
+            .await
     }
 }

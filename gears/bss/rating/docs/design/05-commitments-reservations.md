@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Commitments & Reservations (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Contracts & Agreements, Pricing (Product Catalog), OSS (reservation entitlement), Subscriptions | Downstream: Rating, Billing (obligation execution) | Owners: BSS Rating team -->
 

@@ -1,3 +1,6 @@
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- migration-note: converted from the legacy VHP architecture design slice to the gears-sdlc design-slice format. Original preserved unchanged at vhp-architecture/docs/bss/design/DESIGN-billing-ledger-balances-202606091200/05-DESIGN-billing-ledger-adjustments-notes-refunds-202606091500.md (Slice 3 — Adjustments: Credit/Debit Notes & Refunds). Inherited engine mechanics (PostingService, IdempotencyGate, BalanceProjector, commit trigger, TieOutJob, outbox relay) are specified in ./01-repository-foundation.md. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — Credit/Debit Notes & Refunds (Design, Slice 3) -->
 

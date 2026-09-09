@@ -4,6 +4,9 @@ date: 2026-07-10
 decision-makers: "BSS Rating team"
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # ADR-0001: Adopt the Pricing Canonical Scope Key (Do Not Define a Tariffs Key)
 
 <!-- toc -->

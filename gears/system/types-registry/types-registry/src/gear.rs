@@ -14,6 +14,7 @@ use crate::config::TypesRegistryConfig;
 use crate::domain::admission::{NullDispatch, OperationDispatch};
 use crate::domain::local_client::TypesRegistryLocalClient;
 use crate::domain::ports::Stores;
+use crate::domain::ports::metrics::AdmissionMetrics;
 use crate::domain::registry_service::RegistryService;
 use crate::domain::service::TypesRegistryService;
 use crate::infra::InMemoryGtsRepository;
@@ -73,6 +74,11 @@ impl Gear for TypesRegistryGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: TypesRegistryConfig = ctx.config_or_default()?;
 
+        // Build admission instruments eagerly from ToolKit's configured provider.
+        let metrics_prefix = cfg.metrics.effective_prefix(Self::MODULE_NAME);
+        let metrics: Arc<dyn AdmissionMetrics> =
+            crate::infra::metrics::default_adapter(&metrics_prefix);
+
         // Startup validation. An unparsable registration-policy region reads
         // exactly like a closed one at admission time, so the boot fails here
         // rather than leaving an operator with refusals that name no cause
@@ -96,7 +102,7 @@ impl Gear for TypesRegistryGear {
             warn!(
                 keys = ?inert,
                 "types_registry accepted configuration keys that P0 does not enforce; \
-                 each key's documentation names the task that binds it"
+                 see each key's documentation for its enforcement status"
             );
         }
 
@@ -197,6 +203,7 @@ impl Gear for TypesRegistryGear {
                 cfg_for_registry,
                 dispatch,
                 crate::domain::registry_service::AdmissionMode::Inline,
+                Arc::clone(&metrics),
             ));
             self.registry
                 .set(registry)

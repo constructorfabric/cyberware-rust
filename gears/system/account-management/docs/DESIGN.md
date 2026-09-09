@@ -1,4 +1,5 @@
-Created:  2026-04-01 by Diffora
+Created:  2026-04-01 by Virtuozzo International GmbH
+Updated:  2026-08-17 by Virtuozzo International GmbH
 
 # Technical Design — Account Management (AM)
 

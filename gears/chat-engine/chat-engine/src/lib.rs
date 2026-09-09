@@ -4,7 +4,7 @@
 //! the SDK and exposes:
 //!
 //! - [`ChatEngineModule`] — the `#[toolkit::module]`-annotated entrypoint
-//!   used by `cyberware-example-server` via the `inventory`-based
+//!   used by `cf-gears-example-server` via the `inventory`-based
 //!   registrator.
 //! - The re-exported SDK types every downstream test / consumer needs so a
 //!   single `use chat_engine::*;` import suffices.

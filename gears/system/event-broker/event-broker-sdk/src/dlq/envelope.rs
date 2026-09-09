@@ -45,7 +45,8 @@ impl DeadLetterEnvelope {
     /// DLQ, so a change made before anything ships leaves it alone: there are no
     /// stored envelopes of an older shape for a reader to distinguish.
     pub const VERSION: u16 = 1;
-    pub const PAYLOAD_TYPE: &'static str = "application/vnd.cyberfabric.event-broker.dlq+json";
+    pub const PAYLOAD_TYPE: &'static str =
+        "application/vnd.constructorfabric.event-broker.dlq+json";
 
     pub fn from_record(record: DeadLetterRecord) -> Self {
         Self {

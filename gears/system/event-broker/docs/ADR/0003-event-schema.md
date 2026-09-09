@@ -239,7 +239,7 @@ The decision is verified by:
 
 * Good, because external interop is "free" — CloudEvents consumers can read events without translation
 * Good, because the field set is normalized against a public standard
-* Bad, because broker-specific concerns (topic identity, partition, idempotent-producer chain) need to be expressed as CloudEvents extensions — adds attribute-name boilerplate (`io.cyberfabric.broker.topic`) for every internal field
+* Bad, because broker-specific concerns (topic identity, partition, idempotent-producer chain) need to be expressed as CloudEvents extensions — adds attribute-name boilerplate (`io.constructorfabric.broker.topic`) for every internal field
 * Bad, because the per-direction surface still needs the marker treatment; CloudEvents conformance does not solve the input/output problem
 * Bad, because CloudEvents-conformance cost is paid on every event on every code path, against a hypothetical future requirement; YAGNI
 * Bad, because future CloudEvents-spec changes become broker-version dependencies

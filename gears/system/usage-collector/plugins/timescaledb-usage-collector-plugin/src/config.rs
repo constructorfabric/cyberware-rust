@@ -98,7 +98,7 @@ impl Default for TimescaleDbPluginConfig {
             connection_timeout_secs: 10,
             statement_timeout_secs: 30,
             retention_period_secs: 365 * 86_400, // 365 days
-            vendor: "cyberfabric".to_owned(),
+            vendor: "constructorfabric".to_owned(),
             priority: 10,
         }
     }

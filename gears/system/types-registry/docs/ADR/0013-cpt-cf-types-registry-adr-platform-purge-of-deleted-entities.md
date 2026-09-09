@@ -145,20 +145,14 @@ Purge requires the entity to be `DELETED`, and re-evaluates the deletion precond
 
 **A minor may be purged only from the top of its major.** Where ADR-0004's minors are in use, the minors of one major that a purge releases **MUST** form a suffix of that major's admitted sequence: releasing `v1.1~` while `v1.2~` is still admitted is refused, with the higher minors listed, exactly as an exact identifier still pinned by an Instance is refused with those Instances listed below.
 
-**Purge and admission serialize on the same row; the protocol is part of this decision.**
-
-* Before evaluating eligibility, purge **MUST** acquire every `version_family` row touched by its pattern and hold those rows through commit.
-* Multi-family purge **MUST** acquire them in deterministic order.
-* Admission **MUST** use the same order because an atomic cyclic unit may span families.
-
-One shared order makes the pair deadlock-free, not merely each operation internally consistent.
+**Purge follows the common writer order; the protocol is part of this decision.** It **MUST** advance `types_registry__coordination_state.entity_write_order` as the transaction's first statement, thereby claiming the row, then lock affected `version_family` rows in canonical order and hold them through commit. Entity rows follow, and the federation routing generation advances last. Every entity-state writer uses this order, which serializes admission and purge and avoids deadlocks.
 
 Without serialization, either race could create a gap:
 
 * purge deems `v1.0~` eligible, admission confirms it as the baseline for `v1.1~`, then purge removes it before admission commits;
 * purge sees no successor to `v1.1~`, admission commits `v1.2~`, then purge removes `v1.1~`.
 
-Deletion preconditions do not catch these races because ADR-0004 deliberately stores no dependency edge between minors. The family row already serializes ownership and minor admission, so this extends lock scope rather than adding a lock.
+Deletion preconditions do not catch these races because ADR-0004 stores no dependency edge between minors. The common writer order and family locks close the gap.
 
 Unlike other purge preconditions, the suffix rule protects a guarantee rather than a foreign key. ADR-0004 requires contiguous minors and counts a `DELETED` predecessor as present so its number cannot be reoccupied.
 
@@ -200,7 +194,7 @@ This dry run belongs to the purge job, not ADR-0012's general write path. It kee
 
 It needs no request-identity rule because purge stores no replayable request. It also guarantees nothing about a later invocation; eligibility may change in between.
 
-Purging a Registry Source Plugin removes its Source Claims with it. No extra ordering is needed: deleting the plugin Instance — a precondition of purging it — already retired those claims and released the foreign key by which they pinned its revisions. The job deletes the claim rows and bumps the routing generation in the same transaction, so cached routing and live federated cursors observe the change.
+Purging a Registry Source Plugin also removes its retired Source Claims. The transaction removes claim rows before their referenced plugin revisions, then removes matched entities and advances the routing generation last. This satisfies `ON DELETE RESTRICT` and makes the purge visible in one routing generation.
 
 Purge never runs on a schedule, on a timer, or as a consequence of any retention rule. Every execution is an explicit act with an operator behind it.
 

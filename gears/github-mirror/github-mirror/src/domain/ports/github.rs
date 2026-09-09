@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+
+use strum::IntoEnumIterator;
+
 use async_trait::async_trait;
 use toolkit_macros::domain_model;
 
@@ -11,52 +15,68 @@ use crate::domain::repo::{
     WorkflowRunRecord,
 };
 
+/// A top-level listing the sync can reconcile deletions for.
+///
+/// One variant per family `reconcile_stale` deletes from: that match is
+/// exhaustive, so a family added here has to be given a delete before the
+/// crate compiles again. `EnumIter` supplies the iteration, so there is no
+/// hand-written list to keep in step with the variants either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
+pub enum Listing {
+    Issues,
+    PullRequests,
+    Commits,
+    Comments,
+    ReviewComments,
+    Labels,
+    Milestones,
+    Releases,
+    Branches,
+    Tags,
+}
+
 /// Which top-level listings this fetch walked to their final page.
 ///
 /// Deletion reconciliation may only run against a listing that is provably
-/// complete: "absent from a truncated page" says nothing about existence.
-/// On this increment the client fetches first pages only, so a listing is
-/// complete exactly when its response advertises no next page.
+/// complete: "absent from a truncated page" says nothing about existence. A
+/// listing is complete when the walk reached a response advertising no next
+/// page, and incomplete when it stopped at the page cap with more to fetch.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ListingCompleteness {
-    pub issues: bool,
-    pub pull_requests: bool,
-    pub commits: bool,
-    pub comments: bool,
-    pub review_comments: bool,
-    pub labels: bool,
-    pub milestones: bool,
-    pub releases: bool,
-    pub branches: bool,
-    pub tags: bool,
-    pub contributors: bool,
-    pub issue_events: bool,
-    pub commit_comments: bool,
-    pub deployments: bool,
+    /// The listings that were read to the end. Keyed by [`Listing`] so it
+    /// cannot drift out of step with the families themselves.
+    complete: HashSet<Listing>,
 }
 
 impl ListingCompleteness {
+    /// Nothing complete - the safe default, since it reconciles nothing.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
     /// Every listing complete — what a fake in tests reports.
     #[must_use]
     pub fn all_complete() -> Self {
         Self {
-            issues: true,
-            pull_requests: true,
-            commits: true,
-            comments: true,
-            review_comments: true,
-            labels: true,
-            milestones: true,
-            releases: true,
-            branches: true,
-            tags: true,
-            contributors: true,
-            issue_events: true,
-            commit_comments: true,
-            deployments: true,
+            complete: Listing::iter().collect(),
         }
+    }
+
+    /// Record whether `listing` was walked to its final page.
+    pub fn set(&mut self, listing: Listing, complete: bool) {
+        if complete {
+            self.complete.insert(listing);
+        } else {
+            self.complete.remove(&listing);
+        }
+    }
+
+    /// Whether `listing` may be reconciled against.
+    #[must_use]
+    pub fn is_complete(&self, listing: Listing) -> bool {
+        self.complete.contains(&listing)
     }
 }
 
@@ -97,9 +117,8 @@ pub struct FetchedRepository {
 
 /// Outbound port to GitHub's REST API (implemented in `infra/github`).
 ///
-/// Increment 1 of gears-rust#4630: fetches a repository and the first page of
-/// its issues, pull requests, and commits. Conditional requests, pagination,
-/// and rate-limit admission arrive as that issue completes.
+/// Fetches a repository and its mirrored families, walking each listing until
+/// GitHub reports no next page or the walk hits its page cap.
 #[async_trait]
 pub trait GithubPort: Send + Sync {
     async fn fetch_repository(

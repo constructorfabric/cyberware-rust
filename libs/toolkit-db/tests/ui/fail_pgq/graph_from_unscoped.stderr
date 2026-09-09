@@ -1,0 +1,7 @@
+error[E0599]: no method named `with_graph` found for struct `SecureSelect<test_entity::Entity, Unscoped>` in the current scope
+  --> tests/ui/fail_pgq/graph_from_unscoped.rs:76:48
+   |
+76 |     let _graph_query = Entity::find().secure().with_graph::<TestGraph>();
+   |                                                ^^^^^^^^^^ method not found in `SecureSelect<test_entity::Entity, Unscoped>`
+   |
+   = note: the method was found for `SecureSelect<E, Scoped>`

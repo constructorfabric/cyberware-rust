@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Plan & Price Modeling — Catalog Foundation (shared publish engine) (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md | Upstream: Product & SKU registry, Effective-dating PriceWindows | Downstream: Tariffs, Subscriptions, Rating, Billing, Marketplace | Owners: BSS Product Catalog team -->
 

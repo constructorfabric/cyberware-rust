@@ -1,0 +1,191 @@
+[package]
+name = "cf-redis-cluster-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Redis backend plugin for the cluster gear: a native ClusterCacheBackend over a fred connection pool plus a native DistributedLockBackend over a SET NX PX lease with Lua-fenced renew and release, for high-throughput cache and lock deployments"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "redis_cluster_plugin"
+
+# `testcontainers`/`testcontainers-modules` are declared as *optional* entries
+# under `[dependencies]` (not `[dev-dependencies]`) on purpose: Cargo does not
+# allow optional dev-dependencies, and the `integration` feature must name them
+# via `dep:` (see the `[features]` doc below). cargo-shear's "misplaced optional
+# dependency" heuristic flags that placement; ignore it here since the placement
+# is required, not accidental.
+[package.metadata.cargo-shear]
+ignored = ["testcontainers", "testcontainers-modules"]
+
+[lints]
+workspace = true
+
+[features]
+# Gates the Layer 2 conformance and Layer 3 testcontainers suites
+# (docs/TESTING.md §4, §7) so a default `cargo test` never requires a Docker
+# daemon. `testcontainers`/`testcontainers-modules` are declared as optional
+# entries under `[dependencies]` below (not `[dev-dependencies]`, which Cargo
+# does not allow to be optional) purely so this feature array can name them
+# directly; every reference to them lives in `tests/`, so enabling this feature
+# has no effect on the plugin's own compiled artifact. Run with
+# `cargo test -p cf-redis-cluster-plugin --features integration`, or
+# `make test-cluster-redis`.
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+# Every entry below carries the reason it is here, since several are less
+# obvious than the crate name suggests — `uuid` and `rand` are load-bearing for
+# correctness rather than convenience, and `opentelemetry` is a direct dependency
+# only because the ADR-004 port cannot express a gauge.
+[dependencies]
+# `ClusterError` / `ProviderErrorKind` (the `redis_error.rs` mapping table),
+# `CacheConsistency` (the `preflight.rs` declaration), and the ADR-004
+# observability contract: the `ClusterMetrics` port, the
+# `InstrumentedCache` decorator the cache is handed out through, and
+# `emit_provider_error`. `otel` pulls in the SDK's OpenTelemetry-backed
+# `OtelClusterMetrics` sink, which is the one concrete `ClusterMetrics` every
+# plugin shares so instrument names and the label allowlist are defined once.
+cluster-sdk = { workspace = true, features = ["otel"] }
+# The four plugin-local metrics of DESIGN.md §9, emitted through a meter this
+# plugin owns rather than through the `ClusterMetrics` port — which has no gauge
+# method, and `cluster_redis_connection_state` is a gauge. Same underlying API the SDK's own
+# adapter uses; postgres-cluster-plugin carries this dependency for the same
+# reason.
+opentelemetry = { workspace = true }
+# The Redis client. Feature selection — including why `enable-rustls` and not
+# `enable-rustls-ring`, why the interfaces are named individually instead of
+# via `i-std`, and why `sha-1` is absent — is documented at the workspace
+# `[workspace.dependencies]` entry and in DESIGN.md §3.1.
+fred = { workspace = true }
+serde = { workspace = true }
+# Deserializes `RedisClusterConfig` / `RedisLockConfig` out of the flattened
+# operator-config options the wiring crate passes through as a serde map
+# (DESIGN.md §8) — the shape `provider.rs` reads, and the shape the Layer 1
+# config tests construct.
+serde_json = { workspace = true }
+# `${VAR}` / `${VAR:-default}` expansion for `url` (DESIGN.md §8), the same
+# mechanism `libs/toolkit-db` uses for DB DSNs. `toolkit` rather than
+# `toolkit-utils` directly, because the `ExpandVars` derive expands to
+# `::toolkit::var_expand::ExpandVars`.
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+# The DEBUG on a `NOSCRIPT` recovery (`scripts.rs`, DESIGN.md §6) and the
+# preflight's WARNs, one per conservative fallback (DESIGN.md §3.4). Those WARNs
+# are emitted by the preflight *runner*, which holds the client; the decision
+# table it feeds is pure and logs nothing, which is what keeps every row of
+# DESIGN.md §3.6 unit-testable with no server.
+tracing = { workspace = true }
+# `ClusterCacheBackend` and `ClusterCacheProvider` are both `#[async_trait]`, so
+# their impls must be too.
+async-trait = { workspace = true }
+# `tokio::time::timeout` around the bounded pool close (`shutdown.rs`), and the
+# runtime the plugin's futures are polled on.
+tokio = { workspace = true }
+# The `CancellationToken` both handles share with their background tasks
+# (DESIGN.md §11 step 1), which the ADR-006 `Drop` guard also cancels — one
+# token per handle, shared by every task that handle owns.
+tokio-util = { workspace = true }
+# `TryStreamExt::try_collect` over the `SCAN` page stream `fred` returns
+# (`cache/scan.rs`).
+futures-util = { workspace = true }
+# The per-key and per-prefix watcher maps (`cache/watch.rs`). Concurrent because
+# the subscriber's fan-out reads and prunes them on its own task while `watch()`
+# inserts from the caller's, and the fan-out must never block.
+dashmap = { workspace = true }
+# The per-acquisition holder token (DESIGN.md §2.4, §5.1) — a fresh v4 UUID that
+# `renew` and `release` fence on. `v4` is declared here rather than inherited:
+# the workspace entry carries `serde` and `v5` only.
+uuid = { workspace = true, features = ["v4"] }
+# Full jitter on the blocking-acquire retry delay (DESIGN.md §5.3). Without it
+# every instance contending for one name retries on the same deterministic
+# schedule, turning a hot lock into synchronized fleet-wide `SET NX` bursts.
+rand = { workspace = true }
+# Layer 3 testcontainers fixtures (`tests/common/mod.rs`, TESTING.md §4.1) —
+# optional, only pulled in by `--features integration`. See the `[features]`
+# doc above for why these live here rather than `[dev-dependencies]`.
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `#[tokio::test]`, for the async unit tests that drive `ScriptExecutor` doubles
+# and the provider's pre-connection config failures.
+tokio = { workspace = true, features = ["macros"] }
+# The four plugin-local metrics of DESIGN.md §9 are OpenTelemetry instruments
+# rather than `ClusterMetrics` calls, so a recording sink cannot observe them.
+# `testing` gates `InMemoryMetricExporter`, which lets a Layer 1 test read a
+# counter back by its contracted name with no server and no collector — the same
+# readback `postgres-cluster-plugin` uses for its own plugin-local gauge.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
+# `tests/common/mod.rs` installs `tracing` subscribers so the Layer 3 scenarios
+# can assert on the DESIGN.md §9 log events. Process-global (`set_global_default`)
+# for the events emitted from spawned tasks — the eviction WARN and the watch
+# reset come off the subscriber fan-out, which `tracing-test`'s thread-local
+# capture never sees — and thread-local (`set_default`) for the scenarios that
+# assert an event's *absence* and so need a buffer no other test can pollute.
+# Same pair, and the same reason, as postgres-cluster-plugin's.
+tracing-subscriber = { workspace = true }
+# Layer 2 conformance suite (TESTING.md §3): the same parametrized suites every
+# other backend runs, wired against this plugin's real Redis-backed
+# cache/lock/leader in `tests/conformance.rs`.
+#
+# Path-only — no version, and not `workspace = true` — because it is an internal
+# dev-dep inside the cluster dependency cycle and so must not pin its own release
+# ahead of this crate's publish (release-plz.toml; the same shape
+# postgres-cluster-plugin uses).
+cf-gears-cluster-conformance = { path = "../../cluster-conformance" }
+# `cluster::defaults::CasBasedLeaderElectionBackend` for the leader conformance
+# suite — the SDK default over this plugin's cache (DESIGN.md §7), so the test
+# exercises that real combination rather than a stand-in — plus
+# `ClusterWiring::from_config` for `RD-LOCK-008` and `RD-SPEC-004`/`004b`, which
+# are about operator YAML resolving through the registry and cannot be written
+# against anything else.
+#
+# This is a **dev-only dependency cycle**: `cf-gears-cluster` now depends on this
+# crate normally (its `provider_registry` registers both Redis providers), and this
+# crate depends on it for tests. Cargo permits that, because a dev-dependency does
+# not participate in the normal build graph — the cycle exists only when building
+# this crate's test targets. postgres-cluster-plugin relies on exactly the same
+# arrangement.
+cluster = { package = "cf-gears-cluster", path = "../../cluster" }
+# `RD-LOCK-008` (TESTING.md §4.3): the "cache on a different provider" half of the
+# end-to-end YAML routing test binds `cache: { provider: standalone }` alongside
+# `lock: { provider: redis }`, which is the point of the scenario — the lock
+# provider must resolve independently of which backend serves the cache.
+cf-gears-standalone-cluster-plugin = { path = "../standalone-cluster-plugin" }
+
+# Layer 2 (conformance) and Layer 3 (testcontainers) test binaries all require a
+# real Docker daemon, so each is gated behind `required-features =
+# ["integration"]` (TESTING.md §7). `cargo test -p cf-redis-cluster-plugin` with
+# no flag then skips *building* these binaries entirely, rather than building them
+# and skipping the test functions inside — which is what keeps a default test run
+# free of both Docker and the testcontainers dependency tree.
+[[test]]
+name = "conformance"
+required-features = ["integration"]
+
+[[test]]
+name = "cache_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "lock_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "watch_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "lifecycle_integration"
+required-features = ["integration"]
+
+[[test]]
+name = "redis_specific"
+required-features = ["integration"]

@@ -118,6 +118,69 @@ async fn list_repos_honours_the_limit_query_param() {
 }
 
 #[tokio::test]
+async fn an_oversized_filter_is_refused_before_it_reaches_sql() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = seeded(common::inmem_db().await, &ctx).await;
+    let router = router_for(service, ctx);
+
+    // One node per value: an `in` list this long is past the platform's
+    // 2,000-node complexity budget.
+    let values = (0..3_000)
+        .map(|n| format!("'r{n}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let request = Request::builder()
+        .uri(format!(
+            "/github-mirror/v1/repos?$filter=name%20in%20({values})"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "an oversized filter must be refused, not translated to SQL"
+    );
+
+    // Same for a filter that is merely enormous rather than deeply nested.
+    let long = "a".repeat(9 * 1024);
+    let request = Request::builder()
+        .uri(format!(
+            "/github-mirror/v1/repos?$filter=name%20eq%20'{long}'"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "filter too long"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_page_request_is_clamped_to_the_configured_maximum() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = seeded(common::inmem_db().await, &ctx).await;
+    let router = router_for(service, ctx);
+
+    let request = Request::builder()
+        .uri("/github-mirror/v1/repos?limit=1000000")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert!(
+        json["items"].as_array().expect("items").len() <= 200,
+        "the store holds fewer rows than the 200-row cap, so a huge limit          must come back as the seeded rows and never as an unbounded read: {json:?}"
+    );
+}
+
+#[tokio::test]
 async fn list_repos_returns_empty_page_on_a_clean_store() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;

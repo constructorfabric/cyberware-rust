@@ -26,7 +26,7 @@ const SAMPLE_USAGE_TYPE_ID: &str =
 fn make_client() -> UsageCollectorLocalClient {
     let hub = Arc::new(ClientHub::new());
     let enforcer = enforcer_for(Arc::new(UnreachableResolver));
-    let svc = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+    let svc = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
     UsageCollectorLocalClient::new(svc)
 }
 
