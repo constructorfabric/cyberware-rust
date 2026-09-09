@@ -2,6 +2,10 @@
 status: proposed
 date: 2026-09-08
 ---
+
+Created:  2026-09-08 by Constructor Tech
+Updated:  2026-09-09 by Constructor Tech
+
 # ADR-0005: Upward-Rooted Collection Read Under the No-Projection PEP Contract
 
 <!-- toc -->
