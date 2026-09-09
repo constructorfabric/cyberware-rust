@@ -523,6 +523,18 @@ When a tenant creates a credential record for a reference that currently resolve
 **Rationale**: The secret type is the contract between the credential and the application that reads it; a tenant must not be able to break that contract unilaterally by shadowing a credential with an incompatible one. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
 <!-- cpt-cf-id-content -->
 
+#### Override Category Consistency
+
+- [ ] `p1` - **ID**: `cpt-cf-credstore-fr-override-category-consistency`
+
+<!-- cpt-cf-id-content -->
+When a tenant writes a credential record for a reference that currently resolves to an ancestor's `shared` credential, the record's **category MUST equal** the category of the credential it overrides; a differing category **MUST** be rejected as a conflict. The rule applies to record creation and to any later category change, and it **MUST** be enforced in the domain layer rather than assumed: the check is an upward resolution of the reference, which the gear performs on every read already.
+
+The rule has a second consumer beyond its own meaning. Because a reference's category is then constant across the chain, an authorization or caller predicate over `category` can be pushed into the database as an ordinary scope clamp, which is what keeps a category-scoped application from making the database read every credential it may see. The gear **MUST NOT** depend on the invariant for correctness, because one path cannot be checked: an ancestor that changes or recreates its own `shared` credential cannot be validated against descendants, since the gear reads upward only and projects no descendant table. A violation **MUST** therefore degrade to a dropped catalogue entry and an operational signal, never to an entry the point read would refuse.
+
+**Rationale**: The category decides which application may read a value, so a reference whose category depends on which tenant you ask from is a reference whose access rules depend on the same. This mirrors `cpt-cf-credstore-fr-override-type-consistency`, which protects the shape of the value; this one protects who may read it. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
+<!-- cpt-cf-id-content -->
+
 - [ ] `p2` - **ID**: `cpt-cf-credstore-fr-suppression`
 
 <!-- cpt-cf-id-content -->
