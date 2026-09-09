@@ -49,6 +49,11 @@ mod order_ent {
 }
 
 impl ScopableEntity for order_ent::Entity {
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+        (pep_properties::OWNER_TENANT_ID, order_ent::Column::TenantId),
+        (pep_properties::RESOURCE_ID, order_ent::Column::Id),
+    ];
+
     fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
         Some(order_ent::Column::TenantId)
     }
@@ -60,16 +65,6 @@ impl ScopableEntity for order_ent::Entity {
     }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
-    }
-    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
-            _ => None,
-        }
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        vec![order_ent::Column::TenantId, order_ent::Column::Id]
     }
 }
 
@@ -106,6 +101,11 @@ mod item_ent {
 }
 
 impl ScopableEntity for item_ent::Entity {
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+        (pep_properties::OWNER_TENANT_ID, item_ent::Column::TenantId),
+        (pep_properties::RESOURCE_ID, item_ent::Column::Id),
+    ];
+
     fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
         Some(item_ent::Column::TenantId)
     }
@@ -117,16 +117,6 @@ impl ScopableEntity for item_ent::Entity {
     }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
-    }
-    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
-            _ => None,
-        }
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        vec![item_ent::Column::TenantId, item_ent::Column::Id]
     }
 }
 

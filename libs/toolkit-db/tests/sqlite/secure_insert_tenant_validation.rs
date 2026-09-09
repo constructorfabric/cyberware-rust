@@ -34,6 +34,11 @@ mod tenant_ent {
 }
 
 impl ScopableEntity for tenant_ent::Entity {
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[(
+        pep_properties::OWNER_TENANT_ID,
+        tenant_ent::Column::TenantId,
+    )];
+
     fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
         Some(tenant_ent::Column::TenantId)
     }
@@ -45,15 +50,6 @@ impl ScopableEntity for tenant_ent::Entity {
     }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
-    }
-    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            _ => None,
-        }
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        vec![tenant_ent::Column::TenantId]
     }
 }
 
@@ -77,6 +73,8 @@ mod unrestricted_ent {
 impl ScopableEntity for unrestricted_ent::Entity {
     const IS_UNRESTRICTED: bool = true;
 
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
     fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }
@@ -88,12 +86,6 @@ impl ScopableEntity for unrestricted_ent::Entity {
     }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
-    }
-    fn resolve_property(_property: &str) -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        Vec::new()
     }
 }
 

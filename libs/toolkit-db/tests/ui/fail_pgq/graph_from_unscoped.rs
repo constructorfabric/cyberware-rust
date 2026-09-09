@@ -33,6 +33,11 @@ mod test_entity {
     impl ActiveModelBehavior for ActiveModel {}
 
     impl toolkit_db::secure::ScopableEntity for Entity {
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+            ("owner_tenant_id", Column::TenantId),
+            ("id", Column::Id),
+        ];
+
         fn tenant_col() -> Option<Column> {
             Some(Column::TenantId)
         }
@@ -44,12 +49,6 @@ mod test_entity {
         }
         fn type_col() -> Option<Column> {
             None
-        }
-        fn resolve_property(_property: &str) -> Option<Column> {
-            Some(Column::TenantId)
-        }
-        fn scope_columns() -> Vec<Column> {
-            vec![Column::TenantId, Column::Id]
         }
     }
 }

@@ -14,6 +14,14 @@ use sea_orm::EntityTrait;
 /// # Example (Manual Implementation)
 /// ```rust,ignore
 /// impl ScopableEntity for user::Entity {
+///     // The property-to-column mapping, written once. `resolve_property`
+///     // and `scope_columns` are two views of this table, provided by the
+///     // trait, so they cannot describe different sets.
+///     const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+///         ("owner_tenant_id", user::Column::TenantId),
+///         ("id", user::Column::Id),
+///     ];
+///
 ///     fn tenant_col() -> Option<Self::Column> {
 ///         Some(user::Column::TenantId)
 ///     }
@@ -25,18 +33,6 @@ use sea_orm::EntityTrait;
 ///     }
 ///     fn type_col() -> Option<Self::Column> {
 ///         None
-///     }
-///     fn resolve_property(property: &str) -> Option<Self::Column> {
-///         match property {
-///             "owner_tenant_id" => Self::tenant_col(),
-///             "id" => Self::resource_col(),
-///             "owner_id" => Self::owner_col(),
-///             _ => None,
-///         }
-///     }
-///     fn scope_columns() -> Vec<Self::Column> {
-///         // Exactly the columns resolve_property can return.
-///         vec![user::Column::TenantId, user::Column::Id]
 ///     }
 /// }
 /// ```
@@ -59,10 +55,9 @@ use sea_orm::EntityTrait;
 ///     pub tenant_id: Uuid,
 ///     pub email: String,
 /// }
-/// // Macro auto-generates resolve_property:
-/// //   "owner_tenant_id" => Some(Column::TenantId)  (from tenant_col)
-/// //   "id"              => Some(Column::Id)         (from resource_col)
-/// //   _                 => None
+/// // Macro auto-generates SCOPE_PROPERTIES:
+/// //   ("owner_tenant_id", Column::TenantId)   (from tenant_col)
+/// //   ("id",              Column::Id)         (from resource_col)
 /// ```
 ///
 /// # Custom PEP Properties
@@ -82,11 +77,10 @@ use sea_orm::EntityTrait;
 ///     pub tenant_id: Uuid,
 ///     pub department_id: Uuid,
 /// }
-/// // Macro auto-generates resolve_property:
-/// //   "owner_tenant_id" => Some(Column::TenantId)      (from tenant_col)
-/// //   "id"              => Some(Column::Id)             (from resource_col)
-/// //   "department_id"   => Some(Column::DepartmentId)   (from pep_prop)
-/// //   _                 => None
+/// // Macro auto-generates SCOPE_PROPERTIES:
+/// //   ("owner_tenant_id", Column::TenantId)       (from tenant_col)
+/// //   ("id",              Column::Id)             (from resource_col)
+/// //   ("department_id",   Column::DepartmentId)   (from pep_prop)
 /// ```
 ///
 /// # Unrestricted Entities
@@ -140,38 +134,273 @@ pub trait ScopableEntity: EntityTrait {
     /// Must be explicitly specified via `type_col = "..."` or `no_type`.
     fn type_col() -> Option<Self::Column>;
 
+    /// Every authorization property this entity understands, paired with the
+    /// column that property means.
+    ///
+    /// The single place the mapping is written.
+    /// [`resolve_property`](Self::resolve_property) looks one property up in
+    /// it, [`scope_columns`](Self::scope_columns) lists its columns, and both
+    /// are provided by this trait, so the lookup and the list cannot describe
+    /// different sets.
+    ///
+    /// Usually the tenant, resource and owner columns plus any `pep_prop(...)`
+    /// columns, keyed by property name. Two entries may name one column.
+    /// [`type_col`](Self::type_col) belongs to no entry: no property name
+    /// addresses it, so no scope can address it either.
+    ///
+    /// `#[derive(Scopable)]` generates the table from the `#[secure(...)]`
+    /// attributes. A manual implementation writes it out:
+    ///
+    /// ```rust,ignore
+    /// const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+    ///     (pep_properties::OWNER_TENANT_ID, Column::TenantId),
+    ///     (pep_properties::RESOURCE_ID, Column::Id),
+    ///     ("department_id", Column::DepartmentId),
+    /// ];
+    /// ```
+    ///
+    /// An unrestricted entity declares an empty table.
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)];
+
     /// Resolve an authorization property name to a database column.
     ///
     /// Maps PEP property names (e.g. `"owner_tenant_id"`) to `SeaORM` columns
     /// so the scope condition builder can translate `AccessScope` constraints
-    /// into SQL `WHERE` clauses.
+    /// into SQL `WHERE` clauses. A property the entity does not declare
+    /// resolves to `None`, which the compiler treats as fail-closed.
     ///
-    /// When using `#[derive(Scopable)]`, this method is auto-generated from
-    /// dimension columns and `pep_prop(...)` entries:
-    /// - `tenant_col` → `"owner_tenant_id"`
-    /// - `resource_col` → `"id"`
-    /// - `owner_col` → `"owner_id"`
-    /// - `pep_prop(custom = "column")` → `"custom"`
-    ///
-    /// Manual implementors must provide all property arms explicitly.
+    /// Provided over [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES). Declare the
+    /// table rather than overriding this.
     #[must_use]
-    fn resolve_property(property: &str) -> Option<Self::Column>;
+    fn resolve_property(property: &str) -> Option<Self::Column> {
+        Self::SCOPE_PROPERTIES
+            .iter()
+            .find(|(name, _)| *name == property)
+            .map(|(_, column)| *column)
+    }
 
-    /// The columns a scope predicate can be compiled against: the same set
-    /// [`resolve_property`](Self::resolve_property) can return, as a list.
+    /// The columns a scope predicate can be compiled against: the columns of
+    /// [`SCOPE_PROPERTIES`](Self::SCOPE_PROPERTIES), in declaration order.
     ///
-    /// `resolve_property` maps one property name to a column and cannot be
-    /// enumerated. The SQL/PGQ graph declaration needs the whole set: a scope
-    /// column left out of an element's `PROPERTIES` list cannot be filtered on
-    /// inside `MATCH` (`docs/arch/secure-orm/ADR/0002`, Policy 3), and an
-    /// element whose set is empty is refused up front instead of compiling to a
-    /// deny-all traversal (Policy 2).
+    /// [`resolve_property`](Self::resolve_property) answers for one property
+    /// and cannot be enumerated, and the SQL/PGQ graph declaration needs the
+    /// whole set. A scope column left out of an element's `PROPERTIES` list
+    /// cannot be filtered on inside `MATCH` (`docs/arch/secure-orm/ADR/0002`,
+    /// Policy 3), and an element whose set is empty is refused up front rather
+    /// than compiling to a deny-all traversal (Policy 2).
     ///
-    /// Usually `tenant_col`, `resource_col` and `owner_col` plus any
-    /// `pep_prop(...)` columns. `type_col` is not part of it: no property name
-    /// resolves to it, so no scope can address it. `#[derive(Scopable)]`
-    /// generates this and `resolve_property` from the same attributes; a manual
-    /// implementation must keep the two in step.
+    /// Provided, like `resolve_property`. Declare the table rather than
+    /// overriding this.
     #[must_use]
-    fn scope_columns() -> Vec<Self::Column>;
+    fn scope_columns() -> Vec<Self::Column> {
+        Self::SCOPE_PROPERTIES
+            .iter()
+            .map(|(_, column)| *column)
+            .collect()
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::ScopableEntity;
+    use sea_orm::IdenStatic as _;
+    use toolkit_security::access_scope::pep_properties;
+
+    /// `DeriveEntityModel` does not derive `PartialEq` on `Column`, so columns
+    /// are compared by the name they render as — which is also what the graph
+    /// declaration writes into `PROPERTIES`.
+    fn table_of<E: ScopableEntity>() -> Vec<(&'static str, &'static str)> {
+        E::SCOPE_PROPERTIES
+            .iter()
+            .map(|(property, column)| (*property, column.as_str()))
+            .collect()
+    }
+
+    fn listed_columns<E: ScopableEntity>() -> Vec<&'static str> {
+        E::scope_columns()
+            .iter()
+            .map(sea_orm::IdenStatic::as_str)
+            .collect()
+    }
+
+    /// Every dimension the derive maps, plus a custom property, so the table
+    /// under test is not the trivial one.
+    mod derived {
+        use sea_orm::entity::prelude::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db_macros::Scopable)]
+        #[sea_orm(table_name = "scope_properties_derived")]
+        #[secure(
+            tenant_col = "tenant_id",
+            resource_col = "id",
+            owner_col = "owner_id",
+            type_col = "kind",
+            pep_prop(department_id = "department_id")
+        )]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: Uuid,
+            pub tenant_id: Uuid,
+            pub owner_id: Uuid,
+            pub kind: String,
+            pub department_id: Uuid,
+        }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+
+    mod unrestricted {
+        use sea_orm::entity::prelude::*;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db_macros::Scopable)]
+        #[sea_orm(table_name = "scope_properties_unrestricted")]
+        #[secure(unrestricted)]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: Uuid,
+            pub config_key: String,
+        }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
+    }
+
+    /// A hand-written implementation, written the way the trait documents.
+    /// Present so the property below is checked on the shape a gear writes,
+    /// not only on the derive's output.
+    mod manual {
+        use sea_orm::entity::prelude::*;
+        use toolkit_security::access_scope::pep_properties;
+
+        #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+        #[sea_orm(table_name = "scope_properties_manual")]
+        pub struct Model {
+            #[sea_orm(primary_key, auto_increment = false)]
+            pub id: Uuid,
+            pub tenant_id: Uuid,
+            pub department_id: Uuid,
+        }
+
+        #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+        pub enum Relation {}
+
+        impl ActiveModelBehavior for ActiveModel {}
+
+        impl crate::secure::ScopableEntity for Entity {
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+                (pep_properties::OWNER_TENANT_ID, Column::TenantId),
+                (pep_properties::RESOURCE_ID, Column::Id),
+                ("department_id", Column::DepartmentId),
+            ];
+
+            fn tenant_col() -> Option<Column> {
+                Some(Column::TenantId)
+            }
+            fn resource_col() -> Option<Column> {
+                Some(Column::Id)
+            }
+            fn owner_col() -> Option<Column> {
+                None
+            }
+            fn type_col() -> Option<Column> {
+                None
+            }
+        }
+    }
+
+    /// What the derive builds out of `#[secure(...)]`: one entry per dimension
+    /// that names a column, plus one per `pep_prop`, keyed by property name.
+    #[test]
+    fn the_derive_builds_the_table_from_the_attributes() {
+        assert_eq!(
+            table_of::<derived::Entity>(),
+            vec![
+                (pep_properties::OWNER_TENANT_ID, "tenant_id"),
+                (pep_properties::RESOURCE_ID, "id"),
+                (pep_properties::OWNER_ID, "owner_id"),
+                ("department_id", "department_id"),
+            ]
+        );
+    }
+
+    /// The property this change exists for (#4726): the lookup and the list are
+    /// two views of one table, so an entity cannot answer for a property whose
+    /// column the list omits, nor list a column no property resolves to.
+    ///
+    /// Checked for the derive and for a hand-written implementation, because
+    /// those were the two places that could drift when the two were written
+    /// separately.
+    #[test]
+    fn the_lookup_and_the_list_are_two_views_of_one_table() {
+        fn check<E: ScopableEntity>(what: &str) {
+            let table = table_of::<E>();
+            let listed = listed_columns::<E>();
+            assert_eq!(
+                listed.len(),
+                table.len(),
+                "{what}: the list must have one column per table entry"
+            );
+            for (index, (property, column)) in table.iter().enumerate() {
+                assert_eq!(
+                    E::resolve_property(property).map(|c| c.as_str()),
+                    Some(*column),
+                    "{what}: the lookup must answer every property the table declares"
+                );
+                assert_eq!(
+                    listed[index], *column,
+                    "{what}: the list must carry every column the table declares"
+                );
+            }
+        }
+
+        check::<derived::Entity>("derived");
+        check::<manual::Entity>("manual");
+        check::<unrestricted::Entity>("unrestricted");
+    }
+
+    /// A property no entry names resolves to nothing, which every caller reads
+    /// as fail-closed.
+    #[test]
+    fn an_undeclared_property_resolves_to_nothing() {
+        assert!(derived::Entity::resolve_property("no_such_property").is_none());
+        assert!(manual::Entity::resolve_property("no_such_property").is_none());
+    }
+
+    /// `type_col` is a dimension but not a scope property: no property name
+    /// addresses it, so a scope cannot either. Were it in the table, an entity
+    /// whose only dimension is `type_col` would pass the Policy 2 gates while
+    /// resolving nothing (`docs/arch/secure-orm/ADR/0002`).
+    #[test]
+    fn the_type_column_is_not_a_scope_property() {
+        assert_eq!(
+            derived::Entity::type_col().map(|c| c.as_str()),
+            Some("kind"),
+            "the fixture must declare a type column for this to mean anything"
+        );
+        assert!(
+            !table_of::<derived::Entity>()
+                .iter()
+                .any(|(_, column)| *column == "kind"),
+            "the type column must not be addressable as a property"
+        );
+        assert!(!listed_columns::<derived::Entity>().contains(&"kind"));
+    }
+
+    /// An unrestricted entity has nothing to scope by, and says so with one
+    /// empty table rather than with two separately-written empty answers.
+    #[test]
+    fn an_unrestricted_entity_declares_an_empty_table() {
+        use unrestricted::Entity;
+
+        const { assert!(unrestricted::Entity::IS_UNRESTRICTED) };
+        assert!(Entity::SCOPE_PROPERTIES.is_empty());
+        assert!(Entity::scope_columns().is_empty());
+        assert!(Entity::resolve_property(pep_properties::OWNER_TENANT_ID).is_none());
+    }
 }

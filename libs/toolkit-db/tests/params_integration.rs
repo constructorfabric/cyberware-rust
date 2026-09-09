@@ -91,6 +91,11 @@ mod ent {
 }
 
 impl ScopableEntity for ent::Entity {
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+        (pep_properties::OWNER_TENANT_ID, ent::Column::TenantId),
+        (pep_properties::RESOURCE_ID, ent::Column::Id),
+    ];
+
     fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
         Some(ent::Column::TenantId)
     }
@@ -102,16 +107,6 @@ impl ScopableEntity for ent::Entity {
     }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
-    }
-    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
-            _ => None,
-        }
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        vec![ent::Column::TenantId, ent::Column::Id]
     }
 }
 

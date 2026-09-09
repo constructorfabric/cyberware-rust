@@ -32,6 +32,8 @@ impl ActiveModelBehavior for ActiveModel {}
 impl ScopableEntity for Entity {
     const IS_UNRESTRICTED: bool = true;
 
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
     fn tenant_col() -> Option<Self::Column> {
         None
     }
@@ -46,13 +48,6 @@ impl ScopableEntity for Entity {
 
     fn type_col() -> Option<Self::Column> {
         None
-    }
-
-    fn resolve_property(_property: &str) -> Option<Self::Column> {
-        None
-    }
-    fn scope_columns() -> Vec<Self::Column> {
-        Vec::new()
     }
 }
 
