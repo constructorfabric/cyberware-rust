@@ -1,11 +1,26 @@
 use uuid::Uuid;
 
 use super::{CONTRACT_MAJOR, StorageError};
-use crate::models::{LeaseToken, PolicyId, QuotaId};
+use crate::models::{BootstrapBundle, ConfigDefaults, LeaseToken, PolicyId, QuotaId};
 
 #[test]
 fn contract_major_is_one_for_the_first_gear_major() {
     assert_eq!(CONTRACT_MAJOR, 1);
+}
+
+#[test]
+fn foundation_bundle_carries_the_contract_major_and_prd_defaults() {
+    let bundle = BootstrapBundle::foundation();
+    assert_eq!(bundle.contract_major, CONTRACT_MAJOR);
+    assert!(bundle.global_policy.is_none(), "seeded by a later feature");
+    assert_eq!(
+        bundle.config_defaults,
+        ConfigDefaults {
+            contention_timeout_ms: 0,
+            max_active_leases: 1000,
+            idempotency_retention_secs: 86_400,
+        }
+    );
 }
 
 #[test]

@@ -1425,18 +1425,6 @@ pub struct BootstrapBundle {
     pub global_policy: Option<PolicyDraft>,
 }
 
-impl BootstrapBundle {
-    /// Foundation bundle: schema check and default configuration rows only.
-    #[must_use]
-    pub fn foundation() -> Self {
-        Self {
-            contract_major: crate::storage_plugin::CONTRACT_MAJOR,
-            config_defaults: ConfigDefaults::default(),
-            global_policy: None,
-        }
-    }
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "models_tests.rs"]

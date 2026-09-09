@@ -6,14 +6,13 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    BootstrapBundle, CapPatch, ConfigDefaults, ContractRef, Decision, DecisionResult,
-    EnforcementMode, EvaluationAttribution, IdempotencySubjectKey, LeaseState, MetricId,
-    NotificationEventKind, OperationType, PageRequest, PageResult, PeriodType, PolicyId,
-    PolicyScope, ProjectionBinding, QuotaDebitPlan, QuotaId, QuotaPatch, QuotaSource, QuotaType,
-    ResourceProjection, ScopeError, SubjectRef, SubjectScope, UnknownValue, ValidityWindow,
+    CapPatch, ContractRef, Decision, DecisionResult, EnforcementMode, EvaluationAttribution,
+    IdempotencySubjectKey, LeaseState, MetricId, NotificationEventKind, OperationType, PageRequest,
+    PageResult, PeriodType, PolicyId, PolicyScope, ProjectionBinding, QuotaDebitPlan, QuotaId,
+    QuotaPatch, QuotaSource, QuotaType, ResourceProjection, ScopeError, SubjectRef, SubjectScope,
+    UnknownValue, ValidityWindow,
 };
 use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
-use crate::storage_plugin::CONTRACT_MAJOR;
 
 fn ts(secs: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(secs).expect("valid unix timestamp")
@@ -333,21 +332,6 @@ fn page_types_default_to_the_platform_page_size_and_map_items() {
     assert_eq!(mapped.items, vec![10, 20, 30]);
     assert_eq!(mapped.next_cursor.as_deref(), Some("c"));
     assert!(PageResult::<u8>::empty().items.is_empty());
-}
-
-#[test]
-fn foundation_bundle_carries_the_contract_major_and_prd_defaults() {
-    let bundle = BootstrapBundle::foundation();
-    assert_eq!(bundle.contract_major, CONTRACT_MAJOR);
-    assert!(bundle.global_policy.is_none(), "seeded by a later feature");
-    assert_eq!(
-        bundle.config_defaults,
-        ConfigDefaults {
-            contention_timeout_ms: 0,
-            max_active_leases: 1000,
-            idempotency_retention_secs: 86_400,
-        }
-    );
 }
 
 #[test]
