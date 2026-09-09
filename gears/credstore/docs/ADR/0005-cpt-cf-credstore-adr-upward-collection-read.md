@@ -120,7 +120,7 @@ This is the first row-reducing cursor pagination in the platform, so it is new c
 
 ### What stays out of the filter
 
-`inheritance` (own / inherited / overridden, and `suppressed` if adopted) is **not** filterable or sortable. It is not a column: it is the outcome of reducing a reference's rows across the chain, so it cannot be pushed into a `WHERE` clause, and filtering it after the query would silently shrink pages in a way the cursor cannot account for. Callers who want "only the platform defaults" or "only what is mine" filter on `owner_tenant_id`, which is an indexed column and expresses the same intent honestly.
+`inheritance` (own / inherited / overridden, and `suppressed` if adopted) is **not** filterable or sortable. It is not a column: it is the outcome of reducing a reference's rows across the chain, so it cannot be pushed into a `WHERE` clause, and filtering it after the query would silently shrink pages in a way the cursor cannot account for. The obvious substitute is not available either: `owner_tenant_id` is unfilterable for its own two reasons (see the table below), so "only what is mine" cannot be asked as a tenant predicate. It is asked as `inheritance` — read from each entry rather than filtered on — and a caller that wants only its own records reads the page and keeps the `own` ones. That costs a client-side pass over a bounded page, which is the price of a catalogue whose items are resolution outcomes rather than rows.
 
 A caller's own `$filter` obeys the same invariance rule as the policy clamp, for the same reason: a predicate over a field that varies across a chain cannot be pushed below the reduction without changing which row wins. So the allowlist splits in two.
 
