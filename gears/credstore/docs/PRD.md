@@ -26,7 +26,7 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
   - [5.5 P1 — Secret Types](#55-p1--secret-types)
   - [5.6 P1 — Deprovisioning Lifecycle](#56-p1--deprovisioning-lifecycle)
   - [5.7 P2 — Planned](#57-p2--planned)
-  - [5.8 P1 — Credential Records and Secret Values](#58-p1--credential-records-and-secret-values)
+  - [5.8 P1 — Planned — Credential Records and Secret Values](#58-p1--planned--credential-records-and-secret-values)
 - [6. Non-Functional Requirements](#6-non-functional-requirements)
   - [6.1 Gear-Specific NFRs](#61-gear-specific-nfrs)
 - [7. Public Library Interfaces](#7-public-library-interfaces)
@@ -331,6 +331,8 @@ The system **MUST** support retrieval on behalf of an arbitrary tenant by an aut
 <!-- cpt-cf-id-content -->
 Every operation **MUST** be authorized through the platform PDP: the gear evaluates an access scope for the operation's action (`read` for get, `write` for put/create, `delete` for delete) against the secret's resolved concrete GTS type (including `generic`), and **MUST** enforce the returned scope on every metadata query at the data layer, enabling per-type policies (e.g., a role that reads `api-key` but not `certificate` secrets). Enforcement is fail-closed: a PDP denial denies the operation; a PDP evaluation failure surfaces as unavailable; out-of-scope or type-denied secrets are indistinguishable from non-existent ones on read.
 
+**Superseded in part** by `cpt-cf-credstore-fr-authz-action-split`: the mechanism — one PDP evaluation per operation against the resolved concrete type, enforced in SQL, fail-closed — holds unchanged, but the action set does not. `read`/`write`/`delete` describes what ships today; the six actions replace it, with no synonym for the old pair, so every policy granting `read` or `write` is re-issued. The use cases below likewise describe the shipped combined flow, not the split one.
+
 **Rationale**: Real tenant isolation enforced in SQL, consistent with the platform policy plane; least privilege per action. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-oagw`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
@@ -419,7 +421,9 @@ The system **MUST** provide at least one production-grade value-store plugin (ex
 **Rationale**: The in-memory static plugin is suitable for development and testing only (values do not survive process restart). **Actors**: `cpt-cf-credstore-actor-backend`
 <!-- cpt-cf-id-content -->
 
-### 5.8 P1 — Credential Records and Secret Values
+### 5.8 P1 — Planned — Credential Records and Secret Values
+
+> **Planned, not shipped.** Every requirement in this section is specified by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) and [ADR-0005](./ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md), both of which are still `proposed`. What ships today is the combined secret-and-value contract of §5.1 through §5.6. The acceptance criteria in §9 that reference these IDs are planned on the same terms.
 
 #### Credential Record and Secret Value Split
 
@@ -513,6 +517,14 @@ Every record representation **MUST** state its relationship to the ancestor chai
 
 #### Tenant-Level Suppression
 
+- [ ] `p2` - **ID**: `cpt-cf-credstore-fr-suppression`
+
+<!-- cpt-cf-id-content -->
+The system **SHOULD** allow a tenant to declare that a credential is disabled for it even when an ancestor publishes one, so that value reads in that tenant and its descendants resolve as absent while the ancestor's credential is untouched.
+
+**Rationale**: Descendants need a way to opt out of an inherited credential without deleting or shadowing it at the ancestor's expense. **Actors**: `cpt-cf-credstore-actor-integrations-admin`
+<!-- cpt-cf-id-content -->
+
 #### Override Type Consistency
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-override-type-consistency`
@@ -533,14 +545,6 @@ When a tenant writes a credential record for a reference that currently resolves
 The rule has a second consumer beyond its own meaning. Because a reference's category is then constant across the chain, an authorization or caller predicate over `category` can be pushed into the database as an ordinary scope clamp, which is what keeps a category-scoped application from making the database read every credential it may see. The gear **MUST NOT** depend on the invariant for correctness, because one path cannot be checked: an ancestor that changes or recreates its own `shared` credential cannot be validated against descendants, since the gear reads upward only and projects no descendant table. A violation **MUST** therefore degrade to a dropped catalogue entry and an operational signal, never to an entry the point read would refuse.
 
 **Rationale**: The category decides which application may read a value, so a reference whose category depends on which tenant you ask from is a reference whose access rules depend on the same. This mirrors `cpt-cf-credstore-fr-override-type-consistency`, which protects the shape of the value; this one protects who may read it. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
-<!-- cpt-cf-id-content -->
-
-- [ ] `p2` - **ID**: `cpt-cf-credstore-fr-suppression`
-
-<!-- cpt-cf-id-content -->
-The system **SHOULD** allow a tenant to declare that a credential is disabled for it even when an ancestor publishes one, so that value reads in that tenant and its descendants resolve as absent while the ancestor's credential is untouched.
-
-**Rationale**: Descendants need a way to opt out of an inherited credential without deleting or shadowing it at the ancestor's expense. **Actors**: `cpt-cf-credstore-actor-integrations-admin`
 <!-- cpt-cf-id-content -->
 
 ## 6. Non-Functional Requirements
@@ -929,7 +933,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 | Secret values leaked through logs/caches | Critical security incident | NFR enforcement (redaction, zeroize, no-store responses), code review |
 | Metadata/backend divergence on partial saga failure | Orphaned backend values, temporarily wedged references | Compensating rollback; deprovisioning saga; reaper backend reconciliation with configurable timeouts; saga metrics |
 | PDP or tenant-resolver outage | Operations fail closed (unavailable) | Ancestor-chain cache absorbs blips; dependency metrics for fast diagnosis |
-| Ancestor-chain cache staleness | Briefly stale hierarchy after re-parenting | Short TTL + LRU; PDP scope still clamps every query |
+| Ancestor-chain cache staleness | A re-parented tenant keeps inheriting its former parent's `shared` credentials for up to the cache TTL | Short TTL + LRU. The own-tenant gate is **not** a control here: it validates the caller's tenant, not the ancestors the cached chain names, which is precisely what lets an inherited read work. Closing the window needs a hierarchy version or change signal from the tenant resolver, which is work outside this gear; until then the TTL is the settling time for credential inheritance after a move |
 | In-memory static plugin in non-dev use | Secret values lost on restart | Production vault plugin (`cpt-cf-credstore-fr-production-backend`); deployment policy |
 | Type-trait misconfiguration | Overly permissive or broken writes for a type | Compiled-in catalog pinned to registered GTS schemas by unit tests; catalog changes are code-reviewed SDK releases; `generic` keeps legacy behavior |
 

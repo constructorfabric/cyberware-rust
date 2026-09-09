@@ -216,6 +216,8 @@ The gear owns all secret metadata in its own `credstore_secrets` table; the back
 
 Every operation evaluates a PDP `AccessScope` for its action on the secret resource type (`gts.cf.core.credstore.secret.v1~`) and enforces that scope in SQL through SecureORM clamps on the metadata table. The shipped action set is `read`, `write`, `delete`; ADR-0004 splits it into `list_meta`, `read_meta`, `write_meta`, `read_value`, `write_value` and `delete` (`cpt-cf-credstore-fr-authz-action-split`, §4.3.2), and accepts neither `read` nor `write` as a synonym for any of them, so every policy granting the old pair is re-issued. Both read and write paths additionally gate on an explicit own-tenant invariant (`scope_includes_tenant`) and emit a `cross_tenant_denied` metric. Out-of-scope access is fail-closed and surfaces as the canonical 404 (anti-enumeration) or 403. Plugins MUST NOT implement authorization.
 
+**The collection read is the exception to "one evaluation per operation"** (§4.4): its resource is a concrete secret type, and a page can span several, so it evaluates `list_meta` once per distinct type the candidate probe found — bounded by the number of types a tenant actually uses, not by the page size, and cacheable per subject. Every other operation addresses exactly one row and therefore one type, so for those the single-evaluation rule holds unchanged.
+
 #### Tenant from SecurityContext
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-principle-tenant-from-ctx`
@@ -436,14 +438,16 @@ The machine-readable API is generated from the handlers: the platform-wide OpenA
 
 | Address | PDP action | Success | Key headers | Preconditions |
 |---|---|---|---|---|
-| `GET /credstore/v1/credentials` | `list_meta` | `200` | none — value-free by construction | OData `$filter`/`$orderby` on an indexed allowlist (§4.7), opaque cursor, `limit`; no total count |
-| `GET /credstore/v1/credentials/{ref}` | `read_meta` | `200` | `ETag` (the CAS validator source, D4 of the ADR) | — |
+| `GET /credstore/v1/credentials` | `list_meta` | `200` | `Cache-Control: no-store` — value-free, but the body varies by tenant and by subject | OData `$filter`/`$orderby` on an indexed allowlist (§4.7), opaque cursor, `limit`; no total count |
+| `GET /credstore/v1/credentials/{ref}` | `read_meta` | `200` | `ETag` (the CAS validator source, D4 of the ADR); `Cache-Control: no-store` | — |
 | `PUT /credstore/v1/credentials/{ref}` | `write_meta` | `201` create, `204` replace | `Location` **and `ETag`** on create; `ETag` on replace | `If-None-Match: *` (create-only, **409** if present), `If-Match: "<id>.<version>"` (guarded replace, 409 on mismatch), or `If-Match: *` (last-writer-wins) |
 | `DELETE /credstore/v1/credentials/{ref}` | `delete` | `204` | — | `If-Match` mandatory |
 | `GET /credstore/v1/credentials/{ref}/secret` | `read_value` | `200` | `Cache-Control: no-store`; audited | — |
 | `PUT /credstore/v1/credentials/{ref}/secret` | `write_value` | `204` | — | `If-Match` mandatory; the validator is read from the record, not from the value |
 | `POST /credstore/v1/credentials:read-secrets` | `read_value`, evaluated per item | `200` | `Cache-Control: no-store` | selector-based, capped, no precondition (see below) |
 | `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression` | `write_meta` (P2, not yet designed in full) | — | — | — |
+
+**Metadata responses are `no-store` too, not only value responses.** A record and a page of records carry no secret, but both vary by requesting tenant and by subject: the same URL legitimately yields a different catalogue to two callers, and an inherited entry depends on the caller's ancestor chain. An intermediary that cached one and served it to the other would disclose one tenant's catalogue to another — reconnaissance rather than value disclosure, but disclosure. The alternative, an identity-aware cache partition, would have to key on tenant *and* subject *and* the resolved chain, which is more contract than a catalogue read is worth. So every credential address, metadata included, is `no-store`; only the value addresses additionally carry per-value audit.
 
 **No `PATCH`, no `POST` on the collection.** Each resource has exactly one write verb, `PUT`; the intent of a write is carried by its precondition rather than by the verb. A partial-update verb would let a client change one field of a record (e.g. `sharing`) without ever holding the whole thing — precisely how an expiry gets dropped unnoticed by a `sharing` edit. `PUT` on the record is a whole-value replace of the mutable metadata: fields absent from the body reset to their defaults, exactly as today's value `PUT` already clears an omitted `expires_at`. `PUT` with `If-None-Match: *` already expresses create-only and keeps the write idempotent, which is what removes the need for a collection-level `POST`. The record's `type` stays immutable regardless of which precondition is used.
 
@@ -668,7 +672,20 @@ Created by the single `m0001_initial_schema` migration (§8). The table is a `Sc
 ALTER TABLE credstore_secrets ADD COLUMN category TEXT NULL;  -- validated at the domain layer (§5.2, §5.4)
 CREATE INDEX idx_credstore_category ON credstore_secrets (tenant_id, category);
 CREATE INDEX idx_credstore_type     ON credstore_secrets (tenant_id, secret_type_uuid);
+
+-- The `declared` status (§6.1) needs both of these, not just the column above:
+-- the initial CHECK admits 1..3 only, so `status = 4` cannot be stored, and
+-- the reaper's pending index covers every non-active row, so a deliberately
+-- long-lived `declared` record would be selected as a stale write and swept.
+ALTER TABLE credstore_secrets DROP CONSTRAINT credstore_secrets_status_check;
+ALTER TABLE credstore_secrets ADD  CONSTRAINT credstore_secrets_status_check
+  CHECK (status IN (1, 2, 3, 4));
+DROP INDEX idx_credstore_pending;
+CREATE INDEX idx_credstore_pending ON credstore_secrets (updated_at)
+  WHERE status IN (1, 3);   -- provisioning/deprovisioning only, never `declared`
 ```
+
+The reaper's stale-row selection narrows with that index: it reads `status IN (1, 3)` rather than `status <> 2`, so `declared` is excluded by the same predicate that drives the sweep instead of by an exception inside it (§6.4). SQLite has no `DROP CONSTRAINT`, so on that backend the widened `CHECK` arrives by table rebuild or is simply absent — the domain layer is the enforcing party either way, and the constraint is a backstop.
 
 `tenant_id` leads both, because no collection query omits the tenant-chain predicate. These two are not there for a future caller-supplied `$filter` only: they serve the **authorization clamp itself** (§4.4), which narrows candidate references by `category` and by type before the chain's rows are read. That is the difference between a category-scoped application reading its own handful of credentials and reading every credential it may see. `owner_id` is deliberately **not** indexed and not filterable: it selects the private key class, which resolution handles, and exposing it would let a caller probe other subjects' private references.
 
@@ -920,7 +937,7 @@ Sequence ID: `cpt-cf-credstore-seq-write-saga` (declared in §4.6).
 The gear's lifecycle entry (`serve`) runs a cancellable loop on `reaper.tick_secs` (default 60 s; delayed missed-tick behavior). Each tick:
 
 1. **Expiry sweep**: flip expired `active` rows (`expires_at <= now`) into the deprovisioning saga (they already stopped resolving at read time; this cleans the backend value and releases the reference).
-2. **List stale non-active rows** (bounded batch) older than `provisioning_timeout_secs` / `deprovisioning_timeout_secs` (both default 300 s), via the pending partial index.
+2. **List stale non-active rows** (bounded batch) older than `provisioning_timeout_secs` / `deprovisioning_timeout_secs` (both default 300 s), via the pending partial index. Planned with ADR-0004: the selection reads `status IN (1, 3)` rather than `status <> 2`, so a `declared` record — a resting state with no timeout — is never mistaken for a crashed write (§6.1, §4.7).
 3. **Backend reconciliation**: issue a best-effort `plugin.delete` for every stale row (closing the orphaned-value debt of §6.2); `NotFound` counts as success.
 4. **Remove rows**: `provisioning` rows unconditionally (the reference must not stay wedged); `deprovisioning` rows only after a successful backend delete — otherwise the row (and the name it holds) waits for the next tick. Counts → `provisioning_reaped` / `deprovisioning_reaped`. The asymmetry is deliberate: a `deprovisioning` row must hold the name until the backend is clean (releasing it early could let this saga's lagging delete erase a successor's value), while keeping a `provisioning` row on a failed backend delete would wedge the reference for as long as the backend stays unreachable. The cost is a possible orphaned backend value with no metadata row when step 3 fails for a reaped `provisioning` row — it is never readable (resolution requires a row) and is overwritten by the next create of the same reference; the accepted tradeoff mirrors §6.2's no-retry orphan.
 5. **Refresh inventory gauges** (row counts per status).
@@ -989,7 +1006,11 @@ Unchanged: prevents enumeration; per-secret access failures are indistinguishabl
 
 **Impact**: up to `ancestor_cache_ttl_secs` (300 s) of stale hierarchy — a re-parented tenant may briefly resolve secrets along the old chain.
 
-**Mitigation**: short TTL + LRU; the chain carries no caller-specific data (safe to share across security contexts); PDP scope still clamps every query, so a stale chain can widen *candidate rows* but never *authorized rows*.
+**Mitigation**: short TTL + LRU; the chain carries no caller-specific data (safe to share across security contexts).
+
+**What the mitigation does not cover, stated rather than implied.** The claim "a stale chain widens candidate rows but never authorized rows" holds for the *type* and *attribute* dimensions, which are checked against the row. It does **not** hold for the tenant dimension: the own-tenant gate validates the caller's own tenant, never the ancestors the chain names, because that is exactly what makes an inherited read work. So after a tenant is re-parented, a cached chain can keep naming the former parent, and that parent's `shared` rows keep resolving for up to the TTL. It is a bounded cross-tenant disclosure — one TTL wide, `shared` rows only, and only for a tenant that was actually moved — but it is a real one, and the gate is not the control for it.
+
+Closing it needs a signal this gear does not have: a hierarchy version or change notification from the Tenant Resolver, checked or subscribed to before a chain is trusted. That is work outside credstore, so the window is accepted here and recorded as a risk (§12) rather than designed away. Operators re-parenting a tenant should treat the TTL as the settling time for credential inheritance.
 
 **Likelihood**: Low | **Impact**: Medium | **Priority**: P2
 

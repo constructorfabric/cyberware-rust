@@ -107,8 +107,8 @@ The deciding arguments are D8 (metadata surfaces cannot carry a value because th
 
 | Address | Returns | PDP action | Notes |
 |---|---|---|---|
-| `GET /credstore/v1/credentials` | credential records (metadata), paginated | `list_meta` | value-free by construction; OData filter/order per `guidelines/DNA/REST/PAGINATION.md` |
-| `GET /credstore/v1/credentials/{ref}` | one credential record (metadata) | `read_meta` | carries the `ETag` — the CAS validator source (D4); `ETag` only for the tenant's own row |
+| `GET /credstore/v1/credentials` | credential records (metadata), paginated | `list_meta` | value-free by construction; `Cache-Control: no-store`, because the body varies by tenant and subject; OData filter/order per `guidelines/DNA/REST/PAGINATION.md` |
+| `GET /credstore/v1/credentials/{ref}` | one credential record (metadata) | `read_meta` | carries the `ETag` — the CAS validator source (D4); `ETag` only for the tenant's own row; `Cache-Control: no-store` |
 | `PUT /credstore/v1/credentials/{ref}` | — (201 on create with `ETag`, 204 on replace) | `write_meta` | create-or-replace of the **record only**: sharing, type, category, expiry. Preconditions carry the intent: `If-None-Match: *` create-only, `If-Match: "<etag>"` guarded replace, `If-Match: *` last-writer-wins |
 | `DELETE /credstore/v1/credentials/{ref}` | — (204) | `delete` | `If-Match` required; releases the reference |
 | `GET /credstore/v1/credentials/{ref}/secret` | the value + the record | `read_value` | `Cache-Control: no-store`; audited |
@@ -224,7 +224,12 @@ Cache-Control: no-store
         "expires_at": null
       }
     },
-    { "reference": "smtp-fallback", "outcome": "not_found" }
+    // No `not_found` entry appears under a filtered selector: a reference the
+    // filter found but the caller may not read is omitted entirely, because
+    // its name was never in the caller's hands. Under the *explicit*
+    // selector the same refusal does appear, as
+    // `{ "reference": "…", "outcome": "not_found" }`, because echoing back a
+    // name the caller just sent discloses nothing.
   ],
   "returned": 2,
   "cap": 25
@@ -252,7 +257,7 @@ Cache-Control: no-store
 - Contract tests: no response schema under `/credentials` or `/credentials/{ref}` contains a `value` property; `value_fp` and `fp_key_id` appear in no schema at all.
 - E2E: a role with `read_meta` but not `read_value` reads the record, obtains the `ETag`, completes a guarded `PUT …/secret`, and still receives 404 on `GET …/secret` — byte-identical to the 404 for a name that does not exist.
 - E2E: the bulk endpoint rejects a selector matching more than the cap with `TOO_MANY_MATCHES`; an item the caller may not read is reported identically to an item that does not exist; a fence-poisoned item does not affect its siblings.
-- E2E: an application granted `read_value` on one category receives exactly its own credentials for a `select` on that category, and an empty result for another category.
+- E2E: an application granted `read_value` on one category receives exactly its own credentials for a `$filter` on that category, and an empty result for another category.
 - E2E: the bulk endpoint accepts `$filter` but rejects `cursor`, `$orderby`, `$top` and `limit`; its response carries no `page_info`.
 - E2E: `PUT /credentials/{ref}` with `If-None-Match: *` returns 201 the first time and 412 the second; a `PUT` naming a different type is rejected; a `PUT` that omits expiry clears it.
 - E2E: a record created without a value returns 404 on its secret **and** an ancestor's inherited value keeps resolving for descendants while the record stays empty.
@@ -372,7 +377,7 @@ Compatibility is recorded here, not optimized for (D1).
 
 - Good: metadata surfaces cannot carry a value because the value is not part of that resource; the invariant is structural.
 - Good: one schema for the list item and the point record (D8); `ETag` naturally available to metadata readers (D4).
-- Good: `/credentials/*/secret` is a single glob for every disclosing route (D5).
+- Good: every disclosing route is its own path, so gateway policy, rate limits and audit selectors need no body inspection (D5). Not a single glob, though: `/credentials/*/secret` misses `POST /credentials:read-secrets`, so both addresses must be named — see Consequences.
 - Good: vocabulary matches the domain and converges with the existing `credentials-storage` service, which matters if the gear becomes its successor.
 - Bad: renames the collection and moves the value read; every HTTP consumer of a value changes.
 
