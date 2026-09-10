@@ -121,7 +121,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -131,6 +130,7 @@ use crate::domain::money::{CurrencyCode, MinorAmount};
 use crate::domain::price_record::PriceRecord;
 use crate::domain::scope_key::{ChargeKind, PhaseId, PlanId, Region};
 use crate::domain::window::KeyWindows;
+use time::OffsetDateTime;
 
 /// The §17.1 billing-cycle matrix: what commercial shape the plan is.
 ///
@@ -351,22 +351,28 @@ impl fmt::Display for Frequency {
 pub enum PhaseKind {
     /// A free or discounted trial phase; publishes `displayTrialDays`.
     Trial,
-    /// Introductory pricing before the evergreen rate.
-    Intro,
+    /// Any time-boxed non-trial phase before the terminal one — an introductory
+    /// price, an onboarding period, a ramp step. The token names the **slot**,
+    /// not a business meaning: the operator's word for the phase is
+    /// [`PlanPhase::display_name`] (D-357). It was `intro` until D-358, which
+    /// renamed it because the word promised "introductory pricing" while nothing
+    /// in this gear ever behaved differently for it — the only kind-dependent
+    /// rules are `trial`'s and the terminal's.
+    Interim,
     /// The steady-state phase. The only legal kind for the terminal phase.
     Evergreen,
 }
 
 impl PhaseKind {
     /// Every kind, stable order.
-    pub const ALL: &'static [Self] = &[Self::Trial, Self::Intro, Self::Evergreen];
+    pub const ALL: &'static [Self] = &[Self::Trial, Self::Interim, Self::Evergreen];
 
     /// The persisted / wire token.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Trial => "trial",
-            Self::Intro => "intro",
+            Self::Interim => "interim",
             Self::Evergreen => "evergreen",
         }
     }
@@ -404,8 +410,10 @@ pub struct CompositeMeter {
 }
 
 /// One row of `pricing_plan_phase`, as the rules read it.
+///
+/// Not `Copy` since D-357: the label is an owned string.
 #[domain_model]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanPhase {
     /// The phase's identity and the value of the `phase` scope-key axis.
     ///
@@ -413,8 +421,15 @@ pub struct PlanPhase {
     /// the phase rows under its own `plan_revision` and never re-mints the id,
     /// so continuing price rows keep pointing at the same phase.
     pub phase_id: PhaseId,
-    /// `trial` | `intro` | `evergreen`. Not terminality; see [`PhaseKind`].
+    /// `trial` | `interim` | `evergreen`. Not terminality; see [`PhaseKind`].
     pub kind: PhaseKind,
+    /// The operator's label — "Onboarding", "Ramp 2" — free-form and optional
+    /// (D-357). Not an identity (that is `phase_id`), not a scope-key axis, and
+    /// carrying no behaviour: `kind` answers what the phase *does*, this answers
+    /// what the operator *calls* it. Versions with the revision like every other
+    /// field here (D-83). `None` on the implicit terminal phase a non-phased plan
+    /// is given (D-19), which nobody authors.
+    pub display_name: Option<String>,
     /// The phase's position in the chain. The **lowest** ordinal is the entry
     /// phase (`inst-ph-graph`); see [`PhaseGraph::entry`].
     pub ordinal: i32,
@@ -712,7 +727,7 @@ pub struct PublishedBaseline {
     pub phase_ids_in_use: BTreeSet<PhaseId>,
     /// The published `available_from`, so a re-publish of an unchanged value
     /// is distinguishable from newly backdating one.
-    pub available_from: Option<DateTime<Utc>>,
+    pub available_from: Option<OffsetDateTime>,
     /// The published `available_to`.
     ///
     /// **Nothing reads it.** `infra::publish::published_baseline` populates it and
@@ -727,7 +742,7 @@ pub struct PublishedBaseline {
     /// It is carried rather than dropped because the availability rule's
     /// `available_to` half is the obvious next registration and the operand would
     /// otherwise have to be re-plumbed to write it.
-    pub available_to: Option<DateTime<Utc>>,
+    pub available_to: Option<OffsetDateTime>,
 }
 
 /// The subject the Slice-2 pipeline runs over: one plan revision's whole shape,
@@ -780,9 +795,9 @@ pub struct PlanShape {
     /// registry; see [`crate::domain::plan_rules`].
     pub plan_tier_override: bool,
     /// Start of the plan's availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    pub available_from: Option<OffsetDateTime>,
     /// End of the plan's availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
+    pub available_to: Option<OffsetDateTime>,
     /// Minimum purchasable quantity (one-time plans).
     pub purchase_min_qty: Option<u64>,
     /// Maximum purchasable quantity (one-time plans).
@@ -849,7 +864,7 @@ pub struct PlanShape {
     /// first publish; see [`PublishedBaseline`].
     pub baseline: Option<PublishedBaseline>,
     /// The instant the pipeline is being run at; see the module doc.
-    pub evaluated_at: DateTime<Utc>,
+    pub evaluated_at: OffsetDateTime,
 }
 
 impl PlanShape {
@@ -861,7 +876,7 @@ impl PlanShape {
     /// no `Default`: `evaluated_at` would derive to the Unix epoch, and an
     /// availability rule measured against 1970 answers confidently and wrongly.
     #[must_use]
-    pub fn new(plan_id: PlanId, revision: u64, evaluated_at: DateTime<Utc>) -> Self {
+    pub fn new(plan_id: PlanId, revision: u64, evaluated_at: OffsetDateTime) -> Self {
         Self {
             plan_id,
             revision,

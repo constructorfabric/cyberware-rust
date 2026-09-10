@@ -5,7 +5,6 @@
 //! Tenant-scoped via `SecureORM` (SQL-level BOLA); out-of-txn on a fresh scoped
 //! connection (the mode is admin-plane, never the hot money path).
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt, SecureInsertExt};
@@ -15,6 +14,7 @@ use uuid::Uuid;
 use crate::domain::fx::revaluation_mode::RevaluationMode;
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::fx_revaluation_mode;
+use time::OffsetDateTime;
 
 /// `SeaORM`-backed FX revaluation-mode repository.
 #[derive(Clone)]
@@ -44,7 +44,7 @@ impl FxRevaluationModeRepo {
         &self,
         scope: &AccessScope,
         tenant: Uuid,
-        at: DateTime<Utc>,
+        at: OffsetDateTime,
     ) -> Result<Option<RevaluationMode>, RepoError> {
         let conn = self
             .db
@@ -89,7 +89,7 @@ impl FxRevaluationModeRepo {
         scope: &AccessScope,
         tenant: Uuid,
         mode: RevaluationMode,
-        effective_from: DateTime<Utc>,
+        effective_from: OffsetDateTime,
     ) -> Result<i64, RepoError> {
         let conn = self
             .db
@@ -109,7 +109,7 @@ impl FxRevaluationModeRepo {
             version: Set(version),
             effective_from: Set(effective_from),
             revaluation_mode: Set(mode.as_str().to_owned()),
-            created_at_utc: Set(Utc::now()),
+            created_at_utc: Set(OffsetDateTime::now_utc()),
         };
         fx_revaluation_mode::Entity::insert(am.clone())
             .secure()
@@ -133,7 +133,7 @@ impl FxRevaluationModeRepo {
         runner: &R,
         scope: &AccessScope,
         tenant: Uuid,
-        at: DateTime<Utc>,
+        at: OffsetDateTime,
     ) -> Result<Option<RevaluationMode>, RepoError> {
         let row = fx_revaluation_mode::Entity::find()
             .secure()

@@ -19,8 +19,8 @@
 //! systematic transforms (drop the `bss.` prefix; `uuid` → `text`;
 //! `bytea` → `blob`; `timestamptz` → `text`).
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -50,9 +50,9 @@ pub struct Model {
     pub row_count: i64,
     /// Failure diagnostic when `status = failed` (id-only / no PII).
     pub error_detail: Option<String>,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// Set when the job reaches a terminal state (`succeeded` / `failed`).
-    pub completed_at_utc: Option<DateTime<Utc>>,
+    pub completed_at_utc: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

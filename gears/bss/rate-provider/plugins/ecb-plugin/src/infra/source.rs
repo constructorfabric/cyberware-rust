@@ -12,9 +12,10 @@ use bss_rate_provider_sdk::error::map_http_error;
 use bss_rate_provider_sdk::fetch::fetch_and_parse;
 use bss_rate_provider_sdk::metrics::SharedFetchMetrics;
 use bss_rate_provider_sdk::publication_time::reject_future_publication_time;
-use chrono::{NaiveDate, NaiveTime, Utc};
+use chrono::{Datelike, NaiveDate};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 use toolkit_http::HttpClient;
 use toolkit_security::SecurityContext;
 
@@ -276,6 +277,31 @@ fn record_currency_rate(
     }
 }
 
+/// The feed's civil date, anchored at midnight UTC — the same instant chrono's
+/// `NaiveDate::and_time(MIN).and_utc()` produced.
+///
+/// # Errors
+///
+/// [`RateProviderError::Internal`] when `time` cannot hold the date. chrono's
+/// `%Y-%m-%d` accepts a signed year past 9999 (`+12345-01-01`); on main such a
+/// document read as far-future and `reject_future_publication_time` refused it.
+/// An epoch fallback here would pass that guard and store the feed as
+/// permanently stale, with `as_of_unix = 0` reported as the fetch instant.
+fn publication_instant(date: NaiveDate) -> Result<OffsetDateTime, RateProviderError> {
+    let unrepresentable = || {
+        RateProviderError::Internal(format!(
+            "ECB publication date {date} is outside the range `time` represents"
+        ))
+    };
+    let month = u8::try_from(date.month())
+        .ok()
+        .and_then(|m| Month::try_from(m).ok())
+        .ok_or_else(unrepresentable)?;
+    let day = u8::try_from(date.day()).map_err(|_| unrepresentable())?;
+    let date = Date::from_calendar_date(date.year(), month, day).map_err(|_| unrepresentable())?;
+    Ok(PrimitiveDateTime::new(date, Time::MIDNIGHT).assume_utc())
+}
+
 /// Convert parsed ECB rows into `ProviderRate`s (base = EUR), each stamped with
 /// `provider` as its provenance. When `pairs` is non-empty, keep only the
 /// requested EUR-based quotes (others omitted, not an error). `as_of` is the
@@ -289,7 +315,8 @@ fn record_currency_rate(
 ///
 /// # Errors
 /// [`RateProviderError::Internal`] when entries were attempted and **all** of
-/// them failed conversion.
+/// them failed conversion, or when `date` is one `time` cannot hold (see
+/// `publication_instant`).
 ///
 /// [`RateProviderError::PairUnavailable`] when a non-empty `pairs` matched
 /// nothing this feed publishes — the contract's shared answer for "not served
@@ -302,7 +329,7 @@ pub fn ecb_rates_to_provider_rates(
     pairs: &[CurrencyPair],
     provider: &str,
 ) -> Result<Vec<ProviderRate>, RateProviderError> {
-    let as_of = date.and_time(NaiveTime::MIN).and_utc();
+    let as_of = publication_instant(date)?;
     let mut out = Vec::with_capacity(raw.len());
     let mut skipped: u64 = 0;
     for (quote, rate_str) in raw {
@@ -404,12 +431,12 @@ impl RateProviderV1 for EcbRateProvider {
         let request = self.client.get(&self.base_url);
         fetch_and_parse(request, &self.id, self.metrics.as_ref(), |bytes| {
             let (date, raw) = parse_ecb_xml(bytes)?;
-            let as_of = date.and_time(NaiveTime::MIN).and_utc();
+            let as_of = publication_instant(date)?;
             // A document dated far enough ahead reads as permanently fresh to
             // the ledger's age-based staleness rule.
-            reject_future_publication_time(as_of, Utc::now(), &self.id)?;
+            reject_future_publication_time(as_of, OffsetDateTime::now_utc(), &self.id)?;
             let rates = ecb_rates_to_provider_rates(date, &raw, pairs, &self.id)?;
-            Ok((rates, as_of.timestamp()))
+            Ok((rates, as_of.unix_timestamp()))
         })
         .await
     }

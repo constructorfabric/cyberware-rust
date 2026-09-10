@@ -21,7 +21,8 @@ use crate::domain::model::{EntryRecord, LineRecord};
 use crate::infra::storage::entity::{account_balance, ar_invoice_balance, journal_line};
 use crate::infra::storage::repo::journal_repo::OdataPageError;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -181,7 +182,7 @@ fn sample_ar_invoice_row() -> ar_invoice_balance::Model {
         disputed_minor: 0,
         functional_balance_minor: None,
         functional_currency: None,
-        original_posted_at: Some(Utc::now()),
+        original_posted_at: Some(OffsetDateTime::now_utc()),
         due_date: Some(NaiveDate::from_ymd_opt(2026, 1, 31).unwrap()),
         last_entry_seq: Some(7),
         version: 3,
@@ -272,7 +273,7 @@ fn sample_entry_record() -> EntryRecord {
         source_business_id: "BIZ-42".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: Uuid::now_v7(),
@@ -584,7 +585,7 @@ mod pg {
     /// A payment-shaped provision for `tenant`: the four money-flow chart
     /// accounts (CASH_CLEARING / UNALLOCATED / PSP_FEE_EXPENSE / AR) plus USD@2
     /// and a UTC monthly calendar. `provision` seeds the OPEN period for the
-    /// CURRENT month (settle/allocate derive `period_id` from `Utc::now()`).
+    /// CURRENT month (settle/allocate derive `period_id` from `OffsetDateTime::now_utc()`).
     pub(super) fn payment_provision_req(tenant: Uuid) -> ProvisionRequest {
         ProvisionRequest {
             tenant_id: tenant,

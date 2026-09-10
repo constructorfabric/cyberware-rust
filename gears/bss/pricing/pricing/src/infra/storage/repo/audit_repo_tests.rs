@@ -15,6 +15,7 @@ use super::{
     AuditPosition, after_position, bulk_operation_chain, overlay_chain, payer_chain, plan_chain,
     policy_chain,
 };
+use crate::domain::instant::from_unix;
 use crate::domain::scope_key::PlanId;
 
 /// The version nibble — the 13th hex digit, `xxxxxxxx-xxxx-Vxxx-…`.
@@ -256,7 +257,7 @@ fn rendered(position: AuditPosition) -> (String, String) {
 #[test]
 fn the_cursor_predicate_is_the_same_three_tier_shape_on_both_engines() {
     let (sqlite, postgres) = rendered(AuditPosition {
-        recorded_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant"),
+        recorded_at: from_unix(1_700_000_000, 0).expect("a valid instant"),
         chain_id: Uuid::from_u128(0x5eed),
         seq: 7,
     });
@@ -305,14 +306,14 @@ fn a_seq_beyond_the_columns_width_is_a_corrupt_row_and_not_a_silent_wrap() {
     // The positive control first: an ordinary seq converts, so the refusal below
     // is about the value and not about the function refusing everything.
     let ok = after_position(AuditPosition {
-        recorded_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant"),
+        recorded_at: from_unix(1_700_000_000, 0).expect("a valid instant"),
         chain_id: Uuid::from_u128(1),
         seq: u64::try_from(i64::MAX).expect("i64::MAX is a u64"),
     });
     assert!(ok.is_ok(), "the widest value the column holds must convert");
 
     let err = after_position(AuditPosition {
-        recorded_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant"),
+        recorded_at: from_unix(1_700_000_000, 0).expect("a valid instant"),
         chain_id: Uuid::from_u128(1),
         seq: u64::MAX,
     });

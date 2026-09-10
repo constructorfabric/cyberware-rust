@@ -11,6 +11,7 @@ pub mod close;
 pub mod enums;
 pub mod error;
 pub mod issued_invoice_manifest;
+pub mod odata;
 pub mod posting;
 pub mod provisioning;
 pub mod psp_settlement_feed;

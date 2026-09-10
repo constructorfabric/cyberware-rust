@@ -81,17 +81,26 @@
 //! job, not this module's; both primitives are transaction-agnostic exactly so
 //! a caller can do that.
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use time::OffsetDateTime;
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
 
+use bss_pricing_sdk::odata::MembershipFilterField;
+
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
+use crate::domain::instant::format_rfc3339;
 use crate::infra::storage::entity::group_membership;
+use crate::infra::storage::odata_mapping::{
+    LIST_LIMIT_CFG, MembershipODataMapper, OdataPageError, domain_page, map_odata_err,
+    query_with_default_order,
+};
 use crate::infra::storage::repo::{audit_repo, check_authored_instant};
 use crate::infra::storage::{RepoError, contention_or_db};
 
@@ -114,9 +123,9 @@ pub struct NewMembership {
     /// Taxonomy value — not validated here; see the module doc.
     pub group_value: String,
     /// Inclusive start of the half-open interval, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
 }
 
 /// One membership, read back into the vocabulary the rest of the system uses.
@@ -131,14 +140,14 @@ pub struct MembershipRow {
     /// The taxonomy value the payer is enrolled in over this interval.
     pub group_value: String,
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended — a membership not (yet)
     /// ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// Who recorded it — pseudonymous principal id.
     pub created_by: Uuid,
     /// When it was recorded, UTC.
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
     /// The row's concurrency token. See the module doc: nothing in this module
     /// compares against it yet.
     pub row_version: u64,
@@ -281,7 +290,7 @@ pub async fn end_membership(
     scope: &AccessScope,
     tenant_id: Uuid,
     membership_id: Uuid,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
     expected_version: u64,
     stamp: AuditStamp,
 ) -> Result<MembershipRow, RepoError> {
@@ -460,7 +469,7 @@ pub async fn memberships_in_group(
     tenant_id: Uuid,
     group_value: &str,
     payer_tenant_id: Option<Uuid>,
-    after: Option<(DateTime<Utc>, Uuid)>,
+    after: Option<(OffsetDateTime, Uuid)>,
     limit: u64,
 ) -> Result<Vec<MembershipRow>, RepoError> {
     let mut filter = Condition::all()
@@ -495,6 +504,54 @@ pub async fn memberships_in_group(
         .await
         .map_err(|e| RepoError::Db(format!("list pricing_group_membership: {e}")))?;
     rows.into_iter().map(to_domain).collect()
+}
+
+/// One `OData` page of a group's memberships. Path `{group}` stays in the SQL
+/// scope. Default order is `effective_from asc, membership_id asc`.
+///
+/// # Errors
+/// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+/// malformed `$filter` / `$orderby` / cursor.
+pub async fn list_odata(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    group_value: &str,
+    query: &ODataQuery,
+) -> Result<Page<MembershipRow>, OdataPageError> {
+    let base_select = group_membership::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(group_membership::Column::TenantId.eq(tenant_id))
+                .add(group_membership::Column::GroupValue.eq(group_value)),
+        );
+    let query = query_with_default_order(
+        query,
+        &[
+            MembershipFilterField::EffectiveFrom,
+            MembershipFilterField::MembershipId,
+        ],
+    );
+    let page = paginate_odata::<
+        MembershipFilterField,
+        MembershipODataMapper,
+        group_membership::Entity,
+        group_membership::Model,
+        _,
+        _,
+    >(
+        base_select,
+        runner,
+        &query,
+        ("membership_id", SortDir::Asc),
+        LIST_LIMIT_CFG,
+        |m| m,
+    )
+    .await
+    .map_err(map_odata_err)?;
+    domain_page(page, to_domain)
 }
 
 /// `inst-cg-resolve`'s narrowing rule: which of the payer's membership
@@ -532,7 +589,7 @@ pub async fn memberships_in_group(
 #[must_use]
 pub fn resolve_active_membership(
     intervals: &[MembershipRow],
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Option<&MembershipRow> {
     intervals
         .iter()
@@ -608,13 +665,13 @@ async fn record_membership_mutation(
 /// function's are.
 fn after_state(
     group_value: &str,
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
 ) -> serde_json::Value {
     serde_json::json!({
         "groupValue": group_value,
-        "effectiveFrom": effective_from.to_rfc3339(),
-        "effectiveTo": effective_to.map(|to| to.to_rfc3339()),
+        "effectiveFrom": format_rfc3339(effective_from),
+        "effectiveTo": effective_to.map(format_rfc3339),
     })
 }
 
@@ -658,8 +715,8 @@ async fn refuse_overlap(
     tenant_id: Uuid,
     payer_tenant_id: Uuid,
     group_value: &str,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
     except: Option<Uuid>,
 ) -> Result<(), RepoError> {
     for row in load_for_payer(runner, scope, tenant_id, payer_tenant_id).await? {
@@ -704,10 +761,10 @@ async fn refuse_overlap(
 /// collide (the half-open reading `pricing_group_membership`'s migration doc and the
 /// migration's own `[)` range spec both state).
 fn intersects(
-    a_from: DateTime<Utc>,
-    a_to: Option<DateTime<Utc>>,
-    b_from: DateTime<Utc>,
-    b_to: Option<DateTime<Utc>>,
+    a_from: OffsetDateTime,
+    a_to: Option<OffsetDateTime>,
+    b_from: OffsetDateTime,
+    b_to: Option<OffsetDateTime>,
 ) -> bool {
     let a_before_b_ends = b_to.is_none_or(|end| a_from < end);
     let b_before_a_ends = a_to.is_none_or(|end| b_from < end);
@@ -736,7 +793,7 @@ fn intersects(
 fn refuse_frozen_end(
     current: &MembershipRow,
     membership_id: Uuid,
-    recorded_at: DateTime<Utc>,
+    recorded_at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let Some(stored) = current.effective_to else {
         return Ok(());
@@ -749,8 +806,8 @@ fn refuse_frozen_end(
         frozen: format!(
             "its effective_to {} had already passed at {}; an elapsed interval is what a bill \
              was computed from",
-            stored.to_rfc3339(),
-            recorded_at.to_rfc3339()
+            format_rfc3339(stored),
+            format_rfc3339(recorded_at)
         ),
     })
 }
@@ -759,7 +816,10 @@ fn refuse_frozen_end(
 ///
 /// [`window_repo::refuse_empty_interval`](super::window_repo)'s reason and
 /// shape, over `chk_pricing_group_membership_interval`'s own CHECK.
-fn refuse_empty_interval(from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> Result<(), RepoError> {
+fn refuse_empty_interval(
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
+) -> Result<(), RepoError> {
     if to.is_none_or(|end| end > from) {
         return Ok(());
     }
@@ -772,10 +832,10 @@ fn refuse_empty_interval(from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> Resu
 /// [`window_repo::render_interval`](super::window_repo)'s reason: the bracket
 /// asymmetry and the spelled-out open end are both the rule an operator is
 /// being told about, not a formatting preference.
-fn render_interval(from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> String {
+fn render_interval(from: OffsetDateTime, to: Option<OffsetDateTime>) -> String {
     match to {
-        Some(to) => format!("[{}, {})", from.to_rfc3339(), to.to_rfc3339()),
-        None => format!("[{}, open-ended)", from.to_rfc3339()),
+        Some(to) => format!("[{}, {})", format_rfc3339(from), format_rfc3339(to)),
+        None => format!("[{}, open-ended)", format_rfc3339(from)),
     }
 }
 

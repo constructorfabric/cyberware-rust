@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, Query};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_security::SecurityContext;
@@ -21,7 +21,9 @@ use crate::api::rest::canonical_json::CanonicalJson;
 use crate::api::rest::error::authz_error_to_canonical;
 use crate::domain::error::DomainError;
 use crate::domain::fx::revaluation_mode::RevaluationMode;
+use crate::domain::instant::rfc3339;
 use crate::infra::storage::repo::FxRevaluationModeRepo;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the FX revaluation-mode operations.
 const TAG: &str = "BSS Ledger FX Revaluation Mode";
@@ -45,7 +47,8 @@ pub struct SetFxRevaluationModeRequest {
     /// unrealized revaluation).
     pub revaluation_mode: String,
     /// When this version takes effect; defaults to now.
-    pub effective_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_from: Option<OffsetDateTime>,
 }
 
 /// The written FX revaluation-mode version (the minted `version` + the value it
@@ -56,7 +59,8 @@ pub struct FxRevaluationModeResponse {
     /// The minted version (`max + 1`, `0` for the first).
     pub version: i64,
     /// The instant this version takes effect.
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// `MODE_A` | `MODE_B`.
     pub revaluation_mode: String,
 }
@@ -168,7 +172,7 @@ async fn set_mode(
     .map_err(authz_error_to_canonical)?;
     let mode = RevaluationMode::parse(&body.revaluation_mode)
         .map_err(|e| CanonicalError::from(DomainError::InvalidRequest(e.to_string())))?;
-    let effective_from = body.effective_from.unwrap_or_else(Utc::now);
+    let effective_from = body.effective_from.unwrap_or_else(OffsetDateTime::now_utc);
     let version = state
         .fx_revaluation_mode
         .write_version(&scope, tenant_id, mode, effective_from)
@@ -214,7 +218,7 @@ async fn get_mode(
     .map_err(authz_error_to_canonical)?;
     let effective = state
         .fx_revaluation_mode
-        .read_effective_mode(&scope, tenant_id, Utc::now())
+        .read_effective_mode(&scope, tenant_id, OffsetDateTime::now_utc())
         .await
         .map_err(|e| {
             CanonicalError::from(DomainError::Internal(format!(

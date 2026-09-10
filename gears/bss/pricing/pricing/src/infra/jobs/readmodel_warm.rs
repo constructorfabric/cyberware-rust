@@ -133,7 +133,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bss_pricing_sdk::{CatalogVersion, PinFrontier};
-use chrono::{DateTime, Utc};
+
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -152,6 +152,7 @@ use crate::infra::storage::repo::{
     outbox_repo, pin_frontier_repo,
 };
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// The `pricing_pin_frontier` rows one pass reads for the pin-eligibility
 /// alarm. One row per tenant that has ever completed a version, so this bounds
@@ -447,7 +448,7 @@ impl ReadModelWarmJob {
     /// [`DomainError::Internal`] only when the pass cannot start — the tenant
     /// discovery read itself failing. Everything after that is isolated within
     /// the pass.
-    pub async fn run(&self, now: DateTime<Utc>) -> Result<SweepReport, DomainError> {
+    pub async fn run(&self, now: OffsetDateTime) -> Result<SweepReport, DomainError> {
         let conn = self
             .db
             .conn()
@@ -505,7 +506,7 @@ impl ReadModelWarmJob {
         &self,
         conn: &impl DBRunner,
         tenant_id: Uuid,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut SweepReport,
         still_pending: &mut Vec<PendingVersionRow>,
     ) -> bool {
@@ -598,7 +599,7 @@ impl ReadModelWarmJob {
         conn: &impl DBRunner,
         tenant_id: Uuid,
         observed: &BTreeMap<String, CatalogVersion>,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut SweepReport,
         still_pending: &mut Vec<PendingVersionRow>,
     ) {
@@ -659,11 +660,10 @@ impl ReadModelWarmJob {
         &self,
         conn: &impl DBRunner,
         pending: &[PendingVersionRow],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut SweepReport,
     ) {
-        let threshold = match chrono::Duration::from_std(self.jobs.catalog_version_overdue_after())
-        {
+        let threshold = match time::Duration::try_from(self.jobs.catalog_version_overdue_after()) {
             Ok(threshold) => threshold,
             Err(e) => {
                 unconvertible_threshold(
@@ -686,7 +686,7 @@ impl ReadModelWarmJob {
         // against the per-pass ceiling of
         // `pending_tenants_per_pass x pending_refs_per_tenant` that is a five-figure
         // scan on a five-second tick, for an answer one map holds.
-        let mut oldest_pending: BTreeMap<Uuid, DateTime<Utc>> = BTreeMap::new();
+        let mut oldest_pending: BTreeMap<Uuid, OffsetDateTime> = BTreeMap::new();
         for row in pending {
             oldest_pending
                 .entry(row.tenant_id)
@@ -702,7 +702,7 @@ impl ReadModelWarmJob {
         for (tenant_id, frontier) in tenants {
             let stale = frontier
                 .as_ref()
-                .is_none_or(|f| now.signed_duration_since(f.advanced_at) >= threshold);
+                .is_none_or(|f| (now - f.advanced_at) >= threshold);
             if !stale {
                 continue;
             }
@@ -715,7 +715,7 @@ impl ReadModelWarmJob {
             // at a five-second tick.
             let waiting = oldest_pending
                 .get(&tenant_id)
-                .is_some_and(|at| now.signed_duration_since(*at) >= threshold);
+                .is_some_and(|at| (now - *at) >= threshold);
             // **The frontier row this pass already read, not a second read of
             // it**. `frontier_is_blocked` used
             // to open with its own `pin_frontier_repo::read_at`, which returns the
@@ -854,7 +854,7 @@ impl ReadModelWarmJob {
         &self,
         conn: &impl DBRunner,
         pending: &[PendingVersionRow],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut SweepReport,
     ) -> Option<Resolution> {
         let ctx = SecurityContext::anonymous();
@@ -995,7 +995,7 @@ impl ReadModelWarmJob {
         &self,
         conn: &impl DBRunner,
         row: &PendingVersionRow,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) {
         if row.commit_observed_at.is_some() {
             return;
@@ -1034,7 +1034,7 @@ impl ReadModelWarmJob {
         tenant_id: Uuid,
         by_version: BTreeMap<CatalogVersion, Vec<PendingVersionRow>>,
         coverage: PassCoverage,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut SweepReport,
     ) {
         let scope = AccessScope::for_tenant(tenant_id);
@@ -1083,15 +1083,14 @@ impl ReadModelWarmJob {
     fn observe_commit_overdue(
         &self,
         row: &PendingVersionRow,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut SweepReport,
     ) {
         if row.commit_observed_at.is_some() {
             return;
         }
-        let waited = now.signed_duration_since(row.requested_at);
-        let threshold = match chrono::Duration::from_std(self.jobs.catalog_version_overdue_after())
-        {
+        let waited = now - row.requested_at;
+        let threshold = match time::Duration::try_from(self.jobs.catalog_version_overdue_after()) {
             Ok(threshold) => threshold,
             Err(e) => {
                 unconvertible_threshold(e, "catalog_version_overdue_after", ALARM_COMMIT_OVERDUE);
@@ -1108,7 +1107,7 @@ impl ReadModelWarmJob {
             pending_ref = %row.pending_ref,
             subject_kind = %row.subject_kind,
             subject_ref = %row.subject_ref,
-            waited_secs = waited.num_seconds(),
+            waited_secs = waited.whole_seconds(),
             "bss-pricing: a catalog version request has stood pending past the max batching \
              delay with no answer from the registry; remediation is a registry re-request, never \
              a silent re-emit"
@@ -1133,13 +1132,13 @@ impl ReadModelWarmJob {
         &self,
         row: &PendingVersionRow,
         observed: Option<&CatalogVersion>,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut SweepReport,
     ) {
         let Some(seen_at) = row.commit_observed_at else {
             return;
         };
-        let threshold = match chrono::Duration::from_std(self.jobs.readmodel_degraded_after()) {
+        let threshold = match time::Duration::try_from(self.jobs.readmodel_degraded_after()) {
             Ok(threshold) => threshold,
             Err(e) => {
                 unconvertible_threshold(
@@ -1150,7 +1149,7 @@ impl ReadModelWarmJob {
                 return;
             }
         };
-        if now.signed_duration_since(seen_at) < threshold {
+        if (now - seen_at) < threshold {
             return;
         }
         let Some(version) = observed.copied() else {
@@ -1301,8 +1300,8 @@ impl ReadModelWarmJob {
         &self,
         row: &PendingVersionRow,
         catalog_version: CatalogVersion,
-        commit_observed_at: DateTime<Utc>,
-        now: DateTime<Utc>,
+        commit_observed_at: OffsetDateTime,
+        now: OffsetDateTime,
         report: &mut SweepReport,
     ) -> bool {
         if row.subject_kind != SubjectKind::Plan {

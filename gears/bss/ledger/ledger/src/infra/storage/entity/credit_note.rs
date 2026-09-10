@@ -12,8 +12,8 @@
 //! (`recognized_minor <= total_deferred_minor`) is guarded on
 //! `recognition_schedule` (Slice 4), both written under the lock order.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ pub struct Model {
     pub deferred_part_minor: i64,
     pub split_basis_ref: Option<String>,
     pub reason_code: String,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

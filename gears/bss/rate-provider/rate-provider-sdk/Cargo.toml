@@ -43,8 +43,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Error propagation for the shared gear-wiring helpers (registration, HTTP client build).
 anyhow = { workspace = true }
-# `DateTime<Utc>` arithmetic for the shared publication-time (clock-skew) guard.
-chrono = { workspace = true }
+# `OffsetDateTime` arithmetic for the shared publication-time (clock-skew) guard.
+time = { workspace = true }
 
 [dev-dependencies]
 # fetch_tests.rs drives `fetch_and_parse` over a real in-process HTTP server

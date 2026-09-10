@@ -5,14 +5,13 @@
 //! accepting anything is indistinguishable from a function that refuses
 //! everything, which is the shape a guard clause takes when its operand is wrong.
 
-use chrono::{DateTime, TimeZone, Utc};
-
 use super::check_tightening;
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
+use time::OffsetDateTime;
 
-fn at(day: i64) -> DateTime<Utc> {
-    Utc.timestamp_opt(1_800_000_000 + day * 86_400, 0)
-        .single()
+fn at(day: i64) -> OffsetDateTime {
+    crate::domain::instant::from_unix(1_800_000_000 + day * 86_400, 0)
         .expect("a representable instant")
 }
 
@@ -38,7 +37,7 @@ fn moving_a_horizon_later_is_refused() {
     // Both instants, because the author corrects one value: a message naming only
     // the submitted one leaves them guessing what it had to beat.
     assert!(
-        detail.contains(&at(10).to_rfc3339()) && detail.contains(&at(30).to_rfc3339()),
+        detail.contains(&format_rfc3339(at(10))) && detail.contains(&format_rfc3339(at(30))),
         "the refusal must name the published horizon and the submitted one: {detail}"
     );
 }
@@ -63,6 +62,6 @@ fn an_unchanged_horizon_is_refused_rather_than_treated_as_a_no_op() {
 #[test]
 fn the_smallest_real_tightening_is_accepted() {
     let published = at(10);
-    let proposed = published - chrono::TimeDelta::milliseconds(1);
+    let proposed = published - time::Duration::milliseconds(1);
     check_tightening(Some(published), proposed).expect("one millisecond earlier is earlier");
 }

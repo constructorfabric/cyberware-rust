@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bss_pricing::domain::audit::AuditStamp;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::CurrencyCode;
 use bss_pricing::domain::overlay::{
     Adjustment, AmountSet, Disclosure, LineKey, OverlayInterval, OverlayLine, ScopeClass,
@@ -40,7 +41,7 @@ use bss_pricing::domain::overlay::{
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewOverlay, OverlayRepo};
-use chrono::{TimeZone, Utc};
+
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
@@ -126,10 +127,7 @@ impl Visit for StatementText {
 fn stamp() -> AuditStamp {
     AuditStamp {
         actor_principal_id: Uuid::from_u128(0x4444),
-        recorded_at: Utc
-            .with_ymd_and_hms(2099, 1, 1, 0, 0, 0)
-            .single()
-            .expect("a valid instant"),
+        recorded_at: utc_ymd_hms(2099, 1, 1, 0, 0, 0),
         correlation_id: Uuid::from_u128(0x5555),
     }
 }

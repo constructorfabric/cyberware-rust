@@ -16,11 +16,15 @@
 //! — when `effective_at` is `None` — `effective_at`).
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostEntry, PostLine, Side, SourceDocType};
-use chrono::{DateTime, Utc};
+
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use chrono::NaiveDate;
+
 use crate::domain::error::DomainError;
+use crate::domain::instant::to_naive_date;
+use time::OffsetDateTime;
 
 /// A settled payment to post (Pattern A input). `gross_minor` is the amount the
 /// payer was charged; `fee_minor` is the processor's cut withheld from it.
@@ -44,7 +48,7 @@ pub struct SettlementInput {
     pub currency: String,
     /// Settlement instant. `None` ⇒ a placeholder effective date the orchestrator
     /// overwrites before posting (see module docs).
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// Build the balanced Pattern-A settlement entry for `input`.
@@ -154,10 +158,10 @@ pub fn build_settlement_entry(input: &SettlementInput) -> Result<PostEntry, Doma
         entry_currency: input.currency.clone(),
         source_doc_type: SourceDocType::PaymentSettle,
         source_business_id: input.payment_id.clone(),
-        effective_at: input
-            .effective_at
-            .unwrap_or(DateTime::UNIX_EPOCH)
-            .date_naive(),
+        effective_at: input.effective_at.map_or(
+            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or(NaiveDate::MIN),
+            to_naive_date,
+        ),
         posted_by_actor_id: Uuid::nil(),
         correlation_id: Uuid::nil(),
         reverses_entry_id: None,

@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use super::{DEFAULT_LIMIT, MAX_LIMIT, PageRequest, decode, encode, page_info};
 use crate::domain::error::DomainError;
+use crate::domain::instant::from_unix;
 
 /// **D-125's two numbers, pinned to their numbers.**
 ///
@@ -121,15 +122,14 @@ fn the_envelope_says_null_forward_when_the_result_is_exhausted() {
 /// instant whose nanoseconds are not a whole microsecond.
 #[test]
 fn an_interval_cursor_round_trips_to_the_nanosecond() {
-    let at = chrono::DateTime::from_timestamp(1_785_000_000, 123_456_789)
-        .expect("a representable instant");
+    let at = from_unix(1_785_000_000, 123_456_789).expect("a representable instant");
     let id = Uuid::from_u128(0x_c0_de);
 
     let token = super::encode_instant_and_id(at, id);
     let (back_at, back_id) = super::decode_instant_and_id(&token).expect("our own token decodes");
 
     assert_eq!(back_at, at, "the instant survives whole");
-    assert_eq!(back_at.timestamp_subsec_nanos(), 123_456_789);
+    assert_eq!(back_at.nanosecond(), 123_456_789);
     assert_eq!(back_id, id);
     // **The encoder, pinned by its bytes**, as the other two shapes are — one by a
     // length and one by a literal. A round trip constrains the pair `encode`/`decode`
@@ -159,7 +159,7 @@ fn an_interval_cursor_round_trips_to_the_nanosecond() {
 /// "not one this surface issued" refusal in both directions.
 #[test]
 fn neither_cursor_shape_accepts_the_others_token() {
-    let at = chrono::DateTime::from_timestamp(1_785_000_000, 0).expect("a representable instant");
+    let at = from_unix(1_785_000_000, 0).expect("a representable instant");
     let id = Uuid::from_u128(0x_c0_de);
 
     let interval_token = super::encode_instant_and_id(at, id);
@@ -200,7 +200,7 @@ fn the_interval_request_takes_the_same_limit_rules() {
         "a page of zero rows never advances and is refused here too"
     );
 
-    let at = chrono::DateTime::from_timestamp(1_785_000_000, 7).expect("a representable instant");
+    let at = from_unix(1_785_000_000, 7).expect("a representable instant");
     let id = Uuid::from_u128(0x_beef);
     let resumed =
         super::IntervalPageRequest::parse(Some(5), Some(&super::encode_instant_and_id(at, id)))
@@ -219,7 +219,7 @@ fn the_interval_envelope_says_null_forward_when_exhausted() {
     assert_eq!(exhausted.prev_cursor, None);
     assert_eq!(exhausted.limit, 10);
 
-    let at = chrono::DateTime::from_timestamp(1_785_000_000, 0).expect("a representable instant");
+    let at = from_unix(1_785_000_000, 0).expect("a representable instant");
     let more = super::interval_page_info(Some((at, Uuid::from_u128(1))), 10);
     assert_eq!(
         more.next_cursor,
@@ -307,7 +307,7 @@ fn an_undecodable_revision_cursor_is_a_malformed_request() {
 /// refusal.
 #[test]
 fn the_revision_cursor_and_the_other_two_shapes_refuse_each_other() {
-    let at = chrono::DateTime::from_timestamp(1_785_000_000, 0).expect("a representable instant");
+    let at = from_unix(1_785_000_000, 0).expect("a representable instant");
     let id = Uuid::from_u128(0x_c0_de);
 
     let plain_token = encode(id);

@@ -2018,6 +2018,229 @@ fn build_string_matcher_rejects_in_list() {
 }
 
 #[test]
+fn id_set_matcher_is_exact_and_hashes_the_normalized_set() {
+    let first = Uuid::from_u128(1);
+    let second = Uuid::from_u128(2);
+    let node = FilterNode::InList {
+        field: IdpUserFilterField::Id,
+        values: vec![
+            ODataValue::Uuid(second),
+            ODataValue::Uuid(first),
+            ODataValue::Uuid(second),
+        ],
+    };
+    let matcher = UserFacade::build_string_matcher(Some(&node)).expect("UUID set supported");
+    assert_eq!(
+        matcher,
+        StringMatcher::IdSet([first, second].into_iter().collect())
+    );
+    let user: UserRep =
+        serde_json::from_value(serde_json::json!({"id": first, "username": "alice"}))
+            .expect("user");
+    assert!(matcher.matches(&user));
+    let unrelated: UserRep =
+        serde_json::from_value(serde_json::json!({"id": Uuid::from_u128(3), "username": "alice"}))
+            .expect("user");
+    assert!(!matcher.matches(&unrelated));
+    let reordered = StringMatcher::IdSet([second, first].into_iter().collect());
+    let hash = UserFacade::filter_hash(Uuid::nil(), "platform", None, &matcher);
+    assert_eq!(
+        hash,
+        UserFacade::filter_hash(Uuid::nil(), "platform", None, &reordered)
+    );
+    assert_ne!(
+        hash,
+        UserFacade::filter_hash(
+            Uuid::nil(),
+            "platform",
+            None,
+            &StringMatcher::IdSet([first].into_iter().collect())
+        )
+    );
+    assert!(!StringMatcher::IdSet(std::collections::BTreeSet::new()).matches(&user));
+    let and = FilterNode::and(vec![
+        node.clone(),
+        FilterNode::binary(
+            IdpUserFilterField::Username,
+            FilterOp::Eq,
+            lit_string("bob"),
+        ),
+    ]);
+    assert!(
+        !UserFacade::build_string_matcher(Some(&and))
+            .expect("AND")
+            .matches(&user)
+    );
+    let or = FilterNode::or(vec![
+        node,
+        FilterNode::binary(
+            IdpUserFilterField::Username,
+            FilterOp::Eq,
+            lit_string("bob"),
+        ),
+    ]);
+    assert!(
+        UserFacade::build_string_matcher(Some(&or))
+            .expect("OR")
+            .matches(&user)
+    );
+}
+
+#[test]
+fn id_set_matcher_refuses_non_uuid_values_without_widening_the_filter() {
+    let node = FilterNode::InList {
+        field: IdpUserFilterField::Id,
+        values: vec![
+            ODataValue::Uuid(Uuid::from_u128(1)),
+            lit_string("not-a-uuid"),
+        ],
+    };
+    assert!(matches!(
+        UserFacade::build_string_matcher(Some(&node)),
+        Err(PluginError::UserOpUnsupported { .. })
+    ));
+}
+
+#[tokio::test]
+async fn batch_user_ids_share_one_membership_read_and_exclude_unrequested_users() {
+    let server = MockServer::start().await;
+    temp_env::async_with_vars([("TEST_REALM_ADMIN_SECRET", Some("ra"))], async move {
+        mount_token_endpoint(&server, "platform").await;
+        let group = Uuid::new_v4();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let absent = Uuid::from_u128(4);
+        Mock::given(method("GET"))
+            .and(path(format!("/admin/realms/platform/groups/{group}/members")))
+            .and(query_param("first", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": first, "username": "alice", "createdTimestamp": 1000},
+                {"id": second, "username": "bob", "firstName": "Bob", "lastName": "Builder", "createdTimestamp": 2000},
+                {"id": Uuid::from_u128(3), "username": "unrequested", "createdTimestamp": 3000}
+            ])))
+            .expect(1)
+            .mount(&server).await;
+        let query = account_management_sdk::ListUsersQuery::with_ids([second, first, absent]).expect("batch");
+        let req = list_users_req(Uuid::new_v4(), Some(make_metadata("platform", RealmBinding::Shared, group, None)), query.pagination, None)
+            .with_filter(query.filter.expect("ID set"));
+        let page = build_facade(&server).list_users_inner(&build_system_ctx(Uuid::nil()), &req).await.expect("batch lookup");
+        assert_eq!(page.items.iter().map(|user| user.id).collect::<Vec<_>>(), [first, second]);
+        assert_eq!(page.items[1].display_name.as_deref(), Some("Bob Builder"));
+        assert!(page.page_info.next_cursor.is_none());
+        server.verify().await;
+    }).await;
+}
+
+#[tokio::test]
+async fn membership_safety_cap_returns_unavailable_not_false_absence() {
+    let server = MockServer::start().await;
+    temp_env::async_with_vars([("TEST_REALM_ADMIN_SECRET", Some("ra"))], async move {
+        mount_token_endpoint(&server, "platform").await;
+        let group = Uuid::new_v4();
+        let batch: Vec<_> = (1..=200).map(|id| serde_json::json!({"id": Uuid::from_u128(id), "username": "member", "createdTimestamp": 1000})).collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/admin/realms/platform/groups/{group}/members")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .expect(u64::try_from(MEMBERS_DRAIN_HARD_CAP.div_ceil(200)).expect("request count"))
+            .mount(&server).await;
+        let query = account_management_sdk::ListUsersQuery::with_ids([Uuid::from_u128(201)]).expect("batch");
+        let req = list_users_req(Uuid::new_v4(), Some(make_metadata("platform", RealmBinding::Shared, group, None)), query.pagination, None)
+            .with_filter(query.filter.expect("ID set"));
+        let result = build_facade(&server).list_users_inner(&build_system_ctx(Uuid::nil()), &req).await;
+        assert!(matches!(result, Err(PluginError::UserOpUnavailable { .. })));
+        server.verify().await;
+    }).await;
+}
+
+/// ID-set cursors resume the same normalized set and refuse a changed set
+/// before any provider call, even when both sets have the same cardinality.
+#[tokio::test]
+async fn batch_user_ids_paginate_and_pin_the_normalized_filter() {
+    let server = MockServer::start().await;
+    temp_env::async_with_vars([("TEST_REALM_ADMIN_SECRET", Some("ra"))], async move {
+        mount_token_endpoint(&server, "platform").await;
+        let tenant = Uuid::new_v4();
+        let group = Uuid::new_v4();
+        let ids = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/admin/realms/platform/groups/{group}/members"
+            )))
+            .and(query_param("first", "0"))
+            .and(query_param("max", "200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"id": ids[2], "username": "unrequested", "createdTimestamp": 500},
+                {"id": ids[0], "username": "alice", "createdTimestamp": 1000},
+                {"id": ids[1], "username": "bob", "createdTimestamp": 1000}
+            ])))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let facade = build_facade(&server);
+        let ctx = build_system_ctx(tenant);
+        let metadata = Some(make_metadata("platform", RealmBinding::Shared, group, None));
+        let query =
+            account_management_sdk::ListUsersQuery::with_ids([ids[0], ids[1]]).expect("batch");
+        let first_request = list_users_req(
+            tenant,
+            metadata.clone(),
+            IdpUserPagination::new(1, None).expect("page"),
+            None,
+        )
+        .with_filter(query.filter.expect("ID filter"));
+        let first = facade
+            .list_users_inner(&ctx, &first_request)
+            .await
+            .expect("first page");
+        assert_eq!(
+            first.items.iter().map(|user| user.id).collect::<Vec<_>>(),
+            [ids[0]]
+        );
+        let cursor = first.page_info.next_cursor.expect("continuation");
+
+        let reordered = FilterNode::InList {
+            field: IdpUserFilterField::Id,
+            values: vec![
+                ODataValue::Uuid(ids[1]),
+                ODataValue::Uuid(ids[0]),
+                ODataValue::Uuid(ids[1]),
+            ],
+        };
+        let second_request = list_users_req(
+            tenant,
+            metadata.clone(),
+            IdpUserPagination::new(1, Some(cursor.clone())).expect("page"),
+            None,
+        )
+        .with_filter(reordered);
+        let second = facade
+            .list_users_inner(&ctx, &second_request)
+            .await
+            .expect("second page");
+        assert_eq!(
+            second.items.iter().map(|user| user.id).collect::<Vec<_>>(),
+            [ids[1]]
+        );
+        assert!(second.page_info.next_cursor.is_none());
+
+        let changed =
+            account_management_sdk::ListUsersQuery::with_ids([ids[0], ids[2]]).expect("batch");
+        let changed_request = list_users_req(
+            tenant,
+            metadata,
+            IdpUserPagination::new(1, Some(cursor)).expect("page"),
+            None,
+        )
+        .with_filter(changed.filter.expect("ID filter"));
+        assert!(matches!(
+            facade.list_users_inner(&ctx, &changed_request).await,
+            Err(PluginError::UserOpRejected { .. })
+        ));
+    })
+    .await;
+}
+
+#[test]
 fn build_string_matcher_rejects_not() {
     let inner = FilterNode::binary(
         IdpUserFilterField::Username,

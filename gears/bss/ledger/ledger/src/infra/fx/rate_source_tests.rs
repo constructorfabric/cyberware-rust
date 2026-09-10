@@ -24,14 +24,14 @@ fn cfg(g10_hours: u64, default_days: u64, order: &[&str]) -> FxConfig {
 fn g10_pair_fresh_just_under_24h() {
     // A G10 pair (USD/EUR) at 23h age is within the 24h window → fresh.
     let cfg = cfg(24, 7, &[]);
-    assert!(!is_stale("USD", "EUR", chrono::Duration::hours(23), &cfg));
+    assert!(!is_stale("USD", "EUR", time::Duration::hours(23), &cfg));
 }
 
 #[test]
 fn g10_pair_stale_past_24h() {
     // The same pair at 25h age has crossed the 24h window → stale.
     let cfg = cfg(24, 7, &[]);
-    assert!(is_stale("USD", "EUR", chrono::Duration::hours(25), &cfg));
+    assert!(is_stale("USD", "EUR", time::Duration::hours(25), &cfg));
 }
 
 #[test]
@@ -39,11 +39,11 @@ fn g10_window_boundary_is_exclusive_at_exactly_24h() {
     // Exactly at the window (age == 24h) is NOT stale (`age > window` is strict);
     // one second past it is.
     let cfg = cfg(24, 7, &[]);
-    assert!(!is_stale("USD", "EUR", chrono::Duration::hours(24), &cfg));
+    assert!(!is_stale("USD", "EUR", time::Duration::hours(24), &cfg));
     assert!(is_stale(
         "USD",
         "EUR",
-        chrono::Duration::hours(24) + chrono::Duration::seconds(1),
+        time::Duration::hours(24) + time::Duration::seconds(1),
         &cfg
     ));
 }
@@ -62,8 +62,8 @@ fn non_g10_pair_uses_max_days_window() {
     // A non-G10 pair (BRL/INR) tolerates up to the configured max-days window:
     // fresh at 6 days, stale past 7.
     let cfg = cfg(24, 7, &[]);
-    assert!(!is_stale("BRL", "INR", chrono::Duration::days(6), &cfg));
-    assert!(is_stale("BRL", "INR", chrono::Duration::days(8), &cfg));
+    assert!(!is_stale("BRL", "INR", time::Duration::days(6), &cfg));
+    assert!(is_stale("BRL", "INR", time::Duration::days(8), &cfg));
 }
 
 #[test]
@@ -72,15 +72,15 @@ fn non_g10_uses_days_even_when_g10_hour_window_would_pass() {
     // window), even though 30h exceeds the 24h G10 window. Catches a base/quote
     // mix-up that mis-routes a non-G10 pair through the tighter window.
     let cfg = cfg(24, 7, &[]);
-    assert!(!is_stale("BRL", "INR", chrono::Duration::hours(30), &cfg));
+    assert!(!is_stale("BRL", "INR", time::Duration::hours(30), &cfg));
 }
 
 #[test]
 fn future_as_of_is_never_stale() {
     // A negative age (future as_of: clock skew) is within any window.
     let cfg = cfg(24, 7, &[]);
-    assert!(!is_stale("USD", "EUR", chrono::Duration::hours(-5), &cfg));
-    assert!(!is_stale("BRL", "INR", chrono::Duration::hours(-5), &cfg));
+    assert!(!is_stale("USD", "EUR", time::Duration::hours(-5), &cfg));
+    assert!(!is_stale("BRL", "INR", time::Duration::hours(-5), &cfg));
 }
 
 // --- provider precedence ---

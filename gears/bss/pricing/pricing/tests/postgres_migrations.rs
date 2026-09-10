@@ -605,6 +605,8 @@ const EXPECTED_PRIMARY_KEYS: &[&str] = &[
     // names the other as its twin.
     "pricing_composite_meter: tenant_id, plan_id, plan_revision, composite_id",
     "pricing_customer_group_taxonomy: tenant_id, value",
+    // D-356 (`pricing_gl_code_taxonomy`): the taxonomies' key on its own table.
+    "pricing_gl_code_taxonomy: tenant_id, value",
     // Slice 9's membership plane (`inst-cg-record`). Keyed on its own surrogate
     // id; D-09's non-overlap is `excl_pricing_group_membership_no_overlap`'s
     // job, not the primary key's.
@@ -706,6 +708,9 @@ const EXPECTED_CHECKS: &[&str] = &[
     // `config`'s four.
     "chk_pricing_customer_group_taxonomy_state",
     "chk_pricing_customer_group_taxonomy_value_present",
+    // D-356's declared GL-code vocabulary, the same two the SQLite mirror carries.
+    "chk_pricing_gl_code_taxonomy_state",
+    "chk_pricing_gl_code_taxonomy_value_present",
     // Slice 9's membership plane (`inst-cg-record`): the value-present guard the
     // four taxonomies also carry, the half-open interval sanity check
     // `pricing_price_window`/`pricing_price_overlay` carry too, and the entity
@@ -1763,6 +1768,7 @@ async fn every_taxonomy_value_predicate_refuses_ascii_whitespace_alone() {
         "pricing_partner_taxonomy",
         "pricing_region_taxonomy",
         "pricing_rounding_policy_taxonomy",
+        "pricing_gl_code_taxonomy",
     ];
 
     let (conn, _guard) = applied().await;

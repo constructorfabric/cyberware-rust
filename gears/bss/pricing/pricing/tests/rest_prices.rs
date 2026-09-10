@@ -178,6 +178,92 @@ async fn a_create_answers_201_with_the_location_and_the_rows_own_tag() {
     );
 }
 
+/// Create's `Location` is a real GET of the row, and that GET's `ETag` is the
+/// token the next `PATCH` must present.
+#[tokio::test]
+async fn create_location_is_a_get_of_the_row() {
+    let harness = Harness::new().await;
+    let plan_id = seeded_plan(&harness).await;
+    let created = harness
+        .allowed()
+        .send(with_headers(
+            "POST",
+            &prices_path(plan_id),
+            Some(create_body("EU")),
+            &keyed("price-get"),
+        ))
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let location = location_of(&created).expect("create sets Location");
+    let price_id = body_json(created).await["price_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .expect("id");
+
+    let got = harness
+        .allowed()
+        .send(request("GET", &location, None))
+        .await;
+    assert_eq!(got.status(), StatusCode::OK);
+    let etag = etag_of(&got).expect("GET emits ETag");
+    let body = body_json(got).await;
+    assert_eq!(body["price_id"], price_id.to_string());
+    assert_eq!(body["lifecycle_state"], "draft");
+    assert_eq!(body["row_version"], 0);
+    assert_eq!(etag, "\"0\"");
+
+    let patched = harness
+        .allowed()
+        .send(with_headers(
+            "PATCH",
+            &price_path(plan_id, price_id),
+            Some(serde_json::json!({ "content": { "model_kind": "flat", "amount_minor": 99 } })),
+            &[("if-match", etag.as_str())],
+        ))
+        .await;
+    assert_eq!(patched.status(), StatusCode::OK);
+}
+
+/// An unknown price reads like an absent one — no existence leak.
+#[tokio::test]
+async fn get_unknown_price_is_404() {
+    let harness = Harness::new().await;
+    let plan_id = seeded_plan(&harness).await;
+    let response = harness
+        .allowed()
+        .send(request("GET", &price_path(plan_id, Uuid::now_v7()), None))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// A matching `If-None-Match` is 304 with no body — GET plan's rule.
+#[tokio::test]
+async fn get_if_none_match_matching_tag_is_304() {
+    let harness = Harness::new().await;
+    let plan_id = seeded_plan(&harness).await;
+    let seeded = seed_price(&harness, plan_id, "EU").await;
+    let first = harness
+        .allowed()
+        .send(request("GET", &price_path(plan_id, seeded.price_id), None))
+        .await;
+    let etag = etag_of(&first).expect("ETag");
+    let again = harness
+        .allowed()
+        .send(with_headers(
+            "GET",
+            &price_path(plan_id, seeded.price_id),
+            None,
+            &[("if-none-match", etag.as_str())],
+        ))
+        .await;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        body_json(again).await,
+        serde_json::Value::Null,
+        "RFC 9110 forbids a 304 body"
+    );
+}
+
 #[tokio::test]
 async fn a_replayed_create_answers_the_original_price_id() {
     let harness = Harness::new().await;
@@ -732,9 +818,18 @@ async fn a_price_under_the_wrong_plans_url_is_not_found() {
             &[("if-match", "\"0\"")],
         ))
         .await;
+    let got = harness
+        .allowed()
+        .send(request(
+            "GET",
+            &price_path(other_plan, seeded.price_id),
+            None,
+        ))
+        .await;
 
     assert_eq!(patched.status(), StatusCode::NOT_FOUND);
     assert_eq!(deleted.status(), StatusCode::NOT_FOUND);
+    assert_eq!(got.status(), StatusCode::NOT_FOUND);
     assert_eq!(
         price_rows(&harness, plan_id).await.len(),
         1,
@@ -982,7 +1077,7 @@ async fn the_page_parameters_are_refused_or_clamped_as_the_contract_says() {
     refused_by(
         &body_json(zero).await,
         "invalid_argument",
-        "limit must be at least 1",
+        "Invalid page size parameter",
     );
 
     let garbage = harness
@@ -997,7 +1092,7 @@ async fn the_page_parameters_are_refused_or_clamped_as_the_contract_says() {
     refused_by(
         &body_json(garbage).await,
         "invalid_argument",
-        "the token is not one this surface issued",
+        "invalid cursor",
     );
 
     let oversized = harness
@@ -1015,6 +1110,69 @@ async fn the_page_parameters_are_refused_or_clamped_as_the_contract_says() {
     );
     let body = body_json(oversized).await;
     assert_eq!(body["page_info"]["limit"], serde_json::json!(1_000));
+}
+
+#[tokio::test]
+async fn a_named_lifecycle_state_key_is_refused_and_odata_filter_matches() {
+    let harness = Harness::new().await;
+    let plan_id = seeded_plan(&harness).await;
+    seed_price(&harness, plan_id, "EU").await;
+
+    let named = harness
+        .allowed()
+        .send(request(
+            "GET",
+            &format!("{}?lifecycle_state=draft", prices_path(plan_id)),
+            None,
+        ))
+        .await;
+    assert_eq!(named.status(), StatusCode::BAD_REQUEST);
+    refused_by(
+        &body_json(named).await,
+        "invalid_argument",
+        "unrecognized query parameter `lifecycle_state`",
+    );
+
+    let draft = body_json(
+        harness
+            .allowed()
+            .send(request(
+                "GET",
+                &format!(
+                    "{}?$filter=lifecycle_state%20eq%20'draft'",
+                    prices_path(plan_id)
+                ),
+                None,
+            ))
+            .await,
+    )
+    .await;
+    let published = body_json(
+        harness
+            .allowed()
+            .send(request(
+                "GET",
+                &format!(
+                    "{}?$filter=lifecycle_state%20eq%20'published'",
+                    prices_path(plan_id)
+                ),
+                None,
+            ))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        draft["items"].as_array().expect("draft page").len(),
+        1,
+        "the seeded row is a draft"
+    );
+    assert!(
+        published["items"]
+            .as_array()
+            .expect("published page")
+            .is_empty(),
+        "$filter=lifecycle_state eq 'published' must drop the draft; ignoring $filter would keep it"
+    );
 }
 
 /// **A foreign tenant's caller moves no row of this tenant's.**

@@ -18,6 +18,7 @@
 
 pub mod entity;
 pub mod migrations;
+pub mod odata_mapping;
 pub mod repo;
 
 use crate::domain::error::DomainError;

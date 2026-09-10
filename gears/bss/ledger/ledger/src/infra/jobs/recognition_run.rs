@@ -28,7 +28,6 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -38,6 +37,7 @@ use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::recognition::run_service::RecognitionRunService;
 use crate::infra::storage::repo::RecognitionRepo;
+use time::OffsetDateTime;
 
 /// Upper bound on the cross-tenant due-segment candidate scan per tick — a
 /// ceiling on how many `PENDING` segment rows one pass loads to derive the
@@ -121,7 +121,7 @@ impl RecognitionRunJob {
         // pre-opens) would recognize next month's segment THIS month — an ASC 606
         // early-recognition break (H1/Z6-1). A tenant whose only due work is a
         // future period has nothing to release yet and is skipped this tick.
-        let current = crate::domain::period::period_id_for(Utc::now());
+        let current = crate::domain::period::period_id_for(OffsetDateTime::now_utc());
         let tenants: std::collections::BTreeSet<Uuid> = pairs
             .iter()
             .filter(|(_, period_id)| period_id.as_str() <= current.as_str())

@@ -10,8 +10,8 @@
 //! CHECK. A debit note raises the invoice's headroom
 //! (`invoice_exposure.debit_note_total_minor += amount`) under the lock order.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -33,7 +33,7 @@ pub struct Model {
     pub amount_minor: i64,
     pub recognized_part_minor: i64,
     pub deferred_part_minor: i64,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

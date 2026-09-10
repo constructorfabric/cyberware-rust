@@ -7,11 +7,12 @@
 //! `(tenant_id, aggregate_id)` and nowhere else, and `dedup_key` is what makes
 //! at-least-once delivery safe for a consumer.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_outbox")]
@@ -31,9 +32,9 @@ pub struct Model {
     pub payload: JsonValue,
     pub dedup_key: String,
     pub correlation_id: Uuid,
-    pub enqueued_at: DateTime<Utc>,
+    pub enqueued_at: OffsetDateTime,
     /// `None` while the relay has not delivered the row yet.
-    pub published_at: Option<DateTime<Utc>>,
+    pub published_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

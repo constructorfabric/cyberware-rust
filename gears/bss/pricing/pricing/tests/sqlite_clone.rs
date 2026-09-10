@@ -43,6 +43,7 @@ use bss_pricing::domain::contracts::{
     EntitlementGrants, GrantSet, PlanChangeContract, UsageCounterOnPlanChange,
 };
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::plan::PlanShapePatch;
@@ -58,7 +59,8 @@ use bss_pricing::infra::storage::repo::{
     BundleComponentDraft, BundleRepo, CompositionDraft, NewBundle, NewPlanDraft, NewPriceDraft,
     PlanRepo, PlanShapeRepo, PriceRepo, bundle_repo, plan_repo, plan_shape_repo, price_repo,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm_migration::MigratorTrait;
 use std::collections::{BTreeMap, BTreeSet};
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -102,8 +104,8 @@ fn stranded_phase() -> PhaseId {
 fn other_stranded_phase() -> PhaseId {
     PhaseId::new(Uuid::from_u128(0x_57_bb))
 }
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 8, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 8, hour, 0, 0)
 }
 fn stamp() -> AuditStamp {
     AuditStamp {
@@ -491,6 +493,7 @@ async fn seed(h: &Harness, composition: Option<CompositionDraft>) {
                 PlanPhase {
                     phase_id: trial_phase(),
                     kind: PhaseKind::Trial,
+                    display_name: None,
                     ordinal: 0,
                     converts_to_phase_id: Some(terminal_phase()),
                     phase_duration_days: Some(14),
@@ -499,6 +502,7 @@ async fn seed(h: &Harness, composition: Option<CompositionDraft>) {
                 PlanPhase {
                     phase_id: terminal_phase(),
                     kind: PhaseKind::Evergreen,
+                    display_name: None,
                     ordinal: 1,
                     converts_to_phase_id: None,
                     phase_duration_days: None,

@@ -1,7 +1,7 @@
 //! The `PriceOverlay` authoring surface, end to end —
 //! `design/09-price-overlays.md` §5.
 //!
-//! What this suite is for, beyond driving the three routes: **the status split**.
+//! What this suite is for, beyond driving the four authoring routes: **the status split**.
 //! §5 types seven of the nine overlay codes as architectural 422s and two of them
 //! **409 outright**, and this platform has no 422 category at all — so the seven
 //! reach the wire as one aggregate 400 whose per-violation codes are the
@@ -9,7 +9,7 @@
 //! invisible to every unit test of the rules, because the rules raise all nine
 //! into one report; it exists only at this seam.
 //!
-//! `rest_authz` drives the same four routes for the **gate**. Nothing here
+//! `rest_authz` drives the same five routes for the **gate**. Nothing here
 //! re-proves that.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -19,7 +19,10 @@ mod rest_support;
 
 use axum::http::StatusCode;
 use bss_pricing::api::rest::overlays::{PRICE_OVERLAY_SUBMIT, PRICE_OVERLAYS};
-use rest_support::{Harness, body_json, code_in, problem_code, request, with_headers};
+use rest_support::{
+    Harness, body_json, code_in, etag_of, location_of, problem_code, request, with_headers,
+};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 fn overlay_path(overlay_id: Uuid) -> String {
@@ -62,6 +65,122 @@ async fn seed_overlay(harness: &Harness, precedence: i32) -> Uuid {
         .as_str()
         .and_then(|s| Uuid::parse_str(s).ok())
         .expect("the created overlay's id")
+}
+
+/// Create's `Location` is a real GET of the draft, and that GET's `ETag` is
+/// the token the next `PATCH` must present.
+#[tokio::test]
+async fn create_location_is_a_get_of_the_draft() {
+    let harness = Harness::new().await;
+    let created = harness
+        .allowed()
+        .send(with_headers(
+            "POST",
+            PRICE_OVERLAYS,
+            Some(serde_json::json!({
+                "scope_class": "global",
+                "precedence": 10,
+                "tax_basis": "delegated_tariffs",
+                "target_plan_ids": [],
+                "lines": [default_discount(1000)],
+            })),
+            &[("idempotency-key", &Uuid::now_v7().to_string())],
+        ))
+        .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let location = location_of(&created).expect("create sets Location");
+    let overlay = body_json(created).await["price_overlay_id"]
+        .as_str()
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .expect("id");
+
+    let got = harness
+        .allowed()
+        .send(request("GET", &location, None))
+        .await;
+    assert_eq!(got.status(), StatusCode::OK);
+    let etag = etag_of(&got).expect("GET emits ETag");
+    let body = body_json(got).await;
+    assert_eq!(body["price_overlay_id"], overlay.to_string());
+    assert_eq!(body["lifecycle_state"], "draft");
+    assert_eq!(body["revision"], 0);
+    assert_eq!(body["row_version"], 0);
+    assert_eq!(etag, "\"0-0\"");
+
+    let patched = harness
+        .allowed()
+        .send(with_headers(
+            "PATCH",
+            &overlay_path(overlay),
+            Some(serde_json::json!({ "revision": 0, "lines": [default_discount(1500)] })),
+            &[("if-match", etag.as_str())],
+        ))
+        .await;
+    assert_eq!(patched.status(), StatusCode::OK);
+}
+
+/// An unknown overlay reads like an absent one — no existence leak.
+#[tokio::test]
+async fn get_unknown_overlay_is_404() {
+    let harness = Harness::new().await;
+    let response = harness
+        .allowed()
+        .send(request("GET", &overlay_path(Uuid::now_v7()), None))
+        .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// With no draft, the by-id read answers the published revision.
+#[tokio::test]
+async fn get_published_overlay_without_a_draft_returns_published() {
+    let harness = Harness::new().await;
+    let overlay = seed_overlay(&harness, 10).await;
+    harness
+        .state
+        .overlays
+        .publish_revision(
+            &harness.scope(),
+            harness.tenant,
+            overlay,
+            0,
+            rest_support::seed_stamp(),
+        )
+        .await
+        .expect("published");
+    let got = harness
+        .allowed()
+        .send(request("GET", &overlay_path(overlay), None))
+        .await;
+    assert_eq!(got.status(), StatusCode::OK);
+    let body = body_json(got).await;
+    assert_eq!(body["lifecycle_state"], "published");
+}
+
+/// A matching `If-None-Match` is 304 with no body — GET plan's rule.
+#[tokio::test]
+async fn get_if_none_match_matching_tag_is_304() {
+    let harness = Harness::new().await;
+    let overlay = seed_overlay(&harness, 10).await;
+    let first = harness
+        .allowed()
+        .send(request("GET", &overlay_path(overlay), None))
+        .await;
+    let etag = etag_of(&first).expect("ETag");
+    let again = harness
+        .allowed()
+        .send(with_headers(
+            "GET",
+            &overlay_path(overlay),
+            None,
+            &[("if-none-match", etag.as_str())],
+        ))
+        .await;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        body_json(again).await,
+        serde_json::Value::Null,
+        "RFC 9110 forbids a 304 body"
+    );
 }
 
 /// Every precondition-violation code the response carries.
@@ -658,20 +777,10 @@ async fn one_currency_named_twice_in_a_line_is_refused_naming_it() {
 ///
 /// Every other case in this file composes `If-Match` from what the test itself set
 /// up — `"0-0"` written out by hand — and that is exactly how the gap survived. A
-/// client cannot do that. It creates an overlay, and then at some point it reloads,
-/// and from that moment the only two responses that ever carried the tag (the create,
-/// and a previous `PATCH`) are gone. There is no single-overlay `GET` either. So the
-/// question this pins is not "does the tag work" but "can a caller **get** one", and
-/// it is answered by reading the list and composing the tag from what it carries.
-///
-/// **The caller's predicament, stated once.** `PATCH /price-overlays/{id}` requires
-/// `If-Match: "<revision>-<version>"`, emitted at exactly two places: the create's
-/// `201` and a `PATCH`'s own `200`. The create's *replay* deliberately omits it,
-/// this list emits no `ETag`, and the `Location` the create sets answers `405`. So
-/// a caller that lost the one-shot tag, and whose overlay was then moved by anyone
-/// else, could construct no `If-Match` that was not `409 STALE_VERSION` and had no
-/// request that would tell it the current version — the door was closed to it
-/// permanently.
+/// client cannot do that. It creates an overlay, and then at some point it reloads.
+/// `GET /price-overlays/{id}` is the reload; this case pins the **list** half: a
+/// caller paging the tenant can still compose the tag from `revision` and
+/// `row_version` on the page, without a collection `ETag`.
 ///
 /// This carried two names until 2026-08-20: a second case,
 /// `the_if_match_tag_can_be_rebuilt_from_the_list_after_a_concurrent_edit`,
@@ -1166,7 +1275,7 @@ async fn the_list_shows_restricted_overlays_to_their_operator() {
         .allowed()
         .send(request(
             "GET",
-            &format!("{PRICE_OVERLAYS}?scope_class=global"),
+            &format!("{PRICE_OVERLAYS}?$filter=scope_class%20eq%20'global'"),
             None,
         ))
         .await;
@@ -1178,12 +1287,80 @@ async fn the_list_shows_restricted_overlays_to_their_operator() {
         .allowed()
         .send(request(
             "GET",
-            &format!("{PRICE_OVERLAYS}?scope_class=partner"),
+            &format!("{PRICE_OVERLAYS}?$filter=scope_class%20eq%20'partner'"),
             None,
         ))
         .await;
     let body = body_json(response).await;
     assert_eq!(body["overlays"].as_array().map(Vec::len), Some(0));
+}
+
+/// Two fresh overlays share `(lifecycle_state, revision)` — both `draft` at
+/// revision 1 — so under `$orderby=lifecycle_state` the tiebreaker `revision`
+/// alone leaves them on one keyset value and page 2 starts past both.
+/// `query_with_unique_order` names `price_overlay_id`; this walks the boundary
+/// it repairs, one row a page.
+#[tokio::test]
+async fn a_one_row_walk_under_a_colliding_orderby_visits_every_overlay() {
+    let harness = Harness::new().await;
+    let mut expected = vec![
+        seed_overlay(&harness, 10).await.to_string(),
+        seed_overlay(&harness, 20).await.to_string(),
+    ];
+    expected.sort();
+
+    let mut walked: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..=expected.len() {
+        let query = match cursor.as_deref() {
+            None => "$orderby=lifecycle_state&limit=1".to_owned(),
+            Some(token) => format!("limit=1&cursor={token}"),
+        };
+        let response = harness
+            .allowed()
+            .send(request("GET", &format!("{PRICE_OVERLAYS}?{query}"), None))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        let page = body_json(response).await;
+        let ids = page["overlays"].as_array().expect("a page");
+        assert_eq!(ids.len(), 1, "one row a page: {page}");
+        walked.extend(
+            ids.iter()
+                .map(|o| o["price_overlay_id"].as_str().expect("an id").to_owned()),
+        );
+        match page["page_info"]["next_cursor"].as_str() {
+            None => break,
+            Some(token) => cursor = Some(token.to_owned()),
+        }
+    }
+
+    let mut seen = walked.clone();
+    seen.sort();
+    assert_eq!(
+        seen, expected,
+        "the walk must visit both overlays, neither twice: {walked:?}"
+    );
+}
+
+/// Retired named keys and extra query keys are 400, pointing at `$filter`.
+#[tokio::test]
+async fn a_named_overlay_filter_key_is_refused() {
+    let harness = Harness::new().await;
+    seed_overlay(&harness, 10).await;
+
+    for query in ["?scope_class=global", "?status=draft"] {
+        let response = harness
+            .allowed()
+            .send(request("GET", &format!("{PRICE_OVERLAYS}{query}"), None))
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        let body = body_json(response).await;
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("$filter"),
+            "{query} names `$filter` as the remedy: {body}"
+        );
+    }
 }
 
 /// **The submit opens the approval unit `inst-pl-commit` promises, and names it.**
@@ -1393,7 +1570,7 @@ async fn an_overlay_unit_can_be_approved_because_its_pin_re_derives() {
                 approver_regions: bss_pricing::infra::approval::RegionGrant::Untransported,
                 stamp: bss_pricing::domain::audit::AuditStamp {
                     actor_principal_id: REVIEWER,
-                    recorded_at: chrono::Utc::now(),
+                    recorded_at: OffsetDateTime::now_utc(),
                     correlation_id: Uuid::from_u128(0x_9d_c0),
                 },
                 withdraw_authority: bss_pricing::domain::approval::WithdrawAuthority::OwnUnitsOnly,
@@ -1460,7 +1637,7 @@ async fn a_rejected_unit_leaves_the_overlay_untouched_and_it_submits_again() {
                 approver_regions: bss_pricing::infra::approval::RegionGrant::Untransported,
                 stamp: bss_pricing::domain::audit::AuditStamp {
                     actor_principal_id: REVIEWER,
-                    recorded_at: chrono::Utc::now(),
+                    recorded_at: OffsetDateTime::now_utc(),
                     correlation_id: Uuid::from_u128(0x_9d_c1),
                 },
                 withdraw_authority: bss_pricing::domain::approval::WithdrawAuthority::OwnUnitsOnly,
@@ -1529,7 +1706,7 @@ async fn approve(harness: &Harness, approval_id: &str) {
                 approver_regions: bss_pricing::infra::approval::RegionGrant::Untransported,
                 stamp: bss_pricing::domain::audit::AuditStamp {
                     actor_principal_id: approver,
-                    recorded_at: chrono::Utc::now(),
+                    recorded_at: OffsetDateTime::now_utc(),
                     correlation_id: Uuid::now_v7(),
                 },
                 withdraw_authority: bss_pricing::domain::approval::WithdrawAuthority::OwnUnitsOnly,

@@ -21,10 +21,11 @@
 //! points is the set's own idiom (D-104's `share_bp`, `platform_cut_bp`). The unit
 //! is in the column name so no reader has to infer it.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_approval_threshold")]
@@ -52,11 +53,11 @@ pub struct Model {
     /// The relative threshold in **basis points** (`10_000` = 100%).
     pub percent_bp: Option<i32>,
     /// When this version takes effect, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// The pseudonymous principal that proposed this version. **Not** the
     /// approval trail — D-10 puts the second principal on `pricing_approval`.
     pub created_by: Uuid,
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

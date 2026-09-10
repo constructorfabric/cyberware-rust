@@ -4,9 +4,10 @@
 
 #![allow(clippy::doc_markdown)]
 
-use chrono::{TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
+
+use crate::domain::instant::from_unix;
 
 use super::{AuditHashInput, audit_genesis_prev_hash};
 
@@ -25,7 +26,7 @@ fn input(before_after: &serde_json::Value) -> AuditHashInput<'_> {
         actor_ref: Some("actor-7"),
         reason_code: Some("rc-1"),
         correlation_id: Some(Uuid::from_u128(9)),
-        at_utc: Utc.timestamp_opt(1_750_000_000, 0).unwrap(),
+        at_utc: from_unix(1_750_000_000, 0).unwrap(),
         before_after,
     }
 }

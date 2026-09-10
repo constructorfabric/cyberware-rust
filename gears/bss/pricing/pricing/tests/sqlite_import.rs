@@ -20,6 +20,7 @@ use bss_pricing::domain::audit::{AuditStamp, AuditSubjectKind};
 use bss_pricing::domain::import::{
     BatchReport, IMPORT_TARGETS_PUBLISHED, ImportRow, RowViolation, classify,
 };
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::price_record::PriceContent;
 use bss_pricing::domain::price_row::{IncludedAllowance, ModelKind, PriceRow, RolloverPolicy};
@@ -30,7 +31,8 @@ use bss_pricing::domain::scope_key::{
 use bss_pricing::infra::import::classify_against_store;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewApproval, NewPriceDraft, PriceRepo, approval_repo};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm_migration::MigratorTrait;
 use std::collections::BTreeSet;
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -51,8 +53,8 @@ fn plan() -> PlanId {
 fn phase() -> PhaseId {
     PhaseId::new(Uuid::from_u128(0xfa_70))
 }
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 9, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 9, hour, 0, 0)
 }
 fn scope() -> AccessScope {
     AccessScope::for_tenant(TENANT)

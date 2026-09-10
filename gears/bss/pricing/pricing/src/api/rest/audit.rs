@@ -33,20 +33,25 @@
 //! [`crate::infra::audit_read::encode`]'s, exactly as `/history` takes its own
 //! engine's — a route may name an engine type and `DE0202` refuses the reverse.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Query};
 use axum::{Json, Router, http::StatusCode};
-use serde::Deserialize;
+use bss_pricing_sdk::odata::{AuditFilterField, AuditOrderField};
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::api::rest::auth_context::require_authenticated;
-use crate::api::rest::cursor;
 use crate::api::rest::error::authz_error_to_canonical;
-use crate::infra::audit_read::{AuditPage, AuditPageRequest, AuditReader};
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
+use crate::domain::instant::rfc3339;
+use crate::infra::audit_read::{AuditEntry, AuditPage, AuditReader};
+use time::OffsetDateTime;
 
 const TAG: &str = "BSS Pricing Audit";
 
@@ -63,15 +68,6 @@ pub struct ApiState {
     pub audit: AuditReader,
 }
 
-/// D-125's two query parameters, both optional.
-#[derive(Debug, Default, Deserialize)]
-pub struct AuditQuery {
-    /// Page size. Absent means D-125's server default; above the cap it clamps.
-    pub limit: Option<String>,
-    /// The opaque token the previous page handed back.
-    pub cursor: Option<String>,
-}
-
 /// One audit record on the wire.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
@@ -85,7 +81,14 @@ pub struct AuditEntryView {
     /// `mutation` or `rollup`.
     pub entry_kind: String,
     /// When it was recorded, UTC.
-    pub recorded_at: String,
+    // Typed rather than pre-rendered, and this is a `//` so it stays out of the
+    // published schema: `recorded_at` is a machine instant this module's own note
+    // exempts from the millisecond quantum, Postgres keeps it at microsecond
+    // precision, and `$filter=recorded_at gt ...` binds at that precision - so a
+    // millisecond-rendered string could not be fed back to resume a walk, and two
+    // entries inside one millisecond read alike.
+    #[serde(with = "rfc3339")]
+    pub recorded_at: OffsetDateTime,
     /// The **pseudonymous** principal who acted — never a display name and never
     /// an email (`inst-au-pii`), which is what lets a 7-year store be read at all.
     pub actor_principal_id: Uuid,
@@ -123,26 +126,26 @@ pub struct AuditPageView {
 impl From<AuditPage> for AuditPageView {
     fn from(page: AuditPage) -> Self {
         Self {
-            entries: page
-                .entries
-                .into_iter()
-                .map(|entry| AuditEntryView {
-                    chain_id: entry.chain_id,
-                    seq: entry.seq,
-                    entry_kind: entry.entry_kind,
-                    recorded_at: entry.recorded_at.to_rfc3339(),
-                    actor_principal_id: entry.actor_principal_id,
-                    action: entry.action,
-                    subject_kind: entry.subject_kind,
-                    subject_ref: entry.subject_ref,
-                    before_state: entry.before_state,
-                    after_state: entry.after_state,
-                    approval_ref: entry.approval_ref,
-                    correlation_id: entry.correlation_id,
-                })
-                .collect(),
+            entries: page.entries.into_iter().map(audit_entry_view).collect(),
             next_cursor: page.next.map(crate::infra::audit_read::encode),
         }
+    }
+}
+
+fn audit_entry_view(entry: AuditEntry) -> AuditEntryView {
+    AuditEntryView {
+        chain_id: entry.chain_id,
+        seq: entry.seq,
+        entry_kind: entry.entry_kind,
+        recorded_at: entry.recorded_at,
+        actor_principal_id: entry.actor_principal_id,
+        action: entry.action,
+        subject_kind: entry.subject_kind,
+        subject_ref: entry.subject_ref,
+        before_state: entry.before_state,
+        after_state: entry.after_state,
+        approval_ref: entry.approval_ref,
+        correlation_id: entry.correlation_id,
     }
 }
 
@@ -167,8 +170,8 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
              key: `seq` counts within a chain segment (D-135), never across the tenant. \
              Paginated on an opaque cursor per D-125, with a server default page size and a \
              hard cap. **Auditor-only**: gates on `audit` x `read` (D-12), which carries no \
-             read of live pricing and no write authority. Two things this surface does not do: \
-             it declares no filters, and it is not the export - `audit` x `export` is a second \
+             read of live pricing and no write authority. `$filter` and `$orderby` are the AM \
+             list contract. This surface is not the export - `audit` x `export` is a second \
              permission for a chunked shape, which `POST /bss-pricing/v1/history/export` is \
              the gear's one holder of.",
         )
@@ -178,6 +181,8 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .param(crate::api::rest::history::limit_param())
         .param(crate::api::rest::history::cursor_param())
         .handler(read_audit)
+        .with_odata_filter::<AuditFilterField>()
+        .with_odata_orderby::<AuditOrderField>()
         .json_response_with_schema::<AuditPageView>(
             openapi,
             StatusCode::OK,
@@ -201,13 +206,16 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
 /// compiled scope becomes the SQL filter. `require_constraints = true` so an
 /// unconstrained allow fails closed instead of exposing every tenant's trail,
 /// which on this surface would be every tenant's before/after states.
+#[allow(clippy::implicit_hasher)]
 async fn read_audit(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<AuditQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Json<AuditPageView>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let scope = crate::authz::access_scope(
         &enforcer,
         &ctx,
@@ -219,22 +227,14 @@ async fn read_audit(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    // Parsed after the gate, for `plans.rs`'s stated reason: a module doc asserting
-    // "the gate before the request" reads as two disciplines if two modules order it
-    // differently.
-    let request = AuditPageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )
-    .map_err(CanonicalError::from)?;
-
-    let page = state
+    let (entries, next_cursor) = state
         .audit
-        .read_page(&scope, ctx.subject_tenant_id(), request)
+        .read_odata(&scope, ctx.subject_tenant_id(), &odata)
         .await
-        // Through the gear's single authoritative ladder rather than a mapping
-        // invented here.
-        .map_err(|e| CanonicalError::from(crate::infra::storage::repo_failure(&e)))?;
+        .map_err(map_odata_page_err)?;
 
-    Ok(Json(AuditPageView::from(page)))
+    Ok(Json(AuditPageView {
+        entries: entries.into_iter().map(audit_entry_view).collect(),
+        next_cursor,
+    }))
 }

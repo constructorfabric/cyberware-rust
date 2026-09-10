@@ -14,7 +14,6 @@
 //! `(tenant, kind, business_key) WHERE state IN ('PENDING','NEEDS_REWORK')`; the
 //! service reads the active record before inserting.
 
-use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, Order};
 use serde_json::Value as JsonValue;
@@ -30,6 +29,7 @@ use crate::infra::storage::entity::{
     dual_control_approval as approval, dual_control_comment as comment,
     dual_control_policy as policy,
 };
+use time::OffsetDateTime;
 
 /// Owned seed for a fresh `PENDING` approval row (preparer step).
 #[derive(Clone)]
@@ -43,9 +43,9 @@ pub struct NewPendingApproval {
     pub threshold_snapshot: JsonValue,
     pub reason_code: String,
     pub prepared_by: Uuid,
-    pub prepared_at: DateTime<Utc>,
+    pub prepared_at: OffsetDateTime,
     pub correlation_id: Uuid,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: OffsetDateTime,
 }
 
 /// Owned seed for a fresh effective-dated dual-control policy version (DC8). The
@@ -55,11 +55,11 @@ pub struct NewPendingApproval {
 pub struct NewPolicyVersion {
     pub tenant: Uuid,
     pub version: i64,
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     pub d2_threshold_minor: i64,
     pub a6_backdating_biz_days: i32,
     pub pending_ttl_seconds: i64,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 /// SeaORM-backed dual-control approval repository.
@@ -158,7 +158,7 @@ impl ApprovalRepo {
         expected_state: &str,
         new_state: &str,
         decider: Option<Uuid>,
-        decided_at: Option<DateTime<Utc>>,
+        decided_at: Option<OffsetDateTime>,
     ) -> Result<u64, RepoError> {
         let result = approval::Entity::update_many()
             .secure()
@@ -233,7 +233,7 @@ impl ApprovalRepo {
         txn: &DbTx<'_>,
         scope: &AccessScope,
         tenant: Uuid,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<u64, RepoError> {
         let result = approval::Entity::update_many()
             .secure()
@@ -276,7 +276,7 @@ impl ApprovalRepo {
         revision: i32,
         author_actor: Uuid,
         body: String,
-        created_at: DateTime<Utc>,
+        created_at: OffsetDateTime,
     ) -> Result<(), RepoError> {
         let am = comment::ActiveModel {
             comment_id: Set(comment_id),
@@ -307,7 +307,7 @@ impl ApprovalRepo {
     ///
     /// # Errors
     /// [`DomainError::Internal`] on a scope or storage failure.
-    pub async fn expire_due_all(&self, now: DateTime<Utc>) -> Result<u64, DomainError> {
+    pub async fn expire_due_all(&self, now: OffsetDateTime) -> Result<u64, DomainError> {
         let conn = self
             .db
             .conn()
@@ -496,7 +496,7 @@ impl ApprovalRepo {
         tenant: Uuid,
         kind: &str,
         business_key: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<approval::Model>, DomainError> {
         let conn = self
             .db

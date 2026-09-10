@@ -13,6 +13,7 @@ pub mod chain;
 pub mod error;
 pub mod exception;
 pub mod fx;
+pub mod instant;
 pub mod invoice;
 pub mod model;
 pub mod money;

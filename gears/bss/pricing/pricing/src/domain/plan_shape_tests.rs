@@ -11,13 +11,13 @@
 
 use std::fmt;
 
-use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
     BillingCycle, CustomIntervalUnit, Frequency, PhaseGraph, PhaseKind, PlanPhase, PlanShape,
 };
 use crate::domain::concurrency::RowVersion;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::CurrencyCode;
 use crate::domain::price_record::PriceRecord;
@@ -25,6 +25,7 @@ use crate::domain::price_row::{ModelKind, PriceRow};
 use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
+use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -46,16 +47,15 @@ fn region(value: &str) -> Region {
     Region::new(value).expect("test region is non-blank")
 }
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, 12, 0, 0)
 }
 
 fn phase(seed: u128, kind: PhaseKind, ordinal: i32, converts_to: Option<PhaseId>) -> PlanPhase {
     PlanPhase {
         phase_id: phase_id(seed),
         kind,
+        display_name: None,
         ordinal,
         converts_to_phase_id: converts_to,
         phase_duration_days: converts_to.is_some().then_some(14),
@@ -213,8 +213,18 @@ fn the_custom_member_of_the_variant_list_carries_a_placeholder_interval() {
 #[test]
 fn phase_kind_tokens_are_the_persisted_spelling() {
     assert_eq!(PhaseKind::Trial.as_str(), "trial");
-    assert_eq!(PhaseKind::Intro.as_str(), "intro");
+    // `interim`, not `intro`, since D-358: the slot is "any time-boxed non-trial
+    // phase" and the old word promised a business meaning nothing behaved on.
+    assert_eq!(PhaseKind::Interim.as_str(), "interim");
     assert_eq!(PhaseKind::Evergreen.as_str(), "evergreen");
+    assert_eq!(
+        PhaseKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>(),
+        ["trial", "interim", "evergreen"],
+        "the roster, in its stable order, and no `intro` in it"
+    );
 
     assert_eq!(PhaseKind::ALL.len(), 3, "one member per variant");
     round_trip(PhaseKind::ALL, PhaseKind::as_str);
@@ -317,7 +327,7 @@ fn entry_is_the_lowest_ordinal_and_not_the_first_authored() {
     let graph = PhaseGraph::new(vec![
         phase(20, PhaseKind::Evergreen, 2, None),
         phase(10, PhaseKind::Trial, 0, Some(phase_id(15))),
-        phase(15, PhaseKind::Intro, 1, Some(phase_id(20))),
+        phase(15, PhaseKind::Interim, 1, Some(phase_id(20))),
     ]);
 
     assert_eq!(

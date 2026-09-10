@@ -23,8 +23,10 @@ use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{PinFrontierRepo, pin_frontier_repo};
 use bss_pricing::infra::storage::{RepoError, repo_failure};
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, TxError};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -47,7 +49,7 @@ async fn advance(
     scope: &AccessScope,
     tenant: Uuid,
     to: CatalogVersion,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let conn = provider.conn().expect("conn");
     pin_frontier_repo::advance(&conn, scope, tenant, to, at).await
@@ -59,9 +61,9 @@ async fn the_frontier_only_ever_moves_forward() {
     let repo = PinFrontierRepo::new(provider.clone());
     let tenant = Uuid::from_u128(0x7e_11);
     let scope = AccessScope::for_tenant(tenant);
-    let t1 = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap();
-    let t2 = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 5).unwrap();
-    let t3 = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 9).unwrap();
+    let t1 = utc_ymd_hms(2026, 8, 2, 10, 0, 0);
+    let t2 = utc_ymd_hms(2026, 8, 2, 10, 0, 5);
+    let t3 = utc_ymd_hms(2026, 8, 2, 10, 0, 9);
 
     // No frontier yet: a consumer has nothing it may pin, and fails closed.
     assert_eq!(
@@ -134,7 +136,7 @@ async fn a_foreign_tenants_frontier_is_invisible() {
     let repo = PinFrontierRepo::new(provider.clone());
     let mine = Uuid::from_u128(0x7e_11);
     let theirs = Uuid::from_u128(0x7e_22);
-    let at = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap();
+    let at = utc_ymd_hms(2026, 8, 2, 10, 0, 0);
 
     advance(
         &provider,
@@ -167,7 +169,7 @@ async fn an_advance_inside_a_callers_transaction_lands() {
     let repo = PinFrontierRepo::new(provider.clone());
     let tenant = Uuid::from_u128(0x7e_11);
     let scope = AccessScope::for_tenant(tenant);
-    let at = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap();
+    let at = utc_ymd_hms(2026, 8, 2, 10, 0, 0);
 
     let inner_scope = scope.clone();
     let (_, outcome) = provider
@@ -210,8 +212,8 @@ async fn an_advance_whose_transaction_rolls_back_leaves_the_frontier_where_it_wa
     let repo = PinFrontierRepo::new(provider.clone());
     let tenant = Uuid::from_u128(0x7e_11);
     let scope = AccessScope::for_tenant(tenant);
-    let t1 = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap();
-    let t2 = Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 5).unwrap();
+    let t1 = utc_ymd_hms(2026, 8, 2, 10, 0, 0);
+    let t2 = utc_ymd_hms(2026, 8, 2, 10, 0, 5);
 
     advance(&provider, &scope, tenant, CatalogVersion::new(2), t1)
         .await

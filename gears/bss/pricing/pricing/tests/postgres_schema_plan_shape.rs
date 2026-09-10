@@ -335,7 +335,7 @@ async fn every_phase_kind_the_domain_renders_is_storable() {
     .await;
     must_succeed(
         &conn,
-        &insert_phase(PHASE_2, PLAN_A, &[("kind", "'intro'")]),
+        &insert_phase(PHASE_2, PLAN_A, &[("kind", "'interim'")]),
     )
     .await;
     must_succeed(
@@ -343,6 +343,61 @@ async fn every_phase_kind_the_domain_renders_is_storable() {
         &insert_phase(PHASE_3, PLAN_A, &[("kind", "'evergreen'")]),
     )
     .await;
+}
+
+/// The operator label (D-357) is stored as given and may be `NULL` — the
+/// unlabelled state every phase authored before D-357 is in.
+///
+/// Both arms, because a column added by editing the migration in place is the
+/// kind of change a fresh chain shows and an applied stand does not: this is the
+/// fresh chain's half of the proof, and D-358's runbook is the stand's.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_phase_label_is_stored_as_given_and_may_be_null() {
+    let conn = applied().await;
+    seed_draft(&conn, PLAN_A).await;
+    must_succeed(
+        &conn,
+        &insert_phase(
+            PHASE_1,
+            PLAN_A,
+            &[("kind", "'interim'"), ("display_name", "'Onboarding'")],
+        ),
+    )
+    .await;
+    must_succeed(
+        &conn,
+        &insert_phase(PHASE_2, PLAN_A, &[("display_name", "NULL")]),
+    )
+    .await;
+    let stored = conn
+        .query_all_raw(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "SELECT phase_id::text AS phase_id, display_name FROM bss.pricing_plan_phase \
+                 WHERE plan_id = '{PLAN_A}' ORDER BY phase_id"
+            ),
+        ))
+        .await
+        .expect("read the labels back");
+    let labels: Vec<(String, Option<String>)> = stored
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "phase_id").expect("phase_id"),
+                row.try_get::<Option<String>>("", "display_name")
+                    .expect("display_name"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            (PHASE_1.to_owned(), Some("Onboarding".to_owned())),
+            (PHASE_2.to_owned(), None),
+        ],
+        "the label is stored as given, and its absence is NULL rather than an empty string"
+    );
 }
 
 /// A draft revision's phase rows are freely mutable **and deletable**, which is
@@ -362,7 +417,7 @@ async fn a_draft_revisions_phases_are_insertable_mutable_and_deletable() {
     must_succeed(
         &conn,
         &format!(
-            "UPDATE bss.pricing_plan_phase SET kind = 'intro', ordinal = 3, \
+            "UPDATE bss.pricing_plan_phase SET kind = 'interim', ordinal = 3, \
              phase_duration_days = 30 WHERE phase_id = '{PHASE_1}' AND plan_revision = 0"
         ),
     )
@@ -395,12 +450,17 @@ async fn a_draft_revisions_phases_are_insertable_mutable_and_deletable() {
 /// A near-miss token stored here reads back as a corrupt row through every typed
 /// path, and `TERMINAL_PHASE_KIND_INVALID` — the pipeline rule that pairs
 /// terminality with `evergreen` — is written over exactly this vocabulary.
+///
+/// `intro` is in the list on purpose: it was the middle token until D-358, and
+/// the rename is not real until the store refuses the old spelling — a `CHECK`
+/// that still admitted it would let a pre-rename writer store a row every typed
+/// reader answers `CorruptRow` for.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_phase_kind_outside_the_three_is_refused() {
     let conn = applied().await;
     seed_draft(&conn, PLAN_A).await;
-    for kind in ["'promo'", "'EVERGREEN'", "'standard'"] {
+    for kind in ["'promo'", "'EVERGREEN'", "'standard'", "'intro'"] {
         must_be_rejected(
             &conn,
             &insert_phase(PHASE_1, PLAN_A, &[("kind", kind)]),

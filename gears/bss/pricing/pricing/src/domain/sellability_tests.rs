@@ -16,12 +16,12 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 
 use super::{
     KeySellability, PinnedFacts, PlanMarketVerdict, Predicate, PredicateAnswer, PredicateOutcome,
     SellabilityFacts, SellabilitySurface,
 };
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::CurrencyCode;
 use crate::domain::plan_shape::Frequency;
@@ -29,6 +29,7 @@ use crate::domain::scope_key::{
     ChargeKind, Cohort, DimensionKey, Meter, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
 use crate::domain::window::{CoverageEnd, KeyWindows, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -39,11 +40,8 @@ use crate::domain::window::{CoverageEnd, KeyWindows, WindowInterval, WindowState
 /// 2099 for the suite convention's reason and not because anything here reads a
 /// clock: every instant in this file is compared against another instant in this
 /// file.
-fn at(day: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
-        + TimeDelta::days(day)
+fn at(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2099, 1, 1, 0, 0, 0) + time::Duration::days(day)
 }
 
 fn plan() -> PlanId {
@@ -324,7 +322,7 @@ fn coverage_reaching_exactly_the_horizon_satisfies_it() {
             recurring(),
             vec![WindowInterval::new(
                 at(0),
-                Some(at(10) + TimeDelta::days(31)),
+                Some(at(10) + time::Duration::days(31)),
                 WindowState::Active,
             )],
         )],
@@ -462,7 +460,7 @@ fn an_instant_whose_horizon_is_not_representable_refuses_rather_than_panicking()
     // fail-closed answer is the false one, and it names why.
     let surface = SellabilitySurface::of_delta(
         &SellabilityFacts::Pinned(sellable_facts()),
-        DateTime::<Utc>::MAX_UTC,
+        crate::domain::instant::max_utc(),
         &eur(),
         &eu(),
     );
@@ -632,7 +630,7 @@ fn the_available_from_boundary_is_inside_the_window_and_the_quantum_before_it_is
     // does not cover that instant either, and (1) refusing is not the statement.
     let before = SellabilitySurface::of_delta(
         &SellabilityFacts::Pinned(facts),
-        from - TimeDelta::milliseconds(1),
+        from - time::Duration::milliseconds(1),
         &eur(),
         &eu(),
     );

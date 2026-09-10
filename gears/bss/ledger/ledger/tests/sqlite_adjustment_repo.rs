@@ -37,8 +37,9 @@ use bss_ledger::infra::storage::repo::adjustment_repo::NewCreditNote;
 use bss_ledger::infra::storage::repo::recognition_repo::NewSchedule;
 use bss_ledger::infra::storage::repo::{AdjustmentRepo, JournalRepo, RecognitionRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -347,7 +348,7 @@ async fn credit_note_row_round_trips() {
         deferred_part_minor: 500,
         split_basis_ref: Some("item=item-1;po=po-1".to_owned()),
         reason_code: "CUSTOMER_GOODWILL".to_owned(),
-        created_at_utc: Utc::now(),
+        created_at_utc: OffsetDateTime::now_utc(),
     };
     let scope_a = scope.clone();
     provider
@@ -374,7 +375,7 @@ async fn credit_note_row_round_trips() {
         deferred_part_minor: 0,
         split_basis_ref: None,
         reason_code: "X".to_owned(),
-        created_at_utc: Utc::now(),
+        created_at_utc: OffsetDateTime::now_utc(),
     };
     let scope_b = scope.clone();
     let dup = provider
@@ -439,7 +440,7 @@ async fn insert_invoice_post(
         source_business_id: invoice.to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 18).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: Uuid::now_v7(),

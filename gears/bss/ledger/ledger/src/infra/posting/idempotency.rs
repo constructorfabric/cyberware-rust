@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::domain::model::{NewEntry, NewLine, RepoError};
 use crate::infra::storage::entity::idempotency_dedup;
+use time::OffsetDateTime;
 
 /// Status literal written when a posting first claims a key.
 const STATUS_CLAIMED: &str = "CLAIMED";
@@ -263,7 +264,7 @@ impl IdempotencyGate {
             )
             .col_expr(
                 idempotency_dedup::Column::PostedAtUtc,
-                Expr::value(Some(chrono::Utc::now())),
+                Expr::value(Some(OffsetDateTime::now_utc())),
             )
             .col_expr(
                 idempotency_dedup::Column::Status,

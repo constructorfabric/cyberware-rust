@@ -16,10 +16,11 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-# `chrono` provides `NaiveDate` in the posting/close value types; no serde
-# feature — this contract crate carries no `#[derive(Serialize/Deserialize)]`
-# (the gear's REST DTOs own serde and map onto these types).
+# `chrono` provides `NaiveDate` in the posting/close value types; instants are
+# `time::OffsetDateTime`. No serde feature — this contract crate carries no
+# `#[derive(Serialize/Deserialize)]` (the gear's REST DTOs own serde).
 chrono = { workspace = true }
+time = { workspace = true }
 thiserror = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 # Canonical OData query + `Page` envelope for the list endpoints. Infra-free
@@ -27,6 +28,10 @@ toolkit-canonical-errors = { workspace = true }
 # SDK only carries the parsed `ODataQuery` and the `Page<T>` result. Mirrors how
 # the platform list surfaces (RBAC/AM/RG) thread `toolkit_odata` through.
 toolkit-odata = { workspace = true }
+# Dummy `#[derive(ODataFilterable)]` query structs generate the typed
+# `FilterField` enums the gear's `paginate_odata` mappers consume. Same
+# hard dep as AM's SDK: list consumers need the field shapes.
+toolkit-odata-macros = { workspace = true }
 toolkit-security = { workspace = true }
 uuid = { workspace = true }
 # GTS PluginV1 base + `#[gts_type_schema]` for the rate-provider plugin spec the

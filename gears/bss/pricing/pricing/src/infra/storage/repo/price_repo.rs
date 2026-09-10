@@ -105,17 +105,21 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use chrono::{DateTime, TimeZone, Utc};
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, Order, Value};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, Order, QuerySelect, Value};
 use serde_json::{Value as JsonValue, json};
+use time::OffsetDateTime;
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{
     AccessScope, DBRunner, DbConn, DbTx, SecureDeleteExt, SecureEntityExt, SecureInsertExt,
     SecureUpdateExt, TxError,
 };
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
+
+use bss_pricing_sdk::odata::{HistoryFilterField, PlanPriceFilterField};
 
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind, subject_state};
 use crate::domain::concurrency::RowVersion;
@@ -138,6 +142,10 @@ use crate::domain::scope_key::{
 use crate::domain::tax_display::RegionTaxReadiness;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::{price, price_tier_band, price_window};
+use crate::infra::storage::odata_mapping::{
+    HistoryODataMapper, LIST_LIMIT_CFG, OdataPageError, PlanPriceODataMapper,
+    filter_mentions_field, map_odata_err, query_with_default_order,
+};
 use crate::infra::storage::repo::check_authored_instant;
 use crate::infra::storage::repo::outbox_repo::{NewOutboxEvent, PriceCreatedPayload};
 use crate::infra::storage::repo::{NewAuditEntry, audit_repo, outbox_repo};
@@ -242,7 +250,7 @@ pub struct NewPriceDraft {
     /// Pseudonymous principal id of the authoring actor.
     pub created_by: Uuid,
     /// When the request was authored, UTC.
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// The causing request's correlation id (D-178).
     ///
     /// The third field of the [`AuditStamp`](crate::domain::audit::AuditStamp)
@@ -266,7 +274,7 @@ pub struct NewPriceDraft {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HistoryPosition {
     /// The authoring instant of the row the previous page ended at.
-    pub authored_at: DateTime<Utc>,
+    pub authored_at: OffsetDateTime,
     /// That row's id — the tie-break within one instant.
     pub price_id: Uuid,
 }
@@ -462,6 +470,114 @@ impl PriceRepo {
             Some(limit),
         )
         .await
+    }
+
+    /// One `OData` page of a plan's price rows. When `$filter` omits
+    /// `lifecycle_state`, `default_states` is `ANDed` (authoring default).
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor.
+    pub async fn list_for_plan_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        plan_id: PlanId,
+        query: &ODataQuery,
+        default_states: &[LifecycleState],
+    ) -> Result<Page<PriceRecord>, OdataPageError> {
+        let conn = self.conn().map_err(OdataPageError::Repo)?;
+        let mut filter = Condition::all()
+            .add(price::Column::TenantId.eq(tenant_id))
+            .add(price::Column::PlanId.eq(plan_id.get()));
+        if !filter_mentions_field(
+            query.filter.as_deref(),
+            PlanPriceFilterField::LifecycleState,
+        ) && !default_states.is_empty()
+        {
+            let tokens: Vec<&str> = default_states
+                .iter()
+                .copied()
+                .map(LifecycleState::as_str)
+                .collect();
+            filter = filter.add(price::Column::LifecycleState.is_in(tokens));
+        }
+        let base_select = price::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(filter);
+        let query = query_with_default_order(query, &[PlanPriceFilterField::PriceId]);
+        let page = paginate_odata::<
+            PlanPriceFilterField,
+            PlanPriceODataMapper,
+            price::Entity,
+            price::Model,
+            _,
+            _,
+        >(
+            base_select,
+            &conn,
+            &query,
+            ("price_id", SortDir::Asc),
+            LIST_LIMIT_CFG,
+            |m| m,
+        )
+        .await
+        .map_err(map_odata_err)?;
+        let items = hydrate_bands(&conn, scope, tenant_id, &page.items)
+            .await
+            .map_err(OdataPageError::Repo)?;
+        Ok(Page {
+            items,
+            page_info: page.page_info,
+        })
+    }
+
+    /// One `OData` page of the tenant's price history. Default order is
+    /// `authored_at asc, price_id asc`.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor.
+    pub async fn list_history_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<PriceRecord>, OdataPageError> {
+        let conn = self.conn().map_err(OdataPageError::Repo)?;
+        let base_select = price::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(price::Column::TenantId.eq(tenant_id)));
+        let query = query_with_default_order(
+            query,
+            &[HistoryFilterField::AuthoredAt, HistoryFilterField::PriceId],
+        );
+        let page = paginate_odata::<
+            HistoryFilterField,
+            HistoryODataMapper,
+            price::Entity,
+            price::Model,
+            _,
+            _,
+        >(
+            base_select,
+            &conn,
+            &query,
+            ("price_id", SortDir::Asc),
+            LIST_LIMIT_CFG,
+            |m| m,
+        )
+        .await
+        .map_err(map_odata_err)?;
+        let items = hydrate_bands(&conn, scope, tenant_id, &page.items)
+            .await
+            .map_err(OdataPageError::Repo)?;
+        Ok(Page {
+            items,
+            page_info: page.page_info,
+        })
     }
 
     /// One **page** of the tenant's price history, in commit order.
@@ -1598,7 +1714,7 @@ pub async fn commit_cutover_rows(
     predecessor: Uuid,
     successor: (Uuid, RowVersion),
     copy: (Uuid, RowVersion),
-    cutover_at: DateTime<Utc>,
+    cutover_at: OffsetDateTime,
     readiness: &RegionTaxReadiness,
     default_rounding_policy: Option<&str>,
 ) -> Result<(), RepoError> {
@@ -1644,7 +1760,7 @@ async fn refuse_ungenerational(
     tenant_id: Uuid,
     predecessor: Uuid,
     copy: Uuid,
-    cutover_at: DateTime<Utc>,
+    cutover_at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let rows: HashMap<Uuid, price::Model> =
         load_rows(runner, scope, tenant_id, [predecessor, copy].into_iter())
@@ -1898,6 +2014,133 @@ fn plan_rows_in_state(tenant_id: Uuid, plan_id: PlanId, state: LifecycleState) -
 /// binds, and keeps the round-trip count a small constant against a per-plan
 /// loop's O(plans).
 const MAX_IN_BINDS: usize = 8192;
+
+/// The three list-page facts about one plan's **authoring** rows — its `draft`
+/// and `published` rows, the set `GET /plans/{planId}/prices` returns under no
+/// `$filter` — for every plan on one list page, in one grouped read (D-360).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanRowAggregate {
+    /// How many `draft` + `published` rows the plan holds — the item count the
+    /// prices list answers unfiltered.
+    pub price_row_count: u64,
+    /// The distinct `model_kind`s of those rows, sorted. A row with none
+    /// contributes to the count and to no kind.
+    pub model_kinds: Vec<String>,
+    /// The distinct currencies of those rows, sorted.
+    pub currencies: Vec<String>,
+}
+
+/// [`PlanRowAggregate`] for each of `plan_ids` that holds at least one authoring
+/// row (D-360).
+///
+/// **One grouped read for the whole page**, not one per plan: grouped by
+/// `(plan_id, model_kind, currency)`, so the row count is the sum of the group
+/// counts and the two vocabularies are the distinct group keys, and the result is
+/// bounded by a plan's model×currency combinations — single digits — never by
+/// its rows. Built with `project_all`, the secure layer's one projection door,
+/// so the scope is compiled before the grouping runs and nothing loads rows to
+/// count them.
+///
+/// A plan with no authoring row has **no entry**; the caller renders zero and two
+/// empty lists. A `NULL` or empty `model_kind` contributes to the count and to no
+/// kind — the reading the Studio's `summarizePlanRows` takes ("tiered
+/// (unspecified)" is the absence of a model, not a variety of one), kept so the
+/// numbers do not move when the Studio switches to these fields.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure.
+pub async fn aggregate_authoring_rows_for_plans(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    plan_ids: &[PlanId],
+) -> Result<HashMap<PlanId, PlanRowAggregate>, RepoError> {
+    #[derive(sea_orm::FromQueryResult)]
+    struct Group {
+        plan_id: Uuid,
+        model_kind: Option<String>,
+        currency: String,
+        cnt: i64,
+    }
+    if plan_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids: Vec<Uuid> = plan_ids.iter().map(|plan| plan.get()).collect();
+    let mut groups = Vec::new();
+    // **Chunked on `MAX_IN_BINDS`, as every other `is_in` in this file is.**
+    // Today's only caller is a page and cannot exceed D-125's limit, but that
+    // bound is the caller's and not this signature's - `load_for_plans` takes the
+    // same predicate over the same table and chunks, and the day a
+    // catalogue-sized id set arrives here an unchunked bind list is a driver
+    // parameter-limit error the caller reads as a 500.
+    for chunk in ids.chunks(MAX_IN_BINDS) {
+        let page = price::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(price::Column::TenantId.eq(tenant_id))
+                    .add(price::Column::PlanId.is_in(chunk.to_vec()))
+                    .add(price::Column::LifecycleState.is_in([
+                        LifecycleState::Draft.as_str(),
+                        LifecycleState::Published.as_str(),
+                    ])),
+            )
+            .project_all(runner, |q| {
+                q.select_only()
+                    .column(price::Column::PlanId)
+                    .column(price::Column::ModelKind)
+                    .column(price::Column::Currency)
+                    .column_as(Expr::col(price::Column::PriceId).count(), "cnt")
+                    .group_by(price::Column::PlanId)
+                    .group_by(price::Column::ModelKind)
+                    .group_by(price::Column::Currency)
+                    .into_model::<Group>()
+            })
+            .await
+            .map_err(|e| RepoError::Db(format!("aggregate authoring rows per plan: {e}")))?;
+        groups.extend(page);
+    }
+
+    let mut out: HashMap<PlanId, PlanRowAggregate> = HashMap::new();
+    for group in groups {
+        let aggregate = out.entry(PlanId::new(group.plan_id)).or_default();
+        aggregate.price_row_count += u64::try_from(group.cnt).unwrap_or(0);
+        if let Some(kind) = group.model_kind.filter(|kind| !kind.is_empty())
+            && !aggregate.model_kinds.contains(&kind)
+        {
+            aggregate.model_kinds.push(kind);
+        }
+        if !aggregate.currencies.contains(&group.currency) {
+            aggregate.currencies.push(group.currency);
+        }
+    }
+    for aggregate in out.values_mut() {
+        aggregate.model_kinds.sort();
+        aggregate.currencies.sort();
+    }
+    Ok(out)
+}
+
+/// Plan-owned metadata for IDs already returned by an original scoped plan read.
+/// A plan resource pin cannot be applied to `pricing_price.price_id`; use a
+/// tenant projection intersected with exactly those authorized plan IDs.
+///
+/// # Errors
+/// Scope/storage failures are propagated; no failure becomes empty aggregates.
+pub async fn aggregate_rows_for_authorized_plans(
+    runner: &impl DBRunner,
+    tenant_id: Uuid,
+    plan_ids: &[PlanId],
+) -> Result<HashMap<PlanId, PlanRowAggregate>, RepoError> {
+    aggregate_authoring_rows_for_plans(
+        runner,
+        &AccessScope::for_tenant(tenant_id),
+        tenant_id,
+        plan_ids,
+    )
+    .await
+}
 
 pub async fn load_for_plan(
     runner: &impl DBRunner,
@@ -2868,8 +3111,8 @@ pub async fn tighten_grandfather_until(
     scope: &AccessScope,
     tenant_id: Uuid,
     price_id: Uuid,
-    prior: Option<DateTime<Utc>>,
-    horizon: DateTime<Utc>,
+    prior: Option<OffsetDateTime>,
+    horizon: OffsetDateTime,
 ) -> Result<PriceRecord, RepoError> {
     check_authored_instant("grandfatherUntil", Some(horizon))?;
     let prior_matches = prior.map_or_else(
@@ -2917,7 +3160,7 @@ async fn refuse_untightenable(
     scope: &AccessScope,
     tenant_id: Uuid,
     price_id: Uuid,
-    prior: Option<DateTime<Utc>>,
+    prior: Option<OffsetDateTime>,
 ) -> RepoError {
     let row = match load_row(runner, scope, tenant_id, price_id).await {
         Err(err) => return err,
@@ -2929,10 +3172,10 @@ async fn refuse_untightenable(
             "price row {price_id}: this transaction read a published generation whose \
              grandfatherUntil was {}, and the store now holds a {} row whose grandfatherUntil is \
              {}",
-            prior.map_or_else(|| "null".to_owned(), |at| at.to_rfc3339()),
+            prior.map_or_else(|| "null".to_owned(), format_rfc3339),
             row.lifecycle_state,
             row.grandfather_until
-                .map_or_else(|| "null".to_owned(), |at| at.to_rfc3339())
+                .map_or_else(|| "null".to_owned(), format_rfc3339)
         ),
     }
 }
@@ -3171,7 +3414,7 @@ async fn mutable_draft(
 /// # Errors
 /// [`RepoError::GrandfatherHorizonOffClass`] naming the class the key holds.
 fn check_grandfather_horizon(
-    horizon: Option<DateTime<Utc>>,
+    horizon: Option<OffsetDateTime>,
     eligibility: PriceEligibility,
 ) -> Result<(), RepoError> {
     if horizon.is_none() || matches!(eligibility, PriceEligibility::ExistingGrandfathered) {
@@ -3560,6 +3803,7 @@ struct PreparedDraft {
     correlation_id: Uuid,
 }
 
+use crate::domain::instant::format_rfc3339;
 /// The two rewrites a price row's content undergoes on its way into the store.
 ///
 /// Defined in [`crate::domain::price_record`] and re-exported here, where it was
@@ -4549,8 +4793,7 @@ fn read_cohort(token: &str) -> Result<Cohort, RepoError> {
         ))
     };
     let millis: i64 = token.parse().map_err(|_| malformed())?;
-    Utc.timestamp_millis_opt(millis)
-        .single()
+    crate::domain::instant::from_unix_millis(millis)
         .map(Cohort::Generation)
         .ok_or_else(malformed)
 }

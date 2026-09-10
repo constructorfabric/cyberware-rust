@@ -3,14 +3,16 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
-    REGION_UNKNOWN, RegionsDeclared, TAXONOMY_VALUE_IN_USE, TaxonomyClass, TaxonomyState,
-    ValueReferences, check_retirable, check_tax_category_removable,
+    GL_CODE_UNKNOWN, GlCodeDeclared, REGION_UNKNOWN, RegionTaxMarkers, RegionsDeclared,
+    TAXONOMY_VALUE_IN_USE, TaxCategoryPatch, TaxonomyClass, TaxonomyEntry, TaxonomyState,
+    TaxonomyValuePatch, ValueReferences, check_retirable, check_tax_category_removable,
+    edit_is_governed, tag_of, tag_of_value,
 };
 use crate::domain::concurrency::RowVersion;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount};
 use crate::domain::overlay::{ScopeClass, ScopeValue};
@@ -21,11 +23,11 @@ use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
 use crate::domain::validation::{ValidationReport, ValidationRule};
+use std::collections::BTreeSet;
+use time::OffsetDateTime;
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 6, 12, 0, 0)
 }
 
 fn plan() -> PlanId {
@@ -119,6 +121,7 @@ fn run(rule: &RegionsDeclared, shape: &PlanShape) -> ValidationReport {
 fn the_codes_are_spelled_as_section_5_spells_them() {
     assert_eq!(REGION_UNKNOWN, "REGION_UNKNOWN");
     assert_eq!(TAXONOMY_VALUE_IN_USE, "TAXONOMY_VALUE_IN_USE");
+    assert_eq!(GL_CODE_UNKNOWN, "GL_CODE_UNKNOWN");
 }
 
 // ---------------------------------------------------------------------------
@@ -464,4 +467,247 @@ fn a_non_region_refusal_does_not_mention_a_price_row_plane() {
         "a partner value is not a price-row axis, so no such plane is named: {detail}"
     );
     assert!(detail.contains("3 published overlay scope(s)"), "{detail}");
+}
+
+// ---------------------------------------------------------------------------
+// D-355: which edits are governed at all.
+// ---------------------------------------------------------------------------
+
+/// The predicate the `PATCH` door reads: the same two planes the retire guard
+/// counts decide whether a second principal is owed.
+#[test]
+fn an_edit_is_governed_iff_something_published_names_the_value() {
+    // Nothing published -> the operator's own act.
+    assert!(!edit_is_governed(ValueReferences::default()));
+    // A published price row on the region axis -> governed.
+    assert!(edit_is_governed(ValueReferences {
+        published_price_rows: 1,
+        active_overlay_scopes: 0,
+    }));
+    // A published overlay scope -> governed (the plane every class has).
+    assert!(edit_is_governed(ValueReferences {
+        published_price_rows: 0,
+        active_overlay_scopes: 1,
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// D-353: the per-value edit and its tag.
+// ---------------------------------------------------------------------------
+
+fn region_entry() -> TaxonomyEntry {
+    TaxonomyEntry {
+        value: ScopeValue::new("eu").expect("a value"),
+        display_name: "EU".to_owned(),
+        state: TaxonomyState::Active,
+        tax: Some(RegionTaxMarkers {
+            tax_category: Some("vat_standard".to_owned()),
+            tax_rate_present: true,
+        }),
+    }
+}
+
+#[test]
+fn an_empty_patch_applies_to_the_held_value_unchanged() {
+    let held = region_entry();
+    assert_eq!(TaxonomyValuePatch::default().apply(&held), held);
+}
+
+#[test]
+fn a_patch_changes_only_what_it_names_and_null_clears_the_category() {
+    let held = region_entry();
+    let relabelled = TaxonomyValuePatch {
+        display_name: Some("Europe".to_owned()),
+        ..TaxonomyValuePatch::default()
+    }
+    .apply(&held);
+    assert_eq!(relabelled.display_name, "Europe");
+    assert_eq!(relabelled.state, held.state);
+    assert_eq!(relabelled.tax, held.tax, "unnamed markers are kept");
+
+    let cleared = TaxonomyValuePatch {
+        tax_category: TaxCategoryPatch::Clear,
+        ..TaxonomyValuePatch::default()
+    }
+    .apply(&held);
+    assert_eq!(
+        cleared.tax.as_ref().and_then(|t| t.tax_category.as_deref()),
+        None
+    );
+    assert!(
+        cleared.tax.as_ref().is_some_and(|t| t.tax_rate_present),
+        "the other marker stays"
+    );
+
+    let retired = TaxonomyValuePatch {
+        state: Some(TaxonomyState::Retired),
+        ..TaxonomyValuePatch::default()
+    }
+    .apply(&held);
+    assert_eq!(retired.state, TaxonomyState::Retired);
+}
+
+#[test]
+fn the_markers_in_a_patch_are_inert_on_a_class_without_them() {
+    let held = TaxonomyEntry {
+        tax: None,
+        ..region_entry()
+    };
+    let patched = TaxonomyValuePatch {
+        tax_category: TaxCategoryPatch::Set("x".to_owned()),
+        tax_rate_present: Some(true),
+        ..TaxonomyValuePatch::default()
+    }
+    .apply(&held);
+    assert_eq!(
+        patched.tax, None,
+        "the route refuses them earlier; the domain never invents a column"
+    );
+}
+
+#[test]
+fn a_values_tag_moves_with_each_rendered_field_and_is_not_the_sets() {
+    let held = region_entry();
+    let base = tag_of_value(TaxonomyClass::Region, &held);
+    assert_ne!(
+        base,
+        tag_of(TaxonomyClass::Region, std::slice::from_ref(&held)),
+        "one value is not the set"
+    );
+    assert_ne!(
+        base,
+        tag_of_value(TaxonomyClass::Brand, &held),
+        "one value in two classes is two resources"
+    );
+    for patch in [
+        TaxonomyValuePatch {
+            display_name: Some("Europe".to_owned()),
+            ..TaxonomyValuePatch::default()
+        },
+        TaxonomyValuePatch {
+            state: Some(TaxonomyState::Retired),
+            ..TaxonomyValuePatch::default()
+        },
+        TaxonomyValuePatch {
+            tax_category: TaxCategoryPatch::Clear,
+            ..TaxonomyValuePatch::default()
+        },
+        TaxonomyValuePatch {
+            tax_rate_present: Some(false),
+            ..TaxonomyValuePatch::default()
+        },
+    ] {
+        assert_ne!(
+            base,
+            tag_of_value(TaxonomyClass::Region, &patch.apply(&held)),
+            "{patch:?}"
+        );
+    }
+    assert_eq!(
+        base,
+        tag_of_value(TaxonomyClass::Region, &held),
+        "an unchanged value renders one tag"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `GlCodeDeclared` — the descriptor's one GL code against the declared set (D-356).
+// ---------------------------------------------------------------------------
+
+fn gl_codes(values: &[&str]) -> GlCodeDeclared {
+    GlCodeDeclared {
+        declared: values.iter().map(|v| (*v).to_owned()).collect(),
+    }
+}
+
+/// A plan whose descriptor set carries `gl_code`, and nothing else the rule
+/// reads.
+fn plan_with_gl_code(gl_code: Option<&str>) -> PlanShape {
+    use crate::domain::plan_shape::DescriptorSet;
+    let mut shape = PlanShape::new(plan(), 1, now());
+    shape.descriptor_set = Some(DescriptorSet {
+        invoice_line_template: Some("{plan}".to_owned()),
+        gl_code: gl_code.map(ToOwned::to_owned),
+        itemization_rule: Some("per_charge".to_owned()),
+        additional: std::collections::BTreeMap::new(),
+    });
+    shape
+}
+
+fn run_gl(rule: &GlCodeDeclared, shape: &PlanShape) -> ValidationReport {
+    let mut report = ValidationReport::default();
+    rule.evaluate(shape, &mut report);
+    report
+}
+
+/// Membership is checked **only once a vocabulary is declared** — the empty set
+/// is the opt-out state, `RoundingPolicyDeclared`'s asymmetry and the invariant
+/// that let the table land without failing every existing plan.
+#[test]
+fn gl_code_membership_is_checked_only_once_a_vocabulary_is_declared() {
+    let unconstrained = GlCodeDeclared {
+        declared: BTreeSet::new(),
+    };
+    assert!(unconstrained.violation_for("glCode", "4000-REV").is_none());
+    assert!(
+        unconstrained
+            .violation_for("glCode", "anything at all")
+            .is_none()
+    );
+
+    let declared = gl_codes(&["4000-REV", "4010-TAX"]);
+    assert!(declared.violation_for("glCode", "4000-REV").is_none());
+    let v = declared
+        .violation_for("glCode", "9999-BAD")
+        .expect("an unknown code is refused");
+    assert_eq!(v.code, GL_CODE_UNKNOWN);
+    assert_eq!(v.subject, "glCode");
+    assert!(
+        v.detail.contains("9999-BAD") && v.detail.contains("/config/gl-codes"),
+        "the finding names the code and the door that declares it: {}",
+        v.detail
+    );
+}
+
+/// The rule reads the descriptor's **one** value and reports at most once — not a
+/// row walk — and it judges a present value only: an absent or blank `glCode` is
+/// `inst-ds-required`'s finding, and a second report of the same absence would
+/// send the author to a vocabulary for a field they have not filled in.
+#[test]
+fn gl_code_rule_judges_the_descriptors_one_present_value_and_nothing_else() {
+    let rule = gl_codes(&["4000-REV"]);
+
+    assert_eq!(rule.name(), "inst-ds-glcode");
+
+    let refused = run_gl(&rule, &plan_with_gl_code(Some("4000")));
+    assert_eq!(codes(&refused), [GL_CODE_UNKNOWN]);
+    assert_eq!(
+        subjects(&refused),
+        [plan_with_gl_code(Some("4000")).subject()],
+        "the subject is the plan, as `inst-ds-required`'s is"
+    );
+
+    assert!(codes(&run_gl(&rule, &plan_with_gl_code(Some("4000-REV")))).is_empty());
+    assert!(
+        codes(&run_gl(&rule, &plan_with_gl_code(None))).is_empty(),
+        "absence is `inst-ds-required`'s finding"
+    );
+    assert!(
+        codes(&run_gl(&rule, &plan_with_gl_code(Some("   ")))).is_empty(),
+        "a blank is an absence wearing a value's shape, and is likewise not this rule's"
+    );
+    let mut without_set = plan_with_gl_code(Some("4000"));
+    without_set.descriptor_set = None;
+    assert!(codes(&run_gl(&rule, &without_set)).is_empty());
+
+    assert!(
+        codes(&run_gl(
+            &GlCodeDeclared {
+                declared: BTreeSet::new()
+            },
+            &plan_with_gl_code(Some("4000"))
+        ))
+        .is_empty(),
+        "and the empty set constrains nothing at the plan level too"
+    );
 }

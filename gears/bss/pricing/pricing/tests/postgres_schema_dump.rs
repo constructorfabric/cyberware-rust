@@ -24,7 +24,7 @@ use schema_dump::postgres_dump;
 ///
 /// The same number the `SQLite` half asserts, and asserted here for the same reason: an
 /// over-eager filter produces a dump that is perfectly deterministic and perfectly useless.
-const PRICING_TABLES: usize = 40;
+const PRICING_TABLES: usize = 41;
 
 fn tables_in(dump: &str) -> Vec<String> {
     let mut names: Vec<String> = dump

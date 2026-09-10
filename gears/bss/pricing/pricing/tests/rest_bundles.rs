@@ -24,6 +24,7 @@ use rest_support::{
     seed_current_plan, seed_draft_plan, seed_foreign_current_plan, seed_foreign_plan, seed_price,
     with_headers,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 fn bundle_path(bundle_id: Uuid) -> String {
@@ -335,7 +336,7 @@ async fn a_retried_create_replays_the_first_answer_and_creates_one_bundle() {
         .allowed()
         .send(with_headers(
             "GET",
-            &format!("{BUNDLES}?plan_id={plan_id}"),
+            &format!("{BUNDLES}?$filter=plan_id%20eq%20{plan_id}"),
             None,
             &[],
         ))
@@ -1642,7 +1643,7 @@ async fn a_composition_edit_voids_the_pending_unit_over_its_plan() {
             serde_json::json!({ "material": true, "reason": "alwaysMaterialTrigger" }),
             bss_pricing::domain::audit::AuditStamp {
                 actor_principal_id: Uuid::from_u128(0x_b0_11),
-                recorded_at: chrono::Utc::now(),
+                recorded_at: OffsetDateTime::now_utc(),
                 correlation_id: Uuid::from_u128(0x_b0_c0),
             },
         )

@@ -15,15 +15,17 @@
 
 use std::collections::HashMap;
 
+use bss_ledger::domain::instant::parse_rfc3339;
 use bss_ledger::domain::model::{AccountRow, NewEntry, NewLine};
 use bss_ledger::infra::posting::projector::{BalanceProjector, ProjectError};
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -57,7 +59,7 @@ fn entry(tenant: Uuid) -> NewEntry {
         source_business_id: "biz-1".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: tenant,
@@ -114,7 +116,7 @@ async fn ar_invoice_stamps(
     raw: &sea_orm::DatabaseConnection,
     account: Uuid,
     invoice_id: &str,
-) -> (Option<DateTime<Utc>>, Option<NaiveDate>) {
+) -> (Option<OffsetDateTime>, Option<NaiveDate>) {
     let row = raw
         .query_one_raw(pg(format!(
             "SELECT original_posted_at, due_date FROM bss.ledger_ar_invoice_balance \
@@ -124,7 +126,7 @@ async fn ar_invoice_stamps(
         .unwrap()
         .expect("ar_invoice_balance row must exist");
     (
-        row.try_get_by_index::<Option<DateTime<Utc>>>(0).unwrap(),
+        row.try_get_by_index::<Option<OffsetDateTime>>(0).unwrap(),
         row.try_get_by_index::<Option<NaiveDate>>(1).unwrap(),
     )
 }
@@ -539,9 +541,7 @@ async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
     let projector = BalanceProjector::new();
 
     // First write: INVOICE_POST DR AR 1000 with due_date d at posted_at t1.
-    let t1 = DateTime::parse_from_rfc3339("2026-06-01T10:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let t1 = parse_rfc3339("2026-06-01T10:00:00Z").unwrap();
     let due = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
     let mut e1 = entry(tenant);
     e1.source_doc_type = SourceDocType::InvoicePost;
@@ -573,9 +573,7 @@ async fn stamps_ar_invoice_original_posted_at_and_due_date_first_write_wins() {
     assert_eq!(due_date, Some(due), "due_date stamped on first write");
 
     // Second write: a payment-allocation CR AR 400 net-down at t2 > t1.
-    let t2 = DateTime::parse_from_rfc3339("2026-06-15T10:00:00Z")
-        .unwrap()
-        .with_timezone(&Utc);
+    let t2 = parse_rfc3339("2026-06-15T10:00:00Z").unwrap();
     let mut e2 = entry(tenant);
     e2.source_doc_type = SourceDocType::PaymentAllocate;
     e2.posted_at_utc = t2;

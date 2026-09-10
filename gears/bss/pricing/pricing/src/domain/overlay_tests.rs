@@ -5,18 +5,16 @@
 //! *order* (a rank, and it must be the one `inst-plv-class-tiebreak` publishes)
 //! and the resolution rule `inst-plv-lines` declares normative.
 
-use chrono::TimeZone;
-
 use super::*;
+use crate::domain::instant::utc_ymd_hms;
+use time::OffsetDateTime;
 
 fn plan(n: u128) -> PlanId {
     PlanId::new(Uuid::from_u128(n))
 }
 
-fn at(year: i32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0)
-        .single()
-        .expect("a valid instant")
+fn at(year: i32) -> OffsetDateTime {
+    utc_ymd_hms(year, 1, 1, 0, 0, 0)
 }
 
 fn line(key: LineKey, bp: i64) -> OverlayLine {

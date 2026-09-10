@@ -28,7 +28,6 @@
 //! audit retrieval p95 ≤ 2 s, inquiry p95 ≤ 5 s, and audit-pack export async
 //! ≤ 15 min — which the bounded scoped reads here meet.
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use std::collections::HashMap;
@@ -39,9 +38,11 @@ use toolkit_db::secure::{AccessScope, DBRunner, DbTx, SecureEntityExt, SecureIns
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
 
+use crate::domain::instant::format_rfc3339;
 use crate::domain::model::RepoError;
 use crate::domain::ports::metrics::{LedgerMetricsPort, NoopLedgerMetrics};
 use crate::infra::storage::entity::{audit_pack_export, journal_entry, journal_line};
+use time::OffsetDateTime;
 
 /// The inquiry filter axes. Every field is optional; an absent field is "any".
 /// `legal_entity_id` + `period_id` filter the entry header; `payer_tenant_id` +
@@ -83,7 +84,7 @@ pub struct EntryRow {
     pub source_doc_type: String,
     pub source_business_id: String,
     pub reverses_entry_id: Option<Uuid>,
-    pub posted_at_utc: DateTime<Utc>,
+    pub posted_at_utc: OffsetDateTime,
     pub posted_by_actor_id: Uuid,
     pub origin: String,
     pub correlation_id: Uuid,
@@ -605,7 +606,7 @@ fn push_row(out: &mut String, entry: &EntryRow, line: Option<&LineRow>) {
         entry.tenant_id.to_string(),
         entry.period_id.clone(),
         entry.legal_entity_id.to_string(),
-        entry.posted_at_utc.to_rfc3339(),
+        format_rfc3339(entry.posted_at_utc),
         entry.source_doc_type.clone(),
         entry.source_business_id.clone(),
         entry.origin.clone(),

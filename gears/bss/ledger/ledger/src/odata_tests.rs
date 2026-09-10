@@ -5,13 +5,15 @@
 
 use super::{
     AccountInfoFilterField, BalanceFilterField, CreditNoteFilterField, DebitNoteFilterField,
-    DisputeFilterField, JournalEntryFilterField, JournalLineFilterField, RecognitionRunFilterField,
-    RefundFilterField,
+    DisputeFilterField, ExceptionFilterField, JournalEntryFilterField, JournalLineFilterField,
+    RecognitionRunFilterField, RefundFilterField,
 };
 use toolkit_odata::filter::{FieldKind, FilterField};
 
 #[test]
 fn account_fields_expose_expected_wire_names_and_kinds() {
+    assert_eq!(AccountInfoFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(AccountInfoFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(AccountInfoFilterField::AccountId.name(), "account_id");
     assert_eq!(AccountInfoFilterField::AccountClass.name(), "account_class");
     assert_eq!(AccountInfoFilterField::Currency.name(), "currency");
@@ -32,6 +34,8 @@ fn account_fields_expose_expected_wire_names_and_kinds() {
 
 #[test]
 fn line_fields_expose_expected_wire_names_and_kinds() {
+    assert_eq!(JournalLineFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(JournalLineFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(JournalLineFilterField::LineId.name(), "line_id");
     assert_eq!(
         JournalLineFilterField::PayerTenantId.name(),
@@ -50,6 +54,8 @@ fn line_fields_expose_expected_wire_names_and_kinds() {
 
 #[test]
 fn balance_fields_expose_expected_wire_names_and_kinds() {
+    assert_eq!(BalanceFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(BalanceFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(BalanceFilterField::AccountId.name(), "account_id");
     assert_eq!(BalanceFilterField::AccountClass.name(), "account_class");
     assert_eq!(BalanceFilterField::Currency.name(), "currency");
@@ -94,6 +100,8 @@ fn unknown_field_does_not_resolve() {
 
 #[test]
 fn refund_fields_round_trips() {
+    assert_eq!(RefundFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(RefundFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(RefundFilterField::RefundId.name(), "refund_id");
     assert_eq!(RefundFilterField::PaymentId.name(), "payment_id");
     assert_eq!(RefundFilterField::PspRefundId.name(), "psp_refund_id");
@@ -102,14 +110,19 @@ fn refund_fields_round_trips() {
     assert_eq!(RefundFilterField::ClearingState.name(), "clearing_state");
     assert_eq!(RefundFilterField::InvoiceId.name(), "invoice_id");
 
-    // Every refund filter dim is a plain `varchar` column.
+    // Seller scope is Uuid; every other refund filter dim is a `varchar`.
     for f in RefundFilterField::FIELDS {
-        assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        if *f == RefundFilterField::TenantId {
+            assert_eq!(f.kind(), FieldKind::Uuid, "{f:?} must be Uuid");
+        } else {
+            assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        }
     }
 
     assert_eq!(
         RefundFilterField::FIELDS,
         &[
+            RefundFilterField::TenantId,
             RefundFilterField::RefundId,
             RefundFilterField::PaymentId,
             RefundFilterField::PspRefundId,
@@ -137,6 +150,8 @@ fn refund_fields_round_trips() {
 
 #[test]
 fn credit_note_fields_round_trips() {
+    assert_eq!(CreditNoteFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(CreditNoteFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(CreditNoteFilterField::CreditNoteId.name(), "credit_note_id");
     assert_eq!(
         CreditNoteFilterField::OriginInvoiceId.name(),
@@ -148,14 +163,18 @@ fn credit_note_fields_round_trips() {
     );
     assert_eq!(CreditNoteFilterField::ReasonCode.name(), "reason_code");
 
-    // Every credit-note filter dim is a plain `varchar` column.
     for f in CreditNoteFilterField::FIELDS {
-        assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        if *f == CreditNoteFilterField::TenantId {
+            assert_eq!(f.kind(), FieldKind::Uuid, "{f:?} must be Uuid");
+        } else {
+            assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        }
     }
 
     assert_eq!(
         CreditNoteFilterField::FIELDS,
         &[
+            CreditNoteFilterField::TenantId,
             CreditNoteFilterField::CreditNoteId,
             CreditNoteFilterField::OriginInvoiceId,
             CreditNoteFilterField::RevenueStream,
@@ -179,20 +198,26 @@ fn credit_note_fields_round_trips() {
 
 #[test]
 fn debit_note_fields_round_trips() {
+    assert_eq!(DebitNoteFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(DebitNoteFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(DebitNoteFilterField::DebitNoteId.name(), "debit_note_id");
     assert_eq!(
         DebitNoteFilterField::OriginInvoiceId.name(),
         "origin_invoice_id"
     );
 
-    // Both debit-note filter dims are plain `varchar` columns.
     for f in DebitNoteFilterField::FIELDS {
-        assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        if *f == DebitNoteFilterField::TenantId {
+            assert_eq!(f.kind(), FieldKind::Uuid, "{f:?} must be Uuid");
+        } else {
+            assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        }
     }
 
     assert_eq!(
         DebitNoteFilterField::FIELDS,
         &[
+            DebitNoteFilterField::TenantId,
             DebitNoteFilterField::DebitNoteId,
             DebitNoteFilterField::OriginInvoiceId,
         ],
@@ -214,19 +239,25 @@ fn debit_note_fields_round_trips() {
 
 #[test]
 fn dispute_fields_round_trips() {
+    assert_eq!(DisputeFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(DisputeFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(DisputeFilterField::DisputeId.name(), "dispute_id");
     assert_eq!(DisputeFilterField::PaymentId.name(), "payment_id");
     assert_eq!(DisputeFilterField::LastPhase.name(), "last_phase");
     assert_eq!(DisputeFilterField::Variant.name(), "variant");
 
-    // Every dispute filter dim is a plain `varchar` column.
     for f in DisputeFilterField::FIELDS {
-        assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        if *f == DisputeFilterField::TenantId {
+            assert_eq!(f.kind(), FieldKind::Uuid, "{f:?} must be Uuid");
+        } else {
+            assert_eq!(f.kind(), FieldKind::String, "{f:?} must be String");
+        }
     }
 
     assert_eq!(
         DisputeFilterField::FIELDS,
         &[
+            DisputeFilterField::TenantId,
             DisputeFilterField::DisputeId,
             DisputeFilterField::PaymentId,
             DisputeFilterField::LastPhase,
@@ -250,6 +281,8 @@ fn dispute_fields_round_trips() {
 
 #[test]
 fn recognition_run_fields_round_trips() {
+    assert_eq!(RecognitionRunFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(RecognitionRunFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(RecognitionRunFilterField::RunId.name(), "run_id");
     assert_eq!(RecognitionRunFilterField::PeriodId.name(), "period_id");
     assert_eq!(RecognitionRunFilterField::Status.name(), "status");
@@ -265,6 +298,7 @@ fn recognition_run_fields_round_trips() {
     assert_eq!(
         RecognitionRunFilterField::FIELDS,
         &[
+            RecognitionRunFilterField::TenantId,
             RecognitionRunFilterField::RunId,
             RecognitionRunFilterField::PeriodId,
             RecognitionRunFilterField::Status,
@@ -287,6 +321,8 @@ fn recognition_run_fields_round_trips() {
 
 #[test]
 fn journal_entry_fields_round_trips() {
+    assert_eq!(JournalEntryFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(JournalEntryFilterField::TenantId.kind(), FieldKind::Uuid);
     assert_eq!(JournalEntryFilterField::EntryId.name(), "entry_id");
     assert_eq!(
         JournalEntryFilterField::SourceDocType.name(),
@@ -313,6 +349,7 @@ fn journal_entry_fields_round_trips() {
     assert_eq!(
         JournalEntryFilterField::FIELDS,
         &[
+            JournalEntryFilterField::TenantId,
             JournalEntryFilterField::EntryId,
             JournalEntryFilterField::SourceDocType,
             JournalEntryFilterField::SourceBusinessId,
@@ -328,6 +365,32 @@ fn journal_entry_fields_round_trips() {
     for f in JournalEntryFilterField::FIELDS {
         assert_eq!(
             JournalEntryFilterField::from_name(f.name()),
+            Some(*f),
+            "{f:?} must round-trip via from_name(name())"
+        );
+    }
+}
+
+#[test]
+fn exception_fields_round_trips() {
+    assert_eq!(ExceptionFilterField::TenantId.name(), "tenant_id");
+    assert_eq!(ExceptionFilterField::ExceptionId.name(), "exception_id");
+    assert_eq!(ExceptionFilterField::ExceptionType.name(), "type");
+    assert_eq!(ExceptionFilterField::Status.name(), "status");
+    assert_eq!(ExceptionFilterField::BusinessRef.name(), "business_ref");
+    assert_eq!(ExceptionFilterField::PeriodId.name(), "period_id");
+    assert_eq!(ExceptionFilterField::TenantId.kind(), FieldKind::Uuid);
+    assert_eq!(
+        ExceptionFilterField::ExceptionType.kind(),
+        FieldKind::String
+    );
+    assert_eq!(
+        ExceptionFilterField::from_name("type"),
+        Some(ExceptionFilterField::ExceptionType)
+    );
+    for f in ExceptionFilterField::FIELDS {
+        assert_eq!(
+            ExceptionFilterField::from_name(f.name()),
             Some(*f),
             "{f:?} must round-trip via from_name(name())"
         );

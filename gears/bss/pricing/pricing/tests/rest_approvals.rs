@@ -21,21 +21,330 @@
 mod common;
 mod rest_support;
 
+#[path = "rest_approvals/counts.rs"]
+mod counts;
+
 use bss_pricing::authz::{actions, labels};
 use bss_pricing::config::JobsConfig;
 use bss_pricing::domain::approval::ApprovalState;
+use bss_pricing::domain::instant::format_rfc3339;
 use bss_pricing::domain::window::WindowState;
 use bss_pricing::infra::jobs::window_activation::WindowActivationJob;
 use bss_pricing::infra::storage::repo::window_repo;
-use chrono::{TimeZone, Utc};
+
+use account_management_sdk::{IdpUser, IdpUserFilterField, ListUsersQuery};
+use async_trait::async_trait;
+use bss_pricing::domain::instant::utc_ymd_hms;
+use bss_pricing::infra::approval_participants::{ApprovalParticipants, ParticipantDirectory};
+use parking_lot::Mutex;
 use rest_support::{
     Harness, approval_row, approval_rows, audit_rows, body_json, problem_code, refused_by,
     seed_publishable_plan, with_headers,
 };
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use toolkit_canonical_errors::{CanonicalError, resource_error};
+use toolkit_odata::filter::{FilterNode, ODataValue};
+use toolkit_odata::{Page, PageInfo};
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 const SUBMITTER: Uuid = Uuid::from_u128(0x5_c0);
 const APPROVER: Uuid = Uuid::from_u128(0xa_c0);
+
+/// Caller, tenant and exact requested profile IDs at the AM boundary.
+type ProfileCall = (Uuid, Uuid, Vec<Uuid>);
+
+/// Simulates only AM's authorized profile response, not approval authorization.
+#[derive(Default)]
+struct Profiles {
+    answers: Mutex<BTreeMap<Uuid, Result<IdpUser, CanonicalError>>>,
+    calls: Mutex<Vec<ProfileCall>>,
+}
+
+#[async_trait]
+impl ParticipantDirectory for Profiles {
+    async fn list_users(
+        &self,
+        ctx: &SecurityContext,
+        query: ListUsersQuery,
+    ) -> Result<Page<IdpUser>, CanonicalError> {
+        let Some(FilterNode::InList {
+            field: IdpUserFilterField::Id,
+            values,
+        }) = query.filter
+        else {
+            panic!("an approval read must request exact IDs, never an unfiltered tenant");
+        };
+        let ids: Vec<_> = values
+            .into_iter()
+            .map(|value| match value {
+                ODataValue::Uuid(id) => id,
+                _ => panic!("typed UUID filter"),
+            })
+            .collect();
+        self.calls
+            .lock()
+            .push((ctx.subject_id(), ctx.subject_tenant_id(), ids.clone()));
+        let answers = self.answers.lock();
+        let items = ids
+            .iter()
+            .filter_map(|id| answers.get(id).cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: u64::from(query.pagination.top()),
+            },
+        ))
+    }
+}
+
+/// The real routes with an observable profile-source boundary.
+async fn named_harness() -> (Harness, Arc<Profiles>) {
+    let mut h = Harness::new().await;
+    let source = Arc::new(Profiles::default());
+    source.answers.lock().insert(
+        SUBMITTER,
+        Ok(IdpUser::new(SUBMITTER, "submitter-login")
+            .with_display_name("Alice Author")
+            .with_email("hidden@example.test")),
+    );
+    source
+        .answers
+        .lock()
+        .insert(APPROVER, Ok(IdpUser::new(APPROVER, "bob-reviewer")));
+    Arc::make_mut(&mut h.governance).participants =
+        ApprovalParticipants::with_directory(source.clone());
+    (h, source)
+}
+
+/// A resource-scoped canonical AM failure without disclosing its detail in Pricing.
+#[resource_error(gts_id!("cf.core.am.user.v1~"))]
+struct ProfileResource;
+
+#[tokio::test]
+async fn participant_names_agree_on_list_and_detail_and_refresh_without_persisting() {
+    let (h, source) = named_harness().await;
+    let id = a_pending_unit(&h).await;
+    let client = h.allowed_as(APPROVER);
+    let decision = client
+        .send(with_headers(
+            "POST",
+            &decision_path(id, "approve"),
+            None,
+            &[],
+        ))
+        .await;
+    assert_eq!(decision.status(), axum::http::StatusCode::OK);
+    let decision = body_json(decision).await;
+    assert!(
+        decision.get("submitter").is_none(),
+        "mutation remains stored metadata only"
+    );
+    assert!(
+        source.calls.lock().is_empty(),
+        "submit and decide do not read profiles"
+    );
+    let path = format!("/bss-pricing/v1/approvals/{id}");
+    let response = client.send(with_headers("GET", &path, None, &[])).await;
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let detail = body_json(response).await;
+    assert_eq!(
+        detail["approval"]["submitter"],
+        serde_json::json!({
+            "principal_id": SUBMITTER, "display_name": "Alice Author", "name_status": "resolved"
+        })
+    );
+    assert_eq!(
+        detail["approval"]["approver"]["display_name"],
+        "bob-reviewer"
+    );
+    let response = client
+        .send(with_headers("GET", "/bss-pricing/v1/approvals", None, &[]))
+        .await;
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let list = body_json(response).await;
+    assert_eq!(list["items"][0], detail["approval"]);
+    assert_eq!(
+        source.calls.lock().len(),
+        2,
+        "one batch of two principals per read, no cross-request cache"
+    );
+    assert!(
+        source
+            .calls
+            .lock()
+            .iter()
+            .all(|(actor, tenant, _)| *actor == APPROVER && *tenant == h.tenant)
+    );
+    assert!(!detail.to_string().contains("hidden@example.test"));
+    let audit_before = audit_rows(&h).await;
+    source.answers.lock().insert(
+        SUBMITTER,
+        Ok(IdpUser::new(SUBMITTER, "submitter-login").with_display_name("Alice Renamed")),
+    );
+    let renamed = body_json(client.send(with_headers("GET", &path, None, &[])).await).await;
+    assert_eq!(
+        renamed["approval"]["submitter"]["display_name"],
+        "Alice Renamed"
+    );
+    assert_eq!(
+        renamed["approval"]["content_hash"],
+        detail["approval"]["content_hash"]
+    );
+    assert_eq!(
+        audit_rows(&h).await.len(),
+        audit_before.len(),
+        "read enrichment never writes audit"
+    );
+    let audit = format!("{audit_before:?}");
+    assert!(!audit.contains("Alice Author") && !audit.contains("bob-reviewer"));
+}
+
+#[tokio::test]
+async fn multiple_approval_rows_lookup_the_same_submitter_once() {
+    let (h, source) = named_harness().await;
+    a_pending_unit(&h).await;
+    let second_plan = Uuid::now_v7();
+    let seeded = seed_publishable_plan(&h, second_plan).await;
+    let response = h
+        .allowed_as(SUBMITTER)
+        .send(with_headers(
+            "POST",
+            &format!("/bss-pricing/v1/plans/{second_plan}/publish"),
+            None,
+            &[("if-match", &seeded.etag())],
+        ))
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+    let list = body_json(
+        h.allowed_as(APPROVER)
+            .send(with_headers("GET", "/bss-pricing/v1/approvals", None, &[]))
+            .await,
+    )
+    .await;
+    let rows = list["items"].as_array().expect("approval page");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|row| row["submitter"]["display_name"] == "Alice Author"
+                && row["approver"].is_null())
+    );
+    assert_eq!(
+        *source.calls.lock(),
+        [(APPROVER, h.tenant, vec![SUBMITTER])]
+    );
+}
+
+#[tokio::test]
+async fn unreadable_approval_and_empty_page_never_trigger_profile_lookup() {
+    let (h, source) = named_harness().await;
+    let id = a_pending_unit(&h).await;
+    let path = format!("/bss-pricing/v1/approvals/{id}");
+    for (client, expected) in [
+        (h.denied(), axum::http::StatusCode::FORBIDDEN),
+        (h.anonymous(), axum::http::StatusCode::UNAUTHORIZED),
+        (h.scope_mismatch(), axum::http::StatusCode::NOT_FOUND),
+    ] {
+        assert_eq!(
+            client
+                .send(with_headers("GET", &path, None, &[]))
+                .await
+                .status(),
+            expected
+        );
+    }
+    let missing = format!("/bss-pricing/v1/approvals/{}", Uuid::now_v7());
+    assert_eq!(
+        h.allowed_as(APPROVER)
+            .send(with_headers("GET", &missing, None, &[]))
+            .await
+            .status(),
+        axum::http::StatusCode::NOT_FOUND
+    );
+    let response = h
+        .scope_mismatch()
+        .send(with_headers("GET", "/bss-pricing/v1/approvals", None, &[]))
+        .await;
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(body_json(response).await["items"], serde_json::json!([]));
+    assert!(source.calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn profile_failures_are_explicit_and_do_not_hide_an_authorized_approval() {
+    let (h, source) = named_harness().await;
+    let id = a_pending_unit(&h).await;
+    let decision = h
+        .allowed_as(APPROVER)
+        .send(with_headers(
+            "POST",
+            &decision_path(id, "approve"),
+            None,
+            &[],
+        ))
+        .await;
+    assert_eq!(decision.status(), axum::http::StatusCode::OK);
+    let path = format!("/bss-pricing/v1/approvals/{id}");
+    let cases = [
+        (
+            ProfileResource::permission_denied()
+                .with_reason("PRIVATE_AM_DETAIL")
+                .create(),
+            "restricted",
+        ),
+        (
+            ProfileResource::not_found("PRIVATE_AM_DETAIL")
+                .with_resource("private-user")
+                .create(),
+            "not_found",
+        ),
+        (
+            CanonicalError::service_unavailable()
+                .with_detail("PRIVATE_AM_DETAIL")
+                .create(),
+            "unavailable",
+        ),
+        (
+            CanonicalError::unauthenticated()
+                .with_reason("PRIVATE_AM_DETAIL")
+                .create(),
+            "restricted",
+        ),
+        (
+            ProfileResource::unimplemented("PRIVATE_AM_DETAIL").create(),
+            "unavailable",
+        ),
+    ];
+    for (error, status) in cases {
+        source.answers.lock().insert(SUBMITTER, Err(error));
+        let response = h
+            .allowed_as(APPROVER)
+            .send(with_headers("GET", &path, None, &[]))
+            .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let detail = body_json(response).await;
+        assert_eq!(detail["approval"]["submitter"]["name_status"], status);
+        assert_eq!(detail["approval"]["approver"]["name_status"], status);
+        assert!(detail["approval"]["approver"]["display_name"].is_null());
+        assert!(detail["approval"]["submitter"]["display_name"].is_null());
+        assert_eq!(
+            detail["approval"]["submitter"]["principal_id"],
+            SUBMITTER.to_string()
+        );
+        assert!(!detail.to_string().contains("PRIVATE_AM_DETAIL"));
+        let list = body_json(
+            h.allowed_as(APPROVER)
+                .send(with_headers("GET", "/bss-pricing/v1/approvals", None, &[]))
+                .await,
+        )
+        .await;
+        assert_eq!(list["items"][0], detail["approval"]);
+    }
+}
 
 /// A plan with one pending unit over it, opened through the publish route.
 async fn a_pending_unit(h: &Harness) -> Uuid {
@@ -568,8 +877,10 @@ async fn the_record_carries_the_content_its_pin_covers() {
         serde_json::json!([{
             "scope_key": pinned["rows"][0]["scope_key"],
             "intervals": [{
-                "effective_from": Utc.with_ymd_and_hms(from_y, from_m, from_d, 0, 0, 0).unwrap(),
-                "effective_to": Utc.with_ymd_and_hms(to_y, to_m, to_d, 0, 0, 0).unwrap(),
+                // The gear's renderer, not `time`'s: an expectation that spells
+                // the instant its own way asserts a form the gear may not emit.
+                "effective_from": format_rfc3339(utc_ymd_hms(from_y, from_m, from_d, 0, 0, 0)),
+                "effective_to": format_rfc3339(utc_ymd_hms(to_y, to_m, to_d, 0, 0, 0)),
                 "state": "scheduled",
             }],
         }]),
@@ -663,10 +974,7 @@ async fn an_activation_under_a_pending_unit_does_not_void_the_approval() {
     // The clock arrives at the fixture window's start. `inst-ws-activate` fires on
     // `now >= effectiveFrom`, so the boundary instant itself is due.
     let (year, month, day) = common::COVERAGE_FROM_UTC;
-    let boundary = Utc
-        .with_ymd_and_hms(year, month, day, 0, 0, 0)
-        .single()
-        .expect("a fixed UTC instant is unambiguous");
+    let boundary = utc_ymd_hms(year, month, day, 0, 0, 0);
 
     let report = WindowActivationJob::new(h.db.clone(), JobsConfig::default())
         .run(boundary)
@@ -859,7 +1167,7 @@ async fn the_queue_lists_pending_and_decided_units_and_filters_by_state() {
         h.allowed_as(APPROVER)
             .send(with_headers(
                 "GET",
-                "/bss-pricing/v1/approvals?state=submitted",
+                "/bss-pricing/v1/approvals?$filter=state%20eq%20'submitted'",
                 None,
                 &[],
             ))
@@ -926,7 +1234,7 @@ async fn the_queue_pages_and_the_cursor_resumes_after_the_last_row() {
 }
 
 #[tokio::test]
-async fn an_unknown_state_filter_is_refused_rather_than_ignored() {
+async fn an_unknown_query_parameter_state_is_refused() {
     let h = Harness::new().await;
 
     let response = h
@@ -940,15 +1248,32 @@ async fn an_unknown_state_filter_is_refused_rather_than_ignored() {
         .await;
 
     assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
-    // And it names the token it rejected, beside the vocabulary it was judged
-    // against. This route renders several 400s — a malformed cursor and a
-    // non-numeric limit among them — so a bare status is satisfied by one
-    // raised before the filter was read at all, which is precisely the state
-    // this case is named against: refused rather than ignored.
     refused_by(
         &body_json(response).await,
         "invalid_argument",
-        "state `pending` is not one of submitted, approved, rejected, voided",
+        "unrecognized query parameter `state`",
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_state_filter_is_refused_rather_than_ignored() {
+    let h = Harness::new().await;
+
+    let response = h
+        .allowed_as(APPROVER)
+        .send(with_headers(
+            "GET",
+            "/bss-pricing/v1/approvals?$filter=state%20eq%20'pending'",
+            None,
+            &[],
+        ))
+        .await;
+
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    refused_by(
+        &body_json(response).await,
+        "invalid_argument",
+        "unknown approval state `pending`",
     );
 }
 

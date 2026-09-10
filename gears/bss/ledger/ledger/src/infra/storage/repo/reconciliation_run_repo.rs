@@ -4,7 +4,6 @@
 //! an out-of-tolerance run feeds an `exception_queue` row + the close gate
 //! (Slice 7, design §4.3).
 
-use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use serde_json::Value as JsonValue;
@@ -15,6 +14,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::reconciliation_run;
+use time::OffsetDateTime;
 
 /// SeaORM-backed reconciliation-run repository.
 #[derive(Clone)]
@@ -50,7 +50,7 @@ impl ReconciliationRunRepo {
             status: Set("RUNNING".to_owned()),
             watermark: Set(None),
             detail: Set(None),
-            at_utc: Set(Utc::now()),
+            at_utc: Set(OffsetDateTime::now_utc()),
         };
         reconciliation_run::Entity::insert(am.clone())
             .secure()

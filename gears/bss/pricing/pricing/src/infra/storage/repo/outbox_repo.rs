@@ -114,7 +114,7 @@
 //! document has something concrete to contradict.
 
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{DateTime, Utc};
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use serde_json::{Value as JsonValue, json};
@@ -124,10 +124,12 @@ use uuid::Uuid;
 use crate::domain::bundle::{InvoiceItemization, PriceBasis};
 use crate::domain::evaluation_policy::EVALUATION_POLICY_GENERATION;
 use crate::domain::events::CatalogEvent;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::overlay::{ScopeSelector, ScopeValue};
 use crate::domain::scope_key::PlanId;
 use crate::infra::storage::entity::outbox;
 use crate::infra::storage::{RepoError, contention_or_db};
+use time::OffsetDateTime;
 
 /// The `PlanPublished` payload, as one type rather than a map built at a call
 /// site.
@@ -231,7 +233,7 @@ pub struct NewOutboxEvent {
     pub correlation_id: Uuid,
     /// When the event was enqueued, UTC — the caller's instant, for the reason
     /// [`NewAuditEntry`](super::audit_repo::NewAuditEntry) gives.
-    pub enqueued_at: DateTime<Utc>,
+    pub enqueued_at: OffsetDateTime,
 }
 
 impl NewOutboxEvent {
@@ -244,7 +246,7 @@ impl NewOutboxEvent {
     pub fn plan_created(
         tenant_id: Uuid,
         payload: &PlanCreatedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -268,7 +270,7 @@ impl NewOutboxEvent {
     pub fn plan_updated(
         tenant_id: Uuid,
         payload: &PlanUpdatedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -297,7 +299,7 @@ impl NewOutboxEvent {
     pub fn plan_published(
         tenant_id: Uuid,
         payload: &PlanPublishedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -323,7 +325,7 @@ impl NewOutboxEvent {
     pub fn plan_retired(
         tenant_id: Uuid,
         payload: &PlanRetiredPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -348,7 +350,7 @@ impl NewOutboxEvent {
     pub fn plan_migration_scheduled(
         tenant_id: Uuid,
         payload: &PlanMigrationScheduledPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -373,7 +375,7 @@ impl NewOutboxEvent {
     pub fn plan_publish_degraded(
         tenant_id: Uuid,
         payload: &PlanPublishDegradedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -402,7 +404,7 @@ impl NewOutboxEvent {
     pub fn price_window_activated(
         tenant_id: Uuid,
         payload: &PriceWindowTransitionPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -429,7 +431,7 @@ impl NewOutboxEvent {
     pub fn price_window_expired(
         tenant_id: Uuid,
         payload: &PriceWindowTransitionPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -474,7 +476,7 @@ impl NewOutboxEvent {
         tenant_id: Uuid,
         event: WindowMutationEvent,
         payload: &PriceWindowTransitionPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
         act: &str,
     ) -> Self {
         Self {
@@ -526,7 +528,7 @@ impl NewOutboxEvent {
     pub fn price_created(
         tenant_id: Uuid,
         payload: &PriceCreatedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -543,7 +545,7 @@ impl NewOutboxEvent {
     pub fn price_updated(
         tenant_id: Uuid,
         payload: &PriceUpdatedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -576,7 +578,7 @@ impl NewOutboxEvent {
     pub fn bundle_updated(
         tenant_id: Uuid,
         payload: &BundleUpdatedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -610,7 +612,7 @@ impl NewOutboxEvent {
     pub fn price_overlay_published(
         tenant_id: Uuid,
         payload: &PriceOverlayPublishedPayload,
-        enqueued_at: DateTime<Utc>,
+        enqueued_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -819,7 +821,7 @@ pub struct PlanMigrationScheduledPayload {
     /// The published target.
     pub target_plan_id: PlanId,
     /// When the migration takes effect.
-    pub effective_at: DateTime<Utc>,
+    pub effective_at: OffsetDateTime,
     /// `all`, or the subscription filter the operator scoped it to.
     pub scope: JsonValue,
     /// The subscriptions excluded from the run — contract-locked, and never
@@ -837,7 +839,7 @@ pub struct PlanMigrationScheduledPayload {
     pub exclusions_unresolved: bool,
     /// **D-39, on the contract rather than in the consumer's head**: a migrated
     /// subscription enters the target's first **non-trial** phase. A migration
-    /// never grants a new `trial`; entering an `intro` phase is allowed. Carried
+    /// never grants a new `trial`; entering an `interim` phase is allowed. Carried
     /// here because §3 step 2 puts the entry-phase rule on this event, and
     /// Subscriptions is what places the subscription.
     pub entry_phase_is_first_non_trial: bool,
@@ -857,7 +859,7 @@ impl PlanMigrationScheduledPayload {
             "sourcePlanId": self.source_plan_id.get(),
             "sourceRevision": self.source_revision,
             "targetPlanId": self.target_plan_id.get(),
-            "effectiveAt": self.effective_at,
+            "effectiveAt": format_rfc3339(self.effective_at),
             "scope": self.scope,
             "excludedSubscriptionRefs": self.excluded_subscription_refs,
             "exclusionsUnresolved": self.exclusions_unresolved,
@@ -930,7 +932,7 @@ pub struct PlanPublishDegradedPayload {
     /// wait **outside** degraded handling, and an age measured from the request
     /// includes nothing but that wait for the first five minutes of every
     /// publish.
-    pub commit_observed_at: DateTime<Utc>,
+    pub commit_observed_at: OffsetDateTime,
     /// The correlation id of the sweep pass that observed it.
     pub correlation_id: Uuid,
 }
@@ -943,7 +945,7 @@ impl PlanPublishDegradedPayload {
             "planId": self.plan_id.get(),
             "catalogVersion": self.catalog_version.get(),
             "pendingVersionRef": self.pending_version_ref,
-            "commitObservedAt": self.commit_observed_at,
+            "commitObservedAt": format_rfc3339(self.commit_observed_at),
             "correlationId": self.correlation_id,
         })
     }
@@ -1037,9 +1039,9 @@ pub struct PriceWindowTransitionPayload {
     /// The price row the window is bound to.
     pub price_id: Uuid,
     /// Inclusive start of the half-open interval, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// The correlation id of the sweep pass that observed the boundary.
     pub correlation_id: Uuid,
 }
@@ -1059,8 +1061,8 @@ impl PriceWindowTransitionPayload {
             "windowId": self.window_id,
             "planId": self.plan_id.get(),
             "priceId": self.price_id,
-            "effectiveFrom": self.effective_from,
-            "effectiveTo": self.effective_to,
+            "effectiveFrom": format_rfc3339(self.effective_from),
+            "effectiveTo": self.effective_to.map(format_rfc3339),
             "correlationId": self.correlation_id,
         })
     }
@@ -1175,7 +1177,7 @@ pub struct PriceUpdatedPayload {
     /// The row it replaced, which every producer of this event has.
     pub supersedes_price_id: Uuid,
     /// The instant coverage hands over from the predecessor to this row.
-    pub changeover: DateTime<Utc>,
+    pub changeover: OffsetDateTime,
     /// The registry's **pending** handle, for [`PlanPublishedPayload`]'s reason: the
     /// version does not exist yet and will not until the registry batches (D-47).
     pub pending_version_ref: String,
@@ -1192,7 +1194,7 @@ impl PriceUpdatedPayload {
             "priceId": self.price_id,
             "scopeKey": self.scope_key,
             "supersedesPriceId": self.supersedes_price_id,
-            "changeover": self.changeover,
+            "changeover": format_rfc3339(self.changeover),
             "pendingVersionRef": self.pending_version_ref,
             "correlationId": self.correlation_id,
         })

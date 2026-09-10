@@ -6,9 +6,9 @@
 //! disposition. Tenant-scoped via `SecureORM`; the resource col is the
 //! synthetic `exception_id`.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -30,8 +30,8 @@ pub struct Model {
     pub status: String,
     pub period_id: Option<String>,
     pub detail: Option<JsonValue>,
-    pub opened_at: DateTime<Utc>,
-    pub resolved_at: Option<DateTime<Utc>>,
+    pub opened_at: OffsetDateTime,
+    pub resolved_at: Option<OffsetDateTime>,
     pub resolved_by: Option<String>,
 }
 

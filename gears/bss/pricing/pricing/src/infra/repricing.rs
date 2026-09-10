@@ -196,7 +196,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use toolkit_db::secure::{AccessScope, DBRunner, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -230,6 +229,7 @@ use crate::infra::storage::repo::{
 };
 use crate::infra::storage::repo_failure;
 use crate::infra::supersession::{SupersessionCommit, commit_supersession, supersession_unit_ref};
+use time::OffsetDateTime;
 
 /// What one call to [`apply_run_in`] found once it finished — the run's whole
 /// journal tally, not only what this particular call decided.
@@ -339,7 +339,7 @@ pub async fn begin_committing_in(
     scope: &AccessScope,
     tenant_id: Uuid,
     operation_id: Uuid,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let conn = db.conn().map_err(|e| {
         DomainError::Internal(format!("bss-pricing: repricing run commit edge: conn: {e}"))
@@ -946,7 +946,7 @@ async fn apply_by_plan(
     operation_id: Uuid,
     by_plan: BTreeMap<PlanId, Vec<JournalRow>>,
     adjustment: &Adjustment,
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<PlanLoopEnd, DomainError> {
     let conn = db.conn().map_err(|e| {
@@ -1167,7 +1167,7 @@ async fn finish_run(
     tenant_id: Uuid,
     operation_id: Uuid,
     straggler_reason: &str,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<RunOutcome, DomainError> {
     bulk_repo::release_locks(runner, scope, tenant_id, operation_id)
         .await
@@ -1322,7 +1322,7 @@ pub async fn abandon_committing_run(
     tenant_id: Uuid,
     operation_id: Uuid,
     note: &str,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<BulkOperationRecord, DomainError> {
     let conn = db.conn().map_err(|e| {
         DomainError::Internal(format!("bss-pricing: repricing run abort: conn: {e}"))
@@ -2063,7 +2063,7 @@ async fn apply_plan_in(
     plan_id: PlanId,
     rows: &[JournalRow],
     adjustment: &Adjustment,
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<(), DomainError> {
     // **Re-asked here, inside the transaction that writes.** The run-level call of
@@ -2132,7 +2132,7 @@ async fn apply_rows_in(
     plan_id: PlanId,
     rows: &[JournalRow],
     adjustment: &Adjustment,
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<Vec<AppliedRow>, DomainError> {
     let now = stamp.recorded_at;
@@ -2477,7 +2477,7 @@ async fn commit_plan_aggregate_in(
     tenant_id: Uuid,
     operation_id: Uuid,
     plan_id: PlanId,
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
     stamp: AuditStamp,
     applied_rows: &[AppliedRow],
 ) -> Result<(), DomainError> {
@@ -2669,7 +2669,6 @@ mod ordinary_failure_release {
     //! after the target transaction has already finished. A sibling run holding the lock before
     //! the call has no such window: the collision is one statement's answer.
 
-    use chrono::{TimeZone, Utc};
     use sea_orm_migration::MigratorTrait;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::secure::AccessScope;
@@ -2679,6 +2678,7 @@ mod ordinary_failure_release {
     use tokio_util::sync::CancellationToken;
 
     use crate::domain::bulk::{BulkKind, BulkState};
+    use crate::domain::instant::utc_ymd_hms;
     use crate::domain::money::{CurrencyCode, MinorAmount};
     use crate::domain::price_record::PriceContent;
     use crate::domain::price_row::{ModelKind, PriceRow};
@@ -2717,7 +2717,7 @@ mod ordinary_failure_release {
         let tenant_id = Uuid::from_u128(0x7e);
         let scope = AccessScope::for_tenant(tenant_id);
         let plan_id = PlanId::new(Uuid::from_u128(0x9a));
-        let now = Utc.with_ymd_and_hms(2026, 8, 12, 0, 0, 0).unwrap();
+        let now = utc_ymd_hms(2026, 8, 12, 0, 0, 0);
 
         // The plan, minimally - `step0_probe`'s own shape, since what is
         // under test here has nothing to do with the plan's own revision.
@@ -2974,7 +2974,6 @@ mod step0_probe {
     //! `tests/postgres_repricing_apply.rs`', and its module doc says why it
     //! cannot live here.
 
-    use chrono::{TimeZone, Utc};
     use sea_orm_migration::MigratorTrait;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     use toolkit_db::secure::AccessScope;
@@ -2982,6 +2981,7 @@ mod step0_probe {
     use uuid::Uuid;
 
     use crate::domain::error::DomainError;
+    use crate::domain::instant::utc_ymd_hms;
     use crate::domain::money::{CurrencyCode, MinorAmount};
     use crate::domain::price_record::PriceContent;
     use crate::domain::price_row::{ModelKind, PriceRow};
@@ -3008,7 +3008,7 @@ mod step0_probe {
         let tenant_id = Uuid::from_u128(0x7e);
         let scope = AccessScope::for_tenant(tenant_id);
         let plan_id = PlanId::new(Uuid::from_u128(0x9a));
-        let now = Utc.with_ymd_and_hms(2026, 8, 11, 0, 0, 0).unwrap();
+        let now = utc_ymd_hms(2026, 8, 11, 0, 0, 0);
 
         // The plan and its first draft revision, committed ahead of the probe:
         // what is under test is the price row's visibility, not the plan's.

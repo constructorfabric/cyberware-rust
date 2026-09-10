@@ -74,6 +74,7 @@ use crate::domain::concurrency::{PolicyTag, TaxonomyTagEntry};
 use crate::domain::error::DomainError;
 use crate::infra::storage::repo::policy_repo;
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag (DE0205).
 const TAG: &str = "BSS Pricing Configuration";
@@ -299,7 +300,7 @@ async fn put_policy(
         tenant,
         requested,
         held.as_deref(),
-        &audit_stamp(&ctx, chrono::Utc::now(), correlation),
+        &audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation),
     )
     .await
     .map_err(|e| CanonicalError::from(repo_failure(&e)))?;

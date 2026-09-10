@@ -32,8 +32,8 @@ use bss_ledger::domain::model::RepoError;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::AdjustmentRepo;
 use bss_ledger::infra::storage::repo::adjustment_repo::NewRefund;
-use chrono::Utc;
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -73,7 +73,7 @@ fn refund_a(tenant: Uuid, refund_id: &str, psp_refund_id: &str, phase: &str) -> 
         clearing_state: "PENDING".to_owned(),
         relates_to_refund_id: None,
         reverses_entry_id: None,
-        created_at_utc: Utc::now(),
+        created_at_utc: OffsetDateTime::now_utc(),
     }
 }
 
@@ -124,7 +124,7 @@ async fn refund_row_round_trips_pattern_a_and_b() {
         clearing_state: "SETTLED".to_owned(),
         relates_to_refund_id: None,
         reverses_entry_id: None,
-        created_at_utc: Utc::now(),
+        created_at_utc: OffsetDateTime::now_utc(),
     };
     insert(&provider, &scope, row_b)
         .await

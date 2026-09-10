@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bss_ledger_sdk::{AccountClass, PostEntry, PostLine, PostingRef, SourceDocType};
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::Datelike;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -52,6 +52,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::fx::realized::carried_relief;
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::domain::payment::chargeback::{
     ChargebackInput, DisputePhase, DisputeVariant, FundsAtOpen, build_chargeback_entry,
@@ -71,6 +72,8 @@ use crate::infra::storage::entity::pending_event_queue;
 use crate::infra::storage::repo::{
     DisputeRepo, NewQueueRow, PaymentRepo, PendingQueueRepo, ReferenceRepo,
 };
+use time::Duration;
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service.
 const ORIGIN_SYSTEM: &str = "SYSTEM";
@@ -111,7 +114,7 @@ pub struct ChargebackRequest {
     pub funds_at_open: FundsAtOpen,
     pub disputed_amount_minor: i64,
     pub currency: String,
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 impl ChargebackRequest {
@@ -149,7 +152,7 @@ pub struct QueuedDispute {
     /// The queue/dedup business id — `dispute_id:cycle:phase`.
     pub business_id: String,
     /// When the intake durably enqueued the request.
-    pub queued_at: DateTime<Utc>,
+    pub queued_at: OffsetDateTime,
 }
 
 /// The financial-key snapshot of a chargeback phase request, persisted as the
@@ -237,7 +240,7 @@ impl QueuedDisputePayload {
 /// [`crate::infra::payment::allocate`]'s `IntakeOutcome`.
 enum IntakeOutcome {
     Enqueued {
-        queued_at: DateTime<Utc>,
+        queued_at: OffsetDateTime,
     },
     AlreadyQueued,
     /// A concurrent/retried intake reused the same key with a DIFFERENT payload
@@ -699,7 +702,7 @@ impl ChargebackService {
         req: &ChargebackRequest,
         business_id: &str,
     ) -> Result<QueuedDispute, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let payload = QueuedDisputePayload::from_request(req);
         let payload_json = serde_json::to_value(&payload)
             .map_err(|e| DomainError::Internal(format!("serialize queue payload: {e}")))?;
@@ -987,7 +990,7 @@ impl ChargebackService {
         tenant: Uuid,
         limit: u64,
     ) -> Result<DrainReport, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let pending_queue = self.pending_queue.clone();
         let scope_owned = scope.clone();
         let claimed: Vec<pending_event_queue::Model> = self
@@ -1060,7 +1063,7 @@ impl ChargebackService {
     ) -> Result<(), DomainError> {
         let scope_owned = scope.clone();
         let business_id = business_id.to_owned();
-        let defer_until = Utc::now() + blocked_backoff(prior_attempts + 1);
+        let defer_until = OffsetDateTime::now_utc() + blocked_backoff(prior_attempts + 1);
         self.db
             .transaction(move |txn| {
                 Box::pin(async move {
@@ -1357,7 +1360,7 @@ impl ChargebackService {
             source_business_id: entry.source_business_id.clone(),
             reverses_entry_id: entry.reverses_entry_id,
             reverses_period_id: entry.reverses_period_id.clone(),
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: entry.effective_at,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: entry.posted_by_actor_id,
@@ -1448,10 +1451,10 @@ fn guard_outcome_transition(
 fn overwrite_header(
     entry: &mut PostEntry,
     ctx: &SecurityContext,
-    effective_at: Option<DateTime<Utc>>,
+    effective_at: Option<OffsetDateTime>,
 ) {
-    let eff_instant = effective_at.unwrap_or_else(Utc::now);
-    let eff_date = eff_instant.date_naive();
+    let eff_instant = effective_at.unwrap_or_else(OffsetDateTime::now_utc);
+    let eff_date = to_naive_date(eff_instant);
     entry.effective_at = eff_date;
     entry.period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
     entry.posted_by_actor_id = ctx.subject_id();

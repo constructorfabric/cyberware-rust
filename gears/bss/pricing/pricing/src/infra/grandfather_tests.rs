@@ -22,24 +22,23 @@
 //! Each refusal is paired with the positive control that differs from it in exactly
 //! the operand under test, so a guard that refused everything could not pass.
 
-use chrono::{TimeDelta, TimeZone};
-
 use crate::domain::error::DomainError;
+use crate::domain::instant::{format_rfc3339, utc_ymd_hms};
 use crate::domain::money::CurrencyCode;
 use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
 use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
 use crate::infra::window::refuse_horizon_span_uncovered;
+use time::OffsetDateTime;
+fn far_future_instant() -> OffsetDateTime {
+    utc_ymd_hms(9999, 12, 31, 23, 59, 59)
+}
 
 /// `infra::window_tests`' scale, and for its reason: an instant no clock reaches
 /// cannot make a case mean something different tomorrow.
-fn at(day: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc
-        .with_ymd_and_hms(2099, 8, 4, 0, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
-        + TimeDelta::days(day)
+fn at(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 4, 0, 0, 0) + time::Duration::days(day)
 }
 
 /// A grandfathered generation whose cohort is the cutover that created it
@@ -72,7 +71,7 @@ fn covered(from: i64, to: Option<i64>) -> KeyWindows {
 /// The wall clock this rule is asked at — before the cohort, so `max(cohort, now)`
 /// resolves to the cohort and the cases are about the horizon rather than about
 /// what day it is.
-fn now() -> chrono::DateTime<chrono::Utc> {
+fn now() -> OffsetDateTime {
     at(-10)
 }
 
@@ -90,7 +89,7 @@ fn coverage_that_stops_at_the_floor_satisfies_the_published_horizon() {
     refuse_horizon_span_uncovered(
         &generation(),
         Some(at(60)),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         &covered(0, Some(91)),
         now(),
     )
@@ -108,7 +107,7 @@ fn tightening_a_finite_horizon_keeps_a_key_that_already_satisfied_the_bound() {
     refuse_horizon_span_uncovered(
         &generation(),
         Some(at(30)),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         &covered(0, Some(91)),
         now(),
     )
@@ -128,7 +127,7 @@ fn a_tightening_is_judged_against_the_horizon_it_proposes() {
     refuse_horizon_span_uncovered(
         &generation(),
         Some(at(29)),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         &covered(0, Some(61)),
         now(),
     )
@@ -143,7 +142,7 @@ fn a_horizon_whose_floor_outruns_the_coverage_is_refused() {
     let err = refuse_horizon_span_uncovered(
         &generation(),
         Some(at(80)),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         &covered(0, Some(91)),
         now(),
     )
@@ -196,7 +195,7 @@ fn an_indefinite_generation_with_a_margin_may_be_bounded() {
     refuse_horizon_span_uncovered(
         &generation(),
         Some(at(60)),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         &covered(0, None),
         now(),
     )
@@ -215,7 +214,7 @@ fn a_generation_whose_coverage_opens_after_its_cohort_may_not_be_bounded() {
     let err = refuse_horizon_span_uncovered(
         &generation(),
         Some(at(60)),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         // Opens thirty days after the cutover that created the generation.
         &covered(30, None),
         now(),
@@ -225,7 +224,7 @@ fn a_generation_whose_coverage_opens_after_its_cohort_may_not_be_bounded() {
         panic!("got: {err:?}");
     };
     assert!(
-        detail.contains(&at(0).to_rfc3339()),
+        detail.contains(&format_rfc3339(at(0))),
         "the refusal names the anchor the span runs from: {detail}"
     );
 }
@@ -250,7 +249,7 @@ fn the_span_walk_carries_no_class_test_of_its_own() {
     let err = refuse_horizon_span_uncovered(
         &ordinary,
         Some(at(60)),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         &KeyWindows {
             scope_key: ordinary.clone(),
             intervals: vec![WindowInterval::new(
@@ -300,8 +299,8 @@ fn the_span_walk_carries_no_class_test_of_its_own() {
 fn a_horizon_whose_floor_is_not_representable_is_refused_rather_than_panicking() {
     let err = refuse_horizon_span_uncovered(
         &generation(),
-        Some(chrono::DateTime::<chrono::Utc>::MAX_UTC),
-        Some(TimeDelta::days(31)),
+        Some(far_future_instant()),
+        Some(time::Duration::days(31)),
         &covered(0, None),
         now(),
     )

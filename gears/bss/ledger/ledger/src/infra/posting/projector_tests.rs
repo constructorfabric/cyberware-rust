@@ -3,7 +3,7 @@
 
 use super::*;
 use bss_ledger_sdk::{MappingStatus, SourceDocType};
-use chrono::Utc;
+use time::OffsetDateTime;
 
 fn entry(tenant: Uuid) -> NewEntry {
     NewEntry {
@@ -16,7 +16,7 @@ fn entry(tenant: Uuid) -> NewEntry {
         source_business_id: "biz-1".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: chrono::NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: tenant,

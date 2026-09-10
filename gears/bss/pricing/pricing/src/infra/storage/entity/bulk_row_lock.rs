@@ -17,6 +17,7 @@ use sea_orm::entity::prelude::*;
 use uuid::Uuid;
 
 use toolkit_db_macros::Scopable;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_bulk_row_lock")]
@@ -44,7 +45,7 @@ pub struct Model {
     /// half: **nothing expires a lock on age**, by design, because D-37 releases
     /// through lease takeover and operator abort instead. So a reader owes this
     /// column an alarm or nothing at all; today it is nothing.
-    pub locked_at: DateTimeUtc,
+    pub locked_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

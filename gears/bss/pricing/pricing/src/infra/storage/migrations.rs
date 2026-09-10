@@ -99,6 +99,7 @@ pub mod m20260821_000039_create_pricing_price_window;
 pub mod m20260821_000040_create_pricing_repricing_journal;
 pub mod m20260821_000041_create_pricing_bundle_revshare;
 pub mod m20260821_000042_create_pricing_price_overlay_line_amount;
+pub mod m20260821_000043_create_pricing_gl_code_taxonomy;
 
 use sea_orm::{ConnectionTrait, Statement};
 use sea_orm_migration::prelude::*;
@@ -205,6 +206,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260821_000040_create_pricing_repricing_journal::Migration),
             Box::new(m20260821_000041_create_pricing_bundle_revshare::Migration),
             Box::new(m20260821_000042_create_pricing_price_overlay_line_amount::Migration),
+            Box::new(m20260821_000043_create_pricing_gl_code_taxonomy::Migration),
             // Shared `coord_leases` table, owned by the `coord` crate. This gear's
             // background work is coordinated as a singleton (§3.8: background work
             // is coordinated as a singleton via the coordination lease library),

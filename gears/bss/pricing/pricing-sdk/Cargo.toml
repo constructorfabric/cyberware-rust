@@ -12,10 +12,10 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-# `DateTime<Utc>` on the pin frontier's `advanced_at`. No serde feature — this
-# contract crate carries no derives (the gear's REST DTOs own serde and map onto
-# these types), mirroring `bss-ledger-sdk`.
-chrono = { workspace = true }
+# `OffsetDateTime` on the pin frontier's `advanced_at` and the OData dummy
+# filter fields. No serde feature — this contract crate carries no derives
+# (the gear's REST DTOs own serde and map onto these types), mirroring AM.
+time = { workspace = true }
 # Every trait surface returns `CanonicalError`, per ADR
 # `cpt-cf-errors-adr-sdk-canonical-projection`: the gear's single
 # `From<DomainError> for CanonicalError` ladder is the authoritative
@@ -26,6 +26,10 @@ toolkit-canonical-errors = { workspace = true }
 # not either — not because the contract needs them.
 thiserror = { workspace = true }
 toolkit-security = { workspace = true }
+# Dummy `#[derive(ODataFilterable)]` query structs generate the typed
+# `FilterField` enums the gear's `paginate_odata` mappers consume.
+toolkit-odata = { workspace = true }
+toolkit-odata-macros = { workspace = true }
 # A registry SKU id, which a plan's `sku_id` binds to and which is a UUID
 # everywhere it appears. The contract carries the type rather than a `String`
 # so a caller cannot pass a code where an id belongs.

@@ -38,10 +38,11 @@
 //! implicit-absence semantics are forbidden by the Foundation and a bp value read
 //! as minor units mis-prices by orders of magnitude.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_price_overlay_line")]
@@ -86,7 +87,7 @@ pub struct Model {
     pub target_sku: Option<String>,
     /// The grandfathered generation's cutover instant. See the module doc — this
     /// is a filter, not a level.
-    pub cohort: Option<DateTime<Utc>>,
+    pub cohort: Option<OffsetDateTime>,
     /// `markup` | `discount` | `fixed`. **D-138 is normative about what each
     /// does to the running amount**: `markup` adds, `discount` subtracts, and
     /// `fixed` **replaces** — an absolute price at that stack layer. An additive

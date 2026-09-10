@@ -9,7 +9,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeZone, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::EntityTrait;
 use sea_orm_migration::MigratorTrait;
@@ -18,20 +17,20 @@ use toolkit_db::secure::{AccessScope, SecureInsertExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::plan_shape::{AddonRule, PlanShape};
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::currency_binding::addon_coverage;
 use bss_pricing::infra::storage::entity::{plan, price};
 use bss_pricing::infra::storage::migrations::Migrator;
+use time::OffsetDateTime;
 
 const TENANT: Uuid = Uuid::from_u128(0x1111_1111);
 const OTHER_TENANT: Uuid = Uuid::from_u128(0x9999_9999);
 const SKU: Uuid = Uuid::from_u128(0x05c0_0001);
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 6, 12, 0, 0)
 }
 
 async fn provider() -> DBProvider<DbError> {

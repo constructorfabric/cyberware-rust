@@ -21,7 +21,6 @@
 //! is wired into the live posting paths in this slice — see
 //! [`RateLocker`](crate::infra::fx::rate_locker::RateLocker).
 
-use chrono::{DateTime, Utc};
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt, SecureOnConflict};
 use toolkit_db::{DBProvider, DbError};
@@ -29,6 +28,7 @@ use uuid::Uuid;
 
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::{fx_rate, fx_rate_snapshot};
+use time::OffsetDateTime;
 
 /// One immutable `ledger_fx_rate_snapshot` row to freeze for a single lock — the
 /// rate [`RateSource`](crate::infra::fx::rate_source::RateSource) resolved,
@@ -43,7 +43,7 @@ pub struct NewRateSnapshot {
     pub base_currency: String,
     pub quote_currency: String,
     pub rate_micro: i64,
-    pub as_of: DateTime<Utc>,
+    pub as_of: OffsetDateTime,
     pub provider: String,
     pub stale: bool,
     pub fallback_order: i32,
@@ -62,7 +62,7 @@ pub struct NewFxRate {
     pub quote_currency: String,
     pub provider: String,
     pub rate_micro: i64,
-    pub as_of: DateTime<Utc>,
+    pub as_of: OffsetDateTime,
     pub fallback_order: i32,
 }
 
@@ -82,7 +82,7 @@ impl FxRepo {
     /// "latest known" rate the `RateSyncJob` / ingest endpoint refreshes. On a PK
     /// conflict the row's `rate_micro`, `as_of`, `fallback_order` and `updated_at`
     /// are overwritten (the tuple identity — tenant/pair/provider — is immutable;
-    /// only the quote moves). `updated_at` is stamped from `Utc::now()` (passed in
+    /// only the quote moves). `updated_at` is stamped from `OffsetDateTime::now_utc()` (passed in
     /// the active model and mirrored in the conflict update) rather than a SQL
     /// `now()`, so the stored ingest-time matches the value `SeaORM` round-trips on
     /// both backends.
@@ -100,7 +100,7 @@ impl FxRepo {
             .conn()
             .map_err(|e| RepoError::Db(format!("conn: {e}")))?;
         let scope = AccessScope::for_tenant(rate.tenant_id);
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let am = fx_rate::ActiveModel {
             tenant_id: Set(rate.tenant_id),
             base_currency: Set(rate.base_currency.clone()),

@@ -22,15 +22,15 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{ALARM_WINDOW_ACTIVATION_OVERDUE, DUE_WINDOWS_PER_PASS, activation_budget, sort_key};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::scope_key::PlanId;
 use crate::infra::storage::repo::window_repo::{DueBoundary, DueWindow};
 
 fn due(boundary: DueBoundary, window: u128, at_day: u32) -> DueWindow {
-    let at = Utc.with_ymd_and_hms(2099, 9, at_day, 0, 0, 0).unwrap();
+    let at = utc_ymd_hms(2099, 9, at_day, 0, 0, 0);
     DueWindow {
         window_id: Uuid::from_u128(window),
         tenant_id: Uuid::from_u128(0x7e_11),

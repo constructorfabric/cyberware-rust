@@ -51,6 +51,7 @@ use crate::infra::posting::idempotency::IdempotencyGate;
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::recognition::sidecar::{PlannedScheduleMaterialization, ScheduleBuilderSidecar};
 use crate::infra::storage::repo::{FxRepo, PostingPolicyRepo, ReferenceRepo};
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service.
 const ORIGIN_SYSTEM: &str = "SYSTEM";
@@ -286,7 +287,7 @@ impl InvoicePostService {
         // (SUSPENSE) keeps the park-and-reclassify path byte-unchanged.
         if self
             .posting_policy_repo
-            .read_effective_policy(scope, inv.seller_tenant_id, chrono::Utc::now())
+            .read_effective_policy(scope, inv.seller_tenant_id, OffsetDateTime::now_utc())
             .await
             .map_err(|e| DomainError::Internal(format!("read posting policy: {e}")))?
             .missing_mapping_mode
@@ -538,7 +539,7 @@ impl InvoicePostService {
             source_business_id: entry.source_business_id.clone(),
             reverses_entry_id: entry.reverses_entry_id,
             reverses_period_id: entry.reverses_period_id.clone(),
-            posted_at_utc: chrono::Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: entry.effective_at,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: entry.posted_by_actor_id,
@@ -573,7 +574,7 @@ impl InvoicePostService {
                     &mut new_lines,
                     &new_entry.entry_currency,
                     fc,
-                    chrono::Utc::now(),
+                    OffsetDateTime::now_utc(),
                 )
                 .await?;
         }

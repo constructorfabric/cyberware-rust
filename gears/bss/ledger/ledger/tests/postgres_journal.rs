@@ -29,7 +29,8 @@ use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::JournalRepo;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, ODataQuery, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -545,7 +546,7 @@ async fn setup_posted_invoice(url: &str) -> (DatabaseConnection, DBProvider<DbEr
         source_business_id: f.invoice_id.clone(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: tenant,
@@ -601,6 +602,143 @@ async fn setup_posted_invoice(url: &str) -> (DatabaseConnection, DBProvider<DbEr
         .expect("invoice post must succeed");
 
     (raw, provider, f)
+}
+
+/// `ledger_account_balance` is keyed `(tenant_id, account_id, currency)` and
+/// `list_balances` breaks ties on `account_id` alone, so an account carried in two
+/// currencies has two rows sharing the tiebreaker. Under a caller's `$orderby`
+/// the pair `[field, account_id]` collides in the keyset predicate and the second
+/// currency falls out at the page boundary. `query_with_unique_order` appends
+/// `currency`; this walks that boundary one row a page.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_one_row_walk_under_account_class_visits_both_currencies_of_an_account() {
+    let container = test_containers::postgres().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let (_raw, provider, f) = setup_posted_invoice(&url).await;
+
+    // A second, EUR invoice over the same AR and REVENUE accounts.
+    ReferenceRepo::new(provider.clone())
+        .upsert_currency_scale(CurrencyScaleRow {
+            tenant_id: f.tenant,
+            currency: "EUR".to_owned(),
+            minor_units: 2,
+            plausible_max_major: DEFAULT_PLAUSIBLE_MAX_MAJOR,
+            source: "iso".to_owned(),
+        })
+        .await
+        .unwrap();
+    let in_eur = |mut line: NewLine| {
+        line.currency = "EUR".to_owned();
+        line
+    };
+    let entry = NewEntry {
+        entry_id: Uuid::now_v7(),
+        tenant_id: f.tenant,
+        legal_entity_id: f.tenant,
+        period_id: "202606".to_owned(),
+        entry_currency: "EUR".to_owned(),
+        source_doc_type: SourceDocType::InvoicePost,
+        source_business_id: "INV-EUR-1".to_owned(),
+        reverses_entry_id: None,
+        reverses_period_id: None,
+        posted_at_utc: OffsetDateTime::now_utc(),
+        effective_at: NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
+        origin: "SYSTEM".to_owned(),
+        posted_by_actor_id: f.tenant,
+        correlation_id: f.tenant,
+        rounding_evidence: serde_json::Value::Null,
+        rate_snapshot_ref: None,
+    };
+    let lines = vec![
+        in_eur(read_line(
+            &f,
+            f.ar_account,
+            AccountClass::Ar,
+            Side::Debit,
+            500,
+            Some("INV-EUR-1"),
+            None,
+            None,
+        )),
+        in_eur(read_line(
+            &f,
+            f.revenue_account,
+            AccountClass::Revenue,
+            Side::Credit,
+            500,
+            None,
+            Some("subscription"),
+            None,
+        )),
+    ];
+    PostingService::new(
+        provider.clone(),
+        std::sync::Arc::new(bss_ledger::infra::events::publisher::LedgerEventPublisher::noop()),
+    )
+    .post(
+        &SecurityContext::anonymous(),
+        &AccessScope::for_tenant(f.tenant),
+        entry,
+        lines,
+        None,
+    )
+    .await
+    .expect("EUR invoice post must succeed");
+
+    let repo = JournalRepo::new(provider);
+    let scope = AccessScope::for_tenant(f.tenant);
+    let by_class = ODataQuery::default().with_order(toolkit_odata::ODataOrderBy(vec![
+        toolkit_odata::OrderKey {
+            field: "account_class".to_owned(),
+            dir: toolkit_odata::SortDir::Asc,
+        },
+    ]));
+
+    // The referent: one page, same order. AR×2, REVENUE×2, TAX×1.
+    let whole = repo
+        .list_balances(&scope, f.tenant, &by_class.clone().with_limit(100))
+        .await
+        .expect("the whole list");
+    let key = |b: &bss_ledger::infra::storage::entity::account_balance::Model| {
+        (b.account_class.clone(), b.currency.clone(), b.account_id)
+    };
+    let expected: Vec<_> = whole.items.iter().map(key).collect();
+    assert_eq!(expected.len(), 5, "{expected:?}");
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|(_, _, account)| *account == f.ar_account)
+            .count(),
+        2,
+        "the AR account is carried in two currencies: {expected:?}"
+    );
+
+    let mut walked = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..=expected.len() {
+        let query = match cursor.take() {
+            None => by_class.clone().with_limit(1),
+            Some(token) => ODataQuery::default()
+                .with_limit(1)
+                .with_cursor(toolkit_odata::CursorV1::decode(&token).expect("cursor decodes")),
+        };
+        let page = repo
+            .list_balances(&scope, f.tenant, &query)
+            .await
+            .expect("a page");
+        walked.extend(page.items.iter().map(key));
+        match page.page_info.next_cursor {
+            None => break,
+            Some(token) => cursor = Some(token),
+        }
+    }
+
+    assert_eq!(
+        walked, expected,
+        "the walk must visit every balance row exactly once, in the referent's order"
+    );
 }
 
 #[tokio::test]

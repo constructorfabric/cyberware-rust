@@ -19,8 +19,10 @@
 
 mod common;
 
+use bss_pricing::domain::instant::utc_ymd_hms;
 use common::{exec, migrated_db, must_succeed, scalar};
 use sea_orm::DatabaseConnection;
+use time::OffsetDateTime;
 
 const TENANT: &str = "11111111-1111-1111-1111-111111111111";
 const ACTOR: &str = "44444444-4444-4444-4444-444444444444";
@@ -417,12 +419,8 @@ fn row_for(currency: &str) -> bss_pricing::infra::storage::repo::ThresholdEntryR
 }
 
 /// The fixture instants, on 2099 by this suite's convention.
-fn at_utc(day: u32) -> chrono::DateTime<chrono::Utc> {
-    use chrono::TimeZone;
-    chrono::Utc
-        .with_ymd_and_hms(2099, 1, day, 0, 0, 0)
-        .single()
-        .expect("a real instant")
+fn at_utc(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 1, day, 0, 0, 0)
 }
 
 /// **A version the store cannot read does not take the tenant's whole policy down

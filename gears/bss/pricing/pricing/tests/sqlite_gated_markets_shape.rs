@@ -42,6 +42,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::price_record::PriceContent;
 use bss_pricing::domain::price_row::{ModelKind, PriceRow};
@@ -52,7 +53,7 @@ use bss_pricing::infra::storage::entity::price;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::price_repo;
 use bss_pricing::infra::storage::repo::{NewPriceDraft, PriceRepo};
-use chrono::{TimeZone, Utc};
+
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -220,10 +221,7 @@ async fn the_gated_market_read_is_paged_and_still_counts_every_market_once() {
                 scope_key: market_key(region, eligibility),
                 content: tax_inclusive_flat(),
                 created_by: Uuid::from_u128(0xac_10),
-                created_at_utc: Utc
-                    .with_ymd_and_hms(2026, 8, 2, 10, 0, 0)
-                    .single()
-                    .expect("a valid instant"),
+                created_at_utc: utc_ymd_hms(2026, 8, 2, 10, 0, 0),
                 correlation_id: Uuid::from_u128(0xc0_11),
             },
         )

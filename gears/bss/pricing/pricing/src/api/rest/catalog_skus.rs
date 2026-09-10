@@ -1,4 +1,8 @@
-//! `GET /bss-pricing/v1/catalog/skus` — what the registry says this tenant sells.
+//! Read-only Product Catalog projections: SKUs and tax-category definitions.
+//!
+//! Tax categories are definitions, not rates or SKU/region defaults. Unlike the
+//! optional SKU suggestions below, an unconfigured category dictionary answers
+//! an explicit 501; a configured provider's outage remains a 503.
 //!
 //! # A pass-through, and it says whose answer it is
 //!
@@ -48,6 +52,29 @@ const TAG: &str = "BSS Pricing";
 /// The one path this surface serves. A constant because three separate route
 /// censuses name it, and a literal repeated four times is a literal that drifts.
 pub const CATALOG_SKUS: &str = "/bss-pricing/v1/catalog/skus";
+
+/// Read-only dictionary for a price row's `tax_category_ref` picker.
+pub const CATALOG_TAX_CATEGORIES: &str = "/bss-pricing/v1/catalog/tax-categories";
+
+/// A definition from Product Catalog; no assignment or rate lives here.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct CatalogTaxCategoryView {
+    /// Stable provider-owned code.
+    pub code: String,
+    /// Human-readable label, read from the provider.
+    pub display_name: String,
+}
+
+/// The dictionary and its configured source. Failure is never an empty success.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct CatalogTaxCategoriesView {
+    /// `local_dev_static` or `registry`. Demo codes are not production taxonomy.
+    pub source: String,
+    /// Definitions in provider order; a configured empty dictionary is `[]`.
+    pub items: Vec<CatalogTaxCategoryView>,
+}
 
 /// One SKU as this gear passes it on.
 #[derive(Debug, Clone)]
@@ -170,9 +197,30 @@ async fn list_skus(
     }
 }
 
-/// Build the router for the one read this surface has.
+/// Read the category dictionary after the same config gate as SKU browsing.
+async fn list_tax_categories(
+    Extension(state): Extension<Arc<ApiState>>,
+    Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
+    extension_ctx: Option<Extension<SecurityContext>>,
+) -> Result<Json<CatalogTaxCategoriesView>, CanonicalError> {
+    let ctx = require_authenticated(extension_ctx)?;
+    require_config_read(&enforcer, &ctx).await?;
+    let categories = state.catalog.list_tax_categories(&ctx).await?;
+    Ok(Json(CatalogTaxCategoriesView {
+        source: state.source.to_owned(),
+        items: categories
+            .into_iter()
+            .map(|category| CatalogTaxCategoryView {
+                code: category.code,
+                display_name: category.display_name,
+            })
+            .collect(),
+    }))
+}
+
+/// Build the two read-only projections over the same provider and gate.
 pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
-    OperationBuilder::get(CATALOG_SKUS)
+    let router = OperationBuilder::get(CATALOG_SKUS)
         .operation_id("bss_pricing.list_catalog_skus")
         .summary("The SKUs this tenant may price")
         .description(
@@ -198,6 +246,36 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .error_403(openapi)
         .error_500(openapi)
         .error_503(openapi)
-        .register(Router::new(), openapi)
+        .register(Router::new(), openapi);
+    OperationBuilder::get(CATALOG_TAX_CATEGORIES)
+        .operation_id("bss_pricing.list_catalog_tax_categories")
+        .summary("Tax-category definitions from Product Catalog")
+        .description(
+            "Read-only codes and display names for a price row's `tax_category_ref`. \
+             Definitions belong to Product Catalog; rates and tax rules do not. \
+             `source` distinguishes the explicitly enabled `local_dev_static` demo from \
+             `registry`. No CRUD, SKU/region assignment or automatic dev fallback. \
+             An unconfigured provider answers 501; an unavailable one answers 503. \
+             Gates on `config` x `read`.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .handler(list_tax_categories)
+        .json_response_with_schema::<CatalogTaxCategoriesView>(
+            openapi,
+            StatusCode::OK,
+            "Definitions and their source.",
+        )
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "No product catalog configured",
+        )
+        .error_503(openapi)
+        .register(router, openapi)
         .layer(Extension(state))
 }

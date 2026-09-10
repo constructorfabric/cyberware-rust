@@ -20,10 +20,11 @@
 //!
 //! [`approval_threshold`]: super::approval_threshold
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_approval_threshold_tombstone")]
@@ -45,12 +46,12 @@ pub struct Model {
     /// approval pin, exactly as it is on an entry version: an operator who could
     /// move it after a reviewer signed would move when the two-person rule comes
     /// back.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// The pseudonymous principal that proposed the retirement. **Not** the
     /// approval trail — D-10 puts the second principal on `pricing_approval`, and
     /// a tenant must not be able to revert the two-person rule single-handed.
     pub created_by: Uuid,
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

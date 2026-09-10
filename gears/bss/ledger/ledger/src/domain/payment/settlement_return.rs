@@ -36,11 +36,15 @@
 //! entry.
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostEntry, PostLine, Side, SourceDocType};
-use chrono::{DateTime, Utc};
+
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use chrono::NaiveDate;
+
 use crate::domain::error::DomainError;
+use crate::domain::instant::to_naive_date;
+use time::OffsetDateTime;
 
 /// A settlement to claw back (architecture §4.2 input). `amount_minor` is the
 /// gross amount the PSP returned; it decrements the original payment's
@@ -65,7 +69,7 @@ pub struct SettlementReturnInput {
     pub currency: String,
     /// Return instant. `None` ⇒ a placeholder effective date the orchestrator
     /// overwrites before posting (see module docs).
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// Build the balanced settlement-return entry for `input`, sized for a return of
@@ -177,10 +181,10 @@ pub fn build_settlement_return_entry(
         entry_currency: input.currency.clone(),
         source_doc_type: SourceDocType::SettlementReturn,
         source_business_id: input.psp_return_id.clone(),
-        effective_at: input
-            .effective_at
-            .unwrap_or(DateTime::UNIX_EPOCH)
-            .date_naive(),
+        effective_at: input.effective_at.map_or(
+            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or(NaiveDate::MIN),
+            to_naive_date,
+        ),
         posted_by_actor_id: Uuid::nil(),
         correlation_id: Uuid::nil(),
         reverses_entry_id: None,

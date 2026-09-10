@@ -38,7 +38,6 @@
 )]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeZone, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
@@ -49,10 +48,12 @@ use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
 
 use bss_pricing::domain::audit::AuditStamp;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::infra::storage::entity::{plan, price, region_taxonomy};
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::window_repo::{NewWindow, WindowRecord, schedule};
+use time::OffsetDateTime;
 
 /// An in-memory `SQLite` database carrying the whole migration chain.
 pub async fn migrated_db() -> DatabaseConnection {
@@ -168,7 +169,7 @@ pub const COVERAGE_TO_UTC: (i32, u32, u32) = (2099, 9, 1);
 /// [`COVERAGE_FROM_UTC`] at the call site would be a second spelling of the one fact
 /// this module exists to keep single.
 #[must_use]
-pub fn coverage_from() -> DateTime<Utc> {
+pub fn coverage_from() -> OffsetDateTime {
     midnight(COVERAGE_FROM_UTC)
 }
 
@@ -180,15 +181,13 @@ pub fn coverage_from() -> DateTime<Utc> {
 /// [`COVERAGE_TO_UTC`] at the call site, which is a second spelling of the one fact
 /// this module keeps single.
 #[must_use]
-pub fn coverage_to() -> DateTime<Utc> {
+pub fn coverage_to() -> OffsetDateTime {
     midnight(COVERAGE_TO_UTC)
 }
 
 /// The two instants above, as instants.
-fn midnight(date: (i32, u32, u32)) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(date.0, date.1, date.2, 0, 0, 0)
-        .single()
-        .expect("a fixed UTC midnight is unambiguous")
+fn midnight(date: (i32, u32, u32)) -> OffsetDateTime {
+    utc_ymd_hms(date.0, date.1, date.2, 0, 0, 0)
 }
 
 /// The window id this fixture gives `price_id`'s coverage.

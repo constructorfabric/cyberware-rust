@@ -101,7 +101,6 @@ use axum::body::Bytes;
 use axum::extract::{Extension, Path};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
-use chrono::Utc;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_security::SecurityContext;
@@ -118,11 +117,13 @@ use crate::domain::bulk::{BulkKind, BulkState};
 use crate::domain::concurrency::RowVersion;
 use crate::domain::error::DomainError;
 use crate::domain::import::{ImportRow, classify};
+use crate::domain::instant::format_rfc3339;
 use crate::domain::scope_key::PlanId;
 use crate::infra::bulk::commit_batch;
 use crate::infra::import::classify_against_store;
 use crate::infra::storage::repo::{NewBulkOperation, bulk_repo};
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 const TAG: &str = "BSS Pricing Bulk Import";
 
@@ -204,7 +205,7 @@ fn run_view(run: &crate::infra::storage::repo::BulkOperationRecord) -> BulkImpor
         state: run.state.as_str().to_owned(),
         client_key: run.client_key.clone(),
         report: run.report.clone(),
-        completed_at: run.completed_at.map(|at| at.to_rfc3339()),
+        completed_at: run.completed_at.map(format_rfc3339),
     }
 }
 
@@ -414,7 +415,7 @@ async fn submit_bulk_import(
         return Ok((StatusCode::ACCEPTED, Json(run_view(&existing))).into_response());
     }
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = audit_stamp(&ctx, now, correlation);
     let run = bulk_repo::open(
         &conn,
@@ -745,7 +746,7 @@ async fn abort_bulk_import(
             tenant,
             operation_id,
             crate::infra::bulk::ABORT_VALIDATING_NOTE,
-            Utc::now(),
+            OffsetDateTime::now_utc(),
         )
         .await
         .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
@@ -784,7 +785,7 @@ async fn abort_bulk_import(
         tenant,
         operation_id,
         crate::infra::bulk::ABORT_NOTE,
-        Utc::now(),
+        OffsetDateTime::now_utc(),
     )
     .await
     .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
@@ -829,7 +830,7 @@ async fn audit_the_open(
             chain_id: crate::infra::storage::repo::audit_repo::bulk_operation_chain(
                 run.operation_id,
             ),
-            recorded_at: Utc::now(),
+            recorded_at: OffsetDateTime::now_utc(),
             actor_principal_id: ctx.subject_id(),
             action: crate::domain::audit::AuditAction::Create,
             subject_kind: crate::domain::audit::AuditSubjectKind::BulkOperation,
@@ -884,7 +885,7 @@ async fn audit_the_abort(
             chain_id: crate::infra::storage::repo::audit_repo::bulk_operation_chain(
                 aborted.operation_id,
             ),
-            recorded_at: Utc::now(),
+            recorded_at: OffsetDateTime::now_utc(),
             actor_principal_id: ctx.subject_id(),
             action: crate::domain::audit::AuditAction::Abandon,
             subject_kind: crate::domain::audit::AuditSubjectKind::BulkOperation,
@@ -1055,7 +1056,7 @@ async fn refuse_unreadable_rows(
     operation_id: Uuid,
     unreadable: &[UnreadableRow],
     submitted: usize,
-    now: chrono::DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> CanonicalError {
     let stored = serde_json::json!({
         "rows": [],

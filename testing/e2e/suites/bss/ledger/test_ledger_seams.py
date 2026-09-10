@@ -19,10 +19,11 @@ REQUEST_TIMEOUT = 10.0
 
 # The tenant the standard E2E token (`e2e-token-tenant-a`) authenticates as —
 # its `subject_tenant_id` in config/e2e-local.yaml's static-authn-plugin. Reads
-# are tenant-scoped, and several take `tenant_id` as a required query param, so
-# the seam tests pass this (in-scope) id: an absent resource then reads as a
-# clean 404 (not a scope miss), and list/read surfaces resolve to the caller's
-# own — possibly empty — data.
+# are tenant-scoped, so the seam tests name this (in-scope) id: an absent
+# resource then reads as a clean 404 (not a scope miss), and list/read surfaces
+# resolve to the caller's own — possibly empty — data. Read-by-id takes it as
+# `?tenant_id=`; collection GETs are OData-only and take `$filter=tenant_id eq
+# <uuid>` instead — a named key there is a 400.
 TENANT_A = TENANT_A_ID
 # The foreign tenant used by the cross-tenant no-existence-leak tests — a
 # different root the token `e2e-token-tenant-b` authenticates as (see conftest).
@@ -56,7 +57,10 @@ def test_accounts_read_is_reachable(base_url, auth_headers, api_base):
     read succeeds and yields a JSON body — the paginated chart envelope.)
     """
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-        r = client.get(f"{base_url}{api_base}/accounts?tenant_id={TENANT_A}", headers=auth_headers)
+        r = client.get(
+            f"{base_url}{api_base}/accounts?$filter=tenant_id%20eq%20{TENANT_A}",
+            headers=auth_headers,
+        )
     assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text}"
     # Either the canonical page envelope or a bare list — both are valid JSON.
     assert isinstance(r.json(), (dict, list))
@@ -162,7 +166,10 @@ def test_balances_read_is_reachable(base_url, auth_headers, api_base):
     404 (route absent) or 5xx (server fault).
     """
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-        r = client.get(f"{base_url}{api_base}/balances?tenant_id={TENANT_A}", headers=auth_headers)
+        r = client.get(
+            f"{base_url}{api_base}/balances?$filter=tenant_id%20eq%20{TENANT_A}",
+            headers=auth_headers,
+        )
     assert r.status_code != 404, f"balances route must be mounted: {r.text}"
     assert r.status_code < 500, f"balances read must not 5xx: {r.status_code} {r.text}"
 
@@ -170,7 +177,10 @@ def test_balances_read_is_reachable(base_url, auth_headers, api_base):
 def test_journal_entries_list_is_reachable(base_url, auth_headers, api_base):
     """The journal-entries list surface returns a JSON page envelope."""
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
-        r = client.get(f"{base_url}{api_base}/journal-entries?tenant_id={TENANT_A}", headers=auth_headers)
+        r = client.get(
+            f"{base_url}{api_base}/journal-entries?$filter=tenant_id%20eq%20{TENANT_A}",
+            headers=auth_headers,
+        )
     assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text}"
     assert isinstance(r.json(), (dict, list))
 

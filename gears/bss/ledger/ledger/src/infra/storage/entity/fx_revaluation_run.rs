@@ -5,8 +5,8 @@
 //! failed/lagged run BLOCKS close instead of leaving a forever-unpostable missing
 //! `FX_REVALUATION`. Tenant-scoped via `SecureORM`.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -33,7 +33,7 @@ pub struct Model {
     pub scope: String,
     /// Lifecycle status — only [`STATUS_COMPLETE`] is persisted.
     pub status: String,
-    pub completed_at_utc: DateTime<Utc>,
+    pub completed_at_utc: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

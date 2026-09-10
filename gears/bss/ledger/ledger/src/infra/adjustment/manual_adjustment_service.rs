@@ -54,7 +54,7 @@
 use std::sync::Arc;
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostingRef, Side, SourceDocType};
-use chrono::{Datelike, Utc};
+use chrono::Datelike;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -68,6 +68,7 @@ use crate::domain::approval::ApprovalKind;
 use crate::domain::approval::intent::{ApprovalIntent, ManualAdjustmentIntent};
 use crate::domain::approval::policy::OperationFacts;
 use crate::domain::error::DomainError;
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::infra::approval::service::ApprovalService;
 use crate::infra::audit::secured_audit_sink::{AuditEventType, SecuredAuditSink};
@@ -79,6 +80,7 @@ use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::posting::chart::load_chart;
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::storage::repo::ReferenceRepo;
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service (mirrors the peer
 /// orchestrators).
@@ -346,7 +348,7 @@ impl ManualAdjustmentHandler {
             .await
             .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
-        let eff_date = Utc::now().date_naive();
+        let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
 
         let mut lines: Vec<NewLine> = Vec::with_capacity(req.legs.len());
@@ -391,7 +393,7 @@ impl ManualAdjustmentHandler {
             source_business_id: req.adjustment_id.clone(),
             reverses_entry_id: None,
             reverses_period_id: None,
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: eff_date,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: ctx.subject_id(),

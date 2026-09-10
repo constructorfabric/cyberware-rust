@@ -3,12 +3,12 @@
 //! next period is plain integer arithmetic on `YYYYMM`. Free functions only (no
 //! `#[domain_model]`), no infrastructure imports (DE0301).
 
-use chrono::{DateTime, NaiveDate, Utc};
+use time::OffsetDateTime;
 
 /// Derive the `period_id` for a UTC instant as `"%Y%m"` (`YYYYMM`).
 #[must_use]
-pub fn period_id_for(now: DateTime<Utc>) -> String {
-    now.format("%Y%m").to_string()
+pub fn period_id_for(now: OffsetDateTime) -> String {
+    crate::domain::instant::yyyymm(now)
 }
 
 /// Increment a `YYYYMM` `period_id` by one month (December rolls into the next
@@ -85,7 +85,7 @@ pub fn previous_period_id(period_id: &str) -> Option<String> {
 /// Pure UTC month arithmetic (decision 1 — no `chrono-tz`); returns `None` when
 /// the input is not a valid 6-character `YYYYMM`.
 #[must_use]
-pub fn period_start_utc(period_id: &str) -> Option<DateTime<Utc>> {
+pub fn period_start_utc(period_id: &str) -> Option<OffsetDateTime> {
     if period_id.len() != 6 {
         return None;
     }
@@ -94,8 +94,7 @@ pub fn period_start_utc(period_id: &str) -> Option<DateTime<Utc>> {
     if !(1..=12).contains(&month) {
         return None;
     }
-    let date = NaiveDate::from_ymd_opt(year, month, 1)?;
-    Some(date.and_hms_opt(0, 0, 0)?.and_utc())
+    crate::domain::instant::try_utc_ymd_hms(year, month, 1, 0, 0, 0)
 }
 
 /// The UTC instant at which `period_id` (`YYYYMM`) ENDS — the first instant of
@@ -104,7 +103,7 @@ pub fn period_start_utc(period_id: &str) -> Option<DateTime<Utc>> {
 /// resolve (the rate in effect at period close, design §4.5). Returns `None`
 /// when the input is not a valid 6-character `YYYYMM`.
 #[must_use]
-pub fn period_end_utc(period_id: &str) -> Option<DateTime<Utc>> {
+pub fn period_end_utc(period_id: &str) -> Option<OffsetDateTime> {
     period_start_utc(&next_period_id(period_id)?)
 }
 

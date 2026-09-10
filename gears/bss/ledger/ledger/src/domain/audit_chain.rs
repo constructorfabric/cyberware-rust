@@ -10,11 +10,12 @@
 //! bytes (sorted keys) so a re-serialization with reordered keys yields the
 //! same hash. SHA-256 via the FIPS-validated `aws-lc-rs` provider.
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use super::canonical::{digest32, put, put_i64, put_opt_str, put_opt_uuid, put_str, put_uuid};
+use crate::domain::instant::timestamp_micros;
+use time::OffsetDateTime;
 
 /// Versioned domain-separation tag for the secured-audit chain; bump only on an
 /// intentional re-freeze of the encoding (which also requires regenerating the
@@ -32,7 +33,7 @@ pub struct AuditHashInput<'a> {
     pub actor_ref: Option<&'a str>,
     pub reason_code: Option<&'a str>,
     pub correlation_id: Option<Uuid>,
-    pub at_utc: DateTime<Utc>,
+    pub at_utc: OffsetDateTime,
     pub before_after: &'a serde_json::Value,
 }
 
@@ -113,7 +114,7 @@ pub fn audit_row_hash(
     put_opt_str(&mut buf, rec.actor_ref);
     put_opt_str(&mut buf, rec.reason_code);
     put_opt_uuid(&mut buf, rec.correlation_id);
-    put_i64(&mut buf, rec.at_utc.timestamp_micros());
+    put_i64(&mut buf, timestamp_micros(rec.at_utc));
     put(&mut buf, &canonical_json(rec.before_after)?);
 
     put(&mut buf, prev_hash);

@@ -32,7 +32,7 @@
 //!
 //! The changeover floors and `inst-ws-future-start` both compare against a clock, so
 //! the fixtures sit inside `common`'s 2099 coverage window and the "now" every case
-//! stamps with is a constant. A fixture computed from `Utc::now()` asserts something
+//! stamps with is a constant. A fixture computed from `OffsetDateTime::now_utc()` asserts something
 //! different every day it runs.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -46,6 +46,7 @@ use bss_pricing::domain::approval::{DecisionBy, WithdrawAuthority};
 use bss_pricing::domain::audit::{AuditStamp, AuditSubjectKind};
 use bss_pricing::domain::error::DomainError;
 use bss_pricing::domain::events::CatalogEvent;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::materiality::{MaterialityReason, MaterialityVerdict};
 use bss_pricing::domain::money::{MinorAmount, RateMinor};
@@ -58,7 +59,9 @@ use bss_pricing::infra::storage::repo::approval_repo;
 use bss_pricing::infra::supersession::{
     SupersessionOutcome, SupersessionRequest, SupersessionService,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
+use bss_pricing::domain::instant::format_rfc3339;
 use rest_support::{Harness, Publishable};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
@@ -72,14 +75,14 @@ const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_5b_c0);
 
 /// The suite's fixed reading of "now": inside `common`'s coverage window
 /// `[2099-08-04, 2099-09-01)` and well before the changeover.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 5, 0, 0, 0).unwrap()
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 5, 0, 0, 0)
 }
 
 /// The changeover: inside the predecessor's coverage and clear of **both** of
 /// `inst-su-instant`'s floors.
-fn changeover() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn changeover() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 fn stamp_of(actor: Uuid) -> AuditStamp {
@@ -382,7 +385,7 @@ async fn a_material_supersession_stages_its_successor_and_opens_a_unit() {
         pending
             .approval
             .subject_ref
-            .contains(&changeover().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            .contains(&format_rfc3339(changeover())),
         "and the changeover, to the millisecond: {}",
         pending.approval.subject_ref
     );
@@ -479,7 +482,6 @@ async fn the_same_act_arriving_twice_is_answered_with_the_same_unit() {
     assert_eq!(
         approval_repo::find_pending_for_subject(
             &h.db.conn().expect("conn"),
-            &h.scope(),
             h.tenant,
             &pending(&first).approval.subject_ref
         )
@@ -758,8 +760,8 @@ async fn a_supersession_records_the_effective_to_it_overwrites() {
         before_state["shortenedWindow"],
         serde_json::json!({
             "scopeKey": key.to_string(),
-            "effectiveFrom": coverage_from,
-            "effectiveTo": coverage_to,
+            "effectiveFrom": format_rfc3339(coverage_from),
+            "effectiveTo": format_rfc3339(coverage_to),
             "state": WindowState::Scheduled.as_str(),
         }),
         "the interval the shorten found, keyed by the two things a reader holding only the act \
@@ -771,8 +773,8 @@ async fn a_supersession_records_the_effective_to_it_overwrites() {
         after_state["shortenedWindow"],
         serde_json::json!({
             "scopeKey": key.to_string(),
-            "effectiveFrom": coverage_from,
-            "effectiveTo": changeover(),
+            "effectiveFrom": format_rfc3339(coverage_from),
+            "effectiveTo": format_rfc3339(changeover()),
             "state": WindowState::Scheduled.as_str(),
         }),
         "and the pair differs in exactly the one field the act moved: {after_state}"
@@ -840,7 +842,7 @@ async fn the_commit_floor_is_answered_before_any_catalog_version_is_requested() 
     // Inside `MAX_BATCHING_DELAY` of the stamped instant, and strictly future — so
     // the submit floor passes and only the commit floor can refuse it.
     let mut request = request_of(&key, 10_000);
-    request.changeover = now() + chrono::Duration::minutes(2);
+    request.changeover = now() + time::Duration::minutes(2);
     let refused = supersede(&h, request, SUBMITTER)
         .await
         .expect_err("two minutes is inside the batching delay");
@@ -878,7 +880,7 @@ async fn an_existing_grandfathered_generation_cannot_be_superseded() {
         seeded.phase,
         PriceEligibility::ExistingGrandfathered,
         base.charge_kind(),
-        Cohort::Generation(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()),
+        Cohort::Generation(utc_ymd_hms(2099, 1, 1, 0, 0, 0)),
     )
     .expect("existing_grandfathered carries a generation");
 
@@ -953,7 +955,7 @@ async fn a_dormant_key_fails_compose_rather_than_committing_half_a_unit() {
     let key = key_of(plan_id, &seeded);
 
     let mut request = request_of(&key, 10_000);
-    request.changeover = common::coverage_to() + chrono::Duration::days(30);
+    request.changeover = common::coverage_to() + time::Duration::days(30);
     let refused = supersede(&h, request, SUBMITTER)
         .await
         .expect_err("coverage has already ended at that instant");
@@ -1450,7 +1452,7 @@ async fn the_submit_floor_is_the_lenient_one_and_the_commit_floor_is_not() {
     let key = key_of(plan_id, &seeded);
 
     let mut request = request_of(&key, 12_000);
-    request.changeover = now() + chrono::Duration::minutes(2);
+    request.changeover = now() + time::Duration::minutes(2);
     let opened = supersede(&h, request, SUBMITTER)
         .await
         .expect("two minutes out is a legal proposal");

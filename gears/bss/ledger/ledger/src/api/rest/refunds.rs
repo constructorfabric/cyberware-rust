@@ -35,6 +35,7 @@
 //! operation with its declared request / response schemas. Mirrors
 //! [`crate::api::rest::adjustments::router`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
@@ -57,9 +58,10 @@ use crate::api::rest::dto::{
     RefundWithCreditNoteRequest, RefundWithCreditNoteResponse,
 };
 use crate::api::rest::error::{authz_error_to_canonical, refund_not_found};
+use crate::api::rest::odata_list::{list_seller_tenant, reject_non_odata_list_params};
 use crate::infra::adjustment::refund_service::{RefundHandler, RefundOutcome};
 use crate::infra::storage::repo::AdjustmentRepo;
-use crate::odata::RefundFilterField;
+use crate::odata::{RefundFilterField, RefundOrderField};
 
 /// `OpenAPI` tag applied to the refund operations.
 const TAG: &str = "BSS Ledger Refunds";
@@ -214,21 +216,17 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_ledger.list_refunds")
         .summary("List recorded refunds (cursor-paginated)")
         .description(
-            "Cursor-paginated list of the recorded refunds for the `tenant_id` \
-             query (the caller's own by default). Supports OData `$filter` over \
-             `payment_id`, `psp_refund_id`, `phase`, `pattern`, `clearing_state`, \
-             and `invoice_id`. The `$filter` ANDs the caller's authorized subtree, \
+            "Cursor-paginated list of the recorded refunds for the seller named \
+             by `$filter=tenant_id eq <uuid>` (the caller's own by default). \
+             Supports OData `$filter` over `tenant_id`, `payment_id`, \
+             `psp_refund_id`, `phase`, `pattern`, `clearing_state`, and \
+             `invoice_id`. The `$filter` ANDs the caller's authorized subtree, \
              so refunds outside it are never returned (SQL-level BOLA). Each item is \
              the same `RefundView` the by-id read returns.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "The refunds' owning seller tenant (defaults to the caller's own).",
-        )
         .query_param_typed(
             "limit",
             false,
@@ -238,6 +236,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_refunds)
         .with_odata_filter::<RefundFilterField>()
+        .with_odata_orderby::<RefundOrderField>()
         .json_response_with_schema::<Page<RefundView>>(
             openapi,
             StatusCode::OK,
@@ -438,24 +437,18 @@ async fn get_refund(
     Ok(Json(RefundView::from(refund)))
 }
 
-/// `GET /refunds` non-OData query: the refunds' owning tenant (the caller's own
-/// when omitted). The `OData` `$filter` / `$orderby` / `limit` / `cursor` are
-/// parsed separately by the `OData` extractor from the same query string;
-/// `tenant_id` stays a plain param alongside them (the list convention).
-#[derive(Debug, serde::Deserialize)]
-struct RefundListQuery {
-    tenant_id: Option<Uuid>,
-}
-
+/// `GET /refunds`: seller from `$filter=tenant_id eq`, else the caller.
+#[allow(clippy::implicit_hasher)]
 async fn list_refunds(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<RefundListQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<RefundView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params(&extras)?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     // (entry, read) PEP gate against the refunds' owning tenant — the SAME action
     // the by-id read / balances run under. The returned scope is the SQL-level BOLA
     // filter the repo binds, so the page never contains a foreign-tenant refund (no

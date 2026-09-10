@@ -45,9 +45,9 @@
 //! by assuming this layer already capped it. Whether a cap ever gets imposed is a
 //! design decision that belongs with the selector edge, not with this repository.
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
@@ -73,7 +73,7 @@ pub struct JournalRow {
     /// The successor the apply created. Present exactly on `applied`.
     pub applied_price_id: Option<Uuid>,
     /// When that commit landed.
-    pub applied_at: Option<DateTime<Utc>>,
+    pub applied_at: Option<OffsetDateTime>,
 }
 
 /// A selected row at expansion.
@@ -199,7 +199,7 @@ pub async fn mark_applied(
     run_id: Uuid,
     price_id: Uuid,
     applied_price_id: Uuid,
-    applied_at: DateTime<Utc>,
+    applied_at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let affected = repricing_journal::Entity::update_many()
         .secure()

@@ -6,12 +6,12 @@
 //! so a case that changed nothing would come back a zero delta rather than a
 //! refusal — which is what makes each `NotComputable` assertion evidence.
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{AmountMove, MoveScale, RowDelta, row_delta};
 use crate::domain::concurrency::RowVersion;
 use crate::domain::contracts::{AnchorDay, BillingAnchorPolicy, ProrationBasis, ProrationContract};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use crate::domain::price_record::PriceRecord;
@@ -57,10 +57,7 @@ fn record(row: PriceRow) -> PriceRecord {
         supersedes_price_id: None,
         lifecycle_state: LifecycleState::Published,
         created_by: Uuid::from_u128(0xac_10),
-        created_at_utc: Utc
-            .with_ymd_and_hms(2026, 8, 2, 10, 0, 0)
-            .single()
-            .expect("a real instant"),
+        created_at_utc: utc_ymd_hms(2026, 8, 2, 10, 0, 0),
         row_version: RowVersion::new(1),
     }
 }

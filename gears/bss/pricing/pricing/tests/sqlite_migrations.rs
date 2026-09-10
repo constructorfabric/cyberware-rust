@@ -42,11 +42,11 @@ use bss_pricing::infra::storage::entity::{
     approval, approval_key, approval_threshold, approval_threshold_tombstone, audit_log,
     brand_taxonomy, bulk_operation, bulk_row_lock, bundle, bundle_component, bundle_revshare,
     bundle_revshare_group, catalog_version_ref, composite_meter, customer_group_taxonomy,
-    group_membership, idempotency_dedup, migration, operator_flag, org_tier_taxonomy, outbox,
-    partner_taxonomy, pin_frontier, plan, plan_addon_rule, plan_descriptor_set,
-    plan_period_floor_cap, plan_phase, policy_object, price, price_overlay, price_overlay_line,
-    price_overlay_line_amount, price_tier_band, price_window, read_model, region_taxonomy,
-    repricing_journal, rounding_policy_taxonomy, snapshot_provenance,
+    gl_code_taxonomy, group_membership, idempotency_dedup, migration, operator_flag,
+    org_tier_taxonomy, outbox, partner_taxonomy, pin_frontier, plan, plan_addon_rule,
+    plan_descriptor_set, plan_period_floor_cap, plan_phase, policy_object, price, price_overlay,
+    price_overlay_line, price_overlay_line_amount, price_tier_band, price_window, read_model,
+    region_taxonomy, repricing_journal, rounding_policy_taxonomy, snapshot_provenance,
 };
 use bss_pricing::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectionTrait, Database, EntityName, EntityTrait, Statement};
@@ -116,6 +116,9 @@ const EXPECTED_TABLES: &[&str] = &[
     // completeness check built out of a second hand list cannot see, and why
     // `owed` below is now taken from the database.
     "pricing_rounding_policy_taxonomy",
+    // D-356's GL-code taxonomy (`pricing_gl_code_taxonomy`): the same shape on its own
+    // table, named here on the day it landed.
+    "pricing_gl_code_taxonomy",
     "coord_leases",
 ];
 
@@ -398,6 +401,9 @@ const EXPECTED_CHECKS: &[&str] = &[
     // over `pricing_customer_group_taxonomy`.
     "chk_pricing_customer_group_taxonomy_state",
     "chk_pricing_customer_group_taxonomy_value_present",
+    // D-356's declared GL-code vocabulary -- the taxonomy shape, on its own table.
+    "chk_pricing_gl_code_taxonomy_state",
+    "chk_pricing_gl_code_taxonomy_value_present",
     // Slice 9's membership plane (`inst-cg-record`): the value-present guard the
     // four taxonomies also carry, the half-open interval sanity check
     // `pricing_price_window`/`pricing_price_overlay` carry too, and the entity
@@ -636,6 +642,8 @@ const EXPECTED_PRIMARY_KEYS: &[(&str, &str)] = &[
     // Slice 9's own taxonomy (`inst-cg-taxonomy`), the four's own key shape on
     // its own table.
     ("pricing_customer_group_taxonomy", "tenant_id, value"),
+    // D-356 (`pricing_gl_code_taxonomy`): the taxonomies' key, on a table of their shape.
+    ("pricing_gl_code_taxonomy", "tenant_id, value"),
     // Slice 9's membership plane (`inst-cg-record`). Keyed on its own surrogate
     // id, not `(tenant_id, payer_tenant_id, effective_from)`: a payer may hold
     // several historical rows and D-09's non-overlap is the exclusion
@@ -1477,6 +1485,8 @@ async fn the_chain_creates_every_table_and_re_runs_cleanly() {
         // roster until 2026-08-20: its entity's column set was read back against
         // its migration by nothing in the fast tier.
         rounding_policy_taxonomy::Entity,
+        // D-356's GL-code taxonomy (`pricing_gl_code_taxonomy`), named on the day it landed.
+        gl_code_taxonomy::Entity,
     );
 
     // The completeness half, and the reason the roster above is no longer a
@@ -2300,16 +2310,17 @@ async fn the_taxonomies_created_after_the_tightening_refuse_whitespace_too() {
     const LATER_TAXONOMIES: &[&str] = &[
         "pricing_customer_group_taxonomy",
         "pricing_rounding_policy_taxonomy",
+        "pricing_gl_code_taxonomy",
     ];
 
     let conn = Database::connect("sqlite::memory:")
         .await
         .expect("connect in-memory sqlite");
     let manager = SchemaManager::new(&conn);
-    // Staged at `pricing_rounding_policy_taxonomy`, the **later** of the two: it is
-    // the earliest point at which both tables exist, so the rows below are written
+    // Staged at `pricing_gl_code_taxonomy`, the **latest** of the three: it is the
+    // earliest point at which all three tables exist, so the rows below are written
     // under a partially applied chain and the remainder runs over them.
-    let remainder = staged_to(&manager, "create_pricing_rounding_policy_taxonomy").await;
+    let remainder = staged_to(&manager, "create_pricing_gl_code_taxonomy").await;
 
     for table in LATER_TAXONOMIES {
         let refused = try_exec(
@@ -2404,6 +2415,7 @@ async fn every_taxonomy_value_predicate_refuses_ascii_whitespace_alone() {
         "pricing_partner_taxonomy",
         "pricing_region_taxonomy",
         "pricing_rounding_policy_taxonomy",
+        "pricing_gl_code_taxonomy",
     ];
 
     let conn = Database::connect("sqlite::memory:")

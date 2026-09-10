@@ -30,10 +30,12 @@ use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::entity::plan;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewPlanDraft, PlanRepo, PlanShapeRepo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureUpdateExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -417,8 +419,8 @@ async fn publish(provider: &DBProvider<DbError>, scope: &AccessScope, plan_id: P
     assert_eq!(result.rows_affected, 1, "the seed must have moved one row");
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, hour, 0, 0)
 }
 
 fn draft_of(plan_id: PlanId, tenant_id: Uuid) -> NewPlanDraft {
@@ -762,7 +764,7 @@ async fn another_tenants_descriptor_set_is_invisible() {
 fn stamp() -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: uuid::Uuid::from_u128(0xac_10),
-        recorded_at: chrono::Utc::now(),
+        recorded_at: OffsetDateTime::now_utc(),
         correlation_id: TEST_CORRELATION,
     }
 }

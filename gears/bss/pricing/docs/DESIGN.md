@@ -6,6 +6,20 @@ Updated:  2026-08-24 by Virtuozzo International GmbH
 
 # Technical Design — Plan & Price Modeling
 
+> **2026-09-10 implementation amendment:** [UI read contracts](./design/ui-read-contracts.md)
+> covers unified pending arrays, approval-read-gated taxonomy previews and
+> reference counts, atomic taxonomy
+> approval and the read-only Product Catalog category dictionary. It explicitly
+> separates implemented behavior from the pending tax-source migration.
+> D-365 adds live approval participant names through the public AM SDK, original
+> caller authorization, request-local deduplication, and bounded lookup time.
+> Typed AM/Keycloak ID-set batches are implemented; large-tenant scan performance,
+> live IAM verification and non-user identity mapping remain open. D-366 disables
+> 304 on enriched plan/taxonomy GETs, retaining their write tokens and adding no-store.
+> D-367 adds SQL-paginated plan sorting/filtering after authoring selection, stable
+> `created_at` plus `revision_created_at`, and scoped `/approvals/counts`.
+> Shared OData libraries are unchanged; model/currency filters use scalar query keys.
+
 <!-- toc -->
 
 - [1. Architecture Overview](#1-architecture-overview)

@@ -32,23 +32,24 @@ mod rest_support;
 
 use axum::http::StatusCode;
 use bss_pricing::api::rest::approvals::{
-    APPROVAL, APPROVAL_APPROVE, APPROVAL_REJECT, APPROVAL_WITHDRAW, APPROVALS,
+    APPROVAL, APPROVAL_APPROVE, APPROVAL_COUNTS, APPROVAL_REJECT, APPROVAL_WITHDRAW, APPROVALS,
 };
 use bss_pricing::api::rest::audit::AUDIT;
 use bss_pricing::api::rest::bulk_imports::{BULK_IMPORT, BULK_IMPORT_ABORT, BULK_IMPORTS};
 use bss_pricing::api::rest::bundles::{BUNDLE_BY_ID, BUNDLE_PUBLISH, BUNDLES};
-use bss_pricing::api::rest::catalog_skus::CATALOG_SKUS;
+use bss_pricing::api::rest::catalog_skus::{CATALOG_SKUS, CATALOG_TAX_CATEGORIES};
 use bss_pricing::api::rest::customer_groups::{
     CUSTOMER_GROUP_MEMBER, CUSTOMER_GROUP_MEMBER_MOVE, CUSTOMER_GROUP_MEMBERS,
-    CUSTOMER_GROUP_TAXONOMY,
+    CUSTOMER_GROUP_MEMBERS_MOVE, CUSTOMER_GROUP_TAXONOMY,
 };
 use bss_pricing::api::rest::cutovers::{PLAN_CUTOVERS, PRICE_GRANDFATHER_UNTIL};
-use bss_pricing::api::rest::frontier::FRONTIER;
+use bss_pricing::api::rest::frontier::{CATALOG_VERSION_REF, FRONTIER};
+use bss_pricing::api::rest::gl_codes::GL_CODES;
 use bss_pricing::api::rest::history::{HISTORY, HISTORY_EXPORT};
 use bss_pricing::api::rest::migrated_origin_snapshots::MIGRATED_ORIGIN_SNAPSHOT;
 use bss_pricing::api::rest::migrations::{MIGRATION_BY_ID, MIGRATIONS};
 use bss_pricing::api::rest::overlays::{PRICE_OVERLAY_BY_ID, PRICE_OVERLAY_SUBMIT, PRICE_OVERLAYS};
-use bss_pricing::api::rest::plans::{PLAN_ABANDON, PLAN_CLONE, PLANS};
+use bss_pricing::api::rest::plans::{PLAN_ABANDON, PLAN_CLONE, PLANS, PLANS_COUNTS};
 use bss_pricing::api::rest::preview::PLAN_PREVIEW;
 use bss_pricing::api::rest::prices::{PLAN_PRICE, PLAN_PRICES};
 use bss_pricing::api::rest::publish::PLAN_PUBLISH;
@@ -58,13 +59,16 @@ use bss_pricing::api::rest::rounding_policies::ROUNDING_POLICIES;
 use bss_pricing::api::rest::rounding_policy::ROUNDING_POLICY;
 use bss_pricing::api::rest::supersessions::PLAN_SUPERSESSIONS;
 use bss_pricing::api::rest::tax_display_policy::TAX_DISPLAY_POLICY;
-use bss_pricing::api::rest::taxonomies::TAXONOMY;
+use bss_pricing::api::rest::taxonomies::{TAXONOMY, TAXONOMY_VALUE, TAXONOMY_VALUES};
 use bss_pricing::api::rest::threshold_policy::APPROVAL_THRESHOLD_POLICY;
 use bss_pricing::api::rest::windows::{
     PLAN_COVERAGE, PLAN_SELLABILITY, PRICE_WINDOW, PRICE_WINDOWS, PRICE_WINDOWS_LIST,
 };
 use bss_pricing::authz::{actions, labels};
 use bss_pricing::domain::approval::ApprovalState;
+use bss_pricing::domain::lifecycle::LifecycleState;
+use bss_pricing::domain::read_model::SubjectRef;
+use bss_pricing::infra::storage::repo::{PendingVersionRow, catalog_version_ref_repo};
 use rest_support::{
     Harness, approval_row, body_json, mutable_planes, plan_count, plan_row_version, price_rows,
     request, seed_draft_plan, seed_price, with_headers,
@@ -116,6 +120,13 @@ fn census() -> Vec<Route> {
         Route {
             method: "GET",
             path: FRONTIER,
+            resource_type: labels::PLAN,
+            action: actions::READ,
+            mutating: false,
+        },
+        Route {
+            method: "GET",
+            path: CATALOG_VERSION_REF,
             resource_type: labels::PLAN,
             action: actions::READ,
             mutating: false,
@@ -186,6 +197,14 @@ fn census() -> Vec<Route> {
         Route {
             method: "GET",
             path: PLANS,
+            resource_type: labels::PLAN,
+            action: actions::READ,
+            mutating: false,
+        },
+        // D-360: the counts read asks the list's exact pair, once.
+        Route {
+            method: "GET",
+            path: PLANS_COUNTS,
             resource_type: labels::PLAN,
             action: actions::READ,
             mutating: false,
@@ -343,6 +362,13 @@ fn census() -> Vec<Route> {
             mutating: false,
         },
         Route {
+            method: "GET",
+            path: PLAN_PRICE,
+            resource_type: labels::PLAN,
+            action: actions::READ,
+            mutating: false,
+        },
+        Route {
             method: "PATCH",
             path: PLAN_PRICE,
             resource_type: labels::PLAN,
@@ -469,6 +495,13 @@ fn census() -> Vec<Route> {
         },
         Route {
             method: "GET",
+            path: APPROVAL_COUNTS,
+            resource_type: labels::APPROVAL,
+            action: actions::READ,
+            mutating: false,
+        },
+        Route {
+            method: "GET",
             path: APPROVAL,
             resource_type: labels::APPROVAL,
             action: actions::READ,
@@ -557,9 +590,26 @@ fn config_routes() -> Vec<Route> {
             action: actions::READ,
             mutating: false,
         },
+        // D-353: the whole-set `PUT` is removed; the per-value routes are the same
+        // resource one value wide, so they gate on the same pair — `config`, never
+        // `approval_policy`.
         Route {
-            method: "PUT",
-            path: TAXONOMY,
+            method: "POST",
+            path: TAXONOMY_VALUES,
+            resource_type: labels::CONFIG,
+            action: actions::WRITE,
+            mutating: true,
+        },
+        Route {
+            method: "GET",
+            path: TAXONOMY_VALUE,
+            resource_type: labels::CONFIG,
+            action: actions::READ,
+            mutating: false,
+        },
+        Route {
+            method: "PATCH",
+            path: TAXONOMY_VALUE,
             resource_type: labels::CONFIG,
             action: actions::WRITE,
             mutating: true,
@@ -621,6 +671,13 @@ fn config_routes() -> Vec<Route> {
             action: actions::WRITE,
             mutating: true,
         },
+        Route {
+            method: "POST",
+            path: CUSTOMER_GROUP_MEMBERS_MOVE,
+            resource_type: labels::CUSTOMER_GROUP,
+            action: actions::WRITE,
+            mutating: true,
+        },
         // C4's enforcement mode. `config`, like the taxonomies and unlike the
         // approval-threshold policy — this one softens how one publish rule
         // reports one missing external fact; that one decides whether a change
@@ -673,12 +730,36 @@ fn config_routes() -> Vec<Route> {
             action: actions::WRITE,
             mutating: true,
         },
+        // D-356's GL-code vocabulary, `config` for the rounding vocabulary's
+        // reason: it narrows what a descriptor may name and decides nothing about
+        // who approves what.
+        Route {
+            method: "GET",
+            path: GL_CODES,
+            resource_type: labels::CONFIG,
+            action: actions::READ,
+            mutating: false,
+        },
+        Route {
+            method: "PUT",
+            path: GL_CODES,
+            resource_type: labels::CONFIG,
+            action: actions::WRITE,
+            mutating: true,
+        },
         // A pass-through of another gear's browse list. `config` x `read` like
         // the taxonomies beside it: it is a suggestion source for authoring and
         // decides nothing, and it is not `plan` because no plan is named.
         Route {
             method: "GET",
             path: CATALOG_SKUS,
+            resource_type: labels::CONFIG,
+            action: actions::READ,
+            mutating: false,
+        },
+        Route {
+            method: "GET",
+            path: CATALOG_TAX_CATEGORIES,
             resource_type: labels::CONFIG,
             action: actions::READ,
             mutating: false,
@@ -777,7 +858,7 @@ fn synthesis_routes() -> Vec<Route> {
 
 fn overlay_routes() -> Vec<Route> {
     vec![
-        // Slice 9's overlay half. All four are `price_overlay` x its own action
+        // Slice 9's overlay half. All five are `price_overlay` x its own action
         // and deliberately **not** `plan`: the AuthZ catalog gives overlays a
         // resource of their own, and D-61's reviewability invariant is why the
         // approving role needs `price_overlay x read` — a reviewer of an
@@ -801,6 +882,13 @@ fn overlay_routes() -> Vec<Route> {
         Route {
             method: "GET",
             path: PRICE_OVERLAYS,
+            resource_type: labels::PRICE_OVERLAY,
+            action: actions::READ,
+            mutating: false,
+        },
+        Route {
+            method: "GET",
+            path: PRICE_OVERLAY_BY_ID,
             resource_type: labels::PRICE_OVERLAY,
             action: actions::READ,
             mutating: false,
@@ -842,9 +930,16 @@ struct Seeded {
     /// by id reach their gate instead of failing to parse a path — the same
     /// reason [`Seeded::window`] exists.
     bundle: Uuid,
-    /// One overlay draft, so the two routes that address an overlay by id reach
-    /// their gate rather than a 404 — [`Seeded::bundle`]'s reason.
+    /// One overlay draft, so the three routes that address an overlay by id
+    /// reach their gate rather than a 404 — [`Seeded::bundle`]'s reason.
     overlay: Uuid,
+    /// One pending catalog-version handle against [`Seeded::plan`], so
+    /// `GET /catalog-version/refs/{pendingRef}` reaches a 200 for the owner
+    /// rather than a 404. The handle is a registry token, not a UUID.
+    pending_ref: String,
+    /// A brand value the tenant declares (`{value}` on the per-value taxonomy
+    /// routes, D-353); `drive` fills `{class}` with `brand`, so this is its pair.
+    brand_value: String,
 }
 
 /// The world the whole census is driven against: a draft plan with a shape and
@@ -921,7 +1016,41 @@ async fn seed(harness: &Harness) -> Seeded {
         )
         .await
         .expect("seed the overlay the two overlay-by-id routes address");
+    let pending_ref = "dev-local-census-v1".to_owned();
+    catalog_version_ref_repo::record_pending(
+        &harness.db.conn().expect("conn"),
+        &harness.scope(),
+        PendingVersionRow::for_subject(
+            harness.tenant,
+            pending_ref.clone(),
+            &SubjectRef::Plan(plan_id),
+            Some(0),
+            Some(LifecycleState::Published),
+            rest_support::at(10),
+        ),
+    )
+    .await
+    .expect("seed the pending handle the catalog-version-ref read addresses");
 
+    let brand_value = "acme";
+    harness
+        .state
+        .taxonomies
+        .declare_value(
+            &harness.scope(),
+            harness.tenant,
+            bss_pricing::domain::taxonomy::TaxonomyClass::Brand,
+            bss_pricing::domain::taxonomy::TaxonomyEntry {
+                value: bss_pricing::domain::overlay::ScopeValue::new(brand_value)
+                    .expect("a non-blank value"),
+                display_name: "Acme".to_owned(),
+                state: bss_pricing::domain::taxonomy::TaxonomyState::Active,
+                tax: None,
+            },
+            rest_support::seed_stamp(),
+        )
+        .await
+        .expect("declare the seeded brand value");
     Seeded {
         plan: plan_id,
         price: price.price_id,
@@ -929,6 +1058,8 @@ async fn seed(harness: &Harness) -> Seeded {
         window,
         bundle,
         overlay,
+        pending_ref,
+        brand_value: brand_value.to_owned(),
     }
 }
 
@@ -956,6 +1087,7 @@ fn drive(
         .replace("{windowId}", &seeded.window.to_string())
         .replace("{bundleId}", &seeded.bundle.to_string())
         .replace("{overlayId}", &seeded.overlay.to_string())
+        .replace("{pendingRef}", &seeded.pending_ref)
         // **Not a seeded id, and it does not need to be.** Both migration item
         // routes ask the PDP *before* they read the row, so a schedule that does
         // not exist still drives the gate — which is the only thing this file
@@ -987,6 +1119,7 @@ fn drive(
         // actually reads, so a denial here is a denial on the path an operator
         // is really walking.
         .replace("{class}", "brand")
+        .replace("{value}", &seeded.brand_value)
         // Task 6's membership routes. `{group}` is a taxonomy **value**, not a
         // seeded id — `group_membership_repo` validates no taxonomy universe
         // (its own module doc), so any non-blank token drives the gate; a
@@ -1036,10 +1169,10 @@ fn body_for(
     key: &'static str,
 ) -> DrivenBody {
     match (route.method, route.path) {
-        // Slice 9's four. The `POST` takes an idempotency key and a whole
-        // overlay; the `PATCH` takes the **overlay revision's** tag, which the
-        // seeded draft stands at as `"0-0"`; the submit takes neither, since its
-        // concurrency is the approval unit's.
+        // Slice 9's five. The `POST` takes an idempotency key and a whole
+        // overlay; the by-id `GET` takes none; the `PATCH` takes the **overlay
+        // revision's** tag, which the seeded draft stands at as `"0-0"`; the
+        // submit takes neither, since its concurrency is the approval unit's.
         ("POST", PRICE_OVERLAYS) => (
             Some(serde_json::json!({
                 "scope_class": "global",
@@ -1274,6 +1407,13 @@ fn body_for(
             Some(serde_json::json!({ "effective_from": "2099-01-01T00:00:00Z" })),
             vec![("idempotency-key", key)],
         ),
+        ("POST", CUSTOMER_GROUP_MEMBERS_MOVE) => (
+            Some(serde_json::json!({
+                "payer_ids": [Uuid::now_v7(), Uuid::now_v7()],
+                "effective_from": "2099-01-01T00:00:00Z"
+            })),
+            vec![("idempotency-key", key)],
+        ),
         ("POST", APPROVAL_REJECT) => (
             Some(serde_json::json!({ "reason": "not signed off" })),
             Vec::new(),
@@ -1389,6 +1529,10 @@ async fn registered_paths() -> Vec<String> {
                 &openapi,
             ))
             .merge(bss_pricing::api::rest::rounding_policies::router(
+                Arc::clone(&harness.state),
+                &openapi,
+            ))
+            .merge(bss_pricing::api::rest::gl_codes::router(
                 Arc::clone(&harness.state),
                 &openapi,
             ))
@@ -2407,7 +2551,7 @@ async fn every_route_asks_the_catalogued_pair() {
     // # What it still cannot bind, and why that is not papered over
     //
     // A question behind a branch this seed does not take is never recorded, so it
-    // is neither asserted nor catalogued here. There are exactly **two**, and they
+    // is neither asserted nor catalogued here. The first **two** are
     // are a pair rather than the one this comment used to name: both
     // `POST /approvals/{approvalId}/approve` and `POST /approvals/{approvalId}/reject`
     // ask `plan × write` a second time when the unit they decided is a **repricing
@@ -2425,6 +2569,11 @@ async fn every_route_asks_the_catalogued_pair() {
     // discrimination — this property pins *one* question on a plan-content unit and
     // that one pins *two* on a batch unit, so the second is provably the bulk arm's.
     // The reject half was not named as owed at all until 2026-08-20.
+    // D-364 adds two more branch-only questions: taxonomy list/detail ask
+    // approval-read only when pending taxonomy units exist. This seed has none.
+    // `rest_taxonomies::taxonomy_pending_preview_tracks_multiple_proposals_and_atomic_apply`
+    // pins config-read then one constrained approval-read for multiple units;
+    // its sibling access tests cover denial, resource scopes and PDP outage.
     for route in census() {
         let harness = Harness::new().await;
         let seeded = seed(&harness).await;
@@ -3028,6 +3177,8 @@ fn absent_ids(seeded: &Seeded) -> Seeded {
     fresh.window = Uuid::now_v7();
     fresh.bundle = Uuid::now_v7();
     fresh.overlay = Uuid::now_v7();
+    "dev-local-absent-v1".clone_into(&mut fresh.pending_ref);
+    "absent-value".clone_into(&mut fresh.brand_value);
     fresh
 }
 
@@ -3080,6 +3231,8 @@ const VARIED_SEGMENTS: &[&str] = &[
     "{windowId}",
     "{bundleId}",
     "{overlayId}",
+    "{pendingRef}",
+    "{value}",
 ];
 
 /// By-id reads this property cannot cover, and **why**, one row per route.
@@ -3272,9 +3425,17 @@ const BY_ID_WRITES_THIS_FIXTURE_CANNOT_STAGE: &[(&str, &str)] = &[
     // cross-tenant claim on these is that a foreign caller's write lands in the
     // foreign caller's own tenant — the emptiness of a body, which is a different
     // property and their own suite's.
-    ("PUT", TAXONOMY),
+    // D-353's per-value taxonomy routes (the whole-set `PUT` that stood here is
+    // removed). The `POST` names `{class}` alone — a resource selector, above — so
+    // its cross-tenant claim is the same emptiness-of-body one. The `PATCH`
+    // asserts the **value's own** tag, which only a read of that value hands out
+    // and this fixture performs no read; its cross-tenant twin is
+    // `rest_taxonomies::a_foreign_tenants_value_reads_and_patches_like_an_absent_one`.
+    ("POST", TAXONOMY_VALUES),
+    ("PATCH", TAXONOMY_VALUE),
     ("POST", CUSTOMER_GROUP_MEMBERS),
     ("POST", CUSTOMER_GROUP_MEMBER_MOVE),
+    ("POST", CUSTOMER_GROUP_MEMBERS_MOVE),
     // Paid in `rest_customer_groups::a_foreign_tenant_cannot_adjust_this_tenants_membership`,
     // which takes the membership id off the enrollment's own response so the
     // `foreign` and `absent` arms can differ in the id whose tenant is in question.

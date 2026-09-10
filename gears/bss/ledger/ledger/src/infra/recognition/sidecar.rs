@@ -36,7 +36,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bss_ledger_sdk::SourceDocType;
-use chrono::Utc;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -50,6 +49,7 @@ use crate::infra::posting::idempotency::{ClaimOutcome, IdempotencyGate};
 use crate::infra::posting::service::{PostSidecar, PostedFacts};
 use crate::infra::storage::repo::RecognitionRepo;
 use crate::infra::storage::repo::recognition_repo::{NewSchedule, NewSegment};
+use time::OffsetDateTime;
 
 /// One schedule to materialize: the pure [`BuiltSchedule`] plan plus the
 /// `source_invoice_item_ref` it draws down (the Contract-liability line this post
@@ -357,7 +357,7 @@ impl PostSidecar for RecognitionStampSidecar {
         .map_err(map_recognition_repo_err)?;
 
         // 2. Segment next (rank 7): flip PENDING/QUEUED → DONE, stamping
-        //    `recognized_at` (the infra wall clock — `Utc::now()` is allowed in
+        //    `recognized_at` (the infra wall clock — `OffsetDateTime::now_utc()` is allowed in
         //    infra, mirroring the payment sidecars' `allocated_at_utc`) + `run_id`.
         //    The status filter refuses an already-DONE row, so a stray re-stamp on
         //    the fresh-claim path is an invariant breach that rolls the post back
@@ -369,7 +369,7 @@ impl PostSidecar for RecognitionStampSidecar {
             &self.schedule_id,
             self.segment_no,
             self.run_id,
-            Utc::now(),
+            OffsetDateTime::now_utc(),
         )
         .await
         .map_err(map_recognition_repo_err)?;

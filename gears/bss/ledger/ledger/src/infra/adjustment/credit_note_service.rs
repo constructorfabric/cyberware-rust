@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostingRef, Side, SourceDocType};
-use chrono::{Datelike, Utc};
+use chrono::Datelike;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -64,6 +64,7 @@ use crate::domain::approval::ApprovalKind;
 use crate::domain::approval::intent::{ApprovalIntent, CreditNoteIntent};
 use crate::domain::approval::policy::OperationFacts;
 use crate::domain::error::DomainError;
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::domain::ports::metrics::{LedgerMetricsPort, NoteOutcome};
 use crate::domain::status::{LIFECYCLE_OPEN, SCHEDULE_STATUS_ACTIVE};
@@ -81,6 +82,7 @@ use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::storage::entity::recognition_schedule;
 use crate::infra::storage::repo::adjustment_repo::NewCreditNote;
 use crate::infra::storage::repo::{AdjustmentRepo, JournalRepo, RecognitionRepo, ReferenceRepo};
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service (mirrors the peer
 /// orchestrators).
@@ -632,7 +634,7 @@ impl CreditNoteHandler {
                 deferred_part_minor: plan.deferred_part_minor,
                 split_basis_ref: Some(plan.split_basis_ref.clone()),
                 reason_code: req.reason_code.clone(),
-                created_at_utc: Utc::now(),
+                created_at_utc: OffsetDateTime::now_utc(),
             },
         }
     }
@@ -776,7 +778,7 @@ impl CreditNoteHandler {
             .await
             .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
-        let eff_date = Utc::now().date_naive();
+        let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
 
         let mut lines: Vec<NewLine> = Vec::with_capacity(plan.legs.len());
@@ -810,7 +812,7 @@ impl CreditNoteHandler {
             source_business_id: req.credit_note_id.clone(),
             reverses_entry_id: None,
             reverses_period_id: None,
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: eff_date,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: ctx.subject_id(),
@@ -1144,7 +1146,7 @@ impl PostSidecar for CreditNotePostSidecar {
                     amount_minor: self.credit_note_amount_minor,
                     recognized_part_minor: self.recognized_part_minor,
                     deferred_part_minor: self.deferred_part_minor,
-                    posted_at_utc: Utc::now(),
+                    posted_at_utc: OffsetDateTime::now_utc(),
                 },
             )
             .await

@@ -4,7 +4,7 @@
 //! `/bss-pricing/v1/{resource}`, with actions as sub-resource segments (D-140),
 //! and every collection surface paginates with an opaque cursor (D-125).
 //!
-//! # The read shape, and the five families that deviate from it
+//! # The read shape, and the three families that still deviate from it
 //!
 //! **The pattern is the approvals pair**: a record family offers a
 //! cursor-paginated `GET` on its collection *and* a `GET` on one member by id, so a
@@ -14,19 +14,10 @@
 //! found: nine families, each missing a *different* half, and no statement anywhere
 //! of which half a tenth family owes.
 //!
-//! Complete pairs: **approvals**, **plans**, **migrations**, **bundles**. The
-//! deviations, each with the reason it is one:
+//! Complete pairs: **approvals**, **plans**, **migrations**, **bundles**,
+//! **price overlays**, **price rows**. The deviations, each with the reason it
+//! is one:
 //!
-//! * **price rows** — `GET /plans/{planId}/prices` lists; there is no
-//!   `GET …/prices/{priceId}`, though `PATCH` and `DELETE` address exactly that
-//!   path. A row is authored, read back and mutated inside one plan's page, and its
-//!   entity tag comes from the page; a by-id read is owed the day a client holds a
-//!   `priceId` across sessions.
-//! * **price overlays** — `GET /price-overlays` lists;
-//!   `/price-overlays/{overlayId}` is `PATCH`-only. This is the sharpest one and
-//!   the only deviation with a cost today: the list narrows on `scope_class` and
-//!   nothing else, so reading one known overlay means paging the tenant's overlay
-//!   set at D-125's default.
 //! * **price windows** — `GET /price-windows` lists (narrowable to one
 //!   `price_id`); `/price-windows/{windowId}` is `PATCH` + `DELETE`. Same shape as
 //!   price rows, mitigated the same way: the `price_id` filter is the practical
@@ -41,7 +32,7 @@
 //!   lists; `PATCH …/members/{id}` and `POST …/members/{payerId}/move` address a
 //!   member by id and there is no `GET …/members/{id}`. The price-row deviation's
 //!   exact shape, and it carries the same mitigation: D-125's cursor pair plus a
-//!   `payer_id` filter, so the filtered page is the practical by-id read. Without
+//!   `payer_tenant_id` filter, so the filtered page is the practical by-id read. Without
 //!   the filter and the pagination the deviation has no mitigation at all, against
 //!   this module's own opening sentence — and a mitigation stated only inside an
 //!   `If-Match` parameter doc at `customer_groups.rs` is one no reader of this
@@ -63,24 +54,12 @@
 //! written down. They are here rather than nowhere, because a reader who greps this
 //! statement for a table and finds it absent concludes the surface is complete.
 //!
-//! * **`pricing_catalog_version_ref` is written all over this gear and read by no
-//!   route.** The writers are
-//!   `grep -rln "catalog_version_ref_repo::record_pending" src/` — nine modules as
-//!   (`publish`, `overlay_publish`, `supersession`, `cutover`,
-//!   `repricing`, `retirement`, `window`, `grandfather`, `membership_publish`,
-//!   the last serving three routes of its own) — and each hands a caller a
-//!   `pendingVersionRef`. The figure is stated as the **command** rather than as a
-//!   number, because it is derivable and a number goes stale the next time a door
-//!   is added; D-344 gave the cutover its own `record_pending`, and a count written
-//!   beside that change would have been wrong in the commit that wrote it. No route
-//!   answers whether a handle committed or which version number
-//!   it became; that half is unchanged and is the finding.
-//!   `GET /catalog-version/frontier` is not that read — it serves the tenant-level
-//!   pin watermark and says nothing about one publish's outcome. **The intended
-//!   reader is named in the design set and is not this gear's**:
-//!   `01-foundation.md` §4.4 has an overdue pending ref *"surface on the publish
-//!   status API"*, which is not among these 67 routes. Owed as a route, not as a
-//!   sentence.
+//! * **`pricing_catalog_version_ref` is written by every publish door and read by
+//!   `GET /catalog-version/refs/{pendingRef}`.** That GET is the one-handle
+//!   status: `pending` / `commit_observed` / `committed`, plus the version once
+//!   finalize has landed. `GET /catalog-version/frontier` remains the tenant
+//!   pin watermark and says nothing about one publish's outcome. The writers
+//!   are still `grep -rln "catalog_version_ref_repo::record_pending" src/`.
 //! * **`GET /migrated-origin-snapshots/{subscriptionRef}` reads a table no route
 //!   writes.** `pricing_snapshot_provenance`'s only writers are
 //!   `SynthesisService::synthesize`/`synthesize_in`, and a crate-wide grep for
@@ -159,9 +138,11 @@ pub mod customer_groups;
 pub mod cutovers;
 pub mod error;
 pub mod frontier;
+pub mod gl_codes;
 pub mod history;
 pub mod migrated_origin_snapshots;
 pub mod migrations;
+pub(crate) mod odata_list;
 pub mod overlays;
 pub mod plans;
 /// The operator-supplied change reason a window is recorded under, bounded.

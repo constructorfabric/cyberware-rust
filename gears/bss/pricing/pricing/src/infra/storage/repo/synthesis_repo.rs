@@ -18,7 +18,6 @@
 //! There is no `update` and no `delete` here, and none is missing: the table
 //! refuses both outright.
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ColumnTrait, Condition, DbErr, EntityTrait};
@@ -31,6 +30,7 @@ use crate::domain::synthesis::SynthesisTrigger;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::snapshot_provenance;
 use crate::infra::storage::repo::check_authored_instant;
+use time::OffsetDateTime;
 
 /// A frozen `migrated-origin` snapshot as this gear holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,7 +44,7 @@ pub struct ProvenanceRecord {
     /// The revision, where the resolved rows had one (D-87: tier 2 has none).
     pub source_revision: Option<u64>,
     /// D-81's instant `t`.
-    pub snapshot_instant: DateTime<Utc>,
+    pub snapshot_instant: OffsetDateTime,
     /// Which trigger froze it.
     pub trigger: SynthesisTrigger,
     /// Who acted.
@@ -69,7 +69,7 @@ pub struct NewProvenance {
     /// The revision, where there is one.
     pub source_revision: Option<u64>,
     /// D-81's instant.
-    pub snapshot_instant: DateTime<Utc>,
+    pub snapshot_instant: OffsetDateTime,
     /// The trigger.
     pub trigger: SynthesisTrigger,
     /// The acting principal.
@@ -79,7 +79,7 @@ pub struct NewProvenance {
     /// The materialized payload.
     pub payload: JsonValue,
     /// The commit instant.
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 /// What [`freeze_or_load`] answered with.

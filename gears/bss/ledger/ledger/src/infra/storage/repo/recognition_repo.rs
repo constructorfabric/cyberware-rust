@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use bss_ledger_sdk::{AccountClass, Side, SourceDocType};
-use chrono::{DateTime, Utc};
+
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait, Order};
@@ -55,6 +55,7 @@ use crate::infra::storage::repo::journal_repo::{
     OdataPageError, map_odata_err, query_with_default_order,
 };
 use crate::odata::RecognitionRunFilterField;
+use time::OffsetDateTime;
 
 /// The `recognition_schedule` row to insert for a freshly materialized ACTIVE
 /// schedule (one per revenue stream, design §3.5 / §4.5). `recognized_minor`
@@ -909,7 +910,7 @@ impl RecognitionRepo {
         schedule_id: &str,
         segment_no: i32,
         run_id: Uuid,
-        recognized_at: DateTime<Utc>,
+        recognized_at: OffsetDateTime,
     ) -> Result<(), RepoError> {
         let result = recognition_segment::Entity::update_many()
             .secure()
@@ -1581,7 +1582,7 @@ impl RecognitionRepo {
         tenant: Uuid,
         run_id: Uuid,
         period_id: &str,
-        started_at_utc: DateTime<Utc>,
+        started_at_utc: OffsetDateTime,
     ) -> Result<(), RepoError> {
         let conn = self
             .db

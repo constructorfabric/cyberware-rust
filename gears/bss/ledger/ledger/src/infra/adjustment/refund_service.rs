@@ -70,7 +70,7 @@
 use std::sync::Arc;
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostingRef, Side, SourceDocType};
-use chrono::{Datelike, Duration, Utc};
+use chrono::Datelike;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -86,6 +86,7 @@ use crate::domain::approval::intent::{ApprovalIntent, RefundIntent, RefundWithCr
 use crate::domain::approval::policy::OperationFacts;
 use crate::domain::error::DomainError;
 use crate::domain::fx::realized::carried_relief;
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine, RepoError};
 use crate::domain::payment::chargeback::DisputePhase;
 use crate::domain::ports::metrics::LedgerMetricsPort;
@@ -113,6 +114,8 @@ use crate::infra::storage::repo::{
     AdjustmentRepo, DisputeRepo, JournalRepo, NewQueueRow, PaymentRepo, PendingQueueRepo,
     ReferenceRepo,
 };
+use time::Duration;
+use time::OffsetDateTime;
 
 /// The WORK-STATE queue `flow` for a refund-of-refund claw-back that DEFERRED on an
 /// out-of-order / would-underflow money-out decrement (Group E, design §4.4). This
@@ -532,7 +535,7 @@ impl RefundHandler {
         // is HELD inside `post_refund_inner` (Z5-2): the hold intake durably enqueues
         // the payload + signals `RefundDisputeHeld`, which we surface here as a
         // `DisputeHeld` 202 (mirroring the `Quarantined` 202) rather than a raw error.
-        let held_at = Utc::now();
+        let held_at = OffsetDateTime::now_utc();
         match self.post_refund(ctx, scope, req).await {
             Ok(posting) => Ok(RefundOutcome::Posted(posting)),
             Err(DomainError::RefundDisputeHeld(business_id)) => {
@@ -1047,7 +1050,7 @@ impl RefundHandler {
         req: &RefundRequest,
         open: &crate::infra::storage::entity::dispute::Model,
     ) -> Result<String, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let business_id = refund_business_id(&req.psp_refund_id, req.phase.as_str());
         let payload = DisputeHeldRefundPayload::from_request(req, &open.dispute_id, open.cycle);
         let payload_json = serde_json::to_value(&payload)
@@ -1199,7 +1202,7 @@ impl RefundHandler {
         tenant: Uuid,
         limit: u64,
     ) -> Result<DisputeHoldDrainReport, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let pending_queue = self.pending_queue.clone();
         let scope_owned = scope.clone();
         let claimed: Vec<pending_event_queue::Model> = self
@@ -1268,8 +1271,8 @@ impl RefundHandler {
         match last_phase {
             // STILL OPEN ⇒ back off (or escalate if aged out). The cash stays held.
             Some(DisputePhase::Opened) => {
-                let aged =
-                    (Utc::now() - row.queued_at) >= Duration::seconds(DISPUTE_HOLD_AGING_SECS);
+                let aged = (OffsetDateTime::now_utc() - row.queued_at)
+                    >= Duration::seconds(DISPUTE_HOLD_AGING_SECS);
                 if aged {
                     self.escalate_dispute_hold(ctx, scope, &req, &dispute_id, &row.business_id)
                         .await?;
@@ -1829,7 +1832,7 @@ impl RefundHandler {
         scope: &AccessScope,
         req: &RefundRequest,
     ) -> Result<String, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let business_id = clawback_business_id(&req.psp_refund_id);
         let payload = QueuedClawbackPayload::from_request(req);
         let payload_json = serde_json::to_value(&payload)
@@ -1957,7 +1960,7 @@ impl RefundHandler {
         tenant: Uuid,
         limit: u64,
     ) -> Result<ClawbackDrainReport, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let pending_queue = self.pending_queue.clone();
         let scope_owned = scope.clone();
         let claimed: Vec<pending_event_queue::Model> = self
@@ -2039,7 +2042,8 @@ impl RefundHandler {
             // Still underflows: defer again UNLESS the row has aged out, in which
             // case it never reconciled → escalate (design §4.4).
             Err(DomainError::RefundClawbackDeferred(_)) => {
-                let aged = (Utc::now() - row.queued_at) >= Duration::seconds(CLAWBACK_AGING_SECS);
+                let aged = (OffsetDateTime::now_utc() - row.queued_at)
+                    >= Duration::seconds(CLAWBACK_AGING_SECS);
                 if aged {
                     self.escalate_clawback(ctx, scope, &req, &row.business_id)
                         .await?;
@@ -2196,7 +2200,7 @@ impl RefundHandler {
     ) -> Result<(), DomainError> {
         let scope_owned = scope.clone();
         let business_id = business_id.to_owned();
-        let defer_until = Utc::now() + clawback_backoff(prior_attempts + 1);
+        let defer_until = OffsetDateTime::now_utc() + clawback_backoff(prior_attempts + 1);
         self.db
             .transaction(move |txn| {
                 Box::pin(async move {
@@ -2230,7 +2234,7 @@ impl RefundHandler {
         scope: &AccessScope,
         req: &RefundRequest,
     ) -> Result<RefundOutcome, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let business_id = refund_business_id(&req.psp_refund_id, req.phase.as_str());
         let payload = QuarantinedRefundPayload::from_request(req);
         let payload_json = serde_json::to_value(&payload)
@@ -2383,7 +2387,7 @@ impl RefundHandler {
         tenant: Uuid,
         limit: u64,
     ) -> Result<QuarantineDrainReport, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let pending_queue = self.pending_queue.clone();
         let scope_owned = scope.clone();
         let claimed: Vec<pending_event_queue::Model> = self
@@ -2443,7 +2447,8 @@ impl RefundHandler {
             .await
             .map_err(|e| DomainError::Internal(format!("re-read origin settlement: {e}")))?;
         if settlement.is_none() {
-            let aged = (Utc::now() - row.queued_at) >= Duration::seconds(QUARANTINE_AGING_SECS);
+            let aged = (OffsetDateTime::now_utc() - row.queued_at)
+                >= Duration::seconds(QUARANTINE_AGING_SECS);
             if aged {
                 self.escalate_quarantine(ctx, scope, &req, &row.business_id)
                     .await?;
@@ -2774,7 +2779,7 @@ impl RefundHandler {
             .await
             .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
-        let eff_date = Utc::now().date_naive();
+        let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
 
         let mut lines: Vec<NewLine> = Vec::with_capacity(plan.legs.len());
@@ -2827,7 +2832,7 @@ impl RefundHandler {
             source_business_id: business_id.to_owned(),
             reverses_entry_id,
             reverses_period_id,
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: eff_date,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: ctx.subject_id(),
@@ -3027,7 +3032,7 @@ impl RefundHandler {
             // first-order refund. Rides the request verbatim.
             relates_to_refund_id: req.relates_to_refund_id.clone(),
             reverses_entry_id,
-            created_at_utc: Utc::now(),
+            created_at_utc: OffsetDateTime::now_utc(),
         }
     }
 
@@ -3159,7 +3164,7 @@ pub struct QuarantineHandle {
     /// The quarantine/dedup business id (`psp_refund_id:phase`).
     pub business_id: String,
     /// When the intake durably quarantined the request.
-    pub quarantined_at: chrono::DateTime<Utc>,
+    pub quarantined_at: OffsetDateTime,
 }
 
 /// The handle a dispute-held refund returns (Z5-2, design §5): the queue key + the
@@ -3172,7 +3177,7 @@ pub struct DisputeHoldHandle {
     /// The dispute-hold/dedup business id (`psp_refund_id:phase`).
     pub business_id: String,
     /// When the intake durably held the request.
-    pub held_at: chrono::DateTime<Utc>,
+    pub held_at: OffsetDateTime,
 }
 
 /// The outcome of the atomic `refund-with-credit-note` composite

@@ -11,11 +11,12 @@
 //! `None` is a fact about where the row came from rather than something not yet
 //! filled in.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_snapshot_provenance")]
@@ -41,7 +42,7 @@ pub struct Model {
     /// outlier.
     pub source_revision: Option<i64>,
     /// D-81's per-trigger instant `t`, UTC, frozen at execution.
-    pub snapshot_instant: DateTime<Utc>,
+    pub snapshot_instant: OffsetDateTime,
     /// `migration` | `first_rating`.
     pub trigger_kind: String,
     pub acting_principal: Uuid,
@@ -51,7 +52,7 @@ pub struct Model {
     /// set and grant set. What rating evaluates from and Billing posts from,
     /// resolving no id through the read model.
     pub payload: JsonValue,
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

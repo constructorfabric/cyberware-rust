@@ -91,12 +91,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, Order};
+use time::OffsetDateTime;
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{
     AccessScope, DBRunner, DbTx, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertExt,
     SecureUpdateExt,
 };
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
+
+use bss_pricing_sdk::odata::OverlayFilterField;
 
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use crate::domain::lifecycle::LifecycleState;
@@ -114,6 +119,10 @@ use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::{
     brand_taxonomy, customer_group_taxonomy, org_tier_taxonomy, partner_taxonomy, plan, price,
     price_overlay, price_overlay_line, price_overlay_line_amount, region_taxonomy,
+};
+use crate::infra::storage::odata_mapping::{
+    LIST_LIMIT_CFG, OdataPageError, OverlayODataMapper, map_odata_err, query_with_default_order,
+    query_with_unique_order,
 };
 use crate::infra::storage::repo::plan_repo::{read_token, tx_failure};
 use crate::infra::storage::repo::{NewAuditEntry, audit_repo, check_authored_instant};
@@ -702,6 +711,41 @@ impl OverlayRepo {
         record_of(&row, lines).map(Some)
     }
 
+    /// The revision an authoring caller is working with: the open draft, else
+    /// the published revision.
+    ///
+    /// Same rule as the plan plane's `GET /plans/{planId}`: a caller editing an
+    /// overlay is working on the draft, and a read that answered the published
+    /// revision would hand them a body their next `PATCH` would not match.
+    /// `current` stays published-only — a pin and a re-warm must not see a draft.
+    ///
+    /// # Errors
+    /// As [`OverlayRepo::load`].
+    pub async fn authoring(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        price_overlay_id: Uuid,
+    ) -> Result<Option<OverlayRecord>, RepoError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| RepoError::Db(format!("pricing_price_overlay conn: {e}")))?;
+        if let Some(row) = revision_in_state(
+            &conn,
+            scope,
+            tenant_id,
+            price_overlay_id,
+            OverlayLifecycle::Draft,
+        )
+        .await?
+        {
+            let lines = read_lines(&conn, scope, price_overlay_id, tenant_id, row.revision).await?;
+            return record_of(&row, lines).map(Some);
+        }
+        self.current(scope, tenant_id, price_overlay_id).await
+    }
+
     /// Every overlay revision of one tenant, optionally narrowed to one scope
     /// class — the `GET /bss-pricing/v1/price-overlays` read.
     ///
@@ -792,6 +836,66 @@ impl OverlayRepo {
             records.push(record_of(&row, lines)?);
         }
         Ok(records)
+    }
+
+    /// One `OData` page of overlay revisions. Default order is
+    /// `price_overlay_id asc` with `revision` as the seekset tiebreaker.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor.
+    pub async fn list_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<OverlayRecord>, OdataPageError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| OdataPageError::Db(format!("pricing_price_overlay conn: {e}")))?;
+        let base_select = price_overlay::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(price_overlay::Column::TenantId.eq(tenant_id)));
+        let query = query_with_default_order(query, &[OverlayFilterField::PriceOverlayId]);
+        // `revision` is the tiebreaker below and only the second half of the
+        // `(price_overlay_id, revision)` key, so a caller's `$orderby` would
+        // leave `[field, revision]` — two overlays both `published` at revision
+        // 1 then share a keyset value and one is dropped at the page boundary.
+        let query = query_with_unique_order(&query, &[OverlayFilterField::PriceOverlayId]);
+        let page = paginate_odata::<
+            OverlayFilterField,
+            OverlayODataMapper,
+            price_overlay::Entity,
+            price_overlay::Model,
+            _,
+            _,
+        >(
+            base_select,
+            &conn,
+            &query,
+            ("revision", SortDir::Asc),
+            LIST_LIMIT_CFG,
+            |m| m,
+        )
+        .await
+        .map_err(map_odata_err)?;
+
+        let mut lines_by_row = read_lines_for_page(&conn, scope, tenant_id, &page.items)
+            .await
+            .map_err(OdataPageError::Repo)?;
+        let mut items = Vec::with_capacity(page.items.len());
+        for row in page.items {
+            let lines = lines_by_row
+                .remove(&(row.price_overlay_id, row.revision))
+                .unwrap_or_default();
+            items.push(record_of(&row, lines).map_err(OdataPageError::Repo)?);
+        }
+        Ok(Page {
+            items,
+            page_info: page.page_info,
+        })
     }
 
     /// Is `value` declared in the taxonomy `class` validates against, and active?
@@ -2181,7 +2285,7 @@ async fn plan_facts(
 /// What the **price** plane says about an overlay's targets.
 struct MarketFacts {
     currencies: BTreeMap<PlanId, BTreeSet<CurrencyCode>>,
-    cohorts: BTreeMap<PlanId, BTreeSet<chrono::DateTime<chrono::Utc>>>,
+    cohorts: BTreeMap<PlanId, BTreeSet<OffsetDateTime>>,
 }
 
 /// Which markets each target sells, and which grandfathered generations it has
@@ -2447,10 +2551,9 @@ async fn declares_selector(
 ///
 /// `None` is *"not a generation"* and covers both the `none` sentinel and a
 /// token no writer of this crate produces.
-fn published_generation(token: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone;
+fn published_generation(token: &str) -> Option<OffsetDateTime> {
     let millis: i64 = token.parse().ok()?;
-    chrono::Utc.timestamp_millis_opt(millis).single()
+    crate::domain::instant::from_unix_millis(millis)
 }
 
 /// The highest revision number this overlay has ever minted.

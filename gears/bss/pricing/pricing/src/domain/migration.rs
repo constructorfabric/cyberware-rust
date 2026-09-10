@@ -52,12 +52,13 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Duration, Utc};
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
+use crate::domain::instant::try_days;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::plan_shape::PhaseKind;
+use time::OffsetDateTime;
 
 /// Wire code for a migration whose target is not a published plan
 /// (`11-lifecycle.md` §5, `inst-mg-target`, 422).
@@ -286,10 +287,10 @@ impl NoticePeriod {
     /// window.
     pub fn earliest_effective(
         self,
-        announced_at: DateTime<Utc>,
-    ) -> Result<DateTime<Utc>, DomainError> {
-        Duration::try_days(self.days)
-            .and_then(|notice| announced_at.checked_add_signed(notice))
+        announced_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime, DomainError> {
+        try_days(self.days)
+            .and_then(|notice| announced_at.checked_add(notice))
             .ok_or_else(|| {
                 DomainError::MigrationNoticeTooShort(format!(
                     "this tenant's {} day migration notice period cannot be honoured: it does \
@@ -315,8 +316,8 @@ impl NoticePeriod {
     /// is reachable from a refusal that only says "too short".
     pub fn ensure_honoured(
         self,
-        announced_at: DateTime<Utc>,
-        effective_at: DateTime<Utc>,
+        announced_at: OffsetDateTime,
+        effective_at: OffsetDateTime,
     ) -> Result<(), DomainError> {
         let earliest = self.earliest_effective(announced_at)?;
         if effective_at >= earliest {
@@ -387,7 +388,7 @@ pub fn ensure_distinct_plans(
 
 /// Which phase of the target a migrated subscription enters (D-39, confirmed, `inst-mg-boundary`).
 ///
-/// **A migration never grants a new `trial`, and does grant `intro`.** The rule
+/// **A migration never grants a new `trial`, and does grant `interim`.** The rule
 /// is the catalog's to state and Subscriptions' to honour — it rides the
 /// `PlanMigrationScheduled` contract — so what lives here is the selection, not
 /// an enforcement: this gear owns no subscription to place.
@@ -396,8 +397,9 @@ pub fn ensure_distinct_plans(
 /// acquisition instrument, granted once per subscriber to let them evaluate a
 /// product they have not bought; a migrated subscriber has already bought, and
 /// re-granting it would hand free time to every existing customer of a plan
-/// being consolidated. An `intro` phase is a *price* concession on a purchase
-/// that has been made, which is exactly what a migration is imposing.
+/// being consolidated. An `interim` phase (`intro` until D-358) is a *price*
+/// concession on a purchase that has been made, which is exactly what a migration
+/// is imposing.
 ///
 /// Returns the index of the first non-trial phase in the target's ordered phase
 /// chain, or `None` when the chain is empty or entirely trial — the latter being

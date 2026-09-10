@@ -153,7 +153,6 @@ use std::sync::Arc;
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
@@ -161,12 +160,14 @@ use uuid::Uuid;
 use crate::config::JobsConfig;
 use crate::domain::audit::AuditStamp;
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::scope_key::PlanId;
 use crate::infra::storage::repo::window_repo::{DueBoundary, DueWindow};
 use crate::infra::storage::repo::{
     NewOutboxEvent, PriceWindowTransitionPayload, outbox_repo, window_repo,
 };
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// The Warn alarm §7 names for a boundary that has stood uncrossed past the job
 /// SLO. The string is the design set's, not this module's.
@@ -276,7 +277,7 @@ pub struct ActivationReport {
     /// Carried because the alarm is raised once for the pass and an operator still
     /// needs one window to look at: the count says how wide the stall is, this says
     /// where it started. `None` whenever `overdue` is zero.
-    pub oldest_overdue: Option<(Uuid, DateTime<Utc>, Uuid)>,
+    pub oldest_overdue: Option<(Uuid, OffsetDateTime, Uuid)>,
 }
 
 /// The UTC window activation/expiry sweep: one pass, cross-tenant.
@@ -360,7 +361,7 @@ impl WindowActivationJob {
     /// [`DomainError`] only when the pass cannot start — the connection or one of
     /// the two due reads failing. A per-window fault is isolated: it is counted,
     /// logged, and the window stays due for the next tick.
-    pub async fn run(&self, now: DateTime<Utc>) -> Result<ActivationReport, DomainError> {
+    pub async fn run(&self, now: OffsetDateTime) -> Result<ActivationReport, DomainError> {
         let conn = self
             .db
             .conn()
@@ -406,7 +407,7 @@ impl WindowActivationJob {
         &self,
         conn: &impl DBRunner,
         boundary: DueBoundary,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         limit: u64,
     ) -> Result<Vec<DueWindow>, DomainError> {
         window_repo::list_due(conn, &AccessScope::allow_all(), boundary, now, limit)
@@ -448,7 +449,7 @@ impl WindowActivationJob {
     /// no later pass sees it; the second leaves it due, ageing into the overdue
     /// alarm. Splitting the levels would mean pre-reading the outbox to decide
     /// which one this is, which is a query racing the insert it is asking about.
-    async fn flip(&self, window: &DueWindow, now: DateTime<Utc>, report: &mut ActivationReport) {
+    async fn flip(&self, window: &DueWindow, now: OffsetDateTime, report: &mut ActivationReport) {
         let scope = AccessScope::for_tenant(window.tenant_id);
         let payload = PriceWindowTransitionPayload {
             window_id: window.window_id,
@@ -529,22 +530,22 @@ impl WindowActivationJob {
     fn observe_overdue(
         &self,
         window: &DueWindow,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         report: &mut ActivationReport,
     ) {
-        let threshold =
-            match chrono::Duration::from_std(self.jobs.window_activation_overdue_after()) {
-                Ok(threshold) => threshold,
-                Err(e) => {
-                    crate::infra::jobs::unconvertible_threshold(
-                        e,
-                        "window_activation_overdue_after",
-                        ALARM_WINDOW_ACTIVATION_OVERDUE,
-                    );
-                    return;
-                }
-            };
-        let late = now.signed_duration_since(window.at);
+        let threshold = match time::Duration::try_from(self.jobs.window_activation_overdue_after())
+        {
+            Ok(threshold) => threshold,
+            Err(e) => {
+                crate::infra::jobs::unconvertible_threshold(
+                    e,
+                    "window_activation_overdue_after",
+                    ALARM_WINDOW_ACTIVATION_OVERDUE,
+                );
+                return;
+            }
+        };
+        let late = now - window.at;
         if late < threshold {
             return;
         }
@@ -573,7 +574,7 @@ impl WindowActivationJob {
     /// what an operator needs to act on, and the alarm is what an alerting rule can
     /// match. D-238's own words — "a Critical that an operator can only find by
     /// grepping logs is the state the plane was opened to end".
-    fn raise_overdue(&self, report: &ActivationReport, now: DateTime<Utc>) {
+    fn raise_overdue(&self, report: &ActivationReport, now: OffsetDateTime) {
         let Some((tenant_id, at, window_id)) = report.oldest_overdue else {
             return;
         };
@@ -582,8 +583,8 @@ impl WindowActivationJob {
             overdue = report.overdue,
             oldest_tenant_id = %tenant_id,
             oldest_window_id = %window_id,
-            oldest_boundary_at = %at.to_rfc3339(),
-            oldest_late_secs = now.signed_duration_since(at).num_seconds(),
+            oldest_boundary_at = %format_rfc3339(at),
+            oldest_late_secs = (now - at).whole_seconds(),
             "bss-pricing: price window boundaries have stood uncrossed past the activation SLO; \
              the lease singleton is stalled or its flips are being refused"
         );
@@ -598,7 +599,7 @@ impl WindowActivationJob {
 /// A free function so it is assertable without a database: the changeover order
 /// is the one property of this key that a suite could otherwise only observe
 /// through two committed outbox rows.
-fn sort_key(window: &DueWindow) -> (Uuid, Uuid, DateTime<Utc>, u8, Uuid) {
+fn sort_key(window: &DueWindow) -> (Uuid, Uuid, OffsetDateTime, u8, Uuid) {
     (
         window.tenant_id,
         window.plan_id.get(),

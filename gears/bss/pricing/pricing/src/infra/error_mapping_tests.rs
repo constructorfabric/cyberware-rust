@@ -966,6 +966,7 @@ fn declared_status(err: &DomainError) -> u16 {
         | D::PrecedenceDuplicate(_)
         | D::OverlayIntervalOverlap(_)
         | D::TaxonomyValueInUse(_)
+        | D::TaxonomyValueExists(_)
         | D::ApprovalNotPending(_)
         | D::PendingChangeUnitExists(_)
         | D::ApprovalContentMismatch(_)
@@ -1053,6 +1054,7 @@ fn one_of_every_variant() -> Vec<DomainError> {
         D::PrecedenceDuplicate(d()),
         D::OverlayIntervalOverlap(d()),
         D::TaxonomyValueInUse(d()),
+        D::TaxonomyValueExists(d()),
         D::ApprovalNotPending(d()),
         D::PendingChangeUnitExists(d()),
         D::ApprovalContentMismatch(d()),
@@ -1078,7 +1080,7 @@ fn one_of_every_variant() -> Vec<DomainError> {
 /// gate [`declared_status`]'s exhaustive match cannot give: a new variant makes
 /// that match fail to compile, and this makes the roster that is *missing* the
 /// value fail the case. Bump it in the same edit that adds the variant to both.
-const DOMAIN_ERROR_VARIANTS: usize = 67;
+const DOMAIN_ERROR_VARIANTS: usize = 68;
 
 #[test]
 fn every_domain_error_variant_lands_in_its_declared_category() {

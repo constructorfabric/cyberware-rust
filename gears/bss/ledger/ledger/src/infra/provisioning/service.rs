@@ -18,7 +18,6 @@
 //! [`DomainError::Internal`].
 
 use bss_ledger_sdk::{AccountInfo, ProvisionOutcome, ProvisionRequest};
-use chrono::Utc;
 use sea_orm::DbErr;
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
@@ -30,6 +29,7 @@ use crate::domain::model::{
 use crate::domain::provisioning::plan;
 use crate::domain::status::{LIFECYCLE_OPEN, PERIOD_STATUS_OPEN};
 use crate::infra::storage::repo::ReferenceRepo;
+use time::OffsetDateTime;
 
 /// Record-separator framing a sentinel-encoded scale-out-of-range business
 /// error inside a `DbErr::Custom` payload: `BSS_PROV_SCALE_OOR␟<currency>`.
@@ -66,7 +66,7 @@ impl ProvisioningService {
     pub async fn provision(&self, req: ProvisionRequest) -> Result<ProvisionOutcome, DomainError> {
         // --- PRE-TRANSACTION (fail fast, no writes) ---
         plan::validate_calendar(&req.fiscal_calendar)?;
-        let period_id = plan::initial_period_id(Utc::now());
+        let period_id = plan::initial_period_id(OffsetDateTime::now_utc());
 
         // --- TRANSACTION ---
         // Clone the repo + request into the closure so the `transaction`

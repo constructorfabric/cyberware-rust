@@ -90,7 +90,6 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use toolkit_db::secure::{AccessScope, DBRunner, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -100,6 +99,7 @@ use uuid::Uuid;
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use crate::domain::concurrency::RowVersion;
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::materiality::{self, ChangeSet, MaterialityVerdict, PublishedPriceBaseline};
 use crate::domain::plan_shape::PlanShape;
@@ -126,6 +126,7 @@ use crate::infra::storage::repo::{
 };
 use crate::infra::storage::repo_failure;
 use crate::infra::window::VerdictJson;
+use time::OffsetDateTime;
 
 /// Everything the supersession unit's commit writes, built **from** the composed
 /// plan rather than beside it.
@@ -244,7 +245,7 @@ impl SupersessionCommit {
     /// open-ended, and an accessor for one would invite a caller to close a key's
     /// coverage as a side effect of repricing it.
     #[must_use]
-    pub const fn successor_from(&self) -> DateTime<Utc> {
+    pub const fn successor_from(&self) -> OffsetDateTime {
         self.windows.successor.effective_from
     }
 }
@@ -486,12 +487,12 @@ pub async fn commit_supersession(
 pub fn supersession_unit_ref(
     plan_id: PlanId,
     key: &crate::domain::scope_key::ScopeKey,
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
 ) -> String {
     format!(
         "{}/supersession/{key}/{}",
         plan_id.get(),
-        changeover.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        format_rfc3339(changeover)
     )
 }
 
@@ -522,7 +523,7 @@ pub struct SupersessionRequest {
     /// The canonical scope key being repriced.
     pub key: ScopeKey,
     /// When coverage hands over from the predecessor to the successor.
-    pub changeover: DateTime<Utc>,
+    pub changeover: OffsetDateTime,
     /// The successor row's authored content.
     pub successor: PriceContent,
     /// The id the successor draft is authored under, if this call is what stages it.
@@ -565,7 +566,7 @@ pub struct SupersessionReceipt {
     /// The row that arrived on it — the **staged** draft's id, never a minted one.
     pub successor_price_id: Uuid,
     /// The instant coverage handed over at.
-    pub changeover: DateTime<Utc>,
+    pub changeover: OffsetDateTime,
     /// The predecessor's window, whose end now sits at the changeover.
     pub shortened_window_id: Uuid,
     /// The successor's window, open-ended from the changeover.
@@ -609,7 +610,7 @@ pub struct SupersessionPending {
     /// The successor draft standing on the key.
     pub successor_price_id: Uuid,
     /// The instant coverage would hand over at.
-    pub changeover: DateTime<Utc>,
+    pub changeover: OffsetDateTime,
     /// The window whose end would move to the changeover.
     pub shortened_window_id: Uuid,
     /// Why a second principal is required — the evaluator's own answer, carried rather
@@ -988,7 +989,7 @@ pub async fn supersede_in(
         if let Some(staged) = context.staged.as_ref() {
             refuse_divergent_successor(staged, &successor_content)?;
             if let Some(held) =
-                approval_repo::find_pending_for_subject(txn, scope, tenant_id, &subject_ref)
+                approval_repo::find_pending_for_subject(txn, tenant_id, &subject_ref)
                     .await
                     .map_err(|e| repo_failure(&e))?
             {
@@ -1468,7 +1469,7 @@ async fn enqueue_events(
     successor: &PriceRecord,
     written: &SupersessionWritten,
     pending_ref: &str,
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<(), DomainError> {
     outbox_repo::enqueue(
@@ -1512,7 +1513,7 @@ async fn enqueue_events(
                 correlation_id: stamp.correlation_id,
             },
             stamp.recorded_at,
-            &format!("supersede/{}", changeover.to_rfc3339()),
+            &format!("supersede/{}", format_rfc3339(changeover)),
         ),
     )
     .await
@@ -1589,7 +1590,7 @@ async fn read_unit_context(
     scope: &AccessScope,
     tenant_id: Uuid,
     key: &ScopeKey,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<UnitContext, DomainError> {
     let plan_id = key.plan_id();
     let revision = plan_repo::load_current(runner, scope, tenant_id, plan_id)

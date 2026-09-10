@@ -44,8 +44,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-# `DateTime::from_timestamp` in the composite fallback tests.
-chrono = { workspace = true }
+# `OffsetDateTime::from_unix_timestamp` in the composite fallback tests.
+time = { workspace = true }
 # Integration test (tests/discovery.rs): drive DiscoveringRateProvider over a real
 # ClientHub + an in-memory types-registry mock with fake scoped source plugins.
 tokio = { workspace = true }

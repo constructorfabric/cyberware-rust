@@ -112,6 +112,10 @@ COLUMN bss.pricing_customer_group_taxonomy display_name text NOT NULL DEFAULT -
 COLUMN bss.pricing_customer_group_taxonomy state text NOT NULL DEFAULT 'active'::text
 COLUMN bss.pricing_customer_group_taxonomy tenant_id uuid NOT NULL DEFAULT -
 COLUMN bss.pricing_customer_group_taxonomy value text NOT NULL DEFAULT -
+COLUMN bss.pricing_gl_code_taxonomy display_name text NOT NULL DEFAULT -
+COLUMN bss.pricing_gl_code_taxonomy state text NOT NULL DEFAULT 'active'::text
+COLUMN bss.pricing_gl_code_taxonomy tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_gl_code_taxonomy value text NOT NULL DEFAULT -
 COLUMN bss.pricing_group_membership created_at_utc timestamp with time zone NOT NULL DEFAULT now()
 COLUMN bss.pricing_group_membership created_by uuid NOT NULL DEFAULT -
 COLUMN bss.pricing_group_membership effective_from timestamp with time zone NOT NULL DEFAULT -
@@ -223,6 +227,7 @@ COLUMN bss.pricing_plan_period_floor_cap plan_revision bigint NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_period_floor_cap region text NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_period_floor_cap tenant_id uuid NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_phase converts_to_phase_id uuid NULL DEFAULT -
+COLUMN bss.pricing_plan_phase display_name text NULL DEFAULT -
 COLUMN bss.pricing_plan_phase display_trial_days integer NULL DEFAULT -
 COLUMN bss.pricing_plan_phase kind text NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_phase ordinal integer NOT NULL DEFAULT -
@@ -379,7 +384,7 @@ CONSTRAINT bss.pricing_approval chk_pricing_approval_decided_at CHECK (((state =
 CONSTRAINT bss.pricing_approval chk_pricing_approval_distinct_principals CHECK (((approver_principal IS NULL) OR (approver_principal <> submitter_principal)))
 CONSTRAINT bss.pricing_approval chk_pricing_approval_reason CHECK (((state <> 'rejected'::text) OR (reason IS NOT NULL)))
 CONSTRAINT bss.pricing_approval chk_pricing_approval_state CHECK ((state = ANY (ARRAY['submitted'::text, 'approved'::text, 'rejected'::text, 'voided'::text])))
-CONSTRAINT bss.pricing_approval chk_pricing_approval_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text])))
+CONSTRAINT bss.pricing_approval chk_pricing_approval_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text, 'taxonomy_value'::text])))
 CONSTRAINT bss.pricing_approval pricing_approval_pkey PRIMARY KEY (approval_id)
 CONSTRAINT bss.pricing_approval_key chk_pricing_approval_key_state CHECK ((state = ANY (ARRAY['submitted'::text, 'approved'::text, 'rejected'::text, 'voided'::text])))
 CONSTRAINT bss.pricing_approval_key pricing_approval_key_pkey PRIMARY KEY (approval_id, scope_key)
@@ -395,7 +400,7 @@ CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_action CHECK ((action = A
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_entry_kind CHECK ((entry_kind = ANY (ARRAY['mutation'::text, 'rollup'::text])))
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_rollup CHECK (((entry_kind = 'rollup'::text) = (segment_heads IS NOT NULL)))
 CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_seq CHECK ((seq >= 0))
-CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text])))
+CONSTRAINT bss.pricing_audit_log chk_pricing_audit_log_subject_kind CHECK ((subject_kind = ANY (ARRAY['plan_revision'::text, 'price_unit'::text, 'window'::text, 'policy'::text, 'overlay'::text, 'bulk_operation'::text, 'membership'::text, 'taxonomy_value'::text])))
 CONSTRAINT bss.pricing_audit_log pricing_audit_log_pkey PRIMARY KEY (tenant_id, chain_id, seq)
 CONSTRAINT bss.pricing_brand_taxonomy chk_pricing_brand_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_brand_taxonomy chk_pricing_brand_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
@@ -436,6 +441,9 @@ CONSTRAINT bss.pricing_composite_meter pricing_composite_meter_pkey PRIMARY KEY 
 CONSTRAINT bss.pricing_customer_group_taxonomy chk_pricing_customer_group_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
 CONSTRAINT bss.pricing_customer_group_taxonomy chk_pricing_customer_group_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
 CONSTRAINT bss.pricing_customer_group_taxonomy pricing_customer_group_taxonomy_pkey PRIMARY KEY (tenant_id, value)
+CONSTRAINT bss.pricing_gl_code_taxonomy chk_pricing_gl_code_taxonomy_state CHECK ((state = ANY (ARRAY['active'::text, 'retired'::text])))
+CONSTRAINT bss.pricing_gl_code_taxonomy chk_pricing_gl_code_taxonomy_value_present CHECK ((length(btrim(value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
+CONSTRAINT bss.pricing_gl_code_taxonomy pricing_gl_code_taxonomy_pkey PRIMARY KEY (tenant_id, value)
 CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_group_value_present CHECK ((length(btrim(group_value, (((((chr(9) || chr(10)) || chr(11)) || chr(12)) || chr(13)) || chr(32)))) > 0))
 CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_interval CHECK (((effective_to IS NULL) OR (effective_to > effective_from)))
 CONSTRAINT bss.pricing_group_membership chk_pricing_group_membership_row_version CHECK ((row_version >= 0))
@@ -501,7 +509,7 @@ CONSTRAINT bss.pricing_plan_period_floor_cap fk_pricing_plan_period_floor_cap_re
 CONSTRAINT bss.pricing_plan_period_floor_cap pricing_plan_period_floor_cap_pkey PRIMARY KEY (plan_id, plan_revision, currency, region)
 CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_display_trial_days CHECK (((display_trial_days IS NULL) OR (display_trial_days = phase_duration_days)))
 CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_duration_non_negative CHECK (((phase_duration_days IS NULL) OR (phase_duration_days >= 0)))
-CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_kind CHECK ((kind = ANY (ARRAY['trial'::text, 'intro'::text, 'evergreen'::text])))
+CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_kind CHECK ((kind = ANY (ARRAY['trial'::text, 'interim'::text, 'evergreen'::text])))
 CONSTRAINT bss.pricing_plan_phase chk_pricing_plan_phase_trial_projection_non_negative CHECK (((display_trial_days IS NULL) OR (display_trial_days >= 0)))
 CONSTRAINT bss.pricing_plan_phase fk_pricing_plan_phase_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision)
 CONSTRAINT bss.pricing_plan_phase pricing_plan_phase_pkey PRIMARY KEY (tenant_id, plan_id, plan_revision, phase_id)
@@ -662,6 +670,7 @@ INDEX bss pricing_bundle_revshare_pkey CREATE UNIQUE INDEX pricing_bundle_revsha
 INDEX bss pricing_catalog_version_ref_pkey CREATE UNIQUE INDEX pricing_catalog_version_ref_pkey ON bss.pricing_catalog_version_ref USING btree (tenant_id, pending_ref, subject_kind, subject_ref)
 INDEX bss pricing_composite_meter_pkey CREATE UNIQUE INDEX pricing_composite_meter_pkey ON bss.pricing_composite_meter USING btree (tenant_id, plan_id, plan_revision, composite_id)
 INDEX bss pricing_customer_group_taxonomy_pkey CREATE UNIQUE INDEX pricing_customer_group_taxonomy_pkey ON bss.pricing_customer_group_taxonomy USING btree (tenant_id, value)
+INDEX bss pricing_gl_code_taxonomy_pkey CREATE UNIQUE INDEX pricing_gl_code_taxonomy_pkey ON bss.pricing_gl_code_taxonomy USING btree (tenant_id, value)
 INDEX bss pricing_group_membership_pkey CREATE UNIQUE INDEX pricing_group_membership_pkey ON bss.pricing_group_membership USING btree (membership_id)
 INDEX bss pricing_idempotency_dedup_pkey CREATE UNIQUE INDEX pricing_idempotency_dedup_pkey ON bss.pricing_idempotency_dedup USING btree (tenant_id, operation, client_key)
 INDEX bss pricing_migration_pkey CREATE UNIQUE INDEX pricing_migration_pkey ON bss.pricing_migration USING btree (tenant_id, migration_id)

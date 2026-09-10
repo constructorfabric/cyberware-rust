@@ -133,22 +133,35 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
+use crate::domain::instant::rfc3339;
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, Order, QuerySelect};
 use serde_json::{Value as JsonValue, json};
+use time::OffsetDateTime;
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
+
+use bss_pricing_sdk::odata::ApprovalFilterField;
 
 use crate::domain::approval::content_pin::membership_content_hash;
 use crate::domain::approval::{ApprovalDecision, ApprovalState};
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use crate::domain::membership_change::{MembershipMoveProposal, MembershipMoveSet};
+use crate::domain::overlay::ScopeValue;
 use crate::domain::scope_key::PlanId;
+use crate::domain::taxonomy::{
+    TaxCategoryPatch, TaxonomyClass, TaxonomyState, TaxonomyValuePatch, TaxonomyValueProposal,
+};
 use crate::infra::storage::entity::{approval, approval_key};
+use crate::infra::storage::odata_mapping::{
+    ApprovalODataMapper, LIST_LIMIT_CFG, OdataPageError, domain_page, map_odata_err,
+    query_with_default_order,
+};
 use crate::infra::storage::repo::{NewAuditEntry, audit_repo};
 use crate::infra::storage::{RepoError, contention_or_db, policy_guard_or_contention};
 
@@ -219,6 +232,8 @@ pub const SUBJECT_KINDS_WITH_A_WRITER: &[AuditSubjectKind] = &[
     AuditSubjectKind::Overlay,
     AuditSubjectKind::BulkOperation,
     AuditSubjectKind::Membership,
+    // D-353: `ApprovalService::submit_taxonomy_value_on`.
+    AuditSubjectKind::TaxonomyValue,
 ];
 
 /// A record to open — the pending half of `pricing_approval`.
@@ -305,9 +320,9 @@ pub struct ApprovalRecord {
     /// The materiality evaluator's output.
     pub materiality: JsonValue,
     /// When it was opened, UTC.
-    pub submitted_at: DateTime<Utc>,
+    pub submitted_at: OffsetDateTime,
     /// When it was decided, UTC; `None` exactly while pending.
-    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_at: Option<OffsetDateTime>,
 }
 
 /// Open a pending approval record, **and its `submit` record**.
@@ -526,6 +541,341 @@ pub async fn list_page(
         .collect()
 }
 
+/// State totals for the whole authorized approval set, independent of pagination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApprovalCounts {
+    /// Sum of all four states.
+    pub total: u64,
+    /// Pending review.
+    pub submitted: u64,
+    /// Approved units.
+    pub approved: u64,
+    /// Rejected units.
+    pub rejected: u64,
+    /// Withdrawn or automatically voided units.
+    pub voided: u64,
+}
+
+/// Count by state in one database aggregate under the original approval scope.
+///
+/// # Errors
+/// Storage/scope failures and corrupt persisted states or counts fail the read.
+pub async fn counts(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+) -> Result<ApprovalCounts, RepoError> {
+    #[derive(sea_orm::FromQueryResult)]
+    struct Row {
+        state: String,
+        count: i64,
+    }
+    let rows = approval::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(approval::Column::TenantId.eq(tenant_id)))
+        .project_all(runner, |q| {
+            q.select_only()
+                .column(approval::Column::State)
+                .column_as(approval::Column::ApprovalId.count(), "count")
+                .group_by(approval::Column::State)
+                .into_model::<Row>()
+        })
+        .await
+        .map_err(|e| RepoError::Db(format!("count pricing_approval: {e}")))?;
+    let mut counts = ApprovalCounts::default();
+    for row in rows {
+        let count = u64::try_from(row.count)
+            .map_err(|_| RepoError::CorruptRow("negative approval count".to_owned()))?;
+        match super::plan_repo::read_token(
+            "pricing_approval.state",
+            &row.state,
+            ApprovalState::ALL,
+            ApprovalState::as_str,
+        )? {
+            ApprovalState::Submitted => counts.submitted = count,
+            ApprovalState::Approved => counts.approved = count,
+            ApprovalState::Rejected => counts.rejected = count,
+            ApprovalState::Voided => counts.voided = count,
+        }
+        counts.total += count;
+    }
+    Ok(counts)
+}
+
+/// One `OData` page of the tenant's approval records. Default order is
+/// `approval_id asc`.
+///
+/// # Errors
+/// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+/// malformed `$filter` / `$orderby` / cursor.
+pub async fn list_odata(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    query: &ODataQuery,
+) -> Result<Page<ApprovalRecord>, OdataPageError> {
+    let base_select = approval::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(approval::Column::TenantId.eq(tenant_id)));
+    let query = query_with_default_order(query, &[ApprovalFilterField::ApprovalId]);
+    let page = paginate_odata::<
+        ApprovalFilterField,
+        ApprovalODataMapper,
+        approval::Entity,
+        approval::Model,
+        _,
+        _,
+    >(
+        base_select,
+        runner,
+        &query,
+        ("approval_id", SortDir::Asc),
+        LIST_LIMIT_CFG,
+        |m| m,
+    )
+    .await
+    .map_err(map_odata_err)?;
+    domain_page(page, to_domain)
+}
+
+/// Pending units belonging directly to the authorized page of plans.
+///
+/// One read of submitted plan/revision, window and price-unit subjects; indirect
+/// tenant policy and overlay effects are not plan-owned units. Resolve ownership
+/// with [`subject_aggregate`], the same parser used by the mutation/audit path.
+/// Empty pages do not query. Each plan's units are ordered oldest first, then by
+/// approval id, so equal timestamps do not reorder badges between reads.
+///
+/// # Errors
+/// [`RepoError::Db`] on storage failure; [`RepoError::CorruptRow`] on invalid
+/// persisted subjects. A failure must not appear as an empty pending list.
+pub async fn pending_for_plans(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    plan_ids: &[PlanId],
+) -> Result<BTreeMap<PlanId, Vec<ApprovalRecord>>, RepoError> {
+    let requested: BTreeSet<_> = plan_ids.iter().copied().collect();
+    let mut pending = BTreeMap::<PlanId, Vec<ApprovalRecord>>::new();
+    if requested.is_empty() {
+        return Ok(pending);
+    }
+    for (plan_id, units) in pending_by_plan(runner, scope, tenant_id, &requested).await? {
+        // The predicate is a `subject_ref` prefix, so a stored ref whose head is
+        // not one of the requested ids cannot match — but the parse still decides
+        // ownership, and a `LIKE` is not the parser. Kept as the authority.
+        if requested.contains(&plan_id) {
+            pending.insert(plan_id, units);
+        }
+    }
+    Ok(pending)
+}
+
+/// Every plan the tenant holds an open unit over, bounded by the open units.
+///
+/// The `has_pending_approvals` filter's operand. It is deliberately **not**
+/// authorized here — the caller intersects it with a scoped plan read, which is
+/// what [`pending_by_plan`]'s own note means by "never expose this tenant
+/// projection directly". Reading it first is the point: the filter used to start
+/// from the tenant's whole catalogue of draft, published and retired plan ids so
+/// that it could ask about all of them, which is a catalogue-sized read to answer
+/// a question whose answer is bounded by how many reviews are open.
+///
+/// # Errors
+/// [`RepoError::Db`] on storage failure; [`RepoError::CorruptRow`] on a stored
+/// subject this crate cannot have written.
+pub async fn plan_ids_with_open_units(
+    runner: &impl DBRunner,
+    tenant_id: Uuid,
+) -> Result<Vec<PlanId>, RepoError> {
+    let rows = approval::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::for_tenant(tenant_id))
+        .filter(
+            Condition::all()
+                .add(approval::Column::TenantId.eq(tenant_id))
+                .add(approval::Column::State.eq(ApprovalState::Submitted.as_str()))
+                .add(approval::Column::SubjectKind.is_in([
+                    AuditSubjectKind::PlanRevision.as_str(),
+                    AuditSubjectKind::Window.as_str(),
+                    AuditSubjectKind::PriceUnit.as_str(),
+                ])),
+        )
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("read open plan units: {e}")))?;
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        let unit = to_domain(row)?;
+        if let SubjectAggregate::Plan(plan_id) = subject_aggregate(&unit)? {
+            ids.insert(plan_id);
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
+/// Internal pending join index. Both plan badges and the computed plan filter
+/// use this parser, so they cannot disagree about which subject belongs to a plan.
+/// Never expose this tenant projection directly: intersect with scoped plan reads.
+///
+/// # Errors
+/// Scope/storage failures or malformed persisted subjects fail the read.
+async fn pending_by_plan(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    requested: &BTreeSet<PlanId>,
+) -> Result<BTreeMap<PlanId, Vec<ApprovalRecord>>, RepoError> {
+    let mut pending = BTreeMap::<PlanId, Vec<ApprovalRecord>>::new();
+    // **The requested plans are a predicate, not a post-filter.**
+    //
+    // All three kinds this reads spell their subject `<plan_id>/<rest>` —
+    // `subject_plan` is the parser and it takes the head before the first `/` for
+    // every one of them — so the plan the caller asked about is expressible in
+    // SQL. Without it the read was the tenant's whole open-review set on every
+    // call, and `GET /plans/{planId}` asking about one plan paid for all of it;
+    // the ceiling was how many reviews the tenant happens to have open, which is
+    // not a bound the request can see.
+    let mut owned = Condition::any();
+    for plan_id in requested {
+        owned = owned.add(approval::Column::SubjectRef.starts_with(format!("{}/", plan_id.get())));
+    }
+    let rows = approval::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(approval::Column::TenantId.eq(tenant_id))
+                .add(approval::Column::State.eq(ApprovalState::Submitted.as_str()))
+                .add(approval::Column::SubjectKind.is_in([
+                    AuditSubjectKind::PlanRevision.as_str(),
+                    AuditSubjectKind::Window.as_str(),
+                    AuditSubjectKind::PriceUnit.as_str(),
+                ]))
+                .add(owned),
+        )
+        .order_by(approval::Column::SubmittedAt, Order::Asc)
+        .order_by(approval::Column::ApprovalId, Order::Asc)
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("read pending plan units: {e}")))?;
+    for row in rows {
+        let unit = to_domain(row)?;
+        if let SubjectAggregate::Plan(plan_id) = subject_aggregate(&unit)? {
+            pending.entry(plan_id).or_default().push(unit);
+        }
+    }
+    Ok(pending)
+}
+
+/// A pending taxonomy unit and its parsed proposal, from the same stored row.
+#[derive(Debug, Clone)]
+pub struct PendingTaxonomyUnit {
+    /// Internal approval data; a config reader may see only pending metadata.
+    pub record: ApprovalRecord,
+    /// The existing subject payload, not a second stored draft.
+    pub proposal: TaxonomyValueProposal,
+}
+
+/// Submitted proposals for exactly the authorized taxonomy values being read.
+///
+/// One query, ordered oldest first then by id. The caller first reads the
+/// values under `config × read`, then passes that scope's tenant projection:
+/// taxonomy resource ids are tenant ids, not approval ids. This metadata join
+/// does NOT authorize exposing proposal content; use [`visible_ids`] under the
+/// original `approval × read` scope before doing so. Empty value sets do not query.
+///
+/// # Errors
+/// Storage failures and malformed persisted proposals fail the read, never
+/// masquerade as an empty pending array. Corruption diagnostics omit content.
+pub async fn pending_for_taxonomy_values(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    class: TaxonomyClass,
+    values: &[String],
+) -> Result<BTreeMap<String, Vec<PendingTaxonomyUnit>>, RepoError> {
+    let requested: BTreeSet<_> = values.iter().map(String::as_str).collect();
+    let mut pending = BTreeMap::<String, Vec<PendingTaxonomyUnit>>::new();
+    if requested.is_empty() {
+        return Ok(pending);
+    }
+    let rows = approval::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(approval::Column::TenantId.eq(tenant_id))
+                .add(approval::Column::State.eq(ApprovalState::Submitted.as_str()))
+                .add(approval::Column::SubjectKind.eq(AuditSubjectKind::TaxonomyValue.as_str())),
+        )
+        .order_by(approval::Column::SubmittedAt, Order::Asc)
+        .order_by(approval::Column::ApprovalId, Order::Asc)
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("read pending taxonomy units: {e}")))?;
+    for row in rows {
+        let record = to_domain(row)?;
+        // **The re-wording is a redaction, not lost context.** The inner
+        // `CorruptRow` prints the `subject_ref`, and that ref *is* the stored
+        // proposal — class, value and patch — so propagating it puts the content
+        // of a pending change into an error a config reader receives. This path
+        // exists to hand back pending *metadata* and not content, which is what
+        // `sqlite_approval_repo::a_malformed_pending_taxonomy_subject_fails_without_exposing_content`
+        // pins. The diagnosis lives in the log line below instead.
+        let proposal = subject_taxonomy_value(&record).map_err(|e| {
+            tracing::warn!(
+                approval_id = %record.approval_id,
+                error = %e,
+                "bss-pricing: stored taxonomy proposal does not decode"
+            );
+            RepoError::CorruptRow(format!(
+                "approval {} has an invalid taxonomy proposal",
+                record.approval_id
+            ))
+        })?;
+        if proposal.class == class && requested.contains(proposal.value.as_str()) {
+            pending
+                .entry(proposal.value.as_str().to_owned())
+                .or_default()
+                .push(PendingTaxonomyUnit { record, proposal });
+        }
+    }
+    Ok(pending)
+}
+
+/// Which candidate approval ids the caller's full approval-read scope exposes.
+///
+/// A batch intersection, including resource-id predicates, not a tenant-only
+/// permission check. Empty input does not query. No content is returned here.
+///
+/// # Errors
+/// [`RepoError::Db`] on storage failure.
+pub async fn visible_ids(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    approval_ids: &[Uuid],
+) -> Result<BTreeSet<Uuid>, RepoError> {
+    if approval_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let rows = approval::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(approval::Column::TenantId.eq(tenant_id))
+                .add(approval::Column::ApprovalId.is_in(approval_ids.iter().copied())),
+        )
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("read visible approval ids: {e}")))?;
+    Ok(rows.into_iter().map(|row| row.approval_id).collect())
+}
+
 /// The **pending** unit pinned to a revision of `plan_id`, if the plan holds one.
 ///
 /// One half of what `PENDING_CHANGE_UNIT_EXISTS` reads
@@ -656,18 +1006,30 @@ pub async fn cutover_units_of_plan(
 /// the *window*, where the register's names a scope key: an operator told "another unit
 /// holds `<plan>|EUR|eu|…`" about their own second submit over one window has to work
 /// out that the two are the same review. The overstatement would become true for a
-/// subject kind that holds no key, which is why the check is kept rather than deleted —
-/// but no such kind has a writer here yet.
+/// subject kind that holds no key — and D-353's taxonomy-value unit is one: a taxonomy
+/// value is not a scope key, so [`find_pending_key_holder`] cannot contend over it, and
+/// this check is that kind's refusal outright rather than a better message for one the
+/// register already made.
+///
+/// # Why the operand is a tenant scope and not the caller's
+///
+/// `pricing_approval` declares `resource_col = "approval_id"`, which no caller's plan
+/// or config grant can pin — so a resource-constrained scope matches nothing here and
+/// the check answers `None`, admitting the second unit it exists to refuse. For the
+/// taxonomy-value kind, which has no register behind it, that is the whole control.
+/// Pendingness is a fact about the tenant's records rather than about who is asking, so
+/// the operand is derived from `tenant_id`; `tenant_only()` would not do, being
+/// deny-all on an unconstrained scope and reading `None` the same way.
 ///
 /// # Errors
 /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::CorruptRow`] on
 /// a token outside its enumeration.
 pub async fn find_pending_for_subject(
     runner: &impl DBRunner,
-    scope: &AccessScope,
     tenant_id: Uuid,
     subject_ref: &str,
 ) -> Result<Option<ApprovalRecord>, RepoError> {
+    let scope = &AccessScope::for_tenant(tenant_id);
     let row = approval::Entity::find()
         .secure()
         .scope_with(scope)
@@ -933,7 +1295,7 @@ pub async fn void_pending_for_subject(
     tenant_id: Uuid,
     subject_ref: &str,
     reason: &str,
-    voided_at: DateTime<Utc>,
+    voided_at: OffsetDateTime,
 ) -> Result<u64, RepoError> {
     let result = approval::Entity::update_many()
         .secure()
@@ -1340,7 +1702,11 @@ pub fn subject_aggregate(record: &ApprovalRecord) -> Result<SubjectAggregate, Re
         AuditSubjectKind::PlanRevision | AuditSubjectKind::PriceUnit | AuditSubjectKind::Window => {
             subject_plan(record).map(SubjectAggregate::Plan)
         }
-        AuditSubjectKind::Policy => Ok(SubjectAggregate::Policy),
+        // A taxonomy value (D-353) is a row of the tenant's config object, and its
+        // audit records already sit on `policy_chain()` (`taxonomy_repo::
+        // record_value_mutation`): the unit that decides one of those edits belongs
+        // on the same segment, or the decision and the edit it authorised sort apart.
+        AuditSubjectKind::Policy | AuditSubjectKind::TaxonomyValue => Ok(SubjectAggregate::Policy),
         // **Its own aggregate, resolved by parse like every other kind.** This arm
         // refused outright while the unit was unwired — "storable and not resolvable",
         // which was true for exactly as long as nothing opened one. D-225's
@@ -1410,7 +1776,7 @@ pub fn subject_aggregate(record: &ApprovalRecord) -> Result<SubjectAggregate, Re
 /// # Errors
 /// [`RepoError::Db`] when the set will not serialize — unreachable for
 /// [`MembershipMoveProposalWire`]'s three fields (a `Uuid`, a `String` and a
-/// `DateTime<Utc>`, none of which can fail to serialize), and *reported*
+/// `OffsetDateTime`, none of which can fail to serialize), and *reported*
 /// rather than unwrapped so a caller on a route answers 500 instead of
 /// panicking a request thread.
 pub fn membership_move_subject_ref(set: &MembershipMoveSet) -> Result<String, RepoError> {
@@ -1422,6 +1788,123 @@ pub fn membership_move_subject_ref(set: &MembershipMoveSet) -> Result<String, Re
     let json = serde_json::to_string(&wire)
         .map_err(|e| RepoError::Db(format!("cannot render a membership move set: {e}")))?;
     Ok(format!("membership-move/{json}"))
+}
+
+/// The prefix every taxonomy-value unit's `subject_ref` carries (D-353).
+pub const TAXONOMY_VALUE_REF_PREFIX: &str = "taxonomy-value/";
+
+/// The `subject_ref` a taxonomy-value unit is opened under — the whole proposal,
+/// encoded as the subject, for [`membership_move_subject_ref`]'s reason: a
+/// taxonomy value has no draft table, so the pending edit has nowhere else to
+/// live. One pending unit per exact `(class, value, patch)`.
+///
+/// # Errors
+/// [`RepoError::Db`] when the proposal will not serialize — unreachable for the
+/// wire shape's plain fields, and reported rather than unwrapped so a route
+/// answers 500 instead of panicking a request thread.
+pub fn taxonomy_value_subject_ref(proposal: &TaxonomyValueProposal) -> Result<String, RepoError> {
+    let json = serde_json::to_string(&TaxonomyValueProposalWire::of(proposal))
+        .map_err(|e| RepoError::Db(format!("cannot render a taxonomy value proposal: {e}")))?;
+    Ok(format!("{TAXONOMY_VALUE_REF_PREFIX}{json}"))
+}
+
+/// The proposal a taxonomy-value unit's `subject_ref` names —
+/// [`subject_membership_move`]'s counterpart.
+///
+/// # Errors
+/// [`RepoError::CorruptRow`] on a ref this crate cannot have written.
+pub fn subject_taxonomy_value(record: &ApprovalRecord) -> Result<TaxonomyValueProposal, RepoError> {
+    let corrupt = || {
+        RepoError::CorruptRow(format!(
+            "approval {} names the subject {:?}, which is not taxonomy-value/<json>",
+            record.approval_id, record.subject_ref
+        ))
+    };
+    let json = record
+        .subject_ref
+        .strip_prefix(TAXONOMY_VALUE_REF_PREFIX)
+        .ok_or_else(corrupt)?;
+    // Its own message, but still without the payload. `corrupt()` says the ref
+    // "is not taxonomy-value/<json>", which is false once the prefix has matched —
+    // the two failures are a missing prefix and a body that will not parse, and
+    // they are diagnosed differently. What it must not do is quote the body: that
+    // body is the stored proposal, and a config reader must not receive the
+    // content of a pending change in an error. `serde_json`'s own message can
+    // echo the input, so only its line and column are carried.
+    let wire: TaxonomyValueProposalWire = serde_json::from_str(json).map_err(|e| {
+        RepoError::CorruptRow(format!(
+            "approval {} carries a taxonomy-value payload that does not decode at line {}, \
+             column {}",
+            record.approval_id,
+            e.line(),
+            e.column()
+        ))
+    })?;
+    wire.into_domain().ok_or_else(corrupt)
+}
+
+/// The stored spelling of a [`TaxonomyValueProposal`].
+///
+/// [`TaxCategoryPatch`]'s three meanings — keep, set, clear — are two members
+/// here, because a nullable member alone folds the clear into the keep on the
+/// way back.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TaxonomyValueProposalWire {
+    class: String,
+    value: String,
+    display_name: Option<String>,
+    state: Option<String>,
+    tax_category: Option<String>,
+    clear_tax_category: bool,
+    tax_rate_present: Option<bool>,
+}
+
+impl TaxonomyValueProposalWire {
+    fn of(proposal: &TaxonomyValueProposal) -> Self {
+        let TaxonomyValuePatch {
+            display_name,
+            state,
+            tax_category,
+            tax_rate_present,
+        } = &proposal.patch;
+        Self {
+            class: proposal.class.path_segment().to_owned(),
+            value: proposal.value.as_str().to_owned(),
+            display_name: display_name.clone(),
+            state: state.map(|s| s.as_str().to_owned()),
+            tax_category: match tax_category {
+                TaxCategoryPatch::Set(category) => Some(category.clone()),
+                TaxCategoryPatch::Keep | TaxCategoryPatch::Clear => None,
+            },
+            clear_tax_category: matches!(tax_category, TaxCategoryPatch::Clear),
+            tax_rate_present: *tax_rate_present,
+        }
+    }
+
+    fn into_domain(self) -> Option<TaxonomyValueProposal> {
+        let class = TaxonomyClass::parse_segment(&self.class)?;
+        let value = ScopeValue::new(&self.value)?;
+        let state = match self.state {
+            None => None,
+            Some(token) => Some(TaxonomyState::parse(&token)?),
+        };
+        let tax_category = if self.clear_tax_category {
+            TaxCategoryPatch::Clear
+        } else {
+            self.tax_category
+                .map_or(TaxCategoryPatch::Keep, TaxCategoryPatch::Set)
+        };
+        Some(TaxonomyValueProposal {
+            class,
+            value,
+            patch: TaxonomyValuePatch {
+                display_name: self.display_name,
+                state,
+                tax_category,
+                tax_rate_present: self.tax_rate_present,
+            },
+        })
+    }
 }
 
 /// The membership-move payload a unit's `subject_ref` names.
@@ -1466,7 +1949,8 @@ pub fn subject_membership_move(record: &ApprovalRecord) -> Result<MembershipMove
 struct MembershipMoveProposalWire {
     payer_tenant_id: Uuid,
     group_value: String,
-    effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    effective_from: OffsetDateTime,
 }
 
 impl MembershipMoveProposalWire {
@@ -1567,7 +2051,7 @@ pub async fn void_pending_for_plan(
     scope: &AccessScope,
     tenant_id: Uuid,
     plan_id: PlanId,
-    voided_at: DateTime<Utc>,
+    voided_at: OffsetDateTime,
 ) -> Result<u64, RepoError> {
     let result = approval::Entity::update_many()
         .secure()
@@ -1645,7 +2129,7 @@ async fn swap(
     state: ApprovalState,
     approver_principal: Option<Uuid>,
     reason: Option<String>,
-    decided_at: DateTime<Utc>,
+    decided_at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let result = approval::Entity::update_many()
         .secure()

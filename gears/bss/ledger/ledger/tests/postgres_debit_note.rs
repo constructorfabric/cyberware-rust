@@ -52,6 +52,7 @@ use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -139,8 +140,8 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
         .await
         .unwrap();
     // Seed BOTH the invoice's period (`s.period_id`) and the CURRENT period: the
-    // adjustment handlers post into `Utc::now()`'s period (credit/debit-note
-    // `eff_date = Utc::now()`), so a fixed historical period alone makes the test
+    // adjustment handlers post into `OffsetDateTime::now_utc()`'s period (credit/debit-note
+    // `eff_date = OffsetDateTime::now_utc()`), so a fixed historical period alone makes the test
     // date-dependent (green only in that calendar month). ON CONFLICT dedups when
     // `now` already equals `s.period_id`.
     raw.execute_raw(pg(format!(
@@ -149,7 +150,7 @@ async fn setup(url: &str) -> (DatabaseConnection, DBProvider<DbError>, Seller) {
          ON CONFLICT DO NOTHING",
         t = s.tenant,
         p = s.period_id,
-        cur = chrono::Utc::now().format("%Y%m")
+        cur = bss_ledger::domain::instant::yyyymm(OffsetDateTime::now_utc())
     )))
     .await
     .unwrap();

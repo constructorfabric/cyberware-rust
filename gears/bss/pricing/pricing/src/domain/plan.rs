@@ -25,7 +25,6 @@
 //! the revision and are copied on a new one (D-83); they are Slice-2 storage and
 //! are not modelled here yet.
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -34,6 +33,7 @@ use crate::domain::contracts::{EntitlementGrants, PlanChangeContract};
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::plan_shape::{BillingCycle, Frequency};
 use crate::domain::scope_key::PlanId;
+use time::OffsetDateTime;
 
 /// One revision of a plan: the unit `pricing_plan` stores, the unit the
 /// projector sources a plan subject from, and the unit an `ETag` denotes.
@@ -122,9 +122,9 @@ pub struct PlanRevision {
     /// grouping; it never overrides the single-currency-per-invoice invariant.
     pub invoice_grouping_key: Option<String>,
     /// Start of the plan's availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    pub available_from: Option<OffsetDateTime>,
     /// End of the plan's availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
+    pub available_to: Option<OffsetDateTime>,
     /// The entitlement grant set this revision publishes (Slice 6, §6, D-41).
     ///
     /// Revision-scoped like every other plan column (D-83).
@@ -150,7 +150,7 @@ pub struct PlanRevision {
     /// `pricing_audit_log`.
     pub created_by: Uuid,
     /// When this revision row was created, UTC.
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// The plan this one was cloned from (`inst-cl-copy`, D-19), or `None` for
     /// an authored plan.
     ///
@@ -240,9 +240,9 @@ pub struct PlanShapePatch {
     /// Move the Billing invoice-layout hint (D-96).
     pub invoice_grouping_key: Option<String>,
     /// Move the start of the availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    pub available_from: Option<OffsetDateTime>,
     /// Move the end of the availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
+    pub available_to: Option<OffsetDateTime>,
     /// Replace the entitlement grant set wholesale (Slice 6, §6, D-41).
     ///
     /// Wholesale for [`PlanShapePatch::change_contract`]'s reason: the

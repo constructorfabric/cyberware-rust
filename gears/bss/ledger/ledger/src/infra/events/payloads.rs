@@ -10,7 +10,8 @@
 //! an internal identifier, enum code, or amount — there is **no PII**
 //! (no names, emails, or free-text business content).
 
-use chrono::{DateTime, Utc};
+use crate::domain::instant::rfc3339;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// One leg of a posted ledger entry, summarised for downstream consumers.
@@ -48,7 +49,8 @@ pub struct LedgerEntryPosted {
     /// Caller-supplied source business id (the idempotency key).
     pub source_business_id: String,
     /// Post timestamp (UTC).
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
     /// Monotonic creation sequence within the period.
     pub created_seq: i64,
     /// The entry's legs.
@@ -249,7 +251,8 @@ pub struct CreditNotePosted {
     /// schedule's deferred remainder).
     pub deferred_part_minor: i64,
     /// Post timestamp (UTC).
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
 }
 
 /// Emitted on every successful debit-note post (Slice 3 §4.3 / Group F
@@ -284,7 +287,8 @@ pub struct DebitNotePosted {
     /// recognition schedule).
     pub deferred_part_minor: i64,
     /// Post timestamp (UTC).
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
 }
 
 /// Emitted on every successful refund-phase post (Slice 3 §4.4 / §6 / Group G
@@ -405,7 +409,8 @@ pub struct LedgerFxRevaluationCompleted {
     /// The number of grains moved (remeasured with a non-zero delta) in this entry.
     pub grains_moved: i32,
     /// Post timestamp (UTC).
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
 }
 
 /// Emitted on every successful unrealized-revaluation REVERSAL post (Slice 5
@@ -446,7 +451,8 @@ pub struct LedgerFxRevaluationReversed {
     /// to zero. Wire-encoded as a JSON number (i64).
     pub fx_unrealized_minor: i64,
     /// Post timestamp (UTC).
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
 }
 
 /// Emitted on every successful fiscal-period close (Slice 7 Group C / design §6
@@ -471,7 +477,8 @@ pub struct LedgerPeriodClosed {
     /// The Finance actor who initiated the close (an id, not PII).
     pub closed_by: Uuid,
     /// Close commit timestamp (UTC).
-    pub closed_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub closed_at_utc: OffsetDateTime,
 }
 
 /// Emitted on every completed reconciliation check (Slice 7 Phase 3 / design §6
@@ -502,7 +509,8 @@ pub struct LedgerReconciliationCompleted {
     /// exception (`RECON_MISMATCH` / `PSP_VARIANCE` / `MISSED_POSTING`).
     pub within_tolerance: bool,
     /// Run completion timestamp (UTC).
-    pub at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub at_utc: OffsetDateTime,
 }
 
 /// Category of an invariant-violation alarm.
@@ -792,7 +800,8 @@ pub struct LedgerTamperVerified {
     /// Number of entries the walk visited (the observed chain length).
     pub chain_length: i64,
     /// When the verification completed (UTC).
-    pub verified_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub verified_at_utc: OffsetDateTime,
 }
 
 /// Emitted when the daily chain Verifier detects a break (dormant; see the §6
@@ -806,7 +815,8 @@ pub struct LedgerTamperFailed {
     /// Period of that entry.
     pub period_id: String,
     /// When the break was detected (UTC).
-    pub detected_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub detected_at_utc: OffsetDateTime,
 }
 
 /// Emitted when a GDPR right-to-erasure is applied to a payer's PII map
@@ -819,7 +829,8 @@ pub struct LedgerErasureApplied {
     /// Opaque reference / token for the erased payer record (NOT the PII).
     pub payer_pii_ref: String,
     /// When the erasure was applied (UTC).
-    pub applied_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub applied_at_utc: OffsetDateTime,
 }
 
 /// Emitted when a forensic re-identification of a payer is recorded (dormant;
@@ -833,7 +844,8 @@ pub struct LedgerReidentificationRecorded {
     /// Opaque reference / token for the investigator who performed the read.
     pub investigator_ref: String,
     /// When the re-identification was recorded (UTC).
-    pub recorded_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub recorded_at_utc: OffsetDateTime,
 }
 
 /// Emitted when an audit-pack CSV export completes (dormant; see the §6 note
@@ -848,7 +860,8 @@ pub struct LedgerAuditPackExported {
     /// read; `None` for a routine own-tenant export.
     pub target_scope_tenant_id: Option<Uuid>,
     /// When the export completed (UTC).
-    pub exported_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub exported_at_utc: OffsetDateTime,
 }
 
 // Tests parked with the event broker: the `TypedEvent` impls + JSON-Schema

@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::instant::from_unix_millis;
 
 /// One arriving schedule, spelled out so each case varies exactly one field.
 fn arriving() -> NewMigration {
@@ -8,12 +9,12 @@ fn arriving() -> NewMigration {
         source_plan_id: PlanId::new(Uuid::from_u128(0x_50_11)),
         source_revision: 3,
         target_plan_id: PlanId::new(Uuid::from_u128(0x_7a_22)),
-        effective_at: DateTime::from_timestamp_millis(1_800_000_000_000).expect("a valid instant"),
-        announced_at: DateTime::from_timestamp_millis(1_700_000_000_000).expect("a valid instant"),
+        effective_at: from_unix_millis(1_800_000_000_000).expect("a valid instant"),
+        announced_at: from_unix_millis(1_700_000_000_000).expect("a valid instant"),
         scope: serde_json::json!({"kind": "all"}),
         delta_report: serde_json::json!({"deltas": []}),
         created_by: Uuid::from_u128(0x_ac_70),
-        created_at: DateTime::from_timestamp_millis(1_700_000_000_000).expect("a valid instant"),
+        created_at: from_unix_millis(1_700_000_000_000).expect("a valid instant"),
     }
 }
 
@@ -102,7 +103,7 @@ fn a_resubmission_naming_a_different_request_is_not_a_replay() {
 fn a_differing_effective_date_is_still_a_replay_today() {
     let held = held_from(&arriving());
     let later = NewMigration {
-        effective_at: DateTime::from_timestamp_millis(1_900_000_000_000).expect("a valid instant"),
+        effective_at: from_unix_millis(1_900_000_000_000).expect("a valid instant"),
         ..arriving()
     };
     assert!(StatedRequest::of(&later).matches(&held));
@@ -120,10 +121,10 @@ fn a_retry_whose_minted_and_derived_fields_moved_is_still_a_replay() {
     let held = held_from(&arriving());
     let retry = NewMigration {
         source_revision: held.source_revision + 4,
-        announced_at: held.announced_at + chrono::TimeDelta::hours(2),
+        announced_at: held.announced_at + time::Duration::hours(2),
         delta_report: serde_json::json!({"deltas": ["a_field_the_target_gained"]}),
         created_by: Uuid::from_u128(0x_ac_ff),
-        created_at: held.announced_at + chrono::TimeDelta::hours(2),
+        created_at: held.announced_at + time::Duration::hours(2),
         ..arriving()
     };
     assert!(

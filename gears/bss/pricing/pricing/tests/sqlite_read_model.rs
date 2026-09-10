@@ -31,6 +31,7 @@ use bss_pricing::config::{JobsConfig, LimitsConfig};
 use bss_pricing::domain::concurrency::RowVersion;
 use bss_pricing::domain::contracts::{BillingAnchorPolicy, ProrationBasis, ProrationContract};
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::{format_rfc3339, parse_rfc3339, utc_ymd_hms};
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::overlay::{
@@ -72,7 +73,8 @@ use bss_pricing::infra::storage::repo::{
 };
 use bss_pricing_sdk::CatalogVersion;
 use bss_pricing_sdk::catalog_version_registry::{CatalogVersionRegistryV1, PendingVersionRef};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
@@ -92,10 +94,7 @@ const TEST_CORRELATION: uuid::Uuid = uuid::Uuid::from_u128(0x_c0_11_a7_10);
 
 /// The stamp an audited repository call is made under: who acted, when, and the
 /// request's correlation.
-fn stamp_of(
-    actor: uuid::Uuid,
-    when: chrono::DateTime<chrono::Utc>,
-) -> bss_pricing::domain::audit::AuditStamp {
+fn stamp_of(actor: uuid::Uuid, when: OffsetDateTime) -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -263,13 +262,13 @@ const OTHER_TENANT: Uuid = Uuid::from_u128(0x7e_22);
 const ACTOR: Uuid = Uuid::from_u128(0xac_10);
 const CORRELATION: Uuid = Uuid::from_u128(0xc0_11);
 
-fn at(hour: u32) -> DateTime<Utc> {
+fn at(hour: u32) -> OffsetDateTime {
     at_min(hour, 0)
 }
 
 /// Minute resolution, because two publishes of one pass must be tellable apart.
-fn at_min(hour: u32, minute: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, minute, 0).unwrap()
+fn at_min(hour: u32, minute: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, minute, 0)
 }
 
 fn ctx_of(tenant: Uuid) -> SecurityContext {
@@ -476,6 +475,7 @@ async fn seed_publishable_of(
             vec![PlanPhase {
                 phase_id: phase,
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -581,7 +581,7 @@ async fn publish(
     plan_id: PlanId,
     revision: u64,
     version: RowVersion,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> String {
     publish_of(h, TENANT, plan_id, revision, version, now).await
 }
@@ -592,7 +592,7 @@ async fn publish_of(
     plan_id: PlanId,
     revision: u64,
     version: RowVersion,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> String {
     let receipt = h
         .publish
@@ -617,7 +617,7 @@ async fn publish_of(
 }
 
 /// Seed a plan, publish it at `now`, and return `(plan_id, pending_ref)`.
-async fn seed_and_publish_at(h: &Harness, tier: &str, now: DateTime<Utc>) -> (PlanId, String) {
+async fn seed_and_publish_at(h: &Harness, tier: &str, now: OffsetDateTime) -> (PlanId, String) {
     seed_and_publish_for(h, TENANT, tier, now).await
 }
 
@@ -625,7 +625,7 @@ async fn seed_and_publish_for(
     h: &Harness,
     tenant: Uuid,
     tier: &str,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> (PlanId, String) {
     let plan_id = PlanId::new(Uuid::new_v4());
     let (revision, version) = seed_publishable_of(h, tenant, plan_id, tier).await;
@@ -661,7 +661,7 @@ async fn retire(h: &Harness, plan_id: PlanId) {
     assert_eq!(moved.rows_affected, 1, "one current revision was retired");
 }
 
-async fn sweep(h: &Harness, now: DateTime<Utc>) -> SweepReport {
+async fn sweep(h: &Harness, now: OffsetDateTime) -> SweepReport {
     h.job.run(now).await.expect("the sweep pass runs")
 }
 
@@ -1094,11 +1094,13 @@ async fn an_enrolled_membership_reaches_the_read_model_as_a_published_subject() 
     );
     assert_eq!(
         rows[0].payload.get("effectiveFrom"),
-        Some(&serde_json::json!(enrolled.effective_from))
+        Some(&serde_json::json!(format_rfc3339(enrolled.effective_from)))
     );
     assert_eq!(
         rows[0].payload.get("effectiveTo"),
-        Some(&serde_json::json!(enrolled.effective_to))
+        Some(&serde_json::json!(
+            enrolled.effective_to.map(format_rfc3339)
+        ))
     );
 }
 
@@ -1190,14 +1192,14 @@ async fn each_of_two_publish_units_over_one_membership_freezes_the_state_it_judg
     assert_eq!(rows[1].catalog_version, 5);
     assert_eq!(
         rows[0].payload.get("effectiveTo"),
-        Some(&serde_json::json!(None::<DateTime<Utc>>)),
+        Some(&serde_json::json!(None::<OffsetDateTime>)),
         "version 4 froze the enrollment, which was open-ended when its publish judged it; \
          reading the row live at sweep time is what freezes the *later* state under the \
          earlier commit's version, permanently, on an INSERT-only row"
     );
     assert_eq!(
         rows[1].payload.get("effectiveTo"),
-        Some(&serde_json::json!(at(9))),
+        Some(&serde_json::json!(format_rfc3339(at(9)))),
         "and version 5 froze the end, which is the state *its* publish judged"
     );
 
@@ -1218,7 +1220,7 @@ async fn each_of_two_publish_units_over_one_membership_freezes_the_state_it_judg
         );
         assert_eq!(
             row.payload.get("effectiveFrom"),
-            Some(&serde_json::json!(at(1)))
+            Some(&serde_json::json!(format_rfc3339(at(1))))
         );
     }
 }
@@ -2047,7 +2049,7 @@ async fn one_handle_still_refuses_a_second_record_of_the_same_subject() {
     let h = harness().await;
     let conn = h.provider.conn().expect("conn");
     let overlay_id = Uuid::new_v4();
-    let row = |at: DateTime<Utc>| {
+    let row = |at: OffsetDateTime| {
         PendingVersionRow::for_subject(
             TENANT,
             "pend-twice".to_owned(),
@@ -2440,7 +2442,7 @@ async fn a_registry_that_has_not_committed_the_batch_leaves_the_seam_untouched()
 
     // One minute after the request, which is inside the ratified five-minute
     // max batching delay: the wait is budgeted, so nothing alarms.
-    let report = sweep(&h, at(12) + chrono::Duration::minutes(1)).await;
+    let report = sweep(&h, at(12) + time::Duration::minutes(1)).await;
     assert_eq!(report.pending_seen, 1);
     assert_eq!(report.versions_projected, 0);
     assert_eq!(report.commit_overdue, 0);
@@ -2806,7 +2808,7 @@ async fn a_version_freezes_the_revision_its_own_publish_judged() {
 async fn seed_observed_but_unwarm(
     h: &Harness,
     version: u64,
-    requested_at: DateTime<Utc>,
+    requested_at: OffsetDateTime,
 ) -> String {
     let conn = h.provider.conn().expect("conn");
     catalog_version_ref_repo::record_pending(
@@ -2831,7 +2833,7 @@ async fn seed_observed_but_unwarm(
 async fn seed_observed_but_unwarm_overlay(
     h: &Harness,
     version: u64,
-    requested_at: DateTime<Utc>,
+    requested_at: OffsetDateTime,
 ) -> String {
     let conn = h.provider.conn().expect("conn");
     catalog_version_ref_repo::record_pending(
@@ -2872,7 +2874,7 @@ async fn an_overlay_subjects_stuck_warm_raises_the_frontier_alarm_and_no_degrade
     let _pending = seed_observed_but_unwarm_overlay(&h, 5, at_min(12, 1)).await;
 
     sweep(&h, at(13)).await;
-    let outside = sweep(&h, at(13) + chrono::Duration::seconds(5)).await;
+    let outside = sweep(&h, at(13) + time::Duration::seconds(5)).await;
 
     assert_eq!(
         outside.degraded_emitted, 0,
@@ -2896,7 +2898,7 @@ async fn an_overlay_subjects_stuck_warm_raises_the_frontier_alarm_and_no_degrade
 }
 
 /// A ref's recorded commit observation.
-async fn observed_at(h: &Harness, pending_ref: &str) -> Option<DateTime<Utc>> {
+async fn observed_at(h: &Harness, pending_ref: &str) -> Option<OffsetDateTime> {
     refs(h)
         .await
         .into_iter()
@@ -3030,13 +3032,13 @@ async fn an_observed_commit_is_degraded_only_once_the_propagation_slo_has_passed
         "an observation zero seconds old is inside the SLO"
     );
 
-    let inside = sweep(&h, at(13) + chrono::Duration::seconds(4)).await;
+    let inside = sweep(&h, at(13) + time::Duration::seconds(4)).await;
     assert_eq!(
         inside.degraded_emitted, 0,
         "four seconds after the observation is still inside it"
     );
 
-    let outside = sweep(&h, at(13) + chrono::Duration::seconds(5)).await;
+    let outside = sweep(&h, at(13) + time::Duration::seconds(5)).await;
     assert_eq!(
         outside.degraded_emitted, 1,
         "five seconds is the SLO, and the warm has not landed"
@@ -3055,7 +3057,7 @@ async fn an_observed_commit_is_degraded_only_once_the_propagation_slo_has_passed
     );
     assert_eq!(
         events[0].payload.get("commitObservedAt"),
-        Some(&serde_json::json!(at(13))),
+        Some(&serde_json::json!(format_rfc3339(at(13)))),
         "and measures the wait from the observation, not from the request"
     );
     assert_eq!(
@@ -3088,7 +3090,7 @@ async fn an_observed_commit_is_never_overdue_however_long_it_stays_unresolved() 
 
     sweep(&h, at(13)).await;
     let much_later = sweep(&h, at(23)).await;
-    let later_still = sweep(&h, at(23) + chrono::Duration::hours(5)).await;
+    let later_still = sweep(&h, at(23) + time::Duration::hours(5)).await;
 
     assert_eq!(
         much_later.commit_overdue, 0,
@@ -3354,7 +3356,7 @@ async fn a_sweep_with_no_registry_configured_is_inert() {
 fn stamp() -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: uuid::Uuid::from_u128(0xac_10),
-        recorded_at: chrono::Utc::now(),
+        recorded_at: OffsetDateTime::now_utc(),
         correlation_id: TEST_CORRELATION,
     }
 }
@@ -3374,17 +3376,17 @@ fn stamp() -> bss_pricing::domain::audit::AuditStamp {
 /// while the fixture sat in 2099 would put the fixture *after* every window here,
 /// making it the far end of every key's coverage and swamping the `coverageEnd`
 /// assertions this section exists for.
-fn window_at(day: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, 1, 0, 0, 0).unwrap() + chrono::Duration::days(day)
+fn window_at(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, 1, 0, 0, 0) + time::Duration::days(day)
 }
 
 /// The inclusive start of the coverage window `seed_publishable_of` schedules.
 ///
 /// Read off `common`'s constants rather than restated, so a fixture assertion
 /// cannot disagree with the fixture.
-fn coverage_window_from() -> DateTime<Utc> {
+fn coverage_window_from() -> OffsetDateTime {
     let (y, m, d) = common::COVERAGE_FROM_UTC;
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    utc_ymd_hms(y, m, d, 0, 0, 0)
 }
 
 /// Cancel the coverage window `seed_publishable_of` scheduled on `price_id`.
@@ -3523,8 +3525,8 @@ async fn window(
     h: &Harness,
     price_id: Uuid,
     id: u128,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
     state: WindowState,
 ) {
     let conn = h.provider.conn().expect("conn");
@@ -3558,7 +3560,7 @@ async fn window(
     // second after activating it, ten days before its end: a window that stopped
     // applying before the interval it was projected over had run, which is
     // exactly what the read model here is asked to project.
-    let path: Vec<(WindowState, DateTime<Utc>)> = match state {
+    let path: Vec<(WindowState, OffsetDateTime)> = match state {
         WindowState::Scheduled => vec![],
         WindowState::Active => vec![(WindowState::Active, from)],
         WindowState::Expired => vec![
@@ -3669,7 +3671,7 @@ async fn a_cancelled_window_is_not_projected_and_an_expired_one_is() {
     // through an interval nothing was ever effective on.
     assert_eq!(
         groups[0].get("coverageEnd"),
-        Some(&serde_json::json!({ "kind": "ends", "at": window_at(40) }))
+        Some(&serde_json::json!({ "kind": "ends", "at": format_rfc3339(window_at(40)) }))
     );
 }
 
@@ -3738,7 +3740,7 @@ async fn a_draft_rows_window_does_not_move_the_published_keys_coverage_end() {
     // where the draft's window ends.
     assert_eq!(
         groups[0].get("coverageEnd"),
-        Some(&serde_json::json!({ "kind": "ends", "at": window_at(20) })),
+        Some(&serde_json::json!({ "kind": "ends", "at": format_rfc3339(window_at(20)) })),
         "the key's coverage end is the published row's own"
     );
 
@@ -3754,8 +3756,8 @@ async fn a_draft_rows_window_does_not_move_the_published_keys_coverage_end() {
         vec![
             // The seed's coverage window, without which the row could not have
             // published at all.
-            serde_json::json!(coverage_window_from()),
-            serde_json::json!(window_at(10)),
+            serde_json::json!(format_rfc3339(coverage_window_from())),
+            serde_json::json!(format_rfc3339(window_at(10))),
         ],
         "the draft's interval is absent, not merely uncounted"
     );
@@ -3926,7 +3928,7 @@ async fn a_draft_row_on_a_new_key_gets_no_group_at_all() {
 /// two the payload happened to list first. The payload carries no `window_id` — by
 /// `WindowInterval`'s own decision, a consumer resolving a price at `t` has no call
 /// to make with one — so the start is what names an interval here.
-fn frozen_interval(delta: &read_model::Model, from: DateTime<Utc>) -> WindowInterval {
+fn frozen_interval(delta: &read_model::Model, from: OffsetDateTime) -> WindowInterval {
     let groups = delta
         .payload
         .get("windows")
@@ -3939,7 +3941,7 @@ fn frozen_interval(delta: &read_model::Model, from: DateTime<Utc>) -> WindowInte
         .expect("intervals");
     let matching: Vec<&serde_json::Value> = intervals
         .iter()
-        .filter(|i| i.get("effectiveFrom") == Some(&serde_json::json!(from)))
+        .filter(|i| i.get("effectiveFrom") == Some(&serde_json::json!(format_rfc3339(from))))
         .collect();
     assert_eq!(
         matching.len(),
@@ -3951,7 +3953,7 @@ fn frozen_interval(delta: &read_model::Model, from: DateTime<Utc>) -> WindowInte
         interval
             .get(key)
             .filter(|v| !v.is_null())
-            .map(|v| serde_json::from_value::<DateTime<Utc>>(v.clone()).expect("an instant"))
+            .map(|v| parse_rfc3339(v.as_str().expect("an RFC3339 instant")).expect("an instant"))
     };
     WindowInterval::new(
         instant("effectiveFrom").expect("a window has a start"),

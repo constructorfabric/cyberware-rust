@@ -56,13 +56,14 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 
 use async_trait::async_trait;
-use chrono::Utc;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 
 use bss_pricing_sdk::catalog_version::CatalogVersion;
 
+use crate::domain::instant::timestamp_millis;
 use crate::domain::ports::{CatalogVersionRegistryV1, PendingVersionRef, registry_rejected};
+use time::OffsetDateTime;
 
 /// The prefix every ref this type mints carries, so its artifacts stay findable.
 pub const DEV_LOCAL_REF_PREFIX: &str = "dev-local-v";
@@ -139,7 +140,7 @@ impl LocalDevCatalogVersionRegistryV1 {
     /// O(1): the high-water mark is a field. See [`Issued::high_water`] for why it
     /// is carried rather than read off the map.
     fn next_version(issued: &Issued) -> u64 {
-        let now = u64::try_from(Utc::now().timestamp_millis().max(0)).unwrap_or(0);
+        let now = u64::try_from(timestamp_millis(OffsetDateTime::now_utc()).max(0)).unwrap_or(0);
         now.max(issued.high_water.saturating_add(1))
     }
 

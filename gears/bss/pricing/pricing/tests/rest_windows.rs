@@ -20,13 +20,15 @@ use bss_pricing::api::rest::windows::PLAN_COVERAGE;
 use bss_pricing::domain::approval::ApprovalState;
 use bss_pricing::domain::audit::{AuditStamp, AuditSubjectKind};
 use bss_pricing::domain::contracts::{EntitlementGrants, PlanChangeContract};
+use bss_pricing::domain::instant::format_rfc3339;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::storage::repo::window_repo::{NewWindow, schedule};
-use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use rest_support::{
     Harness, body_json, request, seed_draft_plan, seed_price, seed_publishable_plan, with_headers,
 };
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// One value for the whole binary; what it is asserted about is nothing.
@@ -52,11 +54,19 @@ fn publish_path(plan_id: Uuid) -> String {
 /// the row, and never computed from `now` — a fixture dated off the clock asserts
 /// something different every day it runs. The year tracks that constant's, which is
 /// 2099 so that no real clock ever falls inside a fixture interval; see its doc.
-fn at(day: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 10, 1, 0, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
-        + TimeDelta::days(day)
+/// The gear's own rendering, not a second one written here.
+///
+/// This used to call `time`'s well-known `Rfc3339` directly, which is a
+/// re-implementation of the thing under test: the day the gear's renderer
+/// changed, every expectation built through this helper asserted the form the
+/// gear had stopped emitting, and the failure read as a wire-format regression
+/// rather than as a stale fixture.
+fn wire(at: OffsetDateTime) -> String {
+    bss_pricing::domain::instant::format_rfc3339(at)
+}
+
+fn at(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2099, 10, 1, 0, 0, 0) + time::Duration::days(day)
 }
 
 fn stamp() -> AuditStamp {
@@ -251,15 +261,15 @@ async fn a_covered_key_carries_its_interval_and_its_coverage_end() {
     assert_eq!(
         covered.get("intervals"),
         Some(&serde_json::json!([{
-            "effective_from": common_from(),
-            "effective_to": common_to(),
+            "effective_from": wire(common_from()),
+            "effective_to": wire(common_to()),
             "state": "scheduled",
         }])),
         "the seed's coverage window, whole"
     );
     assert_eq!(
         covered.get("coverage_end"),
-        Some(&serde_json::json!({ "kind": "ends", "at": common_to() }))
+        Some(&serde_json::json!({ "kind": "ends", "at": wire(common_to()) }))
     );
     assert_eq!(covered.get("interior_gaps"), Some(&serde_json::json!([])));
     // The plan really is publishable, so `covered` is not a report about a plan
@@ -276,14 +286,14 @@ async fn a_covered_key_carries_its_interval_and_its_coverage_end() {
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
 }
 
-fn common_from() -> DateTime<Utc> {
+fn common_from() -> OffsetDateTime {
     let (y, m, d) = common::COVERAGE_FROM_UTC;
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    utc_ymd_hms(y, m, d, 0, 0, 0)
 }
 
-fn common_to() -> DateTime<Utc> {
+fn common_to() -> OffsetDateTime {
     let (y, m, d) = common::COVERAGE_TO_UTC;
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+    utc_ymd_hms(y, m, d, 0, 0, 0)
 }
 
 /// An interior gap is named with `[gapStart, gapEnd)` — §9's API criterion.
@@ -311,8 +321,8 @@ async fn an_interior_gap_is_named_with_its_bounds_and_its_key() {
         Some(&serde_json::json!([
             // The seed's window ends where the window scale begins, and the first
             // of these starts ten days later.
-            { "gap_start": common_to(), "gap_end": at(10) },
-            { "gap_start": at(20), "gap_end": at(30) },
+            { "gap_start": wire(common_to()), "gap_end": wire(at(10)) },
+            { "gap_start": wire(at(20)), "gap_end": wire(at(30)) },
         ])),
         "both holes, in gapStart order, half-open"
     );
@@ -323,7 +333,7 @@ async fn an_interior_gap_is_named_with_its_bounds_and_its_key() {
     );
     assert_eq!(
         key.get("coverage_end"),
-        Some(&serde_json::json!({ "kind": "ends", "at": at(40) })),
+        Some(&serde_json::json!({ "kind": "ends", "at": wire(at(40)) })),
         "the coverage end is the far end, which is why the gap list is a separate fact"
     );
 }
@@ -663,10 +673,9 @@ async fn a_malformed_plan_id_never_reaches_the_handler() {
 /// to axum's extractor and answered the same bodiless 400 — against a registration
 /// whose declared 400 has `Problem` as its schema.
 ///
-/// `?limit=abc` on the nine paginated reads and `?price_id=nope` here answered that
-/// until 2026-08-17. The members are `Option<String>` now and
-/// `cursor::parse_limit` / `cursor::parse_uuid_param` refuse them, which is what
-/// `SellabilityQuery` had already done for its three and no other struct had.
+/// `?limit=abc` on the nine paginated reads answered that until 2026-08-17.
+/// `?price_id=` is now a retired named key and is refused as an extra query
+/// parameter. `cursor::parse_limit` still refuses a non-numeric limit.
 /// `module_test`'s `no_query_struct_lets_the_extractor_answer` is the derivation;
 /// this is the wire proof that the derivation is about something real.
 #[tokio::test]
@@ -680,7 +689,7 @@ async fn a_malformed_query_parameter_is_refused_as_a_problem_document() {
             "limit",
         ),
         (
-            "a price filter that is not a uuid",
+            "a retired named price filter",
             "/bss-pricing/v1/price-windows?price_id=nope",
             "price_id",
         ),
@@ -704,11 +713,13 @@ async fn a_malformed_query_parameter_is_refused_as_a_problem_document() {
             problem["type"], "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
             "{what}: {problem}"
         );
-        // And it names the parameter, or the remedy is unreachable on a request
-        // carrying three of them.
-        let detail = problem["detail"].as_str().unwrap_or_default();
+        // The OData extractor names the parameter in `field_violations`, not
+        // always in `detail`. Search both, never `instance` - that echoes the
+        // request path and would satisfy this for free.
+        let detail = problem["detail"].as_str().unwrap_or_default().to_owned();
+        let violations = problem["context"]["field_violations"].to_string();
         assert!(
-            detail.contains(named),
+            detail.contains(named) || violations.contains(named),
             "{what}: the refusal names `{named}`, its own parameter, and not merely \
              some parameter of the request: {problem}"
         );
@@ -823,7 +834,7 @@ async fn a_published_plan_with_no_open_draft_is_still_reported() {
     );
     assert_eq!(
         entry.get("coverage_end"),
-        Some(&serde_json::json!({ "kind": "ends", "at": common_to() }))
+        Some(&serde_json::json!({ "kind": "ends", "at": wire(common_to()) }))
     );
 }
 
@@ -859,8 +870,8 @@ async fn a_cancelled_window_is_reported_and_is_not_coverage() {
     assert_eq!(
         key.get("intervals"),
         Some(&serde_json::json!([{
-            "effective_from": common_from(),
-            "effective_to": common_to(),
+            "effective_from": wire(common_from()),
+            "effective_to": wire(common_to()),
             "state": "cancelled",
         }])),
         "the cancelled interval is in the report"
@@ -994,8 +1005,8 @@ async fn published(h: &Harness, plan_id: Uuid) -> rest_support::Publishable {
 async fn post_window(
     h: &Harness,
     price_id: Uuid,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
 ) -> axum::http::Response<axum::body::Body> {
     post_window_under(h, price_id, from, to, &Uuid::now_v7().to_string()).await
 }
@@ -1004,8 +1015,8 @@ async fn post_window(
 async fn post_window_under(
     h: &Harness,
     price_id: Uuid,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
     key: &str,
 ) -> axum::http::Response<axum::body::Body> {
     h.allowed()
@@ -1013,8 +1024,8 @@ async fn post_window_under(
             "POST",
             &windows_path(price_id),
             Some(serde_json::json!({
-                "effective_from": from,
-                "effective_to": to,
+                "effective_from": wire(from),
+                "effective_to": to.map(wire),
                 "reason_code": "priceIncrease",
             })),
             &[("idempotency-key", key)],
@@ -1026,7 +1037,7 @@ async fn post_window_under(
 async fn patch_window(
     h: &Harness,
     window_id: Uuid,
-    to: Option<DateTime<Utc>>,
+    to: Option<OffsetDateTime>,
 ) -> axum::http::Response<axum::body::Body> {
     patch_window_asserting(h, window_id, to, IF_MATCH).await
 }
@@ -1036,14 +1047,14 @@ async fn patch_window(
 async fn patch_window_asserting(
     h: &Harness,
     window_id: Uuid,
-    to: Option<DateTime<Utc>>,
+    to: Option<OffsetDateTime>,
     if_match: &str,
 ) -> axum::http::Response<axum::body::Body> {
     h.allowed()
         .send(with_headers(
             "PATCH",
             &window_path(window_id),
-            Some(serde_json::json!({ "effective_to": to })),
+            Some(serde_json::json!({ "effective_to": to.map(wire) })),
             &[("if-match", if_match)],
         ))
         .await
@@ -1151,7 +1162,7 @@ async fn a_scheduled_window_answers_202_with_the_pending_version_handle() {
                 // is the only thing in the body a caller can act on, and a 202 whose
                 // handle were absent or empty would be a 202 promising nothing.
                 "pending_version_ref": "pend-0",
-                "effective_from": common_to(),
+                "effective_from": wire(common_to()),
                 "effective_to": null,
                 "state": "scheduled",
             },
@@ -1234,7 +1245,7 @@ async fn a_scheduled_window_with_no_threshold_policy_opens_a_unit_and_writes_not
         format!(
             "{plan_id}/schedule/{}/{}/open",
             seeded.price_id,
-            common_to().to_rfc3339()
+            format_rfc3339(common_to())
         ),
         "the subject names the plan, the act, the price row and the proposed interval"
     );
@@ -1355,7 +1366,13 @@ async fn a_window_units_detail_renders_the_act_being_signed_for() {
         "and on which window: {detail}"
     );
     assert_eq!(
-        detail["proposed_act"]["current_effective_to"], "2099-09-01T00:00:00+00:00",
+        detail["proposed_act"]["current_effective_to"],
+        // The view echoes the act token's own spelling (`interval_end`), so the
+        // literal is the gear's one rendering. It was chrono's `to_rfc3339()`
+        // form here, kept so a retry across the type change still found its unit;
+        // that premise went with the third renderer, and the token now reads the
+        // way every other instant on this document does.
+        "2099-09-01T00:00:00.000000Z",
         "and the end the key loses if it commits - the fixture window's own: {detail}"
     );
 }
@@ -1674,8 +1691,8 @@ async fn an_adjusted_window_answers_202_and_the_stored_end_moves() {
                 "price_id": seeded.price_id,
                 "revision": seeded.revision,
                 "pending_version_ref": "pend-0",
-                "effective_from": common_from(),
-                "effective_to": at(30),
+                "effective_from": wire(common_from()),
+                "effective_to": wire(at(30)),
                 "state": "scheduled",
             },
         })
@@ -1814,7 +1831,7 @@ async fn an_adjusted_window_with_no_threshold_policy_opens_a_unit_and_the_end_st
     );
     assert_eq!(
         body["window"]["effective_to"],
-        serde_json::json!(common_to()),
+        serde_json::json!(wire(common_to())),
         "the 202 echoes the end as it **still** stands, never the one that was asked for"
     );
 
@@ -1901,7 +1918,7 @@ async fn a_foreign_tenants_caller_moves_no_window_and_reads_no_sellability() {
         .send(with_headers(
             "PATCH",
             &window_path(first),
-            Some(serde_json::json!({ "effective_to": common_to() })),
+            Some(serde_json::json!({ "effective_to": wire(common_to()) })),
             &[("if-match", IF_MATCH)],
         ))
         .await;
@@ -1912,7 +1929,7 @@ async fn a_foreign_tenants_caller_moves_no_window_and_reads_no_sellability() {
         .send(with_headers(
             "POST",
             &windows_path(seeded.price_id),
-            Some(serde_json::json!({ "effective_from": common_to() })),
+            Some(serde_json::json!({ "effective_from": wire(common_to()) })),
             &[],
         ))
         .await;
@@ -2112,8 +2129,10 @@ async fn a_cancel_opens_a_unit_and_the_window_is_still_scheduled() {
         unit.subject_ref
     );
     assert!(
-        unit.subject_ref
-            .ends_with("/cancel/0/2099-09-01T00:00:00+00:00/2099-09-01T00:00:00+00:00"),
+        unit.subject_ref.ends_with(&format!(
+            "/cancel/0/{bound}/{bound}",
+            bound = format_rfc3339(common_to())
+        )),
         "and the act is named in full - the operation, the **act sequence the window \
          was read at** (D-190) and the transition it makes. The sequence is what tells \
          a repeated oscillation from its own first occurrence, which the transition \
@@ -2336,7 +2355,7 @@ async fn a_shortening_patch_is_refused_by_the_coverage_rules_before_it_can_open_
     let scheduled = post_window(&h, seeded.price_id, common_to(), None).await;
     assert_eq!(scheduled.status(), StatusCode::ACCEPTED);
 
-    let response = patch_window(&h, first, Some(common_to() - TimeDelta::days(10))).await;
+    let response = patch_window(&h, first, Some(common_to() - time::Duration::days(10))).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let codes: Vec<String> = precondition_violations(response)
@@ -2421,7 +2440,7 @@ async fn a_shortening_below_the_floor_is_refused_as_a_trailing_void() {
     // Ten days inside the stored end, which is below the floor because the stored
     // end *is* the floor here: `now + one month` is 2026 and the coverage end is
     // 2099, so `max(..)` is the coverage end.
-    let target = common_to() - TimeDelta::days(10);
+    let target = common_to() - time::Duration::days(10);
     let response = patch_window(&h, window_id, Some(target)).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2447,7 +2466,7 @@ async fn a_shortening_below_the_floor_is_refused_as_a_trailing_void() {
     // through which instant the key must stay covered.
     let detail = format!("{body}");
     assert!(
-        detail.contains(&common_to().to_rfc3339()),
+        detail.contains(&format_rfc3339(common_to())),
         "the refusal names the instant the key must stay covered through: {detail}"
     );
 
@@ -2532,7 +2551,7 @@ async fn a_schedule_that_opens_an_interior_gap_is_refused_as_a_window_gap() {
 
     // Ten days after the seed's window ends: a hole between two live windows.
     let gap_start = common_to();
-    let gap_end = common_to() + TimeDelta::days(10);
+    let gap_end = common_to() + time::Duration::days(10);
     let response = post_window(&h, seeded.price_id, gap_end, None).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2561,7 +2580,8 @@ async fn a_schedule_that_opens_an_interior_gap_is_refused_as_a_window_gap() {
     );
     let rendered = format!("{body}");
     assert!(
-        rendered.contains(&gap_start.to_rfc3339()) && rendered.contains(&gap_end.to_rfc3339()),
+        rendered.contains(&format_rfc3339(gap_start))
+            && rendered.contains(&format_rfc3339(gap_end)),
         "the hole is named `[gapStart, gapEnd)`: {rendered}"
     );
 
@@ -2654,10 +2674,7 @@ async fn a_window_starting_in_the_past_is_refused_before_the_store_sees_it() {
     let plan_id = Uuid::now_v7();
     let seeded = published(&h, plan_id).await;
 
-    let past = Utc
-        .with_ymd_and_hms(2020, 1, 1, 0, 0, 0)
-        .single()
-        .expect("a fixed instant");
+    let past = utc_ymd_hms(2020, 1, 1, 0, 0, 0);
     let response = post_window(&h, seeded.price_id, past, Some(at(5))).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2769,7 +2786,7 @@ async fn the_no_value_margin_answers_a_different_sentence_from_the_floor() {
 /// read the absence as nought — the direction a fail-closed floor may never round
 /// in.
 ///
-/// So folding `None` into `Some(TimeDelta::zero())` in `longest_cycle_sold` turns
+/// So folding `None` into `Some(time::Duration::ZERO)` in `longest_cycle_sold` turns
 /// this 400 into a **202** — measured, not argued — while the sibling above keeps
 /// answering 400 and moves only its detail. **This is the one case in the file whose
 /// reddening is about the two readings** rather than about a message, which is why
@@ -2835,7 +2852,7 @@ fn sellability_path(plan_id: Uuid, query: &str) -> String {
 fn market_query(at_day: i64) -> String {
     format!(
         "at={}&currency={MARKET_CURRENCY}&region={MARKET_REGION}",
-        at(at_day).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        format_rfc3339(at(at_day))
     )
 }
 
@@ -3033,8 +3050,8 @@ async fn the_document_carries_intervals_and_a_coverage_end_and_no_boolean_anywhe
     assert_eq!(
         key["intervals"],
         serde_json::json!([
-            { "effective_from": at(-10), "effective_to": at(-1), "state": "expired" },
-            { "effective_from": at(-1), "effective_to": serde_json::Value::Null, "state": "active" },
+            { "effective_from": wire(at(-10)), "effective_to": wire(at(-1)), "state": "expired" },
+            { "effective_from": wire(at(-1)), "effective_to": serde_json::Value::Null, "state": "active" },
         ])
     );
     // The derived end, as the discriminated object: a bare null would have to serve
@@ -3420,8 +3437,8 @@ async fn each_missing_or_malformed_query_parameter_is_named_in_a_problem_documen
 
     let cases = [
         ("currency=EUR&region=eu", "at"),
-        ("at=2099-10-01T00:00:00Z&region=eu", "currency"),
-        ("at=2099-10-01T00:00:00Z&currency=EUR", "region"),
+        ("at=2099-10-01T00:00:00.000000Z&region=eu", "currency"),
+        ("at=2099-10-01T00:00:00.000000Z&currency=EUR", "region"),
         ("at=whenever&currency=EUR&region=eu", "at"),
     ];
     for (query, named) in cases {
@@ -3455,8 +3472,11 @@ async fn an_unencoded_offset_instant_is_refused_rather_than_guessed_at() {
     let h = Harness::new().await;
     let plan_id = Uuid::now_v7();
 
-    // What `DateTime::to_rfc3339` produces, pasted into a query string unencoded.
-    let raw = at(0).to_rfc3339();
+    // Chrono's `DateTime::to_rfc3339` (and some clients) write UTC as `+00:00`.
+    // `+` is a space under form-urlencoded query strings, so pasting that form
+    // unencoded is not an instant. `format_rfc3339` uses `Z` and would not
+    // provoke this refusal — the case is the offset form.
+    let raw = format!("{}+00:00", wire(at(0)).trim_end_matches('Z'));
     assert!(
         raw.ends_with("+00:00"),
         "the offset form is what is at issue: {raw}"
@@ -3673,8 +3693,8 @@ async fn an_overlapping_schedule_is_refused_by_its_code_and_writes_nothing() {
     let response = post_window(
         &h,
         seeded.price_id,
-        common_from() + TimeDelta::days(1),
-        Some(common_to() + TimeDelta::days(1)),
+        common_from() + time::Duration::days(1),
+        Some(common_to() + time::Duration::days(1)),
     )
     .await;
 
@@ -3949,8 +3969,8 @@ async fn a_schedule_without_an_idempotency_key_is_refused_and_writes_nothing() {
             "POST",
             &windows_path(seeded.price_id),
             Some(serde_json::json!({
-                "effective_from": common_to(),
-                "effective_to": at(0),
+                "effective_from": wire(common_to()),
+                "effective_to": wire(at(0)),
                 "reason_code": "priceIncrease",
             })),
         ))
@@ -4016,7 +4036,7 @@ async fn a_foreign_tenant_cannot_schedule_a_window_on_this_tenants_row() {
             "POST",
             &windows_path(price_id),
             Some(serde_json::json!({
-                "effective_from": common_to(),
+                "effective_from": wire(common_to()),
                 "effective_to": serde_json::Value::Null,
                 "reason_code": "priceIncrease",
             })),
@@ -4057,7 +4077,7 @@ async fn a_foreign_tenant_cannot_shorten_this_tenants_window() {
         with_headers(
             "PATCH",
             &window_path(id),
-            Some(serde_json::json!({ "effective_to": at(30) })),
+            Some(serde_json::json!({ "effective_to": wire(at(30)) })),
             &[("if-match", IF_MATCH)],
         )
     };

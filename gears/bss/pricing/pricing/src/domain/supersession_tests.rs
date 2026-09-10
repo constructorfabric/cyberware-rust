@@ -1,7 +1,7 @@
 //! The changeover instant's two floors, and the two window operations composed
 //! against it.
 //!
-//! Every case is driven from **fixed** instants rather than `Utc::now()`, and the
+//! Every case is driven from **fixed** instants rather than `OffsetDateTime::now_utc()`, and the
 //! reason is the one D-194's case records one plane over: a rule about the distance
 //! between two instants, tested against a clock that moves, passes or fails by how
 //! long the test took. `now` is a parameter here precisely so it can be a fact.
@@ -13,18 +13,20 @@
 //! under an inclusive end, which is exactly the false positive §9 names and would
 //! double-cover the changeover instant.
 
-use chrono::{Duration, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
     ChangeoverMoment, MAX_BATCHING_DELAY, NamedWindow, check_changeover_instant, compose_windows,
 };
 use crate::domain::error::DomainError;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::window::{WindowInterval, WindowState};
+use time::Duration;
+use time::OffsetDateTime;
 
 /// A fixed reading of "now" for every case below.
-fn now() -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 3, 1, 12, 0, 0).unwrap()
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2099, 3, 1, 12, 0, 0)
 }
 
 #[test]
@@ -35,7 +37,7 @@ fn at_submit_the_instant_must_only_be_strictly_future() {
     check_changeover_instant(now() + MAX_BATCHING_DELAY, now(), ChangeoverMoment::Submit)
         .expect("well clear of both floors");
     check_changeover_instant(
-        now() + chrono::Duration::milliseconds(1),
+        now() + time::Duration::milliseconds(1),
         now(),
         ChangeoverMoment::Submit,
     )
@@ -47,9 +49,9 @@ fn at_submit_now_itself_and_anything_behind_it_is_refused() {
     // Strictly future, so the boundary is exclusive: an instant equal to `now` is
     // an instant that has arrived.
     for behind in [
-        chrono::Duration::zero(),
-        chrono::Duration::milliseconds(1),
-        chrono::Duration::days(30),
+        time::Duration::ZERO,
+        time::Duration::milliseconds(1),
+        time::Duration::days(30),
     ] {
         let err = check_changeover_instant(now() - behind, now(), ChangeoverMoment::Submit)
             .expect_err("an instant at or behind now has passed");
@@ -70,7 +72,7 @@ fn at_commit_the_instant_must_clear_the_whole_batching_delay() {
     // yet addressable at any completed `CatalogVersion`, so renewals and arrears
     // fail closed for up to the whole delay.
     check_changeover_instant(
-        now() + MAX_BATCHING_DELAY + chrono::Duration::milliseconds(1),
+        now() + MAX_BATCHING_DELAY + time::Duration::milliseconds(1),
         now(),
         ChangeoverMoment::Commit,
     )
@@ -79,7 +81,7 @@ fn at_commit_the_instant_must_clear_the_whole_batching_delay() {
     // The instant a submit would have accepted, refused at commit — which is the
     // whole point of there being two moments.
     let err = check_changeover_instant(
-        now() + chrono::Duration::milliseconds(1),
+        now() + time::Duration::milliseconds(1),
         now(),
         ChangeoverMoment::Commit,
     )
@@ -115,7 +117,7 @@ fn the_delay_is_the_ratified_five_minutes() {
     // derives the expected number instead of accepting either of two spellings — the
     // `||` that used to be here would have stayed green with the constant changed
     // (review, 2026-08-05).
-    assert_eq!(MAX_BATCHING_DELAY, chrono::Duration::minutes(5));
+    assert_eq!(MAX_BATCHING_DELAY, time::Duration::minutes(5));
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +129,7 @@ fn window_id(n: u128) -> Uuid {
 }
 
 /// The changeover every case below composes against: well clear of both floors.
-fn changeover() -> chrono::DateTime<Utc> {
+fn changeover() -> OffsetDateTime {
     now() + Duration::days(30)
 }
 
@@ -671,7 +673,7 @@ fn the_commit_remedy_states_the_delay_from_the_constant_and_not_from_a_copy() {
     let DomainError::SupersessionInstantPassed(detail) = err else {
         panic!("got: {err:?}");
     };
-    let seconds = MAX_BATCHING_DELAY.num_seconds();
+    let seconds = MAX_BATCHING_DELAY.whole_seconds();
     assert!(
         detail.contains(&format!("{seconds}s")),
         "the operator has to be told how far ahead is far enough, from the constant \

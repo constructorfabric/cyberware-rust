@@ -15,6 +15,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use bss_pricing::domain::bulk::{BulkKind, BulkState, JournalState};
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::price_record::PriceContent;
 use bss_pricing::domain::price_row::{ModelKind, PriceRow};
@@ -27,7 +28,8 @@ use bss_pricing::infra::storage::repo::repricing_journal_repo::NewJournalRow;
 use bss_pricing::infra::storage::repo::{
     IdempotencyGate, NewBulkOperation, NewPriceDraft, PriceRepo, bulk_repo, repricing_journal_repo,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
@@ -37,8 +39,8 @@ use uuid::Uuid;
 const TENANT: Uuid = Uuid::from_u128(0x7e_51);
 const ACTOR: Uuid = Uuid::from_u128(0xac_50);
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 10, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 10, hour, 0, 0)
 }
 
 fn scope() -> AccessScope {

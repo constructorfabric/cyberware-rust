@@ -1,7 +1,8 @@
 //! The `PriceOverlay` authoring surface — `design/09-price-overlays.md` §5,
 //! `inst-pl-author` / `inst-pl-validate` / `inst-pl-return` / `inst-pl-commit`.
 //!
-//! Three routes: author or edit an overlay draft, submit it, and list them.
+//! Four routes: author or edit an overlay draft, read one by id, submit it, and
+//! list them.
 //!
 //! # A save lands a **draft only**, and nothing publishes from it
 //!
@@ -47,6 +48,7 @@
 //! them out of the report and answers the typed conflict, and everything else
 //! goes in the envelope. No route here declares a 422.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -54,9 +56,11 @@ use axum::extract::{Extension, Path, Query};
 use axum::http::header::{ETAG, LOCATION};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
-use chrono::{DateTime, Utc};
+use bss_pricing_sdk::odata::OverlayFilterField;
+
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::DbTx;
 use toolkit_odata::PageInfo;
@@ -66,19 +70,12 @@ use uuid::Uuid;
 use crate::api::rest::approvals::{ApprovalView, MaterialityView};
 use crate::api::rest::auth_context::{audit_stamp, require_authenticated};
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
-use crate::api::rest::cursor::{self, PageRequest};
-
-/// One page's request for the `(id, revision)` walk — [`PageRequest`]'s shape over
-/// the pair this list's cursor names. Local rather than in `cursor`, because it is
-/// the only walk on that pair.
-struct PageRequestPair {
-    limit: u64,
-    after: Option<(uuid::Uuid, u64)>,
-}
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::preconditions;
 use crate::api::rest::state::{AuthoringState, GovernanceState};
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{self, ChangeSet, MaterialityReason, MaterialityVerdict};
 use crate::domain::overlay::{
@@ -91,6 +88,7 @@ use crate::domain::overlay_rules::{
 use crate::domain::scope_key::PlanId;
 use crate::infra::idempotent::{self, Guarded, GuardedRequest, TxFuture};
 use crate::infra::storage::repo::{NewOverlay, OverlayRecord, overlay_repo};
+use time::OffsetDateTime;
 
 const TAG: &str = "BSS Pricing Overlays";
 
@@ -126,7 +124,7 @@ const OVERLAY_ACT_REASON: &str = MaterialityReason::AlwaysMaterialTrigger.as_str
 
 /// `POST` — author an overlay draft; `GET` — list them.
 pub const PRICE_OVERLAYS: &str = "/bss-pricing/v1/price-overlays";
-/// `PATCH` — replace an open draft revision's whole line set.
+/// `GET` — the authoring revision; `PATCH` — replace an open draft's line set.
 pub const PRICE_OVERLAY_BY_ID: &str = "/bss-pricing/v1/price-overlays/{overlayId}";
 /// `POST` — submit the draft for the always-material approval unit.
 pub const PRICE_OVERLAY_SUBMIT: &str = "/bss-pricing/v1/price-overlays/{overlayId}/submit";
@@ -158,9 +156,11 @@ pub struct CreateOverlayRequest {
     /// default.
     pub disclosure: Option<String>,
     /// Inclusive start of the overlay's own interval.
-    pub effective_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_from: Option<OffsetDateTime>,
     /// Exclusive end of it.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
     /// The plans the lines may target.
     pub target_plan_ids: Vec<Uuid>,
     /// The adjustment lines, whole. At least one (D-42).
@@ -191,7 +191,8 @@ pub struct OverlayLineRequest {
     pub target_sku: Option<String>,
     /// The grandfathered generation this line filters to (D-78). Requires
     /// `plan_id`.
-    pub cohort: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub cohort: Option<OffsetDateTime>,
     /// `markup | discount | fixed`.
     pub adjustment_kind: String,
     /// `percent_bp | amount`. **Declared, never inferred** (D-08).
@@ -213,17 +214,6 @@ pub struct AmountRequest {
     pub value_minor: i64,
 }
 
-/// `GET /bss-pricing/v1/price-overlays` — the query.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct ListOverlaysQuery {
-    /// Narrow to one scope class.
-    pub scope_class: Option<String>,
-    /// Rows per page; server default 100, hard cap 1,000 (D-125).
-    pub limit: Option<String>,
-    /// The opaque token a previous page returned (D-125).
-    pub cursor: Option<String>,
-}
-
 /// One overlay revision, as the read surface renders it.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request, response)]
@@ -237,12 +227,11 @@ pub struct OverlayView {
     ///
     /// **Without it the edit door was reachable from nowhere.** The tag was
     /// emitted at exactly two places, the create's `201` and the `PATCH`'s own
-    /// `200`; the create's *replay* deliberately omits it, this list emitted no
-    /// `ETag`, and there is no `GET …/price-overlays/{id}` — the `Location` the
-    /// create sets answers `405`. So a caller that lost the one-shot tag, and
-    /// whose overlay was then moved by anyone else, could construct no `If-Match`
-    /// that was not `409 STALE_VERSION`, and no request existed that would tell it
-    /// the current version.
+    /// `200`; the create's *replay* deliberately omits it and this list emits no
+    /// `ETag`. `GET …/price-overlays/{id}` is the reload: it answers the
+    /// authoring revision and the tag a subsequent `PATCH` must present. A
+    /// caller that lost the one-shot tag re-reads that path rather than paging
+    /// the tenant's overlay set.
     ///
     /// The three sibling lists carry their token on the page for this reason and
     /// say so — `windows.rs`'s `mutation_seq` (*"a caller that lists and then
@@ -268,9 +257,11 @@ pub struct OverlayView {
     /// Its exposure flag.
     pub disclosure: String,
     /// Inclusive start of its own interval.
-    pub effective_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_from: Option<OffsetDateTime>,
     /// Exclusive end of it.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
     /// The plans its lines may target.
     pub target_plan_ids: Vec<Uuid>,
     /// Its lines.
@@ -288,7 +279,8 @@ pub struct OverlayLineView {
     /// Its SKU narrowing.
     pub target_sku: Option<String>,
     /// The generation it filters to.
-    pub cohort: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub cohort: Option<OffsetDateTime>,
     /// `markup | discount | fixed`.
     pub adjustment_kind: String,
     /// `percent_bp | amount`.
@@ -621,7 +613,7 @@ async fn create_overlay(
     };
     let lines = lines_of(interval, &body.lines)?;
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = audit_stamp(&ctx, now, correlation);
     let target_ref = TargetRef {
         plans: body
@@ -794,7 +786,7 @@ async fn replace_lines(
     // interval check here would judge a value the request does not carry.
     let lines = lines_of(OverlayInterval::default(), &body.lines)?;
 
-    let stamp = audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp = audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let row_version = state
         .overlays
         .replace_lines(
@@ -953,7 +945,7 @@ async fn submit_overlay(
                 tenant,
                 crate::domain::publish::OverlayPublishUnit::new(price_overlay_id, record.revision),
                 authorization,
-                audit_stamp(&ctx, Utc::now(), correlation),
+                audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation),
             )
             .await?;
         return Ok((
@@ -998,7 +990,7 @@ async fn submit_overlay(
             &content,
             Uuid::now_v7(),
             stored_materiality,
-            audit_stamp(&ctx, Utc::now(), correlation),
+            audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation),
         )
         .await?;
 
@@ -1115,16 +1107,17 @@ pub struct SubmitOverlayRequest {
     pub revision: u64,
 }
 
+#[allow(clippy::implicit_hasher)]
 async fn list_overlays(
     Extension(state): Extension<Arc<AuthoringState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<ListOverlaysQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let tenant = ctx.subject_tenant_id();
-    // A **read**, and the PDP derives the scope from the subject: reads pass no
-    // owner tenant, so the returned scope is the SQL filter.
     let scope = crate::authz::access_scope(
         &enforcer,
         &ctx,
@@ -1136,83 +1129,78 @@ async fn list_overlays(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    let class = match query.scope_class.as_deref() {
-        None => None,
-        Some(token) => Some(ScopeClass::parse(token).ok_or_else(|| {
-            DomainError::InvalidRequest(format!("scope_class `{token}` is not a scope class"))
-        })?),
-    };
-
-    let limit = PageRequest::parse(cursor::parse_limit(query.limit.as_deref())?, None)?.limit;
-    let after = query
-        .cursor
-        .as_deref()
-        .map(cursor::decode_id_and_revision)
-        .transpose()?;
-    let page = (limit, after);
-    let page = PageRequestPair {
-        limit: page.0,
-        after: page.1,
-    };
-    // One row more than the page, so "is there another page" is answered without
-    // a second query and without a `next_cursor` pointing at nothing.
-    let probe = page.limit.saturating_add(1);
-    let mut overlays = state
+    let page = state
         .overlays
-        .list(&scope, tenant, class, page.after, probe)
+        .list_odata(&scope, tenant, &odata)
         .await
-        .map_err(|e| crate::infra::storage::repo_failure(&e))?;
-
-    let has_more = u64::try_from(overlays.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        overlays.pop();
-    }
-    let next = has_more
-        .then(|| {
-            overlays
-                .last()
-                .map(|row| (row.price_overlay_id, row.revision))
-        })
-        .flatten();
-
+        .map_err(map_odata_page_err)?;
     Ok(Json(OverlayListView {
-        overlays: overlays.iter().map(view_of).collect(),
-        page_info: cursor::revision_page_info(next, page.limit),
+        overlays: page.items.iter().map(view_of).collect(),
+        page_info: page.page_info,
     })
     .into_response())
+}
+
+/// `GET /price-overlays/{overlayId}` — the authoring revision.
+///
+/// Draft wins when one is open, else the published revision. Same rule as
+/// [`super::plans`]' `GET /plans/{planId}`: a caller editing an overlay is
+/// working on the draft, and a read that answered the published revision would
+/// hand them a body their next `PATCH` would not match. Abandoned-only, missing,
+/// or out of scope all read as 404 — one answer, so a 403 cannot confirm that
+/// a foreign tenant's overlay exists.
+///
+/// The gate is `price_overlay × read` with `owner_tenant_id = None`, so the PDP
+/// derives the scope from the subject; `resource_id` names this overlay.
+async fn get_overlay(
+    Extension(state): Extension<Arc<AuthoringState>>,
+    Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
+    extension_ctx: Option<Extension<SecurityContext>>,
+    Path(price_overlay_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Response, CanonicalError> {
+    let ctx = require_authenticated(extension_ctx)?;
+    let scope = crate::authz::access_scope(
+        &enforcer,
+        &ctx,
+        &crate::authz::resource_types::PRICE_OVERLAY,
+        crate::authz::actions::READ,
+        /* owner_tenant_id */ None,
+        /* resource_id */ Some(crate::authz::ResourceRef(price_overlay_id)),
+    )
+    .await
+    .map_err(authz_error_to_canonical)?;
+
+    let tenant = ctx.subject_tenant_id();
+    let record = state
+        .overlays
+        .authoring(&scope, tenant, price_overlay_id)
+        .await
+        .map_err(|e| crate::infra::storage::repo_failure(&e))?
+        .ok_or_else(|| CanonicalError::from(not_readable(price_overlay_id)))?;
+
+    let view = view_of(&record);
+    let tag = preconditions::revision_etag(
+        view.revision,
+        crate::domain::concurrency::RowVersion::new(view.row_version),
+    );
+    if preconditions::if_none_match(&headers, &tag) {
+        return Ok(preconditions::not_modified(&tag));
+    }
+    Ok(([(ETAG, tag)], Json(view)).into_response())
+}
+
+/// The "absent, or not yours, or holding nothing an author can act on" refusal.
+fn not_readable(price_overlay_id: Uuid) -> DomainError {
+    DomainError::NotFound {
+        subject: "price overlay".to_owned(),
+        id: price_overlay_id.to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The router.
 // ---------------------------------------------------------------------------
-
-/// The list read's own narrowing parameter.
-///
-/// Declared because [`ListOverlaysQuery`] reads it: a query parameter a handler
-/// honours and the document does not name is one a generated client cannot send,
-/// and a caller who cannot narrow pages the tenant's whole overlay set at D-125's
-/// default. The page pair beside it is `history`'s, spelled once for the gear.
-fn scope_class_param() -> ParamSpec {
-    ParamSpec {
-        name: "scope_class".to_owned(),
-        location: ParamLocation::Query,
-        required: false,
-        description: Some(
-            "Narrow to one of L2's scope classes, by its `snake_case` token as the overlay's own \
-             `scope_class` field carries it. Absent returns every class. An unknown token is \
-             refused `400` rather than silently ignored: a filter that quietly matched everything \
-             would answer a narrowed question with the whole set. The classes are not enumerated \
-             here - D-120 added two after this surface was written, and a list beside a \
-             vocabulary leaves only one of the two true."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
-}
 
 /// Mount the overlay authoring routes.
 pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Router {
@@ -1258,22 +1246,22 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .summary("List PriceOverlays")
         .description(
             "The admin and Tariffs read. Returns **every** revision, draft included, optionally \
-             narrowed to one `scope_class`, and paginated on an opaque cursor per D-125. Ordered \
-             by overlay id then revision - the cursor's own key and **not** precedence order: a \
-             keyset walk has to be ordered by the key its cursor names. Every row carries its \
-             `precedence`, so a caller assembling a stack reads it from the row rather than from \
-             the sequence. It does **not** filter on `disclosure`: L6 governs consumer-facing \
-             exposure and section 3 step 7 is explicit that operator and service reads are \
-             unaffected, so a `restricted` overlay is still its author's to read. Gates on \
-             `price_overlay` x `read`.",
+             narrowed with `$filter=scope_class eq 'global'`, and paginated on an opaque cursor \
+             per D-125. Default order is `price_overlay_id` then `revision` - the seekset \
+             tiebreaker. Every row carries its `precedence`, so a caller assembling a stack \
+             reads it from the row rather than from the sequence. It does **not** filter on \
+             `disclosure`: L6 governs consumer-facing exposure and section 3 step 7 is explicit \
+             that operator and service reads are unaffected, so a `restricted` overlay is still \
+             its author's to read. Gates on `price_overlay` x `read`.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
         .param(crate::api::rest::history::limit_param())
         .param(crate::api::rest::history::cursor_param())
-        .param(scope_class_param())
         .handler(list_overlays)
+        .with_odata_filter::<OverlayFilterField>()
+        .with_odata_orderby::<OverlayFilterField>()
         .json_response_with_schema::<OverlayListView>(
             openapi,
             StatusCode::OK,
@@ -1282,6 +1270,42 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    let router = OperationBuilder::get(PRICE_OVERLAY_BY_ID)
+        .operation_id("bss_pricing.get_price_overlay")
+        .summary("Read a PriceOverlay's authoring revision")
+        .description(
+            "Returns the overlay's **open draft** revision when it has one, and its **published** \
+             revision otherwise, with its whole line set. This is the authoring read \
+             (`price_overlay` x `read`); `lifecycle_state` and `revision` name which revision \
+             was answered, so a caller never infers it. The `ETag` header carries \
+             `\"<revision>-<row_version>\"` and is what `PATCH` takes as `If-Match`. An overlay \
+             outside the caller's scope reads exactly like an absent one (404, no existence \
+             leak). The create's `Location` is this path.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("overlayId", "The overlay to read.")
+        .param(crate::api::rest::plans::if_none_match_param())
+        .handler(get_overlay)
+        .json_response_with_schema::<OverlayView>(
+            openapi,
+            StatusCode::OK,
+            "The overlay's open draft revision, or its published revision.",
+        )
+        .no_content_response(
+            StatusCode::NOT_MODIFIED,
+            "The caller's `If-None-Match` matches the current representation, so the body is \
+             not re-sent.",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);

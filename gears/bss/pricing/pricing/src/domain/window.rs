@@ -64,11 +64,12 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::scope_key::ScopeKey;
+use time::OffsetDateTime;
 
 /// A scheduled or adjusted window intersects one already on the same canonical
 /// scope key (§5, **409**).
@@ -286,9 +287,9 @@ impl fmt::Display for WindowState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WindowInterval {
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended (`inst-ws-expire`).
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// Where the window stands in §4's machine.
     pub state: WindowState,
 }
@@ -297,8 +298,8 @@ impl WindowInterval {
     /// Name an interval.
     #[must_use]
     pub const fn new(
-        effective_from: DateTime<Utc>,
-        effective_to: Option<DateTime<Utc>>,
+        effective_from: OffsetDateTime,
+        effective_to: Option<OffsetDateTime>,
         state: WindowState,
     ) -> Self {
         Self {
@@ -323,7 +324,7 @@ impl WindowInterval {
     /// consumers of pure containment (the coverage walk, `inst-el-bootstrap`'s
     /// generation match) unable to ask the question they actually have.
     #[must_use]
-    pub fn covers(&self, at: DateTime<Utc>) -> bool {
+    pub fn covers(&self, at: OffsetDateTime) -> bool {
         self.effective_from <= at && self.effective_to.is_none_or(|end| at < end)
     }
 
@@ -335,7 +336,7 @@ impl WindowInterval {
 
     /// Has `effective_from` arrived — `inst-ws-activate`'s trigger condition?
     #[must_use]
-    pub fn has_started(&self, now: DateTime<Utc>) -> bool {
+    pub fn has_started(&self, now: OffsetDateTime) -> bool {
         now >= self.effective_from
     }
 
@@ -346,7 +347,7 @@ impl WindowInterval {
     /// coverage simply stopped fails closed downstream rather than falling back to
     /// anything.
     #[must_use]
-    pub fn is_due_to_expire(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_due_to_expire(&self, now: OffsetDateTime) -> bool {
         self.effective_to.is_some_and(|end| now >= end)
     }
 
@@ -368,8 +369,8 @@ impl WindowInterval {
 /// the form a creation check needs, which has two instants and no row.
 #[must_use]
 pub fn interval_is_non_empty(
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
 ) -> bool {
     effective_to.is_none_or(|end| end > effective_from)
 }
@@ -478,9 +479,9 @@ impl fmt::Display for WindowRefusal {
 /// [`DomainError::InvalidRequest`] when `effective_to <= effective_from`;
 /// [`DomainError::WindowStartInPast`] when the start is not strictly future.
 pub fn check_creation(
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     if !interval_is_non_empty(effective_from, effective_to) {
         return Err(empty_interval(effective_from, effective_to));
@@ -491,8 +492,8 @@ pub fn check_creation(
     Err(WindowRefusal::StartInPast.refuse(format!(
         "effectiveFrom {} is not strictly after {}; a window's start must be in \
          the future at creation",
-        effective_from.to_rfc3339(),
-        now.to_rfc3339()
+        format_rfc3339(effective_from),
+        format_rfc3339(now)
     )))
 }
 
@@ -556,10 +557,10 @@ pub enum FrozenEnd {
     TerminalState(WindowState),
     /// The **stored** end has already passed at `now`, so moving it in either
     /// direction rewrites what was chargeable. Carries the end that passed.
-    StoredEndPassed(DateTime<Utc>),
+    StoredEndPassed(OffsetDateTime),
     /// The **target** end is not strictly after `now`, which would make the move a
     /// retroactive reprice rather than a schedule. Carries the target.
-    TargetNotFuture(DateTime<Utc>),
+    TargetNotFuture(OffsetDateTime),
 }
 
 /// `inst-ws-immutable`'s three grounds, as one total function — `None` when the
@@ -589,8 +590,8 @@ pub enum FrozenEnd {
 #[must_use]
 pub fn frozen_end(
     current: &WindowInterval,
-    to: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    to: Option<OffsetDateTime>,
+    now: OffsetDateTime,
 ) -> Option<FrozenEnd> {
     if current.state.is_terminal() {
         return Some(FrozenEnd::TerminalState(current.state));
@@ -620,8 +621,8 @@ pub fn frozen_end(
 /// [`DomainError::WindowHistoricalImmutable`] for each of [`frozen_end`]'s grounds.
 pub fn check_effective_to_adjustment(
     current: &WindowInterval,
-    to: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    to: Option<OffsetDateTime>,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     if let Some(ground) = frozen_end(current, to, now) {
         return Err(WindowRefusal::HistoricalImmutable.refuse(match ground {
@@ -630,13 +631,13 @@ pub fn check_effective_to_adjustment(
             }
             FrozenEnd::StoredEndPassed(stored) => format!(
                 "effectiveTo {} has already passed at {}; only a future end may be moved",
-                stored.to_rfc3339(),
-                now.to_rfc3339()
+                format_rfc3339(stored),
+                format_rfc3339(now)
             ),
             FrozenEnd::TargetNotFuture(target) => format!(
                 "effectiveTo {} is not after {}; an end may only be moved to a future instant",
-                target.to_rfc3339(),
-                now.to_rfc3339()
+                format_rfc3339(target),
+                format_rfc3339(now)
             ),
         }));
     }
@@ -670,7 +671,7 @@ pub fn check_effective_to_adjustment(
 /// nothing about the coverage the key is left with, which is `inst-fg-trailing`'s and
 /// ranges over every window of the key rather than this one.
 #[must_use]
-pub fn shortens(current: &WindowInterval, to: Option<DateTime<Utc>>) -> bool {
+pub fn shortens(current: &WindowInterval, to: Option<OffsetDateTime>) -> bool {
     match (current.effective_to, to) {
         // An open-ended window bounded anywhere loses its whole tail; open-ended
         // either side of the move loses nothing.
@@ -736,14 +737,14 @@ pub fn transition(from: WindowState, to: WindowState) -> Result<(), DomainError>
 /// which is pairing each of the four rejections with the one code §5 declares for
 /// it; [`WindowRefusal::refuse`] is where it becomes the ladder's value.
 fn empty_interval(
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
 ) -> DomainError {
     DomainError::InvalidRequest(format!(
         "the window interval [{}, {}) is empty; effectiveTo must be strictly after \
          effectiveFrom",
-        effective_from.to_rfc3339(),
-        effective_to.map_or_else(|| "open-ended".to_owned(), |to| to.to_rfc3339())
+        format_rfc3339(effective_from),
+        effective_to.map_or_else(|| "open-ended".to_owned(), format_rfc3339)
     ))
 }
 
@@ -806,7 +807,7 @@ impl KeyWindows {
     /// about the data.
     #[must_use]
     pub fn coverage_end(&self) -> CoverageEnd {
-        let mut end: Option<DateTime<Utc>> = None;
+        let mut end: Option<OffsetDateTime> = None;
         for interval in self
             .intervals
             .iter()
@@ -854,7 +855,7 @@ impl KeyWindows {
     /// asked. Two rosters for two sentences, exactly as `COVERING_STATES`' own doc
     /// argues against deriving itself from `OCCUPYING_STATES`.
     #[must_use]
-    pub fn covers_at(&self, at: DateTime<Utc>) -> bool {
+    pub fn covers_at(&self, at: OffsetDateTime) -> bool {
         self.intervals
             .iter()
             .filter(|i| i.state != WindowState::Cancelled)
@@ -915,9 +916,9 @@ impl KeyWindows {
     #[must_use]
     pub fn first_uncovered_from(
         &self,
-        from: DateTime<Utc>,
-        until: Option<DateTime<Utc>>,
-    ) -> Option<DateTime<Utc>> {
+        from: OffsetDateTime,
+        until: Option<OffsetDateTime>,
+    ) -> Option<OffsetDateTime> {
         let mut covered_through = from;
         // Sorted here rather than trusted; see the doc. `effective_to` is the
         // second component so that two intervals sharing a start are walked
@@ -949,7 +950,7 @@ impl KeyWindows {
 
 /// Where a canonical scope key's coverage stops.
 ///
-/// **Three arms and not `Option<DateTime<Utc>>`**, which is a divergence from the
+/// **Three arms and not `Option<OffsetDateTime>`**, which is a divergence from the
 /// signature the phase plan sketches for `KeyCoverage::coverage_end` and is worth
 /// the words. `Option` has to spend its `None` on one of two answers that are
 /// **opposites** under the D-80 horizon predicate: a key covered forever passes
@@ -963,7 +964,7 @@ pub enum CoverageEnd {
     /// instant and no publish should have frozen it.
     Uncovered,
     /// Coverage runs to this exclusive instant.
-    Ends(DateTime<Utc>),
+    Ends(OffsetDateTime),
     /// An open-ended window covers every instant from its start onward.
     OpenEnded,
 }
@@ -985,7 +986,7 @@ impl CoverageEnd {
     /// convenience and not the type: a caller that branches on nothing but this
     /// has the ambiguity back.
     #[must_use]
-    pub const fn at(self) -> Option<DateTime<Utc>> {
+    pub const fn at(self) -> Option<OffsetDateTime> {
         match self {
             Self::Ends(at) => Some(at),
             Self::Uncovered | Self::OpenEnded => None,

@@ -11,9 +11,10 @@ use bss_rate_provider_sdk::error::map_http_error;
 use bss_rate_provider_sdk::fetch::fetch_and_parse;
 use bss_rate_provider_sdk::metrics::SharedFetchMetrics;
 use bss_rate_provider_sdk::publication_time::reject_future_publication_time;
-use chrono::{DateTime, Utc};
 use secrecy::ExposeSecret;
 use serde_json::Value;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use toolkit_http::{HttpClient, RequestBuilder};
 use toolkit_security::SecurityContext;
 
@@ -65,7 +66,7 @@ pub fn map_json_document(
         .ok_or_else(|| {
             RateProviderError::Internal(format!("as_of path '{}' missing", mapping.as_of))
         })?;
-    let as_of: DateTime<Utc> = as_of_raw.parse().map_err(|e| {
+    let as_of = OffsetDateTime::parse(as_of_raw, &Rfc3339).map_err(|e| {
         RateProviderError::Internal(format!("as_of '{as_of_raw}' not RFC3339: {e}"))
     })?;
     let rates_obj = json_lookup(body, &mapping.rates)
@@ -110,7 +111,7 @@ fn map_entry(
     entry: &Value,
     mapping: &Mapping,
     base: &str,
-    as_of: DateTime<Utc>,
+    as_of: OffsetDateTime,
     provider: &str,
 ) -> Option<ProviderRate> {
     let normalized_quote = normalize_currency(quote).or_else(|| {
@@ -244,9 +245,13 @@ impl RateProviderV1 for HttpJsonRateProvider {
             // staleness rule; rejecting also lets the composite fall through to
             // the next source instead of storing the bad value.
             if let Some(first) = rates.first() {
-                reject_future_publication_time(first.as_of, Utc::now(), &self.settings.id)?;
+                reject_future_publication_time(
+                    first.as_of,
+                    OffsetDateTime::now_utc(),
+                    &self.settings.id,
+                )?;
             }
-            let as_of_unix = rates.first().map_or(0, |r| r.as_of.timestamp());
+            let as_of_unix = rates.first().map_or(0, |r| r.as_of.unix_timestamp());
             if !pairs.is_empty() {
                 // Case-insensitive, matching the ECB source: both sit behind the
                 // same `CompositeRateProvider`, so a caller passing "usd" must

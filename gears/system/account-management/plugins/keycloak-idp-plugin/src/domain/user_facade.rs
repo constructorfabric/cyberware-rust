@@ -317,7 +317,8 @@ enum StringMatchOp {
 /// evaluated over each KC-fetched member. Mirrors the operator subset
 /// the `/users` list contract supports: `and` / `or` of `eq` /
 /// `contains` clauses on the string fields (`username` / `email` /
-/// `first_name` / `last_name` / `display_name`).
+/// `first_name` / `last_name` / `display_name`), and exact typed UUID sets
+/// (`id in (...)`) at any supported nesting level.
 ///
 /// `id eq <uuid>` is captured separately by
 /// [`UserFacade::extract_id_filter`]; inside a top-level `and` it
@@ -331,6 +332,8 @@ enum StringMatchOp {
 enum StringMatcher {
     #[default]
     Always,
+    /// Exact typed ID set, evaluated in place even inside a composite filter.
+    IdSet(std::collections::BTreeSet<Uuid>),
     Field {
         field: IdpUserFilterField,
         op: StringMatchOp,
@@ -349,6 +352,7 @@ impl StringMatcher {
     fn matches(&self, rep: &UserRep) -> bool {
         match self {
             StringMatcher::Always => true,
+            StringMatcher::IdSet(ids) => ids.contains(&rep.id),
             StringMatcher::All(children) => children.iter().all(|c| c.matches(rep)),
             StringMatcher::Any(children) => children.iter().any(|c| c.matches(rep)),
             StringMatcher::Field { field, op, needle } => {
@@ -379,6 +383,13 @@ impl StringMatcher {
     fn feed_hash(&self, state: &mut u64) {
         match self {
             StringMatcher::Always => fnv1a_update(state, [0u8]),
+            StringMatcher::IdSet(ids) => {
+                fnv1a_update(state, [4u8]);
+                fnv1a_update(state, ids.len().to_be_bytes());
+                for id in ids {
+                    fnv1a_update(state, id.as_bytes());
+                }
+            }
             StringMatcher::Field { field, op, needle } => {
                 let field_tag: u8 = match field {
                     IdpUserFilterField::Id => 0,
@@ -1196,8 +1207,8 @@ impl UserFacade {
 
     // TODO(admin-bind follow-up): the `order` clause is still dropped in
     // favour of the hard-coded `(createdTimestamp ASC, id ASC)` cursor
-    // sort, and the v1 client-side filter strategy fetches a single
-    // page from KC's `/groups/{tenant_group_id}/members` endpoint
+    // sort, and the v1 client-side filter strategy drains bounded
+    // pages from KC's `/groups/{tenant_group_id}/members` endpoint
     // (which has no search params) and post-filters. That is correct
     // for small/medium tenants but doesn't scale to "find one user in
     // a tenant with 100k members". Larger follow-up: (a) switch to
@@ -1208,7 +1219,8 @@ impl UserFacade {
     // field×op×order×pagination shapes. The wire-contract bug
     // (string-field filters returning the full user set) is closed by
     // [`Self::build_string_matcher`] + the post-id-filter retain
-    // below — `InList`/`not`/`ne`/`startswith`/`endswith`/non-string
+    // below. Typed UUID `id in (...)` supports batch lookup; other
+    // `InList`/`not`/`ne`/`startswith`/`endswith`/invalid literal
     // shapes (and `id eq` inside `or`) surface `UnsupportedOperation`
     // (HTTP 501) instead of silently dropping the filter clause.
     async fn list_users_impl(
@@ -1224,8 +1236,8 @@ impl UserFacade {
         // ---- Step 3: decode + validate the inbound cursor (if any). ----
         let tenant_id = req.tenant_context.tenant_id;
         let id_filter = Self::extract_id_filter(req.filter.as_ref());
-        // Lower the string half of the filter into a predicate (`eq` /
-        // `contains` / `and` / `or`). Unsupported operators (`ne`, `in`,
+        // Lower string clauses and typed UUID ID sets into a predicate.
+        // Unsupported operators (`ne`, non-ID `in`,
         // `not`, `startswith`, …, or `id eq` inside `or`) surface as
         // `UnsupportedOperation` → 501 BEFORE any KC call, distinct from
         // a 200-with-unfiltered-set false-success.
@@ -1327,9 +1339,11 @@ impl UserFacade {
                                     drained = all.len(),
                                     cap = MEMBERS_DRAIN_HARD_CAP,
                                     "list_users: tenant group membership exceeds drain \
-                                     hard-cap; returning a truncated member set"
+                                     hard-cap before complete enumeration; refusing an incomplete result"
                                 );
-                                break;
+                                return Err(PluginError::UserOpUnavailable {
+                                    detail: "tenant membership enumeration exceeded its safety limit".into(),
+                                });
                             }
                             offset = offset.saturating_add(page_size);
                         }
@@ -1682,6 +1696,7 @@ impl UserFacade {
     ///   * `<string_field> eq '<literal>'` — exact, case-sensitive
     ///   * `<string_field> contains '<literal>'` — substring, case-insensitive
     ///   * `<a> and <b> …`, `<a> or <b> …` — nested freely
+    ///   * `id in (<uuid>, …)` — exact UUID set, including under `and` / `or`
     ///   * `id eq <uuid>` — captured by [`Self::extract_id_filter`];
     ///     inside a top-level `and` it lowers to
     ///     [`StringMatcher::Always`] here.
@@ -1690,10 +1705,10 @@ impl UserFacade {
     /// `last_name` / `display_name`.
     ///
     /// Unsupported shapes surface as [`PluginError::UserOpUnsupported`]
-    /// (HTTP 501): operators other than `eq` / `contains` / `and` /
-    /// `or` (`ne`, `in`, `not`, `startswith`, `endswith`, comparisons),
-    /// a non-string literal on a field, or an `id` clause nested inside
-    /// an `or` (the id half cannot be hoisted out of a disjunction).
+    /// (HTTP 501): operators other than the shapes above (`ne`, non-ID `in`,
+    /// `not`, `startswith`, `endswith`, comparisons), a literal of the wrong
+    /// type, or `id eq` nested inside an `or` (the equality half cannot be
+    /// hoisted out of a disjunction).
     /// `None` (no `$filter`) lowers to [`StringMatcher::Always`].
     fn build_string_matcher(
         filter: Option<&FilterNode<IdpUserFilterField>>,
@@ -1782,6 +1797,21 @@ impl UserFacade {
                      supported: `and`, `or`"
                 ),
             }),
+            FilterNode::InList {
+                field: IdpUserFilterField::Id,
+                values,
+            } => {
+                let ids = values
+                    .iter()
+                    .map(|value| match value {
+                        ODataValue::Uuid(id) => Ok(*id),
+                        _ => Err(PluginError::UserOpUnsupported {
+                            detail: "id-set lookup requires UUID literals".into(),
+                        }),
+                    })
+                    .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+                Ok(StringMatcher::IdSet(ids))
+            }
             FilterNode::InList { .. } => Err(PluginError::UserOpUnsupported {
                 detail: "operator `in` not supported on /users filter".into(),
             }),

@@ -63,13 +63,16 @@
 //! dependency is what matters — a route may name an engine type, and `DE0202`
 //! refuses the reverse, which is how the first draft of D-270 was caught.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Query};
 use axum::{Json, Router, http::StatusCode};
+use bss_pricing_sdk::odata::HistoryFilterField;
 use serde::Deserialize;
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamLocation, ParamSpec};
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -77,7 +80,9 @@ use uuid::Uuid;
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::cursor;
 use crate::api::rest::error::authz_error_to_canonical;
-use crate::infra::history::{HistoryExporter, HistoryPage, HistoryPageRequest};
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
+use crate::domain::instant::format_rfc3339;
+use crate::infra::history::{HistoryEntry, HistoryExporter, HistoryPage, HistoryPageRequest};
 
 const TAG: &str = "BSS Pricing History";
 
@@ -155,28 +160,28 @@ pub struct HistoryPageView {
 impl From<HistoryPage> for HistoryPageView {
     fn from(page: HistoryPage) -> Self {
         Self {
-            entries: page
-                .entries
-                .iter()
-                .map(|entry| HistoryEntryView {
-                    price_id: entry.record.price_id,
-                    plan_id: entry.record.scope_key.plan_id().get(),
-                    lifecycle_state: entry.record.lifecycle_state.as_str().to_owned(),
-                    actor: entry.actor().to_string(),
-                    authored_at: entry.record.created_at_utc.to_rfc3339(),
-                    effective: entry
-                        .effective
-                        .iter()
-                        .map(|interval| EffectiveIntervalView {
-                            from: interval.from.to_rfc3339(),
-                            to: interval.to.map(|to| to.to_rfc3339()),
-                            state: interval.state.as_str().to_owned(),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            entries: page.entries.iter().map(history_entry_view).collect(),
             next_cursor: page.next.map(crate::infra::history::encode),
         }
+    }
+}
+
+fn history_entry_view(entry: &HistoryEntry) -> HistoryEntryView {
+    HistoryEntryView {
+        price_id: entry.record.price_id,
+        plan_id: entry.record.scope_key.plan_id().get(),
+        lifecycle_state: entry.record.lifecycle_state.as_str().to_owned(),
+        actor: entry.actor().to_string(),
+        authored_at: format_rfc3339(entry.record.created_at_utc),
+        effective: entry
+            .effective
+            .iter()
+            .map(|interval| EffectiveIntervalView {
+                from: format_rfc3339(interval.from),
+                to: interval.to.map(format_rfc3339),
+                state: interval.state.as_str().to_owned(),
+            })
+            .collect(),
     }
 }
 
@@ -213,9 +218,9 @@ pub(crate) fn cursor_param() -> ParamSpec {
         location: ParamLocation::Query,
         required: false,
         description: Some(
-            "The opaque token the previous page returned as `next_cursor`. Opaque by contract: \
-             a token a caller can read is a token a caller will construct, and then the walk's \
-             ordering guarantee is whatever that caller assumed."
+            "The opaque token this same operation returned as `next_cursor`. GET history and \
+             GET audit mint an OData CursorV1; POST history/export mints the history-engine \
+             token. The two encodings are not interchangeable."
                 .to_owned(),
         ),
         param_type: "string".to_owned(),
@@ -255,6 +260,8 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .param(limit_param())
         .param(cursor_param())
         .handler(read_history)
+        .with_odata_filter::<HistoryFilterField>()
+        .with_odata_orderby::<HistoryFilterField>()
         .json_response_with_schema::<HistoryPageView>(
             openapi,
             StatusCode::OK,
@@ -272,7 +279,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_pricing.export_price_history")
         .summary("Export immutable price history in bounded chunks")
         .description(
-            "Streams the tenant's price history in the same commit order the interactive read serves, in bounded chunks: one call returns one chunk and the token for the next, and a client walks the token to the end of the history. Identical records, identical order, identical cursor - the only difference is the chunk size a caller asks for, which is what the SLO is stated per (p95 <= 5s per 100 records, scaling linearly to the D-125 hard cap of 1,000). That is why this is a separate surface rather than a larger `limit` on the read: a full 1,000-row page is budgeted at 50s and is an export shape, never an interactive read, so the read keeps the server default of 100 and this is where a caller asks for more. It adds no store - the Foundation's immutability IS the history (`inst-he-nostore`), so an export is a read and produces no job, no file and no artifact to collect later. Gates on `audit` x `export` (D-12): bulk extraction of a seven-year actor trail is grantable separately from reading it, which is the whole reason the action exists beside `audit` x `read`.",
+            "Streams the tenant's price history in the same commit order the interactive read serves, in bounded chunks: one call returns one chunk and the token for the next, and a client walks the token to the end of the history. Identical records and identical order; the cursor is this surface's history-engine token, not the OData CursorV1 GET /history mints, and the two are not interchangeable. The remaining difference is the chunk size a caller asks for, which is what the SLO is stated per (p95 <= 5s per 100 records, scaling linearly to the D-125 hard cap of 1,000). That is why this is a separate surface rather than a larger `limit` on the read: a full 1,000-row page is budgeted at 50s and is an export shape, never an interactive read, so the read keeps the server default of 100 and this is where a caller asks for more. It adds no store - the Foundation's immutability IS the history (`inst-he-nostore`), so an export is a read and produces no job, no file and no artifact to collect later. Gates on `audit` x `export` (D-12): bulk extraction of a seven-year actor trail is grantable separately from reading it, which is the whole reason the action exists beside `audit` x `read`.",
         )
         .tag(TAG)
         .authenticated()
@@ -305,13 +312,16 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
 /// subject and its roles rather than trusting a caller-supplied tenant, and the
 /// compiled scope becomes the SQL filter. `require_constraints = true` so an
 /// unconstrained allow fails closed instead of exposing every tenant's history.
+#[allow(clippy::implicit_hasher)]
 async fn read_history(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<HistoryQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Json<HistoryPageView>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let scope = crate::authz::access_scope(
         &enforcer,
         &ctx,
@@ -328,27 +338,16 @@ async fn read_history(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    // Parsed after the gate, for `plans.rs`'s stated reason: a module doc
-    // asserting "the gate before the request" reads as two disciplines if two
-    // modules order it differently.
-    let request = HistoryPageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )
-    .map_err(CanonicalError::from)?;
-
-    let page = state
+    let (entries, next_cursor) = state
         .history
-        .read_page(&scope, ctx.subject_tenant_id(), request)
+        .read_odata(&scope, ctx.subject_tenant_id(), &odata)
         .await
-        // Through the gear's single authoritative ladder rather than a mapping
-        // invented here: `infra::storage::repo_failure` already decides what a
-        // storage failure means — it is the only conversion, there is no
-        // `From<RepoError>` impl to reach for — and forking it per handler is how
-        // two surfaces start disagreeing about the same failure.
-        .map_err(|e| CanonicalError::from(crate::infra::storage::repo_failure(&e)))?;
+        .map_err(map_odata_page_err)?;
 
-    Ok(Json(HistoryPageView::from(page)))
+    Ok(Json(HistoryPageView {
+        entries: entries.iter().map(history_entry_view).collect(),
+        next_cursor,
+    }))
 }
 
 /// `POST /history/export`: one chunk of the caller tenant's price history
@@ -360,8 +359,15 @@ async fn read_history(
 /// `inst-he-export` describes the same order in bounded chunks and differs only
 /// in the page size a caller asks for. Two types would be two walk orders free to
 /// disagree, over a store whose whole claim is that the sequence of rows is the
-/// truth."* So this handler is [`read_history`] with a different gate, and the
-/// only thing that differs on the wire is which permission it asks for.
+/// truth."* So this handler is [`read_history`] with a different gate over the
+/// same walk order.
+///
+/// The permission is not the only thing that differs on the wire, though, and
+/// [`cursor_param`] is the one that says so: this route mints the
+/// history-engine token from [`HistoryPageRequest`], while `GET /history` mints
+/// an `OData` `CursorV1`. Same order, same rows, two encodings — a token from one
+/// route does not decode on the other, which is a `400` rather than a silently
+/// wrong page. One shared engine was the claim; one shared cursor never was.
 ///
 /// # `POST` with no body, and the two parameters in the query
 ///

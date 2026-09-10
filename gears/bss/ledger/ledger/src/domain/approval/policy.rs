@@ -5,10 +5,11 @@
 //! USD-equivalent (computed with the *operation's own* rate snapshot, DC10) and
 //! the current date, so the whole module is deterministic and unit-testable.
 
-use chrono::{DateTime, Datelike, NaiveDate, Utc, Weekday};
+use chrono::{Datelike, NaiveDate, Weekday};
 use toolkit_macros::domain_model;
 
 use super::ApprovalKind;
+use time::OffsetDateTime;
 
 /// Ratified platform defaults applied when a tenant has no policy row:
 /// D2 = 1000 USD (scale 2) = `100_000` minor (DECISIONS D-1); A6 = 5 business days
@@ -46,7 +47,7 @@ impl DualControlPolicy {
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyVersion {
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     pub version: i64,
     pub policy: DualControlPolicy,
 }
@@ -96,7 +97,7 @@ pub struct OperationFacts {
 /// provenance the read surface renders — [`resolve_policy`] keeps only the
 /// resolved thresholds.
 #[must_use]
-pub fn effective_version(versions: &[PolicyVersion], now: DateTime<Utc>) -> Option<PolicyVersion> {
+pub fn effective_version(versions: &[PolicyVersion], now: OffsetDateTime) -> Option<PolicyVersion> {
     versions
         .iter()
         .filter(|v| v.effective_from <= now)
@@ -112,7 +113,7 @@ pub fn effective_version(versions: &[PolicyVersion], now: DateTime<Utc>) -> Opti
 /// `effective_from <= now`, highest `version` on a tie; the ratified defaults
 /// when none applies.
 #[must_use]
-pub fn resolve_policy(versions: &[PolicyVersion], now: DateTime<Utc>) -> DualControlPolicy {
+pub fn resolve_policy(versions: &[PolicyVersion], now: OffsetDateTime) -> DualControlPolicy {
     effective_version(versions, now).map_or(DualControlPolicy::DEFAULT, |v| v.policy)
 }
 

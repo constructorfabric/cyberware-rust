@@ -7,7 +7,7 @@
 //! This is a claim about *this table's layout*, not about the axis count (D-289).
 //!
 //! `cohort` is a `String` holding the domain token (`none`, or the cutover
-//! instant) rather than an `Option<DateTime<Utc>>`, because it is a column of a
+//! instant) rather than an `Option<OffsetDateTime>`, because it is a column of a
 //! partial `UNIQUE` index and distinct `NULL`s do not collide.
 //!
 //! Money is integer minor units. `amount_minor` is nullable because its
@@ -27,7 +27,8 @@
 //! content that cannot change needs no new entity tag. The migration's module
 //! doc records why the column exists at all, which Foundation §3.7 omits to say.
 
-use chrono::{DateTime, Utc};
+
+use time::OffsetDateTime;
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
@@ -173,14 +174,14 @@ pub struct Model {
     pub rounding_policy_ref: Option<String>,
     /// Grandfathering horizon. Monotonically tightenable only; the table
     /// trigger rejects loosening it.
-    pub grandfather_until: Option<DateTime<Utc>>,
+    pub grandfather_until: Option<OffsetDateTime>,
     /// Set on a successor row; it is what gives the supersession unit guard its
     /// comparison referent (D-127).
     pub supersedes_price_id: Option<Uuid>,
     pub lifecycle_state: String,
     /// Pseudonymous authoring principal (the Slice-12 history-export actor).
     pub created_by: Uuid,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// The `ETag` / optimistic-concurrency row version. The storage spelling of
     /// [`crate::domain::concurrency::RowVersion`], which is the one place that
     /// renders it as an entity tag and parses one back.

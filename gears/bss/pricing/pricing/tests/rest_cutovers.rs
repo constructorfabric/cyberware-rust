@@ -25,17 +25,19 @@ use axum::http::StatusCode;
 use bss_pricing::api::rest::cutovers::PLAN_CUTOVERS;
 use bss_pricing::domain::approval::{DecisionBy, WithdrawAuthority};
 use bss_pricing::infra::approval::{DecideRequest, RegionGrant};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use rest_support::{
     Harness, Publishable, audit_rows, body_json, problem_code, request, seed_publishable_plan,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const SUBMITTER: Uuid = Uuid::from_u128(0x_5d_11);
 const REVIEWER: Uuid = Uuid::from_u128(0x_5d_22);
 
-fn cutover_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn cutover_at() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 fn path(plan_id: Uuid) -> String {
@@ -45,7 +47,9 @@ fn path(plan_id: Uuid) -> String {
 fn cutover_body(predecessor: Uuid, amount: i64) -> serde_json::Value {
     serde_json::json!({
         "predecessor_price_id": predecessor.to_string(),
-        "cutover_at": cutover_at(),
+        "cutover_at": cutover_at()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339"),
         "successor": {
             "model_kind": "flat",
             "amount_minor": amount,
@@ -91,10 +95,10 @@ async fn approve(h: &Harness, approval_id: Uuid) {
                     // A fixed instant, not the wall clock. This suite's whole
                     // premise is that every instant sits in 2099, and the approve is
                     // the step that makes the commit arm reachable - so a
-                    // `Utc::now()` here put a 2026 stamp inside the sequence the
+                    // `OffsetDateTime::now_utc()` here put a 2026 stamp inside the sequence the
                     // module doc says is entirely in 2099, and nothing could assert
                     // the decision instant.
-                    recorded_at: cutover_at() - chrono::Duration::days(1),
+                    recorded_at: cutover_at() - time::Duration::days(1),
                     correlation_id: Uuid::from_u128(0x_5d_c0),
                 },
                 withdraw_authority: WithdrawAuthority::OwnUnitsOnly,
@@ -310,7 +314,11 @@ async fn a_dormant_instant_is_refused_by_its_own_code() {
 
     let mut body = cutover_body(seeded.price_id, 12_000);
     // Past the fixture's coverage window entirely.
-    body["cutover_at"] = serde_json::json!(Utc.with_ymd_and_hms(2099, 12, 1, 0, 0, 0).unwrap());
+    body["cutover_at"] = serde_json::json!(
+        utc_ymd_hms(2099, 12, 1, 0, 0, 0)
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339")
+    );
 
     let response = h
         .allowed_as(SUBMITTER)

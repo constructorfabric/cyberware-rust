@@ -39,7 +39,7 @@ use toolkit_canonical_errors::CanonicalError;
 use async_trait::async_trait;
 use bss_pricing_sdk::CatalogVersion;
 use bss_pricing_sdk::catalog_version_registry::{CatalogVersionRegistryV1, PendingVersionRef};
-use chrono::{DateTime, TimeZone, Utc};
+
 use sea_orm_migration::MigratorTrait as _;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
@@ -49,11 +49,13 @@ use uuid::Uuid;
 
 use super::{BssPricingGear, GATED_MARKETS_LEASE_KEY, WARM_LEASE_KEY, WINDOW_ACTIVATION_LEASE_KEY};
 use crate::config::JobsConfig;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::ports::metrics::PricingMetricsPort;
 use crate::domain::read_model::SubjectRef;
 use crate::infra::metrics::test_harness::MetricsHarness;
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo::{PendingVersionRow, catalog_version_ref_repo};
+use time::OffsetDateTime;
 
 /// A handle that has already panicked, for the arm under test.
 async fn a_panicking_ticker() -> tokio::task::JoinHandle<()> {
@@ -528,10 +530,8 @@ impl CatalogVersionRegistryV1 for NotYetRegistry {
     }
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 3, 4, hour, 0, 0)
-        .single()
-        .expect("a valid instant")
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 3, 4, hour, 0, 0)
 }
 
 /// **The job the lifecycle builds reports on the port the lifecycle hands it.**
@@ -628,6 +628,16 @@ struct EmptyRegistryCatalog;
 
 #[async_trait]
 impl crate::domain::ports::ProductCatalogClientV1 for EmptyRegistryCatalog {
+    async fn list_tax_categories(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<
+        Vec<crate::domain::ports::CatalogTaxCategory>,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        Ok(Vec::new())
+    }
+
     async fn list_skus(
         &self,
         _ctx: &SecurityContext,

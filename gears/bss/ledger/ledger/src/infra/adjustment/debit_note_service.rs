@@ -57,7 +57,7 @@
 use std::sync::Arc;
 
 use bss_ledger_sdk::{MappingStatus, PostingRef, SourceDocType};
-use chrono::{Datelike, Utc};
+use chrono::Datelike;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -71,6 +71,7 @@ use crate::domain::approval::ApprovalKind;
 use crate::domain::approval::intent::{ApprovalIntent, DebitNoteIntent};
 use crate::domain::approval::policy::OperationFacts;
 use crate::domain::error::DomainError;
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::domain::ports::metrics::{LedgerMetricsPort, NoteOutcome};
 use crate::domain::recognition::builder::{ScheduleBuilder, ScheduleOutcome};
@@ -89,6 +90,7 @@ use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::recognition::sidecar::{PlannedScheduleMaterialization, ScheduleBuilderSidecar};
 use crate::infra::storage::repo::adjustment_repo::NewDebitNote;
 use crate::infra::storage::repo::{AdjustmentRepo, ReferenceRepo};
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service (mirrors the peer
 /// orchestrators).
@@ -407,7 +409,7 @@ impl DebitNoteHandler {
                 amount_minor: req.amount_minor,
                 recognized_part_minor: plan.recognized_part_minor,
                 deferred_part_minor: plan.deferred_part_minor,
-                created_at_utc: Utc::now(),
+                created_at_utc: OffsetDateTime::now_utc(),
             },
         });
 
@@ -549,7 +551,7 @@ impl DebitNoteHandler {
             .await
             .map_err(|e| DomainError::Internal(format!("currency scale resolve: {e}")))?;
 
-        let eff_date = Utc::now().date_naive();
+        let eff_date = to_naive_date(OffsetDateTime::now_utc());
         let period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
 
         let mut lines: Vec<NewLine> = Vec::with_capacity(plan.legs.len());
@@ -583,7 +585,7 @@ impl DebitNoteHandler {
             source_business_id: req.debit_note_id.clone(),
             reverses_entry_id: None,
             reverses_period_id: None,
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: eff_date,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: ctx.subject_id(),
@@ -666,7 +668,7 @@ fn note_outcome(result: &Result<PostingRef, DomainError>) -> NoteOutcome {
 /// post itself derives the same value in `assemble_post`; the schedule build reads
 /// it here as the derivation's invoice-period.
 fn current_period_id() -> String {
-    let now = Utc::now().date_naive();
+    let now = to_naive_date(OffsetDateTime::now_utc());
     format!("{:04}{:02}", now.year(), now.month())
 }
 
@@ -782,7 +784,7 @@ impl PostSidecar for DebitNotePostSidecar {
                     amount_minor: self.debit_note_amount_minor,
                     recognized_part_minor: self.recognized_part_minor,
                     deferred_part_minor: self.deferred_part_minor,
-                    posted_at_utc: Utc::now(),
+                    posted_at_utc: OffsetDateTime::now_utc(),
                 },
             )
             .await

@@ -13,7 +13,7 @@
     clippy::inconsistent_struct_constructor
 )]
 
-use chrono::{DateTime, NaiveDate};
+use chrono::NaiveDate;
 use sea_orm::IdenStatic;
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
@@ -35,6 +35,7 @@ use super::{
     JournalEntryODataMapper, JournalLineColumn, JournalLineODataMapper, RecognitionRunColumn,
     RecognitionRunODataMapper, RefundColumn, RefundODataMapper, TenantAccountColumn,
 };
+use crate::domain::instant::from_unix;
 use toolkit_db::odata::sea_orm_filter::{FieldToColumn, ODataFieldMapping};
 
 // ---------------------------------------------------------------------------
@@ -375,7 +376,7 @@ fn sample_journal_entry() -> journal_entry::Model {
         source_business_id: "INV-2025-0007".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        posted_at_utc: from_unix(1_700_000_000, 0).unwrap(),
         effective_at: NaiveDate::from_ymd_opt(2025, 3, 31).unwrap(),
         origin: "posting".to_owned(),
         posted_by_actor_id: Uuid::from_u128(0x3C),
@@ -403,7 +404,7 @@ fn sample_refund() -> refund::Model {
         clearing_state: "cleared".to_owned(),
         relates_to_refund_id: None,
         reverses_entry_id: None,
-        created_at_utc: DateTime::from_timestamp(1_700_000_001, 0).unwrap(),
+        created_at_utc: from_unix(1_700_000_001, 0).unwrap(),
         version: 1,
     }
 }
@@ -421,7 +422,7 @@ fn sample_credit_note() -> credit_note::Model {
         deferred_part_minor: 400,
         split_basis_ref: None,
         reason_code: "SERVICE_CREDIT".to_owned(),
-        created_at_utc: DateTime::from_timestamp(1_700_000_002, 0).unwrap(),
+        created_at_utc: from_unix(1_700_000_002, 0).unwrap(),
     }
 }
 
@@ -434,7 +435,7 @@ fn sample_debit_note() -> debit_note::Model {
         amount_minor: 750,
         recognized_part_minor: 750,
         deferred_part_minor: 0,
-        created_at_utc: DateTime::from_timestamp(1_700_000_003, 0).unwrap(),
+        created_at_utc: from_unix(1_700_000_003, 0).unwrap(),
     }
 }
 
@@ -458,7 +459,7 @@ fn sample_recognition_run() -> recognition_run::Model {
         tenant_id: Uuid::from_u128(0x2E),
         period_id: "2025-04".to_owned(),
         run_id: Uuid::from_u128(0x0E),
-        started_at_utc: DateTime::from_timestamp(1_700_000_004, 0).unwrap(),
+        started_at_utc: from_unix(1_700_000_004, 0).unwrap(),
         status: "completed".to_owned(),
     }
 }
@@ -472,7 +473,7 @@ fn sample_exception() -> exception_queue::Model {
         status: "open".to_owned(),
         period_id: Some("2025-05".to_owned()),
         detail: None,
-        opened_at: DateTime::from_timestamp(1_700_000_005, 0).unwrap(),
+        opened_at: from_unix(1_700_000_005, 0).unwrap(),
         resolved_at: None,
         resolved_by: None,
     }
@@ -1026,4 +1027,196 @@ fn exception_cursor_period_id_none_is_null_string() {
     model.period_id = None;
     let val = ExceptionODataMapper::extract_cursor_value(&model, ExceptionFilterField::PeriodId);
     assert_eq!(val, sea_orm::Value::String(None));
+}
+
+// A nullable column cannot carry a keyset walk: the mapper extracts
+// `Value::String(None)` and the cursor codec has no arm for it, so a NULL on a
+// page boundary would answer 400 to a request the OpenAPI document declares
+// valid. Each of the four is refused as an order key while staying filterable.
+#[test]
+fn nullable_columns_are_refused_as_order_keys() {
+    assert!(!AccountInfoODataMapper::is_orderable(
+        AccountInfoFilterField::RevenueStream
+    ));
+    assert!(!JournalLineODataMapper::is_orderable(
+        JournalLineFilterField::InvoiceId
+    ));
+    assert!(!RefundODataMapper::is_orderable(
+        RefundFilterField::InvoiceId
+    ));
+    assert!(!ExceptionODataMapper::is_orderable(
+        ExceptionFilterField::PeriodId
+    ));
+}
+
+// The refusal is scoped to the nullable column: every mapper that got an
+// override must still order on the key its walk actually uses as a tiebreaker,
+// which goes through the same gate.
+#[test]
+fn the_walks_own_tiebreakers_stay_orderable() {
+    assert!(AccountInfoODataMapper::is_orderable(
+        AccountInfoFilterField::AccountId
+    ));
+    assert!(JournalLineODataMapper::is_orderable(
+        JournalLineFilterField::LineId
+    ));
+    assert!(RefundODataMapper::is_orderable(RefundFilterField::RefundId));
+    assert!(ExceptionODataMapper::is_orderable(
+        ExceptionFilterField::ExceptionId
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// The tenant axis, across all ten mappers
+// ---------------------------------------------------------------------------
+
+// `TenantId` is the one filter field every collection shares, and it is the
+// scoping axis: it must resolve to the row's own owning-tenant column on each
+// table. `journal_line` is the trap — it carries four tenant columns
+// (`tenant_id`, `payer_tenant_id`, `seller_tenant_id`, `resource_tenant_id`),
+// so a mapper that routed the shared field at a role column would scope a
+// listing by the wrong party and still typecheck.
+#[test]
+fn every_mapper_routes_the_tenant_field_at_its_own_tenant_column() {
+    assert_eq!(
+        AccountInfoODataMapper::map_field(AccountInfoFilterField::TenantId).as_str(),
+        TenantAccountColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        JournalLineODataMapper::map_field(JournalLineFilterField::TenantId).as_str(),
+        JournalLineColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        JournalEntryODataMapper::map_field(JournalEntryFilterField::TenantId).as_str(),
+        JournalEntryColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        BalanceODataMapper::map_field(BalanceFilterField::TenantId).as_str(),
+        BalanceColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        RefundODataMapper::map_field(RefundFilterField::TenantId).as_str(),
+        RefundColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        CreditNoteODataMapper::map_field(CreditNoteFilterField::TenantId).as_str(),
+        CreditNoteColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        DebitNoteODataMapper::map_field(DebitNoteFilterField::TenantId).as_str(),
+        DebitNoteColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        DisputeODataMapper::map_field(DisputeFilterField::TenantId).as_str(),
+        DisputeColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        RecognitionRunODataMapper::map_field(RecognitionRunFilterField::TenantId).as_str(),
+        RecognitionRunColumn::TenantId.as_str(),
+    );
+    assert_eq!(
+        ExceptionODataMapper::map_field(ExceptionFilterField::TenantId).as_str(),
+        ExceptionColumn::TenantId.as_str(),
+    );
+}
+
+/// The `journal_line` trap spelled out: the shared scoping field and the
+/// payer-role field are different columns, so the two must not collapse.
+#[test]
+fn the_journal_line_tenant_field_is_not_the_payer_tenant_field() {
+    assert_ne!(
+        JournalLineODataMapper::map_field(JournalLineFilterField::TenantId).as_str(),
+        JournalLineODataMapper::map_field(JournalLineFilterField::PayerTenantId).as_str(),
+    );
+}
+
+// The cursor half of the same axis. `tenant_id` is a `Uuid` column on every
+// table, so it must extract as `Value::Uuid` — a `Value::String` would compare
+// against a `uuid` column as text and the keyset walk would fail in the engine,
+// not here. Each fixture carries a distinct tenant so a mapper reading some
+// other row field cannot pass by coincidence.
+#[test]
+fn every_mapper_extracts_the_tenant_cursor_as_a_uuid() {
+    let account = sample_tenant_account();
+    assert_eq!(
+        AccountInfoODataMapper::extract_cursor_value(&account, AccountInfoFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(account.tenant_id)),
+    );
+
+    let line = sample_journal_line();
+    assert_eq!(
+        JournalLineODataMapper::extract_cursor_value(&line, JournalLineFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(line.tenant_id)),
+    );
+
+    let entry = sample_journal_entry();
+    assert_eq!(
+        JournalEntryODataMapper::extract_cursor_value(&entry, JournalEntryFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(entry.tenant_id)),
+    );
+
+    let balance = sample_account_balance();
+    assert_eq!(
+        BalanceODataMapper::extract_cursor_value(&balance, BalanceFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(balance.tenant_id)),
+    );
+
+    let refund = sample_refund();
+    assert_eq!(
+        RefundODataMapper::extract_cursor_value(&refund, RefundFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(refund.tenant_id)),
+    );
+
+    let credit_note = sample_credit_note();
+    assert_eq!(
+        CreditNoteODataMapper::extract_cursor_value(&credit_note, CreditNoteFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(credit_note.tenant_id)),
+    );
+
+    let debit_note = sample_debit_note();
+    assert_eq!(
+        DebitNoteODataMapper::extract_cursor_value(&debit_note, DebitNoteFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(debit_note.tenant_id)),
+    );
+
+    let dispute = sample_dispute();
+    assert_eq!(
+        DisputeODataMapper::extract_cursor_value(&dispute, DisputeFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(dispute.tenant_id)),
+    );
+
+    let run = sample_recognition_run();
+    assert_eq!(
+        RecognitionRunODataMapper::extract_cursor_value(&run, RecognitionRunFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(run.tenant_id)),
+    );
+
+    let exception = sample_exception();
+    assert_eq!(
+        ExceptionODataMapper::extract_cursor_value(&exception, ExceptionFilterField::TenantId),
+        sea_orm::Value::Uuid(Some(exception.tenant_id)),
+    );
+}
+
+// The ten fixtures each carry a distinct tenant, which is what makes the
+// extraction test above discriminating: a mapper that read a neighbouring
+// `Uuid` field would have to match this row's tenant by accident.
+#[test]
+fn the_fixtures_carry_ten_distinct_tenants() {
+    let tenants = [
+        sample_tenant_account().tenant_id,
+        sample_journal_line().tenant_id,
+        sample_journal_entry().tenant_id,
+        sample_account_balance().tenant_id,
+        sample_refund().tenant_id,
+        sample_credit_note().tenant_id,
+        sample_debit_note().tenant_id,
+        sample_dispute().tenant_id,
+        sample_recognition_run().tenant_id,
+        sample_exception().tenant_id,
+    ];
+    let mut unique = tenants.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), tenants.len());
 }

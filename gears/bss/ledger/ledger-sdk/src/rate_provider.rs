@@ -9,6 +9,7 @@
 //! is a fail-safe no-op (the store stays empty → FX-needing posts block).
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
 
 /// A currency pair to fetch a rate for (ISO 4217 codes).
@@ -26,7 +27,7 @@ pub struct ProviderRate {
     pub base: String,
     pub quote: String,
     pub rate_micro: i64,
-    pub as_of: chrono::DateTime<chrono::Utc>,
+    pub as_of: OffsetDateTime,
     /// The concrete upstream that published THIS rate (`"ecb"`, `"bank-x"`, …),
     /// stamped by the serving source itself.
     ///

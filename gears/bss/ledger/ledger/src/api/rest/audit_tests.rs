@@ -6,13 +6,13 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use axum::http::HeaderMap;
-use chrono::Utc;
 use uuid::Uuid;
 
 use crate::api::rest::audit::correlation_id_header;
 use crate::api::rest::dto::{AuditEntryDto, AuditPackExportDto, FreezeDto, TamperStatusDto};
 use crate::infra::audit::retrieval::{AuditEntryRecord, FreezeRecord, TamperStatusRecord};
 use crate::infra::storage::entity::audit_pack_export;
+use time::OffsetDateTime;
 
 /// S-1: a valid `X-Correlation-Id` header is parsed into the audit record's
 /// `correlation_id`; absent or unparseable yields `None` (the record is still
@@ -48,7 +48,7 @@ fn correlation_id_header_parses_uuid_or_none() {
 fn audit_entry_dto_carries_who_when_source_correlation() {
     let actor = Uuid::now_v7();
     let corr = Uuid::now_v7();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let record = AuditEntryRecord {
         entry_id: Uuid::now_v7(),
         tenant_id: Uuid::now_v7(),
@@ -73,7 +73,7 @@ fn audit_entry_dto_carries_who_when_source_correlation() {
 
 #[test]
 fn tamper_status_dto_reflects_active_freeze() {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let record = TamperStatusRecord {
         scope_frozen: true,
         freezes: vec![FreezeRecord {
@@ -117,7 +117,7 @@ fn tamper_status_dto_unfrozen_is_verified() {
 
 /// Build a succeeded export model for the DTO-projection tests.
 fn succeeded_export(csv: &str) -> audit_pack_export::Model {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     audit_pack_export::Model {
         export_id: Uuid::now_v7(),
         tenant_id: Uuid::now_v7(),

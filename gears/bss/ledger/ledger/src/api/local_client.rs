@@ -18,7 +18,6 @@ use bss_ledger_sdk::{
     RevenueDisaggregation, RevenueDisaggregationEntry, RevenueDisaggregationQuery,
     ScheduleChangeRef, SettlePayment, Side, SourceDocType, TriggerRecognitionRun, UnallocatedView,
 };
-use chrono::Utc;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::SecureEntityExt;
@@ -39,6 +38,7 @@ use crate::infra::storage::entity::{
 };
 use crate::infra::storage::repo::JournalRepo;
 use crate::infra::storage::repo::journal_repo::OdataPageError;
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through the in-process client until a
 /// caller-supplied origin is threaded from the security context.
@@ -270,7 +270,7 @@ impl LedgerClientV1 for LedgerLocalClient {
         )
         .await
         .map_err(authz_error_to_canonical)?;
-        let posted_at_utc = Utc::now();
+        let posted_at_utc = OffsetDateTime::now_utc();
 
         let new_entry = NewEntry {
             entry_id: entry.entry_id,
@@ -796,7 +796,7 @@ impl LedgerClientV1 for LedgerLocalClient {
                         invoice_id: s.invoice_id,
                         amount_minor: s.amount_minor,
                         currency: currency.clone(),
-                        allocated_at_utc: Utc::now(),
+                        allocated_at_utc: OffsetDateTime::now_utc(),
                         precedence_policy_ref: policy_ref.clone(),
                     })
                     .collect();

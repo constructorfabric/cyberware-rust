@@ -93,10 +93,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use crate::domain::instant::format_rfc3339;
 use crate::domain::money::CurrencyCode;
 use crate::domain::overlay::{
     Adjustment, Disclosure, LineKey, OverlayInterval, OverlayLine, ScopeClass, ScopeSelector,
@@ -104,6 +104,7 @@ use crate::domain::overlay::{
 };
 use crate::domain::scope_key::PlanId;
 use crate::domain::validation::ValidationReport;
+use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
 // The codes.
@@ -256,7 +257,7 @@ pub struct OverlayWorld {
     pub sold_currencies: BTreeMap<PlanId, BTreeSet<CurrencyCode>>,
     /// The cutover instants of each plan's published grandfathered generations
     /// (D-78).
-    pub published_cohorts: BTreeMap<PlanId, BTreeSet<DateTime<Utc>>>,
+    pub published_cohorts: BTreeMap<PlanId, BTreeSet<OffsetDateTime>>,
     /// The **other** published overlay holding this `(scope_class, precedence)`,
     /// if any. `None` is the ordinary answer.
     pub precedence_holder: Option<Uuid>,
@@ -504,7 +505,7 @@ fn check_eligibility(candidate: &OverlayCandidate, report: &mut ValidationReport
                      existing_grandfathered row at that cutover instant; adjusting a \
                      grandfathered generation takes an explicit line naming its own instant \
                      (D-78)",
-                    cohort.to_rfc3339()
+                    format_rfc3339(cohort)
                 ),
             );
         }
@@ -605,8 +606,8 @@ fn check_interval_sanity(interval: OverlayInterval, report: &mut ValidationRepor
         format!(
             "the overlay interval [{}, {}) is empty; effective_to must be strictly after \
              effective_from, because nothing is effective over an empty interval",
-            from.to_rfc3339(),
-            to.to_rfc3339()
+            format_rfc3339(from),
+            format_rfc3339(to)
         ),
     );
 }
@@ -966,9 +967,7 @@ fn render_key(key: &LineKey) -> String {
     let sku = key
         .target_sku()
         .map_or_else(|| "-".to_owned(), TargetSku::to_string);
-    let cohort = key
-        .cohort()
-        .map_or_else(|| "-".to_owned(), |at| at.to_rfc3339());
+    let cohort = key.cohort().map_or_else(|| "-".to_owned(), format_rfc3339);
     format!("plan={plan} sku={sku} cohort={cohort}")
 }
 

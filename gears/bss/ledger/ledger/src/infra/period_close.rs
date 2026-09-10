@@ -63,6 +63,7 @@ use crate::infra::storage::repo::{
     ExceptionQueueRepo, FxRevaluationModeRepo, FxRevaluationRunRepo, PeriodCloseRepo,
     RecognitionRepo,
 };
+use time::OffsetDateTime;
 
 /// `period_close.status` literal for an attempted-but-blocked / in-flight close.
 const PERIOD_CLOSE_STATUS_CLOSING: &str = "CLOSING";
@@ -603,7 +604,7 @@ async fn close_in_txn(
                 txn,
                 &scope,
                 tenant_id,
-                chrono::Utc::now(),
+                OffsetDateTime::now_utc(),
             )
             .await
             .map_err(repo_to_db)?
@@ -688,7 +689,7 @@ async fn close_in_txn(
         .await
         .map_err(scope_to_db)?;
 
-    let closed_at = chrono::Utc::now();
+    let closed_at = OffsetDateTime::now_utc();
     PeriodCloseRepo::upsert_status(
         txn,
         &scope,

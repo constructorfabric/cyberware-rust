@@ -43,7 +43,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::ports::{CatalogSku, ProductCatalogClientV1};
+use crate::domain::ports::{CatalogSku, CatalogTaxCategory, ProductCatalogClientV1};
 
 /// The reserved id namespace every fabricated SKU is minted in.
 ///
@@ -99,6 +99,24 @@ fn sku(
 pub struct LocalDevStaticProductCatalog;
 
 impl LocalDevStaticProductCatalog {
+    /// Demo definitions only, enabled by the same explicit opt-in as demo SKUs.
+    /// Codes are stable and visibly fabricated; they encode no jurisdiction or
+    /// rate. Replacing this provider does not rewrite stored price snapshots.
+    #[must_use]
+    pub fn tax_categories() -> Vec<CatalogTaxCategory> {
+        [
+            ("DEV-TAX-SUBSCRIPTION", "Subscription (demo)"),
+            ("DEV-TAX-USAGE", "Usage (demo)"),
+            ("DEV-TAX-SUPPORT", "Support (demo)"),
+        ]
+        .into_iter()
+        .map(|(code, display_name)| CatalogTaxCategory {
+            code: code.to_owned(),
+            display_name: display_name.to_owned(),
+        })
+        .collect()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self
@@ -196,6 +214,13 @@ impl LocalDevStaticProductCatalog {
 impl ProductCatalogClientV1 for LocalDevStaticProductCatalog {
     async fn list_skus(&self, _ctx: &SecurityContext) -> Result<Vec<CatalogSku>, CanonicalError> {
         Ok(Self::skus())
+    }
+
+    async fn list_tax_categories(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<Vec<CatalogTaxCategory>, CanonicalError> {
+        Ok(Self::tax_categories())
     }
 }
 

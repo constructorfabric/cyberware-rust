@@ -3,7 +3,9 @@
 //! PII/correlation/rounding-evidence exclusions, and the §11 byte-repro vector.
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::NaiveDate;
+
+use crate::domain::instant::from_unix;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -21,7 +23,7 @@ fn entry() -> NewEntry {
         source_business_id: "biz-1".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc.timestamp_opt(1_750_000_000, 0).unwrap(),
+        posted_at_utc: from_unix(1_750_000_000, 0).unwrap(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: Uuid::from_u128(4),

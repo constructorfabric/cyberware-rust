@@ -11,19 +11,17 @@
 //! whose store `CHECK` already refuses the row is unreachable through any
 //! repository, which is exactly the shape D-213 recorded one slice over.
 
-use chrono::TimeZone;
-
 use super::*;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::overlay::{AmountSet, Magnitude, ScopeClass, ScopeValue};
+use time::OffsetDateTime;
 
 fn plan(n: u128) -> PlanId {
     PlanId::new(Uuid::from_u128(n))
 }
 
-fn at(year: i32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0)
-        .single()
-        .expect("a valid instant")
+fn at(year: i32) -> OffsetDateTime {
+    utc_ymd_hms(year, 1, 1, 0, 0, 0)
 }
 
 fn eur() -> CurrencyCode {

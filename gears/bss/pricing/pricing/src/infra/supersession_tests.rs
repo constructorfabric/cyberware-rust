@@ -4,14 +4,15 @@
 //! act and two changeovers **two** acts. Everything else in this module needs a database;
 //! this needs three values.
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::supersession_unit_ref;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::money::CurrencyCode;
 use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
+use time::OffsetDateTime;
 
 fn plan() -> PlanId {
     PlanId::new(Uuid::from_u128(0x9_4d7))
@@ -30,8 +31,8 @@ fn key(class: PriceEligibility) -> ScopeKey {
     .expect("both classes pair with cohort none")
 }
 
-fn at(day: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 4, day, 0, 0, 0).unwrap()
+fn at(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 4, day, 0, 0, 0)
 }
 
 /// The rendering, pinned whole.
@@ -52,7 +53,7 @@ fn at(day: u32) -> chrono::DateTime<Utc> {
 const RENDERED: &str = "00000000-0000-0000-0000-0000000094d7/supersession/\
      00000000-0000-0000-0000-0000000094d7|USD|EU|base|\
      00000000-0000-0000-0000-00000000fa8e|all_subscriptions|recurring|none|none|none\
-     /2099-04-01T00:00:00.000Z";
+     /2099-04-01T00:00:00.000000Z";
 
 #[test]
 fn a_retry_of_one_request_names_one_act() {
@@ -128,7 +129,7 @@ fn the_changeover_is_rendered_to_the_millisecond_the_store_quantizes_to() {
     // other. RFC 3339 with milliseconds is what the rest of the crate renders instants
     // as, and it is what makes the subject as fine as the value it names.
     let base = at(1);
-    let a_millisecond_later = base + chrono::Duration::milliseconds(1);
+    let a_millisecond_later = base + time::Duration::milliseconds(1);
 
     assert_ne!(
         supersession_unit_ref(plan(), &key(PriceEligibility::AllSubscriptions), base),

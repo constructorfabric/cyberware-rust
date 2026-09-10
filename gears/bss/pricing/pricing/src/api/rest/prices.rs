@@ -1,4 +1,4 @@
-//! The price authoring plane: `POST`, `PATCH`, `DELETE` and the paginated list
+//! The price authoring plane: `POST`, `GET` by id, `PATCH`, `DELETE` and the paginated list
 //! (`design/03-price-structure.md` §5, D-125, D-140, D-141, D-148).
 //!
 //! # This surface validates a row's shape only where the frozen key already
@@ -53,12 +53,12 @@
 //!
 //! # The `{planId}` segment is checked, not decorative
 //!
-//! `PATCH` and `DELETE` name a plan **and** a price, while the repository keys
-//! on `price_id` alone. So both verbs verify the row actually belongs to the
-//! named plan and answer 404 otherwise. A path that names a parent it does not
-//! check is a path that lets a caller mutate a row through the wrong plan's URL
-//! — and it makes the authz `resource_id` argument a fiction, since the gate is
-//! asked about a resource the handler then does not confirm.
+//! `GET`, `PATCH` and `DELETE` name a plan **and** a price, while the repository
+//! keys on `price_id` alone. So those verbs verify the row actually belongs to
+//! the named plan and answer 404 otherwise. A path that names a parent it does
+//! not check is a path that lets a caller read or mutate a row through the
+//! wrong plan's URL — and it makes the authz `resource_id` argument a fiction,
+//! since the gate is asked about a resource the handler then does not confirm.
 //!
 //! # What Slice 10 has not landed is refused here, not validated
 //!
@@ -114,6 +114,7 @@
 //! Foundation validation envelope, the class D-141 and D-171 give an absent
 //! `If-Match`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -122,8 +123,11 @@ use axum::http::header::{ETAG, LOCATION};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
 use bss_fixtures::ModelKind;
-use chrono::{DateTime, Utc};
+use bss_pricing_sdk::odata::PlanPriceFilterField;
+
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_odata::Page;
@@ -132,12 +136,13 @@ use uuid::Uuid;
 
 use crate::api::rest::auth_context::{audit_stamp, require_authenticated};
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
-use crate::api::rest::cursor::{self, PageRequest};
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::preconditions;
 use crate::api::rest::state::AuthoringState;
 use crate::domain::contracts::{AnchorDay, BillingAnchorPolicy, ProrationBasis, ProrationContract};
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use crate::domain::price_record::{PriceContent, PriceRecord};
@@ -152,6 +157,7 @@ use crate::domain::scope_key::{
 use crate::infra::idempotent::{self, Guarded, GuardedRequest, TxFuture};
 use crate::infra::storage::repo::{NewPriceDraft, price_repo};
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to every price operation (DE0205).
 const TAG: &str = "BSS Pricing Price Rows";
@@ -211,7 +217,8 @@ pub struct ScopeKeyRequest {
     pub charge_kind: String,
     /// The grandfathering generation's cutover instant, or `null` for a row
     /// that retains nobody.
-    pub cohort: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub cohort: Option<OffsetDateTime>,
 }
 
 /// The ten axes as the store holds them.
@@ -242,7 +249,8 @@ pub struct ScopeKeyView {
     /// Axis 7.
     pub charge_kind: String,
     /// Axis 8, `null` when the row retains nobody.
-    pub cohort: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub cohort: Option<OffsetDateTime>,
     /// Axis 9 — the metering unit, `null` on a row that is not metered (D-196).
     pub meter: Option<String>,
     /// Axis 10 — the dimension discriminator on the line, `null` for the
@@ -412,7 +420,8 @@ pub struct PriceContentView {
     pub rounding_policy_ref: Option<String>,
     /// The grandfathering horizon. Only an `existing_grandfathered` row may
     /// carry one.
-    pub grandfather_until: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub grandfather_until: Option<OffsetDateTime>,
     /// The predecessor this row supersedes on its key.
     pub supersedes_price_id: Option<Uuid>,
 }
@@ -491,7 +500,8 @@ pub struct PriceRowView {
     /// Pseudonymous principal id of the authoring actor.
     pub created_by: Uuid,
     /// When the row was authored, UTC.
-    pub created_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub created_at_utc: OffsetDateTime,
     /// The row's own optimistic-concurrency version — never the plan's (D-141),
     /// and the same number the `ETag` quotes.
     pub row_version: u64,
@@ -537,15 +547,6 @@ pub struct PatchPriceRequest {
     pub scope_key: Option<ScopeKeyRequest>,
     /// The row's whole content, replacing what is there.
     pub content: PriceContentView,
-}
-
-/// The two pagination query parameters (D-125). Offset is not offered.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct PricePageQuery {
-    /// Rows per page; server default 100, hard cap 1,000.
-    pub limit: Option<String>,
-    /// The opaque token a previous page returned.
-    pub cursor: Option<String>,
 }
 
 /// Build the Axum router for the price surface and register its operations.
@@ -597,6 +598,37 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .error_403(openapi)
         .error_404(openapi)
         .error_409(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get(PLAN_PRICE)
+        .operation_id("bss_pricing.get_price")
+        .summary("Read one price row by id")
+        .description(
+            "Returns the named row when it belongs to `{planId}`, with its whole content. This \
+             is the authoring read (`plan` x `read`); the create's `Location` is this path. The \
+             `ETag` header carries the row's own version (D-141) and is what `PATCH` and \
+             `DELETE` take as `If-Match`. A row belonging to a different plan than the \
+             `{planId}` segment answers `404`, exactly as an absent row does.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("planId", "The plan the row belongs to.")
+        .path_param("priceId", "The row to read.")
+        .param(crate::api::rest::plans::if_none_match_param())
+        .handler(get_price)
+        .json_response_with_schema::<PriceRowView>(openapi, StatusCode::OK, "The named row.")
+        .no_content_response(
+            StatusCode::NOT_MODIFIED,
+            "The caller's `If-None-Match` matches the current representation, so the body is \
+             not re-sent.",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -685,11 +717,11 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .description(
             "One page of the plan's `draft` and `published` rows, in `price_id` order, with an \
              opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is \
-             1,000 (D-125). `next_cursor` is returned on every page until the result is \
-             exhausted, so a client stops without issuing an extra request that returns an \
-             empty page. `prev_cursor` is always `null`: D-125 specifies a forward walk only. \
-             `superseded` rows are excluded - they are history and no longer current on their \
-             key - and so is any state the price-row machine does not have.",
+             1,000 (D-125). Omitting `$filter` keeps that authoring default. \
+             `$filter=lifecycle_state eq 'superseded'` is how superseded rows appear here; they \
+             also remain on `/history`. `next_cursor` is returned on every page until the \
+             result is exhausted. `prev_cursor` is always `null`: D-125 specifies a forward \
+             walk only.",
         )
         .tag(TAG)
         .authenticated()
@@ -703,6 +735,8 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         )
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_plan_prices)
+        .with_odata_filter::<PlanPriceFilterField>()
+        .with_odata_orderby::<PlanPriceFilterField>()
         .json_response_with_schema::<Page<PriceRowView>>(
             openapi,
             StatusCode::OK,
@@ -759,7 +793,7 @@ async fn create_price(
     // reaching it reaches the same verdict the first call did. The two guards
     // that read the *world* cannot say that, and sit inside the guarded body.
     require_no_key_contradiction(&key, &content)?;
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
 
     let guard = GuardedRequest {
         operation: CREATE_PRICE_OPERATION,
@@ -843,6 +877,41 @@ async fn create_price(
     })
 }
 
+/// `GET /plans/{planId}/prices/{priceId}`.
+///
+/// The gate is `plan x read` with `resource_id = planId`, like
+/// [`list_plan_prices`]: the authz catalog puts `plan × read` on the plan, and
+/// [`row_of_plan`] binds the named row to that plan. A matching
+/// `If-None-Match` is 304 — a read that emits a validator honours the
+/// conditional.
+async fn get_price(
+    Extension(state): Extension<Arc<AuthoringState>>,
+    Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
+    extension_ctx: Option<Extension<SecurityContext>>,
+    Path((plan_id, price_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Response, CanonicalError> {
+    let ctx = require_authenticated(extension_ctx)?;
+    let plan_id = PlanId::new(plan_id);
+    let scope = crate::authz::access_scope(
+        &enforcer,
+        &ctx,
+        &crate::authz::resource_types::PLAN,
+        crate::authz::actions::READ,
+        /* owner_tenant_id */ None,
+        /* resource_id */ Some(crate::authz::ResourceRef(plan_id.get())),
+    )
+    .await
+    .map_err(authz_error_to_canonical)?;
+
+    let record = row_of_plan(&state, &scope, ctx.subject_tenant_id(), plan_id, price_id).await?;
+    let tag = preconditions::etag(record.row_version);
+    if preconditions::if_none_match(&headers, &tag) {
+        return Ok(preconditions::not_modified(&tag));
+    }
+    Ok(answer(&record).into_response())
+}
+
 /// `PATCH /plans/{planId}/prices/{priceId}`.
 async fn patch_price(
     Extension(state): Extension<Arc<AuthoringState>>,
@@ -914,7 +983,7 @@ async fn patch_price(
             price_id,
             expected,
             content,
-            audit_stamp(&ctx, Utc::now(), correlation),
+            audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation),
             // An interactive edit belongs to no run, so the bulk lock excludes it
             // whoever holds the row (`inst-bk-lock`).
             /* on_behalf_of */
@@ -960,7 +1029,7 @@ async fn delete_price(
             tenant,
             price_id,
             expected,
-            audit_stamp(&ctx, Utc::now(), correlation),
+            audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation),
             // An interactive delete belongs to no run, so the bulk lock excludes
             // it whoever holds the row (`inst-bk-lock`) — the sibling `PATCH`'s
             // argument one verb over.
@@ -977,14 +1046,17 @@ async fn delete_price(
 /// The gate is `plan x read` with `owner_tenant_id = None`, so the compiled
 /// scope is the SQL filter and the whole walk is tenant-scoped by construction
 /// rather than by a predicate this handler remembers to add.
+#[allow(clippy::implicit_hasher)]
 async fn list_plan_prices(
     Extension(state): Extension<Arc<AuthoringState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
     Path(plan_id): Path<Uuid>,
-    Query(query): Query<PricePageQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Json<Page<PriceRowView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let plan_id = PlanId::new(plan_id);
     let scope = crate::authz::access_scope(
         &enforcer,
@@ -997,36 +1069,20 @@ async fn list_plan_prices(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    let page = PageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )?;
-    // One row more than the page, so "is there another page" is answered without
-    // a second query and without a page of `next_cursor` pointing at nothing.
-    let probe = page.limit.saturating_add(1);
-    let mut rows = state
+    let page = state
         .prices
-        .list_for_plan_page(
+        .list_for_plan_odata(
             &scope,
             ctx.subject_tenant_id(),
             plan_id,
+            &odata,
             AUTHORING_STATES,
-            page.after,
-            probe,
         )
         .await
-        .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
-
-    let has_more = u64::try_from(rows.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        rows.pop();
-    }
-    let next = has_more
-        .then(|| rows.last().map(|row| row.price_id))
-        .flatten();
+        .map_err(map_odata_page_err)?;
     Ok(Json(Page {
-        items: rows.iter().map(PriceRowView::from).collect(),
-        page_info: cursor::page_info(next, page.limit),
+        items: page.items.iter().map(PriceRowView::from).collect(),
+        page_info: page.page_info,
     }))
 }
 

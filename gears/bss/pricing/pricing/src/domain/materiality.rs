@@ -118,13 +118,13 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 
 use crate::domain::money::CurrencyCode;
 use crate::domain::price_record::PriceRecord;
 use crate::domain::publish::PublishUnitKind;
 use crate::domain::scope_key::ScopeKey;
+use time::OffsetDateTime;
 
 pub mod delta;
 pub mod triggers;
@@ -623,7 +623,7 @@ impl ThresholdRefusal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ThresholdVersion {
     version: u64,
-    effective_from: DateTime<Utc>,
+    effective_from: OffsetDateTime,
     entries: Vec<ThresholdEntry>,
 }
 
@@ -642,7 +642,7 @@ pub(crate) struct ThresholdVersionParts<'a> {
     /// The version number — the `version` half of the store's primary key.
     pub version: u64,
     /// The instant the version starts applying.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// The entries, in the order the pin frames them.
     pub entries: &'a [ThresholdEntry],
 }
@@ -664,7 +664,7 @@ impl ThresholdVersion {
     /// [`ThresholdRefusal::DuplicateCurrency`] when two entries name one currency.
     pub fn new(
         version: u64,
-        effective_from: DateTime<Utc>,
+        effective_from: OffsetDateTime,
         entries: Vec<ThresholdEntry>,
     ) -> Result<Self, ThresholdRefusal> {
         if entries.is_empty() {
@@ -711,7 +711,7 @@ impl ThresholdVersion {
     /// side for the same reason there is no `state` column on
     /// `pricing_approval_threshold`.
     #[must_use]
-    pub const fn tombstone(version: u64, effective_from: DateTime<Utc>) -> Self {
+    pub const fn tombstone(version: u64, effective_from: OffsetDateTime) -> Self {
         Self {
             version,
             effective_from,
@@ -744,7 +744,7 @@ impl ThresholdVersion {
     /// instant's reader (D-188), so `infra::threshold::effective_version` cannot
     /// make the greatest approved version effective ahead of it.
     #[must_use]
-    pub const fn effective_from(&self) -> DateTime<Utc> {
+    pub const fn effective_from(&self) -> OffsetDateTime {
         self.effective_from
     }
 
@@ -762,7 +762,7 @@ impl ThresholdVersion {
     /// the same way for the same instant however many times it is asked — which is
     /// what lets `infra::threshold`'s walk stay idempotent across two reads.
     #[must_use]
-    pub fn is_effective_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_effective_at(&self, now: OffsetDateTime) -> bool {
         now >= self.effective_from
     }
 

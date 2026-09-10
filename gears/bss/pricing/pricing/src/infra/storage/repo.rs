@@ -60,11 +60,12 @@ pub mod taxonomy_repo;
 pub mod threshold_repo;
 pub mod window_repo;
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 use crate::domain::instant;
 use crate::infra::storage::RepoError;
 
+use crate::domain::instant::format_rfc3339;
 pub use approval_repo::{ApprovalRecord, NewApproval};
 pub use audit_repo::NewAuditEntry;
 pub use bulk_repo::{BulkOperationRecord, BulkRepo, NewBulkOperation};
@@ -113,7 +114,7 @@ pub use window_repo::{NewWindow, WindowRecord};
 ///
 /// **What is outside it is machine-generated, not merely uncompared.** `created_at`,
 /// the audit chain, outbox timestamps, `pricing_migration.announced_at` and a
-/// window activation's flip instant are all minted from `Utc::now()`, which carries
+/// window activation's flip instant are all minted from `OffsetDateTime::now_utc()`, which carries
 /// sub-millisecond precision — [`window_repo::transition`] measured what applying
 /// the quantum there does: it refuses every write. `domain::instant` states the
 /// same exclusion from the domain side.
@@ -130,7 +131,7 @@ pub use window_repo::{NewWindow, WindowRecord};
 /// the author corrects one value rather than resubmitting and guessing.
 pub(crate) fn check_authored_instant(
     field: &str,
-    at: Option<DateTime<Utc>>,
+    at: Option<OffsetDateTime>,
 ) -> Result<(), RepoError> {
     let Some(at) = at else {
         return Ok(());
@@ -140,6 +141,6 @@ pub(crate) fn check_authored_instant(
     }
     Err(RepoError::TimestampPrecisionExceeded {
         field: field.to_owned(),
-        value: at.to_rfc3339(),
+        value: format_rfc3339(at),
     })
 }

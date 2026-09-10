@@ -7,7 +7,7 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use toolkit::api::canonical_prelude::{CanonicalError, resource_error};
 use uuid::Uuid;
 
@@ -18,9 +18,11 @@ use bss_ledger_sdk::{
 
 use crate::domain::approval::policy::{DualControlPolicy, PolicyVersion};
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::domain::invoice::aging::AgingBucket;
 use crate::domain::invoice::builder::{InvoiceItem, PostedInvoice, TaxBreakdown};
 use crate::domain::recognition::input::{RecognitionInput, RecognitionTiming};
+use time::OffsetDateTime;
 
 /// One chart-of-accounts row to seed.
 #[derive(Debug, Clone)]
@@ -613,7 +615,8 @@ pub struct AuditEntryDto {
     pub period_id: String,
     pub posted_by_actor_id: Uuid,
     pub origin: String,
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
     pub source_doc_type: String,
     pub source_business_id: String,
     pub correlation_id: Uuid,
@@ -654,10 +657,12 @@ pub struct FreezeDto {
     pub scope: String,
     pub period_id: String,
     pub reason: String,
-    pub frozen_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub frozen_at: OffsetDateTime,
     pub set_by: String,
     pub cleared_by: Option<String>,
-    pub cleared_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub cleared_at: Option<OffsetDateTime>,
 }
 
 impl From<crate::infra::audit::retrieval::FreezeRecord> for FreezeDto {
@@ -774,8 +779,10 @@ pub struct AuditPackExportDto {
     pub csv: Option<String>,
     /// Failure diagnostic when `status = failed`.
     pub error_detail: Option<String>,
-    pub created_at_utc: DateTime<Utc>,
-    pub completed_at_utc: Option<DateTime<Utc>>,
+    #[serde(with = "rfc3339")]
+    pub created_at_utc: OffsetDateTime,
+    #[serde(default, with = "rfc3339::option")]
+    pub completed_at_utc: Option<OffsetDateTime>,
 }
 
 impl AuditPackExportDto {
@@ -960,7 +967,8 @@ pub struct EntryDto {
     pub source_business_id: String,
     pub reverses_entry_id: Option<Uuid>,
     pub reverses_period_id: Option<String>,
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
     pub effective_at: NaiveDate,
     pub posted_by_actor_id: Uuid,
     pub origin: String,
@@ -1097,7 +1105,8 @@ pub struct SettlePaymentRequest {
     /// Advisory currency scale; the ledger resolves the authoritative one.
     pub scale: u8,
     /// Receipt instant; `None` ⇒ stamped at post time (current-month period).
-    pub effective_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// Max length of a client-supplied business id — matches the `varchar(128)`
@@ -1191,7 +1200,8 @@ pub struct ReturnPaymentRequest {
     /// Advisory currency scale; the ledger resolves the authoritative one.
     pub scale: u8,
     /// Return instant; `None` ⇒ stamped at post time (current-month period).
-    pub effective_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 impl ReturnPaymentRequest {
@@ -1284,7 +1294,8 @@ pub struct RecordDisputePhaseRequest {
     /// Advisory currency scale; the ledger resolves the authoritative one.
     pub scale: u8,
     /// Phase instant; `None` ⇒ stamped at post time (current-month period).
-    pub effective_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 impl RecordDisputePhaseRequest {
@@ -1377,7 +1388,8 @@ pub struct DisputePhaseQueuedResponse {
     /// The queue/dedup business id — `dispute_id:cycle:phase`.
     pub business_id: String,
     /// When the intake durably enqueued the request.
-    pub queued_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub queued_at: OffsetDateTime,
 }
 
 impl From<bss_ledger_sdk::DisputeQueued> for DisputePhaseQueuedResponse {
@@ -1492,7 +1504,8 @@ pub struct AllocationDto {
     pub invoice_id: String,
     pub amount_minor: i64,
     pub currency: String,
-    pub allocated_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub allocated_at_utc: OffsetDateTime,
     pub precedence_policy_ref: String,
 }
 
@@ -1553,7 +1566,8 @@ pub struct AllocationQueuedResponse {
     /// The queue/dedup business id — the allocation's `allocation_id`.
     pub business_id: String,
     /// When the intake durably enqueued the request.
-    pub queued_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub queued_at: OffsetDateTime,
 }
 
 impl From<bss_ledger_sdk::AllocationQueued> for AllocationQueuedResponse {
@@ -2952,7 +2966,8 @@ pub struct RefundQuarantinedResponse {
     /// The quarantine/dedup business id — `psp_refund_id:phase`.
     pub business_id: String,
     /// When the intake durably quarantined the request.
-    pub quarantined_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub quarantined_at: OffsetDateTime,
 }
 
 /// The status token a dispute-held refund renders in
@@ -2981,7 +2996,8 @@ pub struct RefundDisputeHeldResponse {
     /// The dispute-hold/dedup business id — `psp_refund_id:phase`.
     pub business_id: String,
     /// When the intake durably held the request.
-    pub held_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub held_at: OffsetDateTime,
 }
 
 /// The `POST /refund-with-credit-note` request body: post a refund AND its paired
@@ -3090,7 +3106,8 @@ pub struct CreditNoteView {
     /// (`None` when the split needed no schedule basis).
     pub split_basis_ref: Option<String>,
     pub reason_code: String,
-    pub created_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub created_at_utc: OffsetDateTime,
 }
 
 impl From<crate::infra::storage::entity::credit_note::Model> for CreditNoteView {
@@ -3132,7 +3149,8 @@ pub struct DebitNoteView {
     pub recognized_part_minor: i64,
     /// The ex-tax deferred part of the split.
     pub deferred_part_minor: i64,
-    pub created_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub created_at_utc: OffsetDateTime,
 }
 
 impl From<crate::infra::storage::entity::debit_note::Model> for DebitNoteView {
@@ -3209,7 +3227,8 @@ pub struct RecognitionRunView {
     pub period_id: String,
     /// The run lifecycle (`RUNNING` / `DONE` / `FAILED`).
     pub status: String,
-    pub started_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub started_at_utc: OffsetDateTime,
 }
 
 impl From<crate::infra::storage::entity::recognition_run::Model> for RecognitionRunView {
@@ -3295,7 +3314,8 @@ pub struct EntryHeaderView {
     /// The reversed entry id when this header is itself a reversal (`None`
     /// otherwise).
     pub reverses_entry_id: Option<Uuid>,
-    pub posted_at_utc: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub posted_at_utc: OffsetDateTime,
     pub effective_at: NaiveDate,
     /// The posting origin (the channel / driver that emitted the entry).
     pub origin: String,
@@ -3341,7 +3361,8 @@ pub struct PayerStateView {
     /// payer).
     pub approved_by: Option<Uuid>,
     /// When the lifecycle state last changed (`None` if never transitioned).
-    pub changed_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub changed_at: Option<OffsetDateTime>,
 }
 
 impl From<crate::infra::storage::entity::payer_state::Model> for PayerStateView {
@@ -3376,7 +3397,8 @@ pub struct DualControlPolicyView {
     pub pending_ttl_seconds: i64,
     /// The `effective_from` instant of the version in force (`None` when the
     /// platform defaults apply — the tenant has no row).
-    pub effective_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_from: Option<OffsetDateTime>,
     /// The `version` number in force (`None` when the platform defaults apply).
     pub version: Option<i64>,
     /// `true` when no tenant row applies and these are the ratified platform
@@ -3467,7 +3489,8 @@ pub struct FxRateIngestRequest {
     /// × 1e6). Must be `> 0`.
     pub rate_micro: i64,
     /// The publication timestamp that drives the staleness rule.
-    pub as_of: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub as_of: OffsetDateTime,
     /// The provider's precedence rank (0 = primary); defaults to `0` when omitted.
     pub fallback_order: Option<i32>,
 }
@@ -3522,7 +3545,8 @@ pub struct FxRateIngestResponse {
     pub quote_currency: String,
     pub provider: String,
     pub rate_micro: i64,
-    pub as_of: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub as_of: OffsetDateTime,
     pub fallback_order: i32,
 }
 
@@ -3536,7 +3560,8 @@ pub struct FxRateSnapshotResponse {
     pub base_currency: String,
     pub quote_currency: String,
     pub rate_micro: i64,
-    pub as_of: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub as_of: OffsetDateTime,
     pub provider: String,
     pub stale: bool,
     pub fallback_order: i32,

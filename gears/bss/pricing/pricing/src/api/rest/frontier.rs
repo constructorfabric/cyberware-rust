@@ -15,19 +15,27 @@
 //! compiled `AccessScope` becomes the SQL-level tenant filter. A frontier
 //! belonging to a tenant outside that scope is invisible rather than forbidden,
 //! which is what keeps the surface from leaking whose catalog exists.
+//!
+//! The sibling `GET /catalog-version/refs/{pendingRef}` is the one-handle
+//! status read. It is not this watermark: a caller holding a publish receipt
+//! asks whether *that* handle committed, not where the tenant pin stands.
 
 use std::sync::Arc;
 
-use axum::extract::Extension;
+use axum::extract::{Extension, Path};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
+use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::error::authz_error_to_canonical;
-use crate::infra::storage::repo::PinFrontierRepo;
+use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
+use crate::infra::storage::repo::{PendingVersionRow, PinFrontierRepo, catalog_version_ref_repo};
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the catalog-version operations (DE0205 requires a
 /// tag and a summary on every registered operation).
@@ -42,6 +50,8 @@ const TAG: &str = "BSS Pricing Catalog Version";
 /// `const` for the reason its siblings do: a route census that spelled one of
 /// its paths as a string literal is a census one rename can walk away from.
 pub const FRONTIER: &str = "/bss-pricing/v1/catalog-version/frontier";
+/// One publish handle's subject rows — `GET` only.
+pub const CATALOG_VERSION_REF: &str = "/bss-pricing/v1/catalog-version/refs/{pendingRef}";
 
 /// Shared per-request state for the catalog-version routes. Built once in
 /// `init()` and shared via `Extension<Arc<ApiState>>`.
@@ -49,6 +59,10 @@ pub const FRONTIER: &str = "/bss-pricing/v1/catalog-version/frontier";
 pub struct ApiState {
     /// The materialized pin-eligibility frontier (`pricing_pin_frontier`).
     pub pin_frontier: PinFrontierRepo,
+    /// The provider the handle-wide ref read opens a connection on. The ref
+    /// store is runner-taking (it joins the publish transaction on write);
+    /// this read has no transaction to join.
+    pub db: DBProvider<DbError>,
 }
 
 /// The tenant's pin-eligibility frontier.
@@ -105,7 +119,8 @@ pub struct PinFrontierView {
     /// UTC instant the frontier last advanced, or `null` when it never has.
     /// The referent of the 5s pin-lag rule and of the
     /// `pricing.readmodel.pin_eligibility_overdue` alarm.
-    pub advanced_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub advanced_at: Option<OffsetDateTime>,
 }
 
 impl PinFrontierView {
@@ -171,6 +186,40 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(Router::new(), openapi);
 
+    let router = OperationBuilder::get("/bss-pricing/v1/catalog-version/refs/{pendingRef}")
+        .operation_id("bss_pricing.get_catalog_version_ref")
+        .summary("Read one pending CatalogVersion handle")
+        .description(
+            "Returns every subject row this tenant recorded against the registry handle a \
+             publish receipt carried (`pending_version_ref`). One handle is one assignment and \
+             may project one, two or three subjects (D-234). `status` is `pending` (registry \
+             has not answered), `commit_observed` (version known, finalize not landed) or \
+             `committed` (the row carries `catalog_version`). This is not the pin-eligibility \
+             frontier: a caller asking whether *this* publish committed must not poll \
+             `GET /catalog-version/frontier`. An unknown handle, or one outside the caller's \
+             scope, is 404. Gates on `plan` x `read`.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param(
+            "pendingRef",
+            "The registry handle the publish receipt named.",
+        )
+        .handler(get_catalog_version_ref)
+        .json_response_with_schema::<CatalogVersionRefView>(
+            openapi,
+            StatusCode::OK,
+            "The handle and every subject row recorded against it.",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     router.layer(Extension(state))
 }
 
@@ -215,6 +264,127 @@ async fn get_frontier(
         PinFrontierView::none_yet,
         PinFrontierView::from,
     )))
+}
+
+/// `GET /catalog-version/refs/{pendingRef}`: every subject of one handle.
+///
+/// Gate as [`get_frontier`]: `plan × read`, tenant from the subject, scope is
+/// the SQL filter. Empty set is 404 — unknown and not-yours read the same.
+async fn get_catalog_version_ref(
+    Extension(state): Extension<Arc<ApiState>>,
+    Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
+    extension_ctx: Option<Extension<SecurityContext>>,
+    Path(pending_ref): Path<String>,
+) -> Result<Json<CatalogVersionRefView>, CanonicalError> {
+    let ctx = require_authenticated(extension_ctx)?;
+    let scope = crate::authz::access_scope(
+        &enforcer,
+        &ctx,
+        &crate::authz::resource_types::PLAN,
+        crate::authz::actions::READ,
+        /* owner_tenant_id */ None,
+        /* resource_id */ None,
+    )
+    .await
+    .map_err(authz_error_to_canonical)?;
+
+    let conn = state.db.conn().map_err(|e| {
+        CanonicalError::from(crate::infra::storage::repo_failure(
+            &crate::infra::storage::RepoError::Db(format!("catalog version ref conn: {e}")),
+        ))
+    })?;
+    let rows = catalog_version_ref_repo::list_for_pending_ref(
+        &conn,
+        &scope,
+        ctx.subject_tenant_id(),
+        &pending_ref,
+    )
+    .await
+    .map_err(|e| CanonicalError::from(crate::infra::storage::repo_failure(&e)))?;
+    if rows.is_empty() {
+        return Err(CanonicalError::from(DomainError::NotFound {
+            subject: "catalog version ref".to_owned(),
+            id: pending_ref,
+        }));
+    }
+    Ok(Json(CatalogVersionRefView {
+        pending_version_ref: pending_ref,
+        subjects: rows
+            .iter()
+            .map(CatalogVersionRefSubjectView::from)
+            .collect(),
+    }))
+}
+
+/// One handle and the subjects the publish unit projected against it.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct CatalogVersionRefView {
+    /// The registry handle the caller asked about.
+    pub pending_version_ref: String,
+    /// One row per subject of that handle, `subject_kind` then `subject_ref`.
+    pub subjects: Vec<CatalogVersionRefSubjectView>,
+}
+
+/// One subject of a pending handle.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct CatalogVersionRefSubjectView {
+    /// `plan | price_overlay | overlay_index | group_membership`.
+    pub subject_kind: String,
+    /// Which one.
+    pub subject_ref: String,
+    /// The revision the publish judged, when the kind has one.
+    pub subject_revision: Option<u64>,
+    /// The lifecycle the publish judged, when the kind has one.
+    pub subject_lifecycle_state: Option<String>,
+    /// Membership pin; absent on every other kind.
+    #[serde(default, with = "rfc3339::option")]
+    pub subject_effective_to: Option<OffsetDateTime>,
+    /// `pending | commit_observed | committed`.
+    pub status: String,
+    /// The assigned version, once finalized.
+    pub catalog_version: Option<u64>,
+    /// When the publish asked for the handle.
+    #[serde(with = "rfc3339")]
+    pub requested_at: OffsetDateTime,
+    /// When this gear first saw the registry answer (D-166).
+    #[serde(default, with = "rfc3339::option")]
+    pub commit_observed_at: Option<OffsetDateTime>,
+    /// When finalize wrote the version.
+    #[serde(default, with = "rfc3339::option")]
+    pub committed_at: Option<OffsetDateTime>,
+}
+
+impl From<&PendingVersionRow> for CatalogVersionRefSubjectView {
+    fn from(row: &PendingVersionRow) -> Self {
+        Self {
+            subject_kind: row.subject_kind.as_str().to_owned(),
+            subject_ref: row.subject_ref.clone(),
+            subject_revision: row.subject_revision,
+            subject_lifecycle_state: row
+                .subject_lifecycle_state
+                .map(|state| state.as_str().to_owned()),
+            subject_effective_to: row.subject_effective_to,
+            status: status_of(row).to_owned(),
+            catalog_version: row
+                .catalog_version
+                .map(bss_pricing_sdk::CatalogVersion::get),
+            requested_at: row.requested_at,
+            commit_observed_at: row.commit_observed_at,
+            committed_at: row.committed_at,
+        }
+    }
+}
+
+fn status_of(row: &PendingVersionRow) -> &'static str {
+    if row.catalog_version.is_some() {
+        "committed"
+    } else if row.commit_observed_at.is_some() {
+        "commit_observed"
+    } else {
+        "pending"
+    }
 }
 
 #[cfg(test)]

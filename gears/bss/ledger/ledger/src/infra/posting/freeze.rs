@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::infra::posting::service::business;
 use crate::infra::storage::entity::scope_freeze;
+use time::OffsetDateTime;
 
 /// `period_id` sentinel for a tenant-wide freeze (every period in the tenant).
 const PERIOD_ALL: &str = "ALL";
@@ -129,7 +130,7 @@ impl ScopeFreezeRepo {
             scope: Set(scope_kind.to_owned()),
             period_id: Set(period_id.to_owned()),
             reason: Set(reason.to_owned()),
-            frozen_at: Set(chrono::Utc::now()),
+            frozen_at: Set(OffsetDateTime::now_utc()),
             set_by: Set(set_by.to_owned()),
             cleared_by: Set(None),
             cleared_at: Set(None),
@@ -185,7 +186,7 @@ impl ScopeFreezeRepo {
             .scope_with(scope)
             .col_expr(
                 scope_freeze::Column::ClearedAt,
-                Expr::value(Some(chrono::Utc::now())),
+                Expr::value(Some(OffsetDateTime::now_utc())),
             )
             .col_expr(
                 scope_freeze::Column::ClearedBy,

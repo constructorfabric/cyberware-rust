@@ -10,10 +10,10 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{CustomIntervalBounds, DescriptorSetComplete, plan_shape_rules};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::plan_shape::{
     AddonRule, BillingCycle, CustomIntervalUnit, Frequency, PlanShape,
 };
@@ -280,7 +280,7 @@ fn no_rule_of_another_slice_is_registered_here() {
 #[test]
 fn one_awful_plan_produces_every_finding_in_one_report() {
     let plan_id = PlanId::new(Uuid::from_u128(0x9_1a4));
-    let now = Utc.with_ymd_and_hms(2026, 8, 2, 12, 0, 0).unwrap();
+    let now = utc_ymd_hms(2026, 8, 2, 12, 0, 0);
     let analytics = Uuid::from_u128(0xadd01);
     let support = Uuid::from_u128(0xadd02);
 
@@ -296,7 +296,7 @@ fn one_awful_plan_produces_every_finding_in_one_report() {
     plan.purchase_min_qty = Some(5);
     plan.purchase_max_qty = Some(2);
     // Newly set, and in the past.
-    plan.available_from = Some(now - chrono::TimeDelta::hours(1));
+    plan.available_from = Some(now - time::Duration::hours(1));
     // No tier, no phases, no descriptor set.
     plan.addon_rules = vec![
         AddonRule {

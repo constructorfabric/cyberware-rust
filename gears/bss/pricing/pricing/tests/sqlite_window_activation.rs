@@ -44,11 +44,14 @@ use bss_pricing::infra::metrics::test_harness::MetricsHarness;
 use bss_pricing::infra::storage::entity::{outbox, price, price_window};
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::window_repo::{self, NewWindow};
-use chrono::{DateTime, Duration, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
+use time::Duration;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt, SecureUpdateExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -94,11 +97,11 @@ const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_c0_11_a7_10);
 /// Days rather than hours so every instant in a test is legibly ordered, and an
 /// addition rather than a calendar literal so a test may reach past the end of
 /// the month — `an_open_ended_window_never_expires` sweeps ten years out.
-fn t(day: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, 1, 0, 0, 0).unwrap() + Duration::days(day)
+fn t(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, 1, 0, 0, 0) + Duration::days(day)
 }
 
-fn stamp_at(when: DateTime<Utc>) -> AuditStamp {
+fn stamp_at(when: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: ACTOR,
         recorded_at: when,
@@ -228,8 +231,8 @@ async fn seed_active_window(
     tenant: Uuid,
     price_id: Uuid,
     id: u128,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
 ) -> Uuid {
     let conn = provider.conn().expect("scoped connection");
     let window_id = Uuid::from_u128(id);
@@ -265,8 +268,8 @@ async fn schedule(
     tenant: Uuid,
     price_id: Uuid,
     id: u128,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
 ) -> Uuid {
     let conn = provider.conn().expect("scoped connection");
     let window_id = Uuid::from_u128(id);
@@ -293,7 +296,7 @@ fn job(provider: &DBProvider<DbError>) -> WindowActivationJob {
 }
 
 /// One pass at `now`.
-async fn sweep(provider: &DBProvider<DbError>, now: DateTime<Utc>) -> ActivationReport {
+async fn sweep(provider: &DBProvider<DbError>, now: OffsetDateTime) -> ActivationReport {
     job(provider)
         .run(now)
         .await
@@ -307,7 +310,7 @@ async fn sweep(provider: &DBProvider<DbError>, now: DateTime<Utc>) -> Activation
 /// like something they assert.
 async fn sweep_watched(
     provider: &DBProvider<DbError>,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> (ActivationReport, MetricsHarness) {
     let harness = MetricsHarness::new();
     let report = WindowActivationJob::new(provider.clone(), JobsConfig::default())
@@ -326,9 +329,9 @@ async fn window_at_rest(
     window_id: Uuid,
 ) -> (
     WindowState,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
 ) {
     let conn = provider.conn().expect("scoped connection");
     let record = window_repo::find(&conn, &scope_of(tenant), tenant, window_id)

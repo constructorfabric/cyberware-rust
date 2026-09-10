@@ -4,7 +4,6 @@
 //! Both ops are generic over `DBRunner` so they run on the caller's transaction.
 //! Tenant-scoped via `SecureORM` (SQL-level BOLA).
 
-use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{
@@ -14,6 +13,7 @@ use uuid::Uuid;
 
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::fx_revaluation_run::{self, SCOPE_PERIOD, STATUS_COMPLETE};
+use time::OffsetDateTime;
 
 /// `SeaORM`-backed FX-revaluation marker repository. Stateless: every method
 /// takes the caller's `runner` (a txn or a scoped connection).
@@ -32,7 +32,7 @@ impl FxRevaluationRunRepo {
         tenant: Uuid,
         period_id: &str,
     ) -> Result<(), RepoError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let am = fx_revaluation_run::ActiveModel {
             tenant_id: Set(tenant),
             period_id: Set(period_id.to_owned()),

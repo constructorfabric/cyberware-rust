@@ -8,7 +8,7 @@
 //! store*, against the resolution rule and the two-version freeze that need rows.
 
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{DateTime, TimeZone, Utc};
+
 use serde_json::json;
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use uuid::Uuid;
 use super::{StoredDelta, sellability_facts};
 use crate::domain::concurrency::RowVersion;
 use crate::domain::contracts::{EntitlementGrants, PlanChangeContract};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount};
 use crate::domain::plan_shape::{
@@ -31,13 +32,11 @@ use crate::domain::scope_key::{
 use crate::domain::sellability::{PinnedFacts, SellabilityFacts};
 use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
 use crate::infra::storage::RepoError;
+use time::OffsetDateTime;
 
 /// `2099-01-01T00:00:00Z` plus `day` whole days.
-fn at(day: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
-        + chrono::TimeDelta::days(day)
+fn at(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2099, 1, 1, 0, 0, 0) + time::Duration::days(day)
 }
 
 fn plan_id() -> PlanId {
@@ -134,6 +133,7 @@ fn populated() -> PlanSubjectDelta {
         phases: vec![PlanPhase {
             phase_id: phase(),
             kind: PhaseKind::Evergreen,
+            display_name: None,
             ordinal: 0,
             converts_to_phase_id: None,
             phase_duration_days: None,

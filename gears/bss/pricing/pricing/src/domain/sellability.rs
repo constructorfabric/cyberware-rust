@@ -248,15 +248,16 @@
 //! reddens the day one appears.
 
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{DateTime, TimeDelta, Utc};
 use toolkit_macros::domain_model;
 
 use crate::domain::coverage::longest_cycle_sold_on;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::CurrencyCode;
 use crate::domain::plan_shape::Frequency;
 use crate::domain::scope_key::{PlanId, PriceEligibility, Region, ScopeKey};
 use crate::domain::window::{CoverageEnd, KeyWindows, WindowInterval};
+use time::OffsetDateTime;
 
 /// What Slice 4 and Slice 10 owe predicate (5).
 const OWED_TO_GA_GATE: &str = "Slice 4's per-market `not_sellable_ga` flag and Slice 10's \
@@ -531,9 +532,9 @@ pub struct PinnedFacts {
     /// The current revision's lifecycle state — predicate (4)'s operand (D-128).
     pub lifecycle_state: LifecycleState,
     /// Start of the plan's availability — predicate (3).
-    pub available_from: Option<DateTime<Utc>>,
+    pub available_from: Option<OffsetDateTime>,
     /// End of the plan's availability — predicate (3).
-    pub available_to: Option<DateTime<Utc>>,
+    pub available_to: Option<OffsetDateTime>,
     /// The plan's recurring frequency — W6's margin, per D-123 a plan-level fact.
     pub frequency: Option<Frequency>,
     /// The canonical scope keys of the version's price rows: the gate's roster
@@ -562,7 +563,7 @@ pub struct SellabilitySurface {
     pub plan_id: PlanId,
     /// The instant every predicate was evaluated at — the caller's, never a
     /// clock this module reads.
-    pub at: DateTime<Utc>,
+    pub at: OffsetDateTime,
     /// The currency half of the bound market.
     pub currency: CurrencyCode,
     /// The region half of the bound market.
@@ -585,7 +586,7 @@ impl SellabilitySurface {
     #[must_use]
     pub fn of_delta(
         facts: &SellabilityFacts,
-        at: DateTime<Utc>,
+        at: OffsetDateTime,
         currency: &CurrencyCode,
         region: &Region,
     ) -> Self {
@@ -755,8 +756,8 @@ fn gate_input_keys(
 fn key_sellability(
     pinned: &PinnedFacts,
     scope_key: ScopeKey,
-    at: DateTime<Utc>,
-    margin: Option<TimeDelta>,
+    at: OffsetDateTime,
+    margin: Option<time::Duration>,
 ) -> KeySellability {
     // A key the window plane does not mention gets an empty set, whose coverage
     // end is `Uncovered`. `PlanSubjectDelta::windows` declares that the two lists
@@ -830,14 +831,14 @@ fn key_sellability(
 /// be shown safe to sell, which is a false predicate.
 fn active_window_with_horizon(
     windows: &KeyWindows,
-    at: DateTime<Utc>,
-    margin: Option<TimeDelta>,
+    at: OffsetDateTime,
+    margin: Option<time::Duration>,
 ) -> PredicateAnswer {
     if !windows.covers_at(at) {
         return PredicateAnswer::Failed {
             detail: format!(
                 "no window of this key covers {}: coverage {}",
-                at.to_rfc3339(),
+                format_rfc3339(at),
                 describe(windows.coverage_end())
             ),
         };
@@ -855,12 +856,12 @@ fn active_window_with_horizon(
     // is request input - unlike the mutation path, whose `now` is this server's
     // clock. An unrepresentable horizon is refused rather than skipped: the
     // predicate has no operand and the fail-closed answer is the false one.
-    let Some(horizon) = at.checked_add_signed(margin) else {
+    let Some(horizon) = at.checked_add(margin) else {
         return PredicateAnswer::Failed {
             detail: format!(
                 "{} plus the longest billing cycle sold on this key is not a representable \
                  instant, so the D-80 horizon cannot be evaluated",
-                at.to_rfc3339()
+                format_rfc3339(at)
             ),
         };
     };
@@ -871,9 +872,9 @@ fn active_window_with_horizon(
             detail: format!(
                 "this key's coverage ends at {} and the D-80 horizon runs to {}: a purchase at {} \
                  would bind a line whose coverage stops inside its first billing cycle",
-                end.to_rfc3339(),
-                horizon.to_rfc3339(),
-                at.to_rfc3339()
+                format_rfc3339(end),
+                format_rfc3339(horizon),
+                format_rfc3339(at)
             ),
         },
         // Unreachable behind `covers_at`, and answered rather than asserted: a
@@ -893,15 +894,15 @@ fn active_window_with_horizon(
 /// and puts the boundary instant outside rather than inside, which is the
 /// fail-closed direction. Reported as a reading taken here, since no document
 /// settles it.
-fn availability(pinned: &PinnedFacts, at: DateTime<Utc>) -> PredicateAnswer {
+fn availability(pinned: &PinnedFacts, at: OffsetDateTime) -> PredicateAnswer {
     if let Some(from) = pinned.available_from
         && at < from
     {
         return PredicateAnswer::Failed {
             detail: format!(
                 "the plan is purchasable from {} and {} is before it",
-                from.to_rfc3339(),
-                at.to_rfc3339()
+                format_rfc3339(from),
+                format_rfc3339(at)
             ),
         };
     }
@@ -911,8 +912,8 @@ fn availability(pinned: &PinnedFacts, at: DateTime<Utc>) -> PredicateAnswer {
         return PredicateAnswer::Failed {
             detail: format!(
                 "the plan is purchasable until {} (exclusive) and {} is not before it",
-                to.to_rfc3339(),
-                at.to_rfc3339()
+                format_rfc3339(to),
+                format_rfc3339(at)
             ),
         };
     }
@@ -943,7 +944,7 @@ fn lifecycle(pinned: &PinnedFacts) -> PredicateAnswer {
 fn describe(end: CoverageEnd) -> String {
     match end {
         CoverageEnd::Uncovered => "does not exist on this key at any instant".to_owned(),
-        CoverageEnd::Ends(at) => format!("ends at {}", at.to_rfc3339()),
+        CoverageEnd::Ends(at) => format!("ends at {}", format_rfc3339(at)),
         CoverageEnd::OpenEnded => "is open-ended".to_owned(),
     }
 }

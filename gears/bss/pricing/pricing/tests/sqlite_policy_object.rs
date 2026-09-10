@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 
 use bss_pricing::config::LimitsConfig;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::plan_rules::{
     DESCRIPTOR_INCOMPLETE, INVALID_CUSTOM_INTERVAL, plan_shape_rules,
 };
@@ -27,7 +28,8 @@ use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::storage::entity::policy_object;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{AuthoringPolicy, PolicyObjectRepo};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::EntityTrait;
 use sea_orm_migration::MigratorTrait;
@@ -61,8 +63,8 @@ async fn harness() -> (PolicyObjectRepo, DBProvider<DbError>) {
     )
 }
 
-fn at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, 9, 0, 0).unwrap()
+fn at() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, 9, 0, 0)
 }
 
 /// Write one tenant's policy row, carrying only what a test configures.

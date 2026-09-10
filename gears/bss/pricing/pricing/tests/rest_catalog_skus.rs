@@ -43,9 +43,9 @@ use toolkit_canonical_errors::CanonicalError;
 use async_trait::async_trait;
 use axum::Router;
 use axum::http::StatusCode;
-use bss_pricing::api::rest::catalog_skus::{ApiState, CATALOG_SKUS};
+use bss_pricing::api::rest::catalog_skus::{ApiState, CATALOG_SKUS, CATALOG_TAX_CATEGORIES};
 use bss_pricing::domain::ports::{
-    CatalogSku, ProductCatalogClientV1, UnconfiguredProductCatalogClientV1,
+    CatalogSku, CatalogTaxCategory, ProductCatalogClientV1, UnconfiguredProductCatalogClientV1,
 };
 use bss_pricing::infra::local_dev_catalog::{
     DEV_LOCAL_CODE_PREFIX, DEV_LOCAL_SKU_PREFIX, LocalDevStaticProductCatalog,
@@ -64,8 +64,91 @@ use authz_resolver_sdk::PolicyEnforcer;
 /// produce the arm's *other* input would prove less.
 struct UnreachableCatalog;
 
+/// A reachable real provider with no definitions, distinct from unconfigured.
+struct EmptyCatalog;
+
+#[async_trait]
+impl ProductCatalogClientV1 for EmptyCatalog {
+    async fn list_skus(&self, _ctx: &SecurityContext) -> Result<Vec<CatalogSku>, CanonicalError> {
+        Ok(Vec::new())
+    }
+
+    async fn list_tax_categories(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<Vec<CatalogTaxCategory>, CanonicalError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn tax_categories_are_named_marked_stable_and_read_only() {
+    let client = client(Arc::new(LocalDevStaticProductCatalog), "local_dev_static");
+    let response = client
+        .send(request("GET", CATALOG_TAX_CATEGORIES, None))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "source": "local_dev_static",
+            "items": [
+                {"code": "DEV-TAX-SUBSCRIPTION", "display_name": "Subscription (demo)"},
+                {"code": "DEV-TAX-USAGE", "display_name": "Usage (demo)"},
+                {"code": "DEV-TAX-SUPPORT", "display_name": "Support (demo)"}
+            ]
+        })
+    );
+    assert_eq!(
+        body_json(
+            client
+                .send(request("GET", CATALOG_TAX_CATEGORIES, None))
+                .await
+        )
+        .await,
+        body
+    );
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        assert_eq!(
+            client
+                .send(request(method, CATALOG_TAX_CATEGORIES, None))
+                .await
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+}
+
+#[tokio::test]
+async fn tax_dictionary_distinguishes_empty_unconfigured_and_unreachable() {
+    let empty = client(Arc::new(EmptyCatalog), "registry")
+        .send(request("GET", CATALOG_TAX_CATEGORIES, None))
+        .await;
+    assert_eq!(empty.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(empty).await,
+        serde_json::json!({"source": "registry", "items": []})
+    );
+    let unconfigured = client(Arc::new(UnconfiguredProductCatalogClientV1), "unconfigured")
+        .send(request("GET", CATALOG_TAX_CATEGORIES, None))
+        .await;
+    assert_eq!(unconfigured.status(), StatusCode::NOT_IMPLEMENTED);
+    let unreachable = client(Arc::new(UnreachableCatalog), "registry")
+        .send(request("GET", CATALOG_TAX_CATEGORIES, None))
+        .await;
+    assert_eq!(unreachable.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[async_trait]
 impl ProductCatalogClientV1 for UnreachableCatalog {
+    async fn list_tax_categories(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<Vec<CatalogTaxCategory>, CanonicalError> {
+        Err(catalog_unreachable("connection refused"))
+    }
+
     async fn list_skus(&self, _ctx: &SecurityContext) -> Result<Vec<CatalogSku>, CanonicalError> {
         Err(catalog_unreachable("connection refused".to_owned()))
     }

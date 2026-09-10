@@ -11,8 +11,8 @@
 //! `reverses_entry_id` is set ONLY on a stage-1 line-negation (PSP reject/void);
 //! `relates_to_refund_id` is the refund-of-refund forward link.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -39,7 +39,7 @@ pub struct Model {
     pub clearing_state: String,
     pub relates_to_refund_id: Option<String>,
     pub reverses_entry_id: Option<Uuid>,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     pub version: i64,
 }
 

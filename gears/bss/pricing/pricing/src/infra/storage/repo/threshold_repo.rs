@@ -41,7 +41,6 @@
 //! two stores; nothing here reads the approval plane, so this module cannot
 //! disagree with it.
 
-use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt, SecureInsertExt};
 use uuid::Uuid;
@@ -51,6 +50,7 @@ use crate::domain::materiality::ThresholdBasis;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::{approval_threshold, approval_threshold_tombstone};
 use crate::infra::storage::repo::check_authored_instant;
+use time::OffsetDateTime;
 
 /// One currency's entry in one version, as the store holds it.
 ///
@@ -113,7 +113,7 @@ pub struct StoredVersion {
     /// [`open_version`] call with one instant, so a per-entry reading would be a
     /// column with N spellings of one fact. A tombstone has one row and therefore
     /// nothing to disagree with.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// The entries, ordered by currency — the order the pin is taken over. Empty
     /// exactly on a tombstone.
     pub entries: Vec<ThresholdEntryRow>,
@@ -319,7 +319,7 @@ pub async fn open_version(
     scope: &AccessScope,
     tenant_id: Uuid,
     version: i64,
-    effective_from: DateTime<Utc>,
+    effective_from: OffsetDateTime,
     entries: &[ThresholdEntryRow],
     stamp: AuditStamp,
 ) -> Result<(), RepoError> {
@@ -382,7 +382,7 @@ pub async fn open_tombstone(
     scope: &AccessScope,
     tenant_id: Uuid,
     version: i64,
-    effective_from: DateTime<Utc>,
+    effective_from: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<(), RepoError> {
     check_authored_instant("effectiveFrom", Some(effective_from))?;
@@ -423,7 +423,7 @@ async fn read_tombstone(
     scope: &AccessScope,
     tenant_id: Uuid,
     version: i64,
-) -> Result<Option<DateTime<Utc>>, RepoError> {
+) -> Result<Option<OffsetDateTime>, RepoError> {
     let row = approval_threshold_tombstone::Entity::find()
         .secure()
         .scope_with(scope)

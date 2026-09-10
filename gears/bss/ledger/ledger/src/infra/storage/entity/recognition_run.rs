@@ -10,8 +10,8 @@
 //! (Phase 2, design §4.3). Tenant-scoped via `SecureORM`; the resource col is
 //! the business `run_id`.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -29,7 +29,7 @@ pub struct Model {
     pub period_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub run_id: Uuid,
-    pub started_at_utc: DateTime<Utc>,
+    pub started_at_utc: OffsetDateTime,
     pub status: String,
 }
 

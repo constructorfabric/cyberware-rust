@@ -32,8 +32,7 @@
 //! surface that renders it, PRD AC #66 — so the marker waits on nothing, and
 //! every resolved plan subject carries it.
 
-use chrono::{DateTime, Utc};
-
+use time::OffsetDateTime;
 /// A committed catalog version. Monotonic per tenant; the registry (Product &
 /// SKU) is the sole incrementer, so this crate only ever carries a value the
 /// catalog received, never one it derived.
@@ -67,5 +66,5 @@ pub struct PinFrontier {
     /// in order — a later version's completion never advances it past a gap.
     pub catalog_version: CatalogVersion,
     /// UTC instant the frontier last advanced.
-    pub advanced_at: DateTime<Utc>,
+    pub advanced_at: OffsetDateTime,
 }

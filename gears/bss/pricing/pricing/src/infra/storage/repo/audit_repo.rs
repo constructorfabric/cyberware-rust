@@ -113,19 +113,27 @@
 //! design set names the surface that discharges it (S5 §5,
 //! `GET /bss-pricing/v1/audit`, Auditor-only, cursor-paginated per D-125).
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use serde_json::Value as JsonValue;
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt, SecureInsertExt};
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
+
+use bss_pricing_sdk::odata::AuditFilterField;
 
 use crate::domain::audit::{
     AuditAction, AuditRecord, AuditSubjectKind, audit_row_hash, genesis_prev_hash,
 };
 use crate::domain::scope_key::PlanId;
 use crate::infra::storage::entity::audit_log;
+use crate::infra::storage::odata_mapping::{
+    AuditODataMapper, LIST_LIMIT_CFG, OdataPageError, map_odata_err, query_with_default_order,
+    query_with_unique_order,
+};
 use crate::infra::storage::{RepoError, contention_or_db};
+use time::OffsetDateTime;
 
 /// The `entry_kind` of everything this module writes.
 ///
@@ -151,7 +159,7 @@ pub struct NewAuditEntry {
     /// database's: the catalog mutates state only in response to an explicit
     /// authoring call (§2.2), so the record's timestamp belongs to the request
     /// rather than to whichever node evaluated `now()`.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: OffsetDateTime,
     /// **Pseudonymous** principal id of the acting operator (`inst-au-pii`).
     /// The column is `uuid` precisely so that constraint is physical.
     pub actor_principal_id: Uuid,
@@ -655,6 +663,50 @@ pub async fn page(
         .map_err(|e| RepoError::Db(format!("page pricing_audit_log: {e}")))
 }
 
+/// One `OData` page of the tenant's audit trail. Default order is
+/// `recorded_at asc, chain_id asc, seq asc`.
+///
+/// # Errors
+/// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+/// malformed `$filter` / `$orderby` / cursor.
+pub async fn list_odata(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    query: &ODataQuery,
+) -> Result<Page<audit_log::Model>, OdataPageError> {
+    let base_select = audit_log::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(audit_log::Column::TenantId.eq(tenant_id)));
+    let query = query_with_default_order(
+        query,
+        &[
+            AuditFilterField::RecordedAt,
+            AuditFilterField::ChainId,
+            AuditFilterField::Seq,
+        ],
+    );
+    // `seq` is the tiebreaker `paginate_odata` appends, and `seq` counts within
+    // a chain segment (D-135), not across the tenant — the key is
+    // `(tenant_id, chain_id, seq)`. A caller's `$orderby` would otherwise leave
+    // `[field, seq]`, and one bulk mutation writes one entry per chain at one
+    // `recorded_at` with `seq` 1, so those entries share a keyset value and all
+    // but one fall out of the walk. Naming `chain_id` here restores the unique
+    // order the default already had.
+    let query = query_with_unique_order(&query, &[AuditFilterField::ChainId]);
+    paginate_odata::<AuditFilterField, AuditODataMapper, audit_log::Entity, audit_log::Model, _, _>(
+        base_select,
+        runner,
+        &query,
+        ("seq", SortDir::Asc),
+        LIST_LIMIT_CFG,
+        |m| m,
+    )
+    .await
+    .map_err(map_odata_err)
+}
+
 /// Every record standing under one subject, in the same commit order [`page`] walks.
 ///
 /// # This is the read that makes `idx_pricing_audit_log_subject` addressable
@@ -737,7 +789,7 @@ pub async fn for_subject(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuditPosition {
     /// The instant the row was recorded.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: OffsetDateTime,
     /// The segment the row belongs to.
     pub chain_id: Uuid,
     /// The row's position within that segment.

@@ -23,23 +23,23 @@
 //!
 //! Reads (`(entry, read)`, PDP-scoped):
 //! - `GET /journal-entries/{entryId}` — tenant from the context.
-//! - `GET /journal-lines?tenant_id=&$filter=&$orderby=&cursor=&limit=` — canonical
-//!   `$filter` over `payer_tenant_id`/`account_class`/`period_id`/`invoice_id`.
-//! - `GET /balances?tenant_id=&$filter=&$orderby=&cursor=&limit=` — `$filter` over
-//!   `account_class`/`currency`.
+//! - `GET /journal-lines?$filter=&$orderby=&cursor=&limit=` — canonical
+//!   `$filter` over `tenant_id`/`payer_tenant_id`/`account_class`/`period_id`/`invoice_id`.
+//! - `GET /balances?$filter=&$orderby=&cursor=&limit=` — `$filter` over
+//!   `tenant_id`/`account_class`/`currency`.
 //! - `GET /balances/ar-aging?tenant_id=&payer=` — buckets via
 //!   [`crate::domain::invoice::aging::ar_aging`].
 //!
 //! Routes register through `OperationBuilder` so `/openapi.json` lists each
 //! operation with its declared request / response schemas.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
 use bss_ledger_sdk::api::LedgerClientV1;
-use chrono::Utc;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::odata::OData;
 use toolkit::api::operation_builder::OperationBuilderODataExt;
@@ -59,6 +59,10 @@ use crate::api::rest::dto::{
 use crate::api::rest::error::{
     authz_error_to_canonical, entry_not_found, reversal_error_to_canonical,
 };
+use crate::api::rest::odata_list::{
+    list_seller_tenant, reject_non_odata_list_params, reject_non_odata_list_params_allowing,
+};
+use crate::domain::instant::to_naive_date;
 use crate::domain::invoice::aging::ar_aging;
 use crate::domain::invoice::builder::build_invoice_entry;
 use crate::domain::invoice::mapping::resolve;
@@ -66,7 +70,10 @@ use crate::domain::invoice::policy::AgingThresholds;
 use crate::domain::invoice::reversal::{build_mapping_correction, build_reversal};
 use crate::infra::invoice_post::InvoicePoster;
 use crate::infra::storage::repo::{JournalRepo, PostingPolicyRepo};
-use crate::odata::{BalanceFilterField, JournalEntryFilterField, JournalLineFilterField};
+use crate::odata::{
+    BalanceFilterField, JournalEntryFilterField, JournalLineFilterField, JournalLineOrderField,
+};
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the journal-entry operations.
 const TAG: &str = "BSS Ledger Journal";
@@ -234,12 +241,13 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_ledger.list_journal_entries")
         .summary("List journal entry headers (cursor-paginated)")
         .description(
-            "Cursor-paginated list of journal entry HEADERS for the `tenant_id` \
-             query (the caller's own by default). Supports OData `$filter` over \
-             `source_doc_type`, `source_business_id`, and `period_id` — the \
-             header-only dims that enable cross-cuts like \"all `MANUAL_ADJUSTMENT` \
-             entries\" or \"all `REFUND` / `CREDIT_NOTE` entries\" (these live on \
-             the entry HEADER, not on `journal_line`). Each item is a lightweight \
+            "Cursor-paginated list of journal entry HEADERS for the seller named \
+             by `$filter=tenant_id eq <uuid>` (the caller's own by default). \
+             Supports OData `$filter` over `tenant_id`, `source_doc_type`, \
+             `source_business_id`, and `period_id` — the header-only dims that \
+             enable cross-cuts like \"all `MANUAL_ADJUSTMENT` entries\" or \
+             \"all `REFUND` / `CREDIT_NOTE` entries\" (these live on the entry \
+             HEADER, not on `journal_line`). Each item is a lightweight \
              `EntryHeaderView` (NO lines, NO hash-chain fields); read the full \
              entry with its lines via `GET /journal-entries/{entryId}`. The \
              `$filter` ANDs the caller's authorized subtree, so headers outside it \
@@ -248,11 +256,6 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "Target tenant (defaults to the caller's own)",
-        )
         .query_param_typed(
             "limit",
             false,
@@ -262,6 +265,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_journal_entries)
         .with_odata_filter::<JournalEntryFilterField>()
+        .with_odata_orderby::<JournalEntryFilterField>()
         .json_response_with_schema::<Page<EntryHeaderView>>(
             openapi,
             StatusCode::OK,
@@ -306,20 +310,16 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_ledger.list_lines")
         .summary("List journal lines (cursor-paginated)")
         .description(
-            "Cursor-paginated list of journal lines for the `tenant_id` query \
-             (the caller's own by default). Supports OData `$filter` over \
-             `payer_tenant_id`, `account_class`, `period_id`, and `invoice_id`. \
-             The `$filter` ANDs the caller's authorized subtree, so rows outside \
-             it are never returned (SQL-level BOLA).",
+            "Cursor-paginated list of journal lines for the seller named by \
+             `$filter=tenant_id eq <uuid>` (the caller's own by default). \
+             Supports OData `$filter` over `tenant_id`, `payer_tenant_id`, \
+             `account_class`, `period_id`, and `invoice_id`. The `$filter` ANDs \
+             the caller's authorized subtree, so rows outside it are never \
+             returned (SQL-level BOLA).",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "Target tenant (defaults to the caller's own)",
-        )
         .query_param_typed(
             "limit",
             false,
@@ -329,6 +329,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_lines)
         .with_odata_filter::<JournalLineFilterField>()
+        .with_odata_orderby::<JournalLineOrderField>()
         .json_response_with_schema::<Page<LineDto>>(
             openapi,
             StatusCode::OK,
@@ -345,24 +346,19 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .summary("List account-balance cache rows (cursor-paginated)")
         .description(
             "Cursor-paginated list of the account-balance cache rows for the \
-             `tenant_id` query (the caller's own by default). Supports OData \
-             `$filter` over `account_class` and `currency`. The `$filter` ANDs \
-             the caller's authorized subtree, so rows outside it are excluded \
-             (SQL-level BOLA). Each row carries BOTH the transaction-currency \
-             `balance_minor` and the Slice-5 functional valuation \
-             (`functional_balance_minor` / `functional_currency`); the latter is \
-             `null` on a single-currency grain, where the functional value equals \
-             `balance_minor` by identity (`?valuation=functional` fallback, P1 \
-             decision 8).",
+             seller named by `$filter=tenant_id eq <uuid>` (the caller's own by \
+             default). Supports OData `$filter` over `tenant_id`, `account_class` \
+             and `currency`. The `$filter` ANDs the caller's authorized subtree, \
+             so rows outside it are excluded (SQL-level BOLA). Each row carries \
+             BOTH the transaction-currency `balance_minor` and the Slice-5 \
+             functional valuation (`functional_balance_minor` / \
+             `functional_currency`); the latter is `null` on a single-currency \
+             grain, where the functional value equals `balance_minor` by identity \
+             (`?valuation=functional` fallback, P1 decision 8).",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "Target tenant (defaults to the caller's own)",
-        )
         .query_param(
             "valuation",
             false,
@@ -380,6 +376,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_balances)
         .with_odata_filter::<BalanceFilterField>()
+        .with_odata_orderby::<BalanceFilterField>()
         .json_response_with_schema::<Page<BalanceDto>>(
             openapi,
             StatusCode::OK,
@@ -653,7 +650,9 @@ async fn reverse_entry(
     }
 
     let into_period = body.period_id.unwrap_or_else(|| original.period_id.clone());
-    let effective_on = body.effective_at.unwrap_or_else(|| Utc::now().date_naive());
+    let effective_on = body
+        .effective_at
+        .unwrap_or_else(|| to_naive_date(OffsetDateTime::now_utc()));
     let reversal = build_reversal(
         &original,
         into_period,
@@ -718,7 +717,9 @@ async fn correct_mapping(
         .period_id
         .clone()
         .unwrap_or_else(|| original.period_id.clone());
-    let effective_on = body.effective_at.unwrap_or_else(|| Utc::now().date_naive());
+    let effective_on = body
+        .effective_at
+        .unwrap_or_else(|| to_naive_date(OffsetDateTime::now_utc()));
 
     // Cross-currency mapping-correction is not yet supported: the reversal half
     // (step 1) clears the original's functional at the original rate, but the
@@ -924,40 +925,22 @@ async fn set_entry_annotation(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// `GET /journal-lines` non-OData query: the target tenant (the caller's own
-/// when omitted). The `OData` `$filter` / `$orderby` / `limit` / `cursor` are
-/// parsed separately by the `OData` extractor from the same query string;
-/// `tenant_id` stays a plain param alongside them (the RBAC list convention).
-#[derive(Debug, serde::Deserialize)]
-struct LinesQuery {
-    tenant_id: Option<Uuid>,
-}
-
+/// `GET /journal-lines`: seller from `$filter=tenant_id eq`, else the caller.
+#[allow(clippy::implicit_hasher)]
 async fn list_lines(
     Extension(state): Extension<Arc<ApiState>>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<LinesQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<LineDto>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params(&extras)?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     let page = state.client.list_lines(&ctx, tenant_id, &odata).await?;
     Ok(Json(Page {
         items: page.items.into_iter().map(LineDto::from).collect(),
         page_info: page.page_info,
     }))
-}
-
-/// `GET /journal-entries` non-OData query: the target tenant (the caller's own
-/// when omitted). The `OData` `$filter` / `$orderby` / `limit` / `cursor` are
-/// parsed separately by the `OData` extractor from the same query string;
-/// `tenant_id` stays a plain param alongside them (the list convention). NOTE: the
-/// same path also serves `POST /journal-entries` (the invoice-post write) and is
-/// the prefix of `GET /journal-entries/{entryId}` (the by-id read) — this is the
-/// HEADER-list `GET` over the bare collection.
-#[derive(Debug, serde::Deserialize)]
-struct JournalEntriesQuery {
-    tenant_id: Option<Uuid>,
 }
 
 /// `GET /journal-entries`: cursor-paginated list of journal entry HEADERS (R5).
@@ -969,15 +952,17 @@ struct JournalEntriesQuery {
 /// repo binds, so the page never contains a foreign-tenant header (no existence
 /// leak). The `$filter` over `source_doc_type` / `source_business_id` / `period_id`
 /// is additive over that scope (it never replaces it).
+#[allow(clippy::implicit_hasher)]
 async fn list_journal_entries(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<JournalEntriesQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<EntryHeaderView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params(&extras)?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     // (entry, read) PEP gate against the target tenant — the SAME action the by-id
     // entry read / journal-lines / balances run under. The returned scope is the
     // SQL-level BOLA filter the repo binds, so the page never contains a foreign-
@@ -1007,22 +992,18 @@ async fn list_journal_entries(
     }))
 }
 
-/// `GET /balances` non-OData query: the target tenant (the caller's own when
-/// omitted). The `OData` `$filter` / `$orderby` / `limit` / `cursor` are parsed
-/// separately by the `OData` extractor; `tenant_id` stays a plain param.
-#[derive(Debug, serde::Deserialize)]
-struct BalancesQuery {
-    tenant_id: Option<Uuid>,
-}
-
+/// `GET /balances`: seller from `$filter=tenant_id eq`, else the caller.
+/// `valuation` stays a named lens (not a filter).
+#[allow(clippy::implicit_hasher)]
 async fn list_balances(
     Extension(state): Extension<Arc<ApiState>>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<BalancesQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<BalanceDto>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params_allowing(&extras, &["valuation"])?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     let page = state.client.list_balances(&ctx, tenant_id, &odata).await?;
     Ok(Json(Page {
         items: page.items.into_iter().map(BalanceDto::from).collect(),
@@ -1071,7 +1052,7 @@ async fn ar_aging_handler(
             )
             .await
             .map_err(authz_error_to_canonical)?;
-            repo.read_effective_policy(&scope, tenant_id, Utc::now())
+            repo.read_effective_policy(&scope, tenant_id, OffsetDateTime::now_utc())
                 .await
                 .map_err(|e| {
                     CanonicalError::from(crate::domain::error::DomainError::Internal(format!(
@@ -1082,7 +1063,7 @@ async fn ar_aging_handler(
         }
         None => AgingThresholds::default(),
     };
-    let buckets = ar_aging(&rows, Utc::now().date_naive(), &thresholds);
+    let buckets = ar_aging(&rows, to_naive_date(OffsetDateTime::now_utc()), &thresholds);
     Ok(Json(ArAgingDto::from(buckets)))
 }
 

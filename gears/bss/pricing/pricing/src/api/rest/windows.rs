@@ -114,6 +114,7 @@
 //! operator here, and the whole value of a remediation surface is that acting on
 //! it makes the publish pass.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
@@ -122,8 +123,11 @@ use axum::http::header::ETAG;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, body::Bytes, http::StatusCode};
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{DateTime, Utc};
+use bss_pricing_sdk::odata::WindowFilterField;
+
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_odata::Page;
@@ -133,14 +137,15 @@ use uuid::Uuid;
 use crate::api::rest::approvals::{ApprovalView, MaterialityView};
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
-use crate::api::rest::cursor::{self, PageRequest};
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::plans::{idempotency_key_param, if_match_param};
 use crate::api::rest::preconditions;
 use crate::api::rest::state::GovernanceState;
 use crate::domain::concurrency::RowVersion;
 use crate::domain::coverage::{self, CoverageReport, KeyCoverage};
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::domain::money::CurrencyCode;
 use crate::domain::read_model::SubjectRef;
 use crate::domain::scope_key::{PlanId, Region};
@@ -154,6 +159,7 @@ use crate::infra::storage::repo::window_repo::WindowRecord;
 use crate::infra::storage::repo::{pin_frontier_repo, price_repo, read_model_repo, window_repo};
 use crate::infra::storage::repo_failure;
 use crate::infra::window::{PendingApproval, WindowMutationOutcome, WindowMutationReceipt};
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the window operations (DE0205 requires a tag and a
 /// summary on every registered operation).
@@ -264,7 +270,8 @@ pub struct CoverageEndView {
     /// `uncovered` | `ends` | `open_ended`.
     pub kind: String,
     /// The exclusive instant coverage ends at, non-null only on `ends`.
-    pub at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub at: Option<OffsetDateTime>,
 }
 
 impl From<CoverageEnd> for CoverageEndView {
@@ -281,9 +288,11 @@ impl From<CoverageEnd> for CoverageEndView {
 #[toolkit_macros::api_dto(response)]
 pub struct WindowIntervalView {
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `null` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
     /// `scheduled` | `active` | `expired` | `cancelled`.
     pub state: String,
 }
@@ -296,24 +305,6 @@ impl From<&WindowInterval> for WindowIntervalView {
             state: interval.state.as_str().to_owned(),
         }
     }
-}
-
-/// The two pagination query parameters plus the price-row filter (D-125).
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct WindowPageQuery {
-    /// Windows per page; server default 100, hard cap 1,000.
-    pub limit: Option<String>,
-    /// The opaque token a previous page returned.
-    pub cursor: Option<String>,
-    /// Narrow the page to one price row's windows.
-    ///
-    /// **`plan_id` is not offered, and the reason is the store rather than
-    /// taste**: `pricing_price_window` carries `price_id` and no plan reference at
-    /// all — the plan and the canonical scope key both live on `pricing_price`, so
-    /// that a window's row and its key cannot disagree. A plan's whole window
-    /// plane is `GET …/plans/{planId}/coverage`, which answers it per key and is
-    /// the surface that question already had.
-    pub price_id: Option<String>,
 }
 
 /// One window on a page: the interval, where it stands, and the precondition the
@@ -339,21 +330,27 @@ pub struct WindowSummaryView {
     /// The row's canonical scope key, the ten axes pipe-separated.
     pub scope_key: String,
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `null` is **open-ended** and not "unset".
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
     /// `scheduled` | `active` | `expired` | `cancelled`.
     pub state: String,
     /// The operator-supplied change reason carried for the audit trail.
     pub reason_code: String,
     /// When the window was scheduled, UTC.
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub created_at: OffsetDateTime,
     /// When it became active, UTC; `null` while it has not.
-    pub activated_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub activated_at: Option<OffsetDateTime>,
     /// When it expired, UTC; `null` while it has not.
-    pub expired_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub expired_at: Option<OffsetDateTime>,
     /// When it was cancelled, UTC; `null` if it never was.
-    pub cancelled_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub cancelled_at: Option<OffsetDateTime>,
     /// The act sequence a `PATCH` or `DELETE` must assert as its `If-Match`.
     ///
     /// On the page for the reason `PlanSummaryView::row_version` is: a caller that
@@ -387,9 +384,11 @@ impl From<&WindowRecord> for WindowSummaryView {
 pub struct CoverageGapView {
     /// Inclusive start of the hole — the instant the preceding window stopped
     /// covering.
-    pub gap_start: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub gap_start: OffsetDateTime,
     /// Exclusive end — the instant the next window starts.
-    pub gap_end: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub gap_end: OffsetDateTime,
 }
 
 /// The body of `POST /prices/{priceId}/windows`.
@@ -408,9 +407,11 @@ pub struct CoverageGapView {
 pub struct ScheduleWindowRequest {
     /// Inclusive start, UTC, strictly in the future (`inst-ws-future-start`,
     /// D-63).
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; absent is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
     /// Why the window was scheduled — free text the store keeps with the row.
     pub reason_code: String,
 }
@@ -425,7 +426,8 @@ pub struct ScheduleWindowRequest {
 #[toolkit_macros::api_dto(request)]
 pub struct AdjustWindowRequest {
     /// The new exclusive end, UTC; absent makes the window open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
 }
 
 /// What a window mutation answers with — the pending handle and the row as stored.
@@ -454,9 +456,11 @@ pub struct WindowMutationView {
     /// for the same reason.
     pub pending_version_ref: Option<String>,
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `null` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
     /// `scheduled` | `active` | `expired` | `cancelled`.
     pub state: String,
 }
@@ -608,7 +612,8 @@ pub struct PlanSellabilityView {
     pub plan_id: Uuid,
     /// The instant the answer is about — the caller's own, echoed so a stored
     /// response cannot be mistaken for one about a different moment.
-    pub at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub at: OffsetDateTime,
     /// The currency half of the bound market.
     pub currency: String,
     /// The region half of the bound market.
@@ -695,11 +700,11 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
         .operation_id("bss_pricing.list_price_windows")
         .summary("List the tenant's price windows (cursor-paginated)")
         .description(
-            "One page of the tenant's price windows in `windowId` order, with an opaque `cursor` \
+            "One page of the tenant's price windows in `window_id` order, with an opaque `cursor` \
              and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). \
-             `price_id` narrows the page to one price row's windows. There is no `plan_id` \
-             filter: a window is bound to a **row** and carries no plan reference, so that the \
-             row and its canonical scope key cannot disagree - a plan's whole time axis is \
+             Narrow with `$filter=price_id eq <uuid>`. There is no `plan_id` filter: a window is \
+             bound to a **row** and carries no plan reference, so that the row and its canonical \
+             scope key cannot disagree - a plan's whole time axis is \
              `GET /bss-pricing/v1/plans/{planId}/coverage`, which answers it per key. Every \
              state is on the page, cancelled and expired included, because \"why did this key \
              lose its successor\" is a question about a plane rather than about a live row. Each \
@@ -716,12 +721,9 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
             "integer",
         )
         .query_param("cursor", false, "Opaque base64url pagination cursor")
-        .query_param(
-            "price_id",
-            false,
-            "Narrow the page to one price row's windows",
-        )
         .handler(list_price_windows)
+        .with_odata_filter::<WindowFilterField>()
+        .with_odata_orderby::<WindowFilterField>()
         .json_response_with_schema::<Page<WindowSummaryView>>(
             openapi,
             StatusCode::OK,
@@ -1141,7 +1143,7 @@ async fn schedule_window(
     let request: ScheduleWindowRequest = preconditions::parse_body(&body)?;
     let digest = preconditions::request_digest(&request)?;
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, now, correlation);
     let windows = state.windows.clone();
     let mutation_ctx = ctx.clone();
@@ -1234,7 +1236,8 @@ async fn adjust_window(
     let expected = preconditions::if_match(&headers)?;
     let request: AdjustWindowRequest = preconditions::parse_body(&body)?;
 
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let outcome = state
         .windows
         .adjust_effective_to(
@@ -1270,7 +1273,8 @@ async fn cancel_window(
     let plan_id = resolve_plan(&state, &coarse, tenant, Lookup::Window(window_id)).await?;
     let scope = window_write_scope(&enforcer, &ctx, plan_id, tenant).await?;
 
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let outcome = state
         .windows
         .cancel(&ctx, &scope, tenant, window_id, verdict_json, stamp)
@@ -1407,16 +1411,19 @@ pub fn verdict_json(
 /// runs under, and `require_constraints` is `true` so an unconstrained allow
 /// fail-closes rather than paging through every tenant's window plane.
 ///
-/// **No `plan_id` parameter**, for the reason [`WindowPageQuery::price_id`]
-/// states: the store has no plan reference on a window and this handler invents
-/// no join to fabricate one.
+/// **No `plan_id` parameter**: the store has no plan reference on a window and
+/// this handler invents no join to fabricate one. Narrow with
+/// `$filter=price_id eq <uuid>`.
+#[allow(clippy::implicit_hasher)]
 async fn list_price_windows(
     Extension(state): Extension<Arc<GovernanceState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<WindowPageQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Json<Page<WindowSummaryView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let scope = crate::authz::access_scope(
         &enforcer,
         &ctx,
@@ -1428,39 +1435,15 @@ async fn list_price_windows(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    let page = PageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )?;
     let conn = state.db.conn().map_err(|e| {
         CanonicalError::internal(format!("bss-pricing: price window listing: {e}")).create()
     })?;
-
-    // One row more than the page, so "is there another page" needs no second
-    // query and no page whose `next_cursor` points at nothing.
-    let probe = page.limit.saturating_add(1);
-    let price_filter = cursor::parse_uuid_param("price_id", query.price_id.as_deref())?;
-    let mut rows = window_repo::list_page(
-        &conn,
-        &scope,
-        ctx.subject_tenant_id(),
-        price_filter,
-        page.after,
-        probe,
-    )
-    .await
-    .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
-
-    let has_more = u64::try_from(rows.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        rows.pop();
-    }
-    let next = has_more
-        .then(|| rows.last().map(|row| row.window_id))
-        .flatten();
+    let page = window_repo::list_odata(&conn, &scope, ctx.subject_tenant_id(), &odata)
+        .await
+        .map_err(map_odata_page_err)?;
     Ok(Json(Page {
-        items: rows.iter().map(WindowSummaryView::from).collect(),
-        page_info: cursor::page_info(next, page.limit),
+        items: page.items.iter().map(WindowSummaryView::from).collect(),
+        page_info: page.page_info,
     }))
 }
 
@@ -1656,7 +1639,7 @@ async fn get_plan_sellability(
 /// own description tells a client to send.
 fn market_of(
     query: &SellabilityQuery,
-) -> Result<(DateTime<Utc>, CurrencyCode, Region), DomainError> {
+) -> Result<(OffsetDateTime, CurrencyCode, Region), DomainError> {
     let required = |value: &Option<String>, name: &str| {
         value.clone().ok_or_else(|| {
             DomainError::InvalidRequest(format!(
@@ -1665,13 +1648,13 @@ fn market_of(
         })
     };
     let at = required(&query.at, "at")?;
-    let at = DateTime::parse_from_rfc3339(&at)
-        .map(|parsed| parsed.with_timezone(&Utc))
-        .map_err(|e| {
+    let at = OffsetDateTime::parse(&at, &::time::format_description::well_known::Rfc3339).map_err(
+        |e| {
             DomainError::InvalidRequest(format!(
                 "the `at` query parameter is not an RFC 3339 instant: {e}"
             ))
-        })?;
+        },
+    )?;
     Ok((
         at,
         CurrencyCode::new(&required(&query.currency, "currency")?)?,

@@ -10,12 +10,11 @@
 //!
 //! Both run inside the SAME serializable transaction as the journal post (see
 //! the [`PostSidecar`] contract): their writes commit atomically with the entry
-//! or roll back with it. This is INFRA code, so the wall clock (`Utc::now()`)
+//! or roll back with it. This is INFRA code, so the wall clock (`OffsetDateTime::now_utc()`)
 //! for the `allocated_at_utc` audit stamp is allowed here.
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -28,6 +27,7 @@ use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::posting::service::{PostSidecar, PostedFacts};
 use crate::infra::storage::repo::payment_repo::NewAllocationRow;
 use crate::infra::storage::repo::{DisputeRepo, PaymentRepo};
+use time::OffsetDateTime;
 
 /// In-transaction sidecar for a payment settlement: seeds the
 /// `payment_settlement` counter row so a later allocation can net against it.
@@ -176,7 +176,7 @@ impl PostSidecar for AllocationSidecar {
             .map_err(map_repo_err)?;
 
         // 2. Insert one `payment_allocation` row per split.
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let rows: Vec<NewAllocationRow> = self
             .splits
             .iter()

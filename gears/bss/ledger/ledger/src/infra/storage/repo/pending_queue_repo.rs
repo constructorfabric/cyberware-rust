@@ -29,7 +29,6 @@
 //! depth) runs out-of-txn via `self.db.conn()`. Every query is scoped
 //! (`.secure().scope_with…`) for SQL-level BOLA — a foreign tenant sees no rows.
 
-use chrono::{DateTime, Utc};
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -44,6 +43,7 @@ use uuid::Uuid;
 use crate::domain::model::RepoError;
 use crate::infra::posting::idempotency::STATUS_QUEUED;
 use crate::infra::storage::entity::pending_event_queue;
+use time::OffsetDateTime;
 
 /// Status literal for a queue row whose deferred effect has been durably
 /// applied (drained) in a later transaction — terminal, never re-claimed.
@@ -60,8 +60,8 @@ pub struct NewQueueRow {
     pub flow: String,
     pub business_id: String,
     pub payload: serde_json::Value,
-    pub queued_at: DateTime<Utc>,
-    pub apply_after: Option<DateTime<Utc>>,
+    pub queued_at: OffsetDateTime,
+    pub apply_after: Option<OffsetDateTime>,
 }
 
 /// SeaORM-backed deferred-apply queue repository (work-state `SoT`). See the
@@ -148,7 +148,7 @@ impl PendingQueueRepo {
         scope: &AccessScope,
         tenant: Uuid,
         flow: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         limit: u64,
     ) -> Result<Vec<pending_event_queue::Model>, RepoError> {
         // Apply the row lock on the raw `find()` Select *before* wrapping it in
@@ -231,7 +231,7 @@ impl PendingQueueRepo {
         tenant: Uuid,
         flow: &str,
         business_id: &str,
-        apply_after: DateTime<Utc>,
+        apply_after: OffsetDateTime,
     ) -> Result<(), RepoError> {
         let result = pending_event_queue::Entity::update_many()
             .secure()
@@ -287,7 +287,7 @@ impl PendingQueueRepo {
     pub async fn list_all_due(
         &self,
         flow: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         limit: u64,
     ) -> Result<Vec<pending_event_queue::Model>, RepoError> {
         let conn = self

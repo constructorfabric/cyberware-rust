@@ -37,7 +37,7 @@ use std::time::Instant;
 use bss_ledger_sdk::{
     AccountClass, MappingStatus, PostEntry, PostLine, PostingRef, Side, SourceDocType,
 };
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::Datelike;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_db::{DBProvider, DbError};
@@ -46,6 +46,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::fx::realized::{ClosingLeg, realize};
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::domain::payment::allocation::{
     AllocationInput, build_allocation_entry, validate_caller_split,
@@ -64,6 +65,8 @@ use crate::infra::posting::idempotency::{
 use crate::infra::posting::service::{PostSidecar, PostedFacts, PostingService};
 use crate::infra::storage::entity::pending_event_queue;
 use crate::infra::storage::repo::{NewQueueRow, PaymentRepo, PendingQueueRepo, ReferenceRepo};
+use time::Duration;
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service.
 const ORIGIN_SYSTEM: &str = "SYSTEM";
@@ -164,7 +167,7 @@ pub struct QueuedAllocation {
     /// The queue/dedup business id — the allocation's `allocation_id` (string).
     pub business_id: String,
     /// When the intake durably enqueued the request.
-    pub queued_at: DateTime<Utc>,
+    pub queued_at: OffsetDateTime,
 }
 
 /// The financial-key snapshot of an allocate request, persisted as the queue
@@ -268,7 +271,7 @@ impl QueuedAllocationPayload {
 /// queue row holds the authoritative `queued_at`, read out-of-txn afterwards).
 enum IntakeOutcome {
     Enqueued {
-        queued_at: DateTime<Utc>,
+        queued_at: OffsetDateTime,
     },
     AlreadyQueued,
     /// A concurrent/retried intake reused the same `allocation_id` with a
@@ -553,7 +556,7 @@ impl AllocationService {
         //    validates the caller's shares instead (see the branch below).
         let effective = self
             .repo
-            .read_effective_policy(scope, input.tenant_id, Utc::now())
+            .read_effective_policy(scope, input.tenant_id, OffsetDateTime::now_utc())
             .await
             .map_err(|e| DomainError::Internal(format!("read precedence policy: {e}")))?;
         let (strategy, policy_ref) = match effective {
@@ -947,7 +950,7 @@ impl AllocationService {
         scope: &AccessScope,
         input: &AllocateRequest,
     ) -> Result<QueuedAllocation, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let business_id = input.allocation_id.to_string();
         let payload = QueuedAllocationPayload::from_request(input);
         // Canonical JSON of the PII-free payload: the queue row's `payload` jsonb
@@ -1199,7 +1202,7 @@ impl AllocationService {
         tenant: Uuid,
         limit: u64,
     ) -> Result<DrainReport, DomainError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         // Claim txn: reserve up to `limit` due rows under SKIP LOCKED. Returned
         // still `QUEUED` — the apply flips each. Its own short txn so the lock is
         // released before the (potentially slow) per-row applies run.
@@ -1285,7 +1288,7 @@ impl AllocationService {
     ) -> Result<(), DomainError> {
         let scope_owned = scope.clone();
         let business_id = business_id.to_owned();
-        let defer_until = Utc::now() + blocked_backoff(prior_attempts + 1);
+        let defer_until = OffsetDateTime::now_utc() + blocked_backoff(prior_attempts + 1);
         self.db
             .transaction(move |txn| {
                 Box::pin(async move {
@@ -1370,7 +1373,7 @@ impl AllocationService {
             source_business_id: entry.source_business_id.clone(),
             reverses_entry_id: entry.reverses_entry_id,
             reverses_period_id: entry.reverses_period_id.clone(),
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: entry.effective_at,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: entry.posted_by_actor_id,
@@ -1422,7 +1425,7 @@ impl AllocationService {
 /// fresh correlation id. If `period_id` stayed `""` the post would fail the
 /// fiscal-period gate, so this overwrite is mandatory.
 fn overwrite_header(entry: &mut PostEntry, ctx: &SecurityContext) {
-    let eff_date = Utc::now().date_naive();
+    let eff_date = to_naive_date(OffsetDateTime::now_utc());
     entry.effective_at = eff_date;
     entry.period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
     entry.posted_by_actor_id = ctx.subject_id();

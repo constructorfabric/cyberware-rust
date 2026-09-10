@@ -76,11 +76,12 @@ use bss_ledger::infra::metrics::test_harness::MetricsHarness;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{AdjustmentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, Side};
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -224,7 +225,7 @@ async fn boot() -> (
     let tdb = connect_db(&repo_url, ConnectOpts::default()).await.unwrap();
     let provider = DBProvider::<DbError>::new(tdb);
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: SUBJECT_TENANT,
         payer: Uuid::now_v7(),
@@ -237,7 +238,7 @@ async fn boot() -> (
         tax: Uuid::now_v7(),
         suspense: Uuid::now_v7(),
         cash_clearing: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());

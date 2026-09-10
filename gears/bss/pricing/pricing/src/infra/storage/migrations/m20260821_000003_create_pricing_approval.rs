@@ -267,7 +267,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
             CONSTRAINT chk_pricing_approval_distinct_principals CHECK (approver_principal IS NULL OR approver_principal <> submitter_principal),
             CONSTRAINT chk_pricing_approval_reason CHECK (state <> 'rejected' OR reason IS NOT NULL),
             CONSTRAINT chk_pricing_approval_state CHECK (state IN ('submitted','approved','rejected','voided')),
-            CONSTRAINT chk_pricing_approval_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership')),
+            CONSTRAINT chk_pricing_approval_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership','taxonomy_value')),
             CONSTRAINT pricing_approval_pkey PRIMARY KEY (approval_id)
         )",
     "CREATE INDEX idx_pricing_approval_subject ON bss.pricing_approval USING btree (tenant_id, state, subject_ref)",
@@ -362,7 +362,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             CONSTRAINT chk_pricing_approval_distinct_principals CHECK (approver_principal IS NULL OR approver_principal <> submitter_principal),
             CONSTRAINT chk_pricing_approval_reason CHECK (state <> 'rejected' OR reason IS NOT NULL),
             CONSTRAINT chk_pricing_approval_state CHECK (state IN ('submitted','approved','rejected','voided')),
-            CONSTRAINT chk_pricing_approval_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership'))
+            CONSTRAINT chk_pricing_approval_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership','taxonomy_value'))
         )",
     "CREATE INDEX idx_pricing_approval_subject ON pricing_approval (tenant_id, state, subject_ref)",
     "CREATE UNIQUE INDEX uq_pricing_approval_policy_pending ON pricing_approval (tenant_id) WHERE subject_kind = 'policy' AND state = 'submitted'",

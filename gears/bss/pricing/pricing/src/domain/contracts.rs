@@ -439,7 +439,7 @@ impl ValidationRule<PlanShape> for ProrationCreditHasBasis {
 /// own anchor as authored; the consuming side reads **one** value, because
 /// Subscriptions' `billingAnchor` is a single field on the aggregate. Nothing
 /// related the N authored values to the one consumed value, so an intro-pricing
-/// plan anchoring `subscription_start` on the intro row and `fixed_day(1)` on
+/// plan anchoring `subscription_start` on the interim row and `fixed_day(1)` on
 /// the terminal row published both into one frozen snapshot with no rule saying
 /// which sets the boundary. This rule makes the question not arise: the phase
 /// axis becomes cycle-clock-neutral by construction.

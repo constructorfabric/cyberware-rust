@@ -19,6 +19,7 @@ use super::canonical::{
     digest32, put, put_i32, put_i64, put_none, put_opt_i64, put_opt_str, put_opt_uuid, put_str,
     put_uuid,
 };
+use crate::domain::instant::timestamp_micros;
 use crate::domain::model::{NewEntry, NewLine};
 
 /// Versioned domain-separation tag; bump only on an intentional re-freeze of
@@ -56,7 +57,7 @@ pub fn chain_row_hash(entry: &NewEntry, lines: &[NewLine], prev_hash: &[u8; 32])
     put_opt_uuid(&mut buf, entry.reverses_entry_id);
     put_opt_str(&mut buf, entry.reverses_period_id.as_deref());
     put_i32(&mut buf, entry.effective_at.num_days_from_ce());
-    put_i64(&mut buf, entry.posted_at_utc.timestamp_micros());
+    put_i64(&mut buf, timestamp_micros(entry.posted_at_utc));
     put_str(&mut buf, &entry.origin);
     put_uuid(&mut buf, entry.posted_by_actor_id);
 

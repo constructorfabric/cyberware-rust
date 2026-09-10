@@ -1,24 +1,22 @@
 //! The window state token, §4's edge set, the interval arithmetic and the five
 //! checked forms a surface calls before it attempts a mutation.
 
-use chrono::{DateTime, TimeZone, Utc};
-
 use super::{
     CoverageEnd, KeyWindows, WINDOW_HISTORICAL_IMMUTABLE, WINDOW_NOT_CANCELLABLE, WINDOW_OVERLAP,
     WINDOW_START_IN_PAST, WindowInterval, WindowRefusal, WindowState, check_cancellation,
     check_creation, check_effective_to_adjustment, group_by_key, group_by_key_seeded, transition,
 };
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
+use crate::domain::instant::utc_ymd_hms;
+use time::OffsetDateTime;
 
 /// `2026-09-01T00:00:00Z` plus `day` days — the instant vocabulary the window
 /// suites share. Days rather than hours so every instant in a test is legibly
 /// ordered, and an offset rather than a calendar day so `t(200)` is still an
 /// instant.
-fn t(day: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0)
-        .single()
-        .expect("a well-defined UTC instant")
-        + chrono::Duration::days(day)
+fn t(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2026, 9, 1, 0, 0, 0) + time::Duration::days(day)
 }
 
 /// The code a refusal reached the caller with, so an assertion names the code
@@ -260,7 +258,7 @@ fn a_window_starting_in_the_past_is_refused() {
     let refusal = check_creation(t(9), Some(t(20)), now).expect_err("a past start is refused");
     assert_eq!(code_of(&refusal), WINDOW_START_IN_PAST);
     assert!(
-        refusal.to_string().contains(&t(9).to_rfc3339()),
+        refusal.to_string().contains(&format_rfc3339(t(9))),
         "the refusal must name the instant an author has to correct: {refusal}"
     );
 }
@@ -279,7 +277,7 @@ fn a_window_starting_at_this_very_instant_is_refused_too() {
         code_of(&check_creation(now, Some(t(20)), now).expect_err("now is not the future")),
         WINDOW_START_IN_PAST
     );
-    check_creation(now + chrono::Duration::milliseconds(1), Some(t(20)), now)
+    check_creation(now + time::Duration::milliseconds(1), Some(t(20)), now)
         .expect("one quantum into the future is the future");
 }
 
@@ -415,7 +413,7 @@ fn shortening_an_active_window_into_the_past_is_refused() {
 
     assert_eq!(code_of(&refusal), WINDOW_HISTORICAL_IMMUTABLE);
     assert!(
-        refusal.to_string().contains(&t(12).to_rfc3339()),
+        refusal.to_string().contains(&format_rfc3339(t(12))),
         "{refusal}"
     );
 }

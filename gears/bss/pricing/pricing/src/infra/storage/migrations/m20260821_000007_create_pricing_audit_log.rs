@@ -100,7 +100,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
             CONSTRAINT chk_pricing_audit_log_entry_kind CHECK (entry_kind IN ('mutation','rollup')),
             CONSTRAINT chk_pricing_audit_log_rollup CHECK ((entry_kind = 'rollup') = (segment_heads IS NOT NULL)),
             CONSTRAINT chk_pricing_audit_log_seq CHECK (seq >= 0),
-            CONSTRAINT chk_pricing_audit_log_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership')),
+            CONSTRAINT chk_pricing_audit_log_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership','taxonomy_value')),
             CONSTRAINT pricing_audit_log_pkey PRIMARY KEY (tenant_id, chain_id, seq)
         )",
     "CREATE INDEX idx_pricing_audit_log_recorded ON bss.pricing_audit_log USING btree (tenant_id, recorded_at)",
@@ -141,7 +141,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             CONSTRAINT chk_pricing_audit_log_entry_kind CHECK (entry_kind IN ('mutation','rollup')),
             CONSTRAINT chk_pricing_audit_log_rollup CHECK ((entry_kind = 'rollup') = (segment_heads IS NOT NULL)),
             CONSTRAINT chk_pricing_audit_log_seq CHECK (seq >= 0),
-            CONSTRAINT chk_pricing_audit_log_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership'))
+            CONSTRAINT chk_pricing_audit_log_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership','taxonomy_value'))
         )",
     "CREATE INDEX idx_pricing_audit_log_recorded ON pricing_audit_log (tenant_id, recorded_at)",
     "CREATE INDEX idx_pricing_audit_log_subject ON pricing_audit_log (tenant_id, subject_kind, subject_ref, recorded_at)",

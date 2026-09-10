@@ -19,18 +19,20 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
+
 use uuid::Uuid;
 
 use super::{HistoryPageRequest, decode, encode};
 use crate::api::rest::cursor::{DEFAULT_LIMIT, MAX_LIMIT};
 use crate::domain::error::DomainError;
+use crate::domain::instant::from_unix;
 use crate::infra::storage::repo::price_repo::HistoryPosition;
+use time::OffsetDateTime;
 
 /// An instant carrying sub-second digits, which is what makes the round trip a
 /// test of anything.
-fn instant() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_785_000_000, 123_456_789).expect("a representable instant")
+fn instant() -> OffsetDateTime {
+    from_unix(1_785_000_000, 123_456_789).expect("a representable instant")
 }
 
 fn position() -> HistoryPosition {
@@ -53,7 +55,7 @@ fn a_cursor_round_trips_whole_and_stays_opaque() {
     // Named separately: the id surviving while the instant is rounded is the
     // failure this token's two-field encoding exists to prevent, and an
     // assertion on the pair alone would not say which half moved.
-    assert_eq!(back.authored_at.timestamp_subsec_nanos(), 123_456_789);
+    assert_eq!(back.authored_at.nanosecond(), 123_456_789);
 }
 
 #[test]

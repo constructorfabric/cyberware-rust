@@ -53,6 +53,7 @@ use crate::api::rest::windows::verdict_json;
 use crate::domain::retirement::{KeptReason, WindowDisposition};
 use crate::domain::scope_key::PlanId;
 use crate::infra::retirement::{RetirementOutcome, RetirementPreview};
+use time::OffsetDateTime;
 
 /// The route's registered path template.
 ///
@@ -264,7 +265,8 @@ async fn retire_plan(
         return Ok((StatusCode::OK, Json(RetirementPreviewView::of(&preview))).into_response());
     }
 
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, chrono::Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let outcome = state
         .retirements
         .retire(&ctx, &scope, tenant, plan_id, verdict_json, stamp)

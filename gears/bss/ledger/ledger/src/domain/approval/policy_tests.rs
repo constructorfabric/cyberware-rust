@@ -1,17 +1,18 @@
 //! Unit tests for the pure dual-control threshold policy.
 
 use super::*;
-use chrono::TimeZone;
+use crate::domain::instant::utc_ymd_hms;
+use time::OffsetDateTime;
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
 }
 
-fn ts(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).unwrap()
+fn ts(y: i32, m: u32, d: u32) -> OffsetDateTime {
+    utc_ymd_hms(y, m, d, 0, 0, 0)
 }
 
-fn version(eff: DateTime<Utc>, version: i64, d2: i64, a6: i32) -> PolicyVersion {
+fn version(eff: OffsetDateTime, version: i64, d2: i64, a6: i32) -> PolicyVersion {
     PolicyVersion {
         effective_from: eff,
         version,

@@ -33,10 +33,12 @@ use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::entity::plan;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewPlanDraft, PlanRepo, PlanShapeRepo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureUpdateExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -54,10 +56,7 @@ const TEST_CORRELATION: uuid::Uuid = uuid::Uuid::from_u128(0x_c0_11_a7_10);
 
 /// The stamp an audited repository call is made under: who acted, when, and the
 /// request's correlation.
-fn stamp_of(
-    actor: uuid::Uuid,
-    when: chrono::DateTime<chrono::Utc>,
-) -> bss_pricing::domain::audit::AuditStamp {
+fn stamp_of(actor: uuid::Uuid, when: OffsetDateTime) -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -579,8 +578,8 @@ async fn publish(provider: &DBProvider<DbError>, scope: &AccessScope, plan_id: P
     assert_eq!(result.rows_affected, 1, "the seed must have moved one row");
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, hour, 0, 0)
 }
 
 fn draft_of(plan_id: PlanId, tenant_id: Uuid) -> NewPlanDraft {

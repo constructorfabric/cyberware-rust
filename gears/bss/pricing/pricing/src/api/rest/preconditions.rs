@@ -67,6 +67,19 @@ use crate::infra::storage::repo::IdempotencyGate;
 /// written, so the router doc, the handler and the tests cannot disagree.
 pub const IDEMPOTENCY_KEY: &str = "idempotency-key";
 
+/// Do not cache authorization-dependent read enrichment. These routes keep
+/// their authored-content `ETag` solely for write preconditions and deliberately
+/// do not evaluate `If-None-Match`: pending units, references and permissions
+/// can change without changing the authored content.
+pub(crate) fn fresh_read(response: impl axum::response::IntoResponse) -> axum::response::Response {
+    let mut response = response.into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    response
+}
+
 /// The longest client key this surface accepts.
 ///
 /// A bound rather than none: the key is a primary-key column
@@ -269,8 +282,10 @@ pub fn policy_etag(tag: &PolicyTag) -> String {
 ///
 /// # Why this exists, and why it is not the mirror of [`if_match`]
 ///
-/// Every read in this gear that emits an `ETag` also reads the header a caller
-/// sends it back in. Emitting without reading is not a correctness defect — RFC
+/// Reads whose `ETag` covers the representation also read the header a caller
+/// sends it back in. Enriched reads use [`fresh_read`] instead: their token
+/// protects authored content only and cannot validate derived metadata.
+/// Emitting without reading is not a correctness defect — RFC
 /// 9110 makes serving a conditional read the server's option — but it is a
 /// **declared-contract** gap on the resource where this module argues the tag
 /// hardest: `policy_etag`'s doc says emitting the tag is not optional there

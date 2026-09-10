@@ -16,6 +16,7 @@ use crate::domain::approval::ApprovalState;
 use crate::domain::audit::AuditSubjectKind;
 use crate::domain::error::DomainError;
 use crate::infra::storage::repo::approval_repo::ApprovalRecord;
+use time::OffsetDateTime;
 
 const SUBMITTER: Uuid = Uuid::from_u128(0x5_bb);
 const APPROVER: Uuid = Uuid::from_u128(0xa_bb);
@@ -38,8 +39,8 @@ fn approved(submitter: Uuid, approver: Option<Uuid>, content_hash: Vec<u8>) -> A
         approver_principal: approver,
         reason: None,
         materiality: serde_json::json!({ "material": true }),
-        submitted_at: chrono::Utc::now(),
-        decided_at: Some(chrono::Utc::now()),
+        submitted_at: OffsetDateTime::now_utc(),
+        decided_at: Some(OffsetDateTime::now_utc()),
     }
 }
 

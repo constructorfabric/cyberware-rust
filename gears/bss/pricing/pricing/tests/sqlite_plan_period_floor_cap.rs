@@ -36,9 +36,11 @@ use bss_pricing::domain::plan_shape::PeriodFloorCap;
 use bss_pricing::domain::scope_key::{PlanId, Region};
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewPlanDraft, PlanRepo, PlanShapeRepo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::DatabaseConnection;
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -444,10 +446,8 @@ async fn an_abandoned_revisions_bounds_can_no_longer_be_dropped() {
 // The repository.
 // ---------------------------------------------------------------------------
 
-fn at(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, day, 10, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn at(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, day, 10, 0, 0)
 }
 
 fn stamp() -> bss_pricing::domain::audit::AuditStamp {

@@ -929,6 +929,7 @@ pub(super) async fn copy_phases(
             tenant_id: Set(row.tenant_id),
             plan_id: Set(row.plan_id),
             kind: Set(row.kind),
+            display_name: Set(row.display_name),
             ordinal: Set(row.ordinal),
             // The successor edge names a phase, and phase ids are stable, so it
             // needs no rewriting either: within the new revision it resolves to
@@ -1665,6 +1666,7 @@ fn phase_model_for(
         tenant_id: Set(tenant_id),
         plan_id: Set(plan_id),
         kind: Set(phase.kind.as_str().to_owned()),
+        display_name: Set(phase.display_name.clone()),
         ordinal: Set(phase.ordinal),
         converts_to_phase_id: Set(phase.converts_to_phase_id.map(PhaseId::get)),
         phase_duration_days: Set(stored_count(
@@ -1749,6 +1751,7 @@ fn to_domain(row: &plan_phase::Model) -> Result<PlanPhase, RepoError> {
             PhaseKind::ALL,
             PhaseKind::as_str,
         )?,
+        display_name: row.display_name.clone(),
         ordinal: row.ordinal,
         converts_to_phase_id: row.converts_to_phase_id.map(PhaseId::new),
         phase_duration_days: read_count(

@@ -3,7 +3,7 @@
 //!
 //! - `GET /bss-ledger/v1/exceptions` — list the tenant's exceptions (the Revenue
 //!   Assurance dashboard / queue), cursor-paginated, with an `OData` `$filter` over
-//!   `type` / `status` / `business_ref` / `period_id`. Gates on
+//!   `tenant_id` / `type` / `status` / `business_ref` / `period_id`. Gates on
 //!   `RECONCILIATION:read`.
 //! - `POST /bss-ledger/v1/exceptions/{exception_id}/resolution` — transition an
 //!   OPEN exception: `ACK` / `RESOLVED` (operator triage), or `APPROVED_EXCEPTION`
@@ -13,12 +13,13 @@
 //! Tenant-scoped (SQL-level BOLA): the compiled `RECONCILIATION` scope is the
 //! filter, so a foreign id reads as `None` ⇒ 404 (no existence leak).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Extension, Path};
+use axum::extract::{Extension, Path, Query};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::odata::OData;
 use toolkit::api::operation_builder::OperationBuilderODataExt;
@@ -31,11 +32,14 @@ use crate::api::local_client::map_odata_page_err;
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::canonical_json::CanonicalJson;
 use crate::api::rest::error::{authz_error_to_canonical, exception_not_found};
+use crate::api::rest::odata_list::{list_seller_tenant, reject_non_odata_list_params};
 use crate::domain::error::DomainError;
 use crate::domain::exception::{ExceptionStatus, ExceptionType};
+use crate::domain::instant::rfc3339;
 use crate::infra::storage::entity::exception_queue;
 use crate::infra::storage::repo::ExceptionQueueRepo;
-use crate::odata::ExceptionFilterField;
+use crate::odata::{ExceptionFilterField, ExceptionOrderField};
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the exception operations.
 const TAG: &str = "BSS Ledger Exceptions";
@@ -56,8 +60,10 @@ pub struct ExceptionView {
     pub business_ref: String,
     pub status: String,
     pub period_id: Option<String>,
-    pub opened_at: DateTime<Utc>,
-    pub resolved_at: Option<DateTime<Utc>>,
+    #[serde(with = "rfc3339")]
+    pub opened_at: OffsetDateTime,
+    #[serde(default, with = "rfc3339::option")]
+    pub resolved_at: Option<OffsetDateTime>,
     pub resolved_by: Option<String>,
 }
 
@@ -95,12 +101,14 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_ledger.list_exceptions")
         .summary("List the tenant's close-blocking exceptions (cursor-paginated)")
         .description(
-            "Cursor-paginated list of the caller tenant's exception-queue rows (the \
-             Revenue Assurance dashboard / queue). Supports OData `$filter` over \
-             `type` (e.g. RECON_MISMATCH), `status` (OPEN / ACK / RESOLVED / \
-             APPROVED_EXCEPTION), `business_ref`, and `period_id`. The `$filter` ANDs \
-             the caller's authorized subtree, so exceptions outside it are never \
-             returned (SQL-level BOLA). Each item is the same `ExceptionView`.",
+            "Cursor-paginated list of exception-queue rows (the Revenue Assurance \
+             dashboard / queue) for the seller named by `$filter=tenant_id eq \
+             <uuid>` (the caller's own by default). Supports OData `$filter` over \
+             `tenant_id`, `type` (e.g. RECON_MISMATCH), `status` (OPEN / ACK / \
+             RESOLVED / APPROVED_EXCEPTION), `business_ref`, and `period_id`. The \
+             `$filter` ANDs the caller's authorized subtree, so exceptions outside \
+             it are never returned (SQL-level BOLA). Each item is the same \
+             `ExceptionView`.",
         )
         .tag(TAG)
         .authenticated()
@@ -114,6 +122,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_exceptions)
         .with_odata_filter::<ExceptionFilterField>()
+        .with_odata_orderby::<ExceptionOrderField>()
         .json_response_with_schema::<Page<ExceptionView>>(
             openapi,
             StatusCode::OK,
@@ -160,20 +169,23 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
 /// `period_id`) ANDs the caller's compiled read scope, so the page never contains
 /// a foreign-tenant exception (SQL-level BOLA, no existence leak). Mirrors
 /// `refunds::list_refunds`.
+#[allow(clippy::implicit_hasher)]
 async fn list_exceptions(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<ExceptionView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant = ctx.subject_tenant_id();
+    reject_non_odata_list_params(&extras)?;
+    let tenant = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     let scope = crate::authz::access_scope(
         &enforcer,
         &ctx,
         &crate::authz::resource_types::RECONCILIATION,
         crate::authz::actions::READ,
-        None,
+        Some(tenant),
         None,
         /* require_constraints */ true,
     )

@@ -24,7 +24,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use chrono::{Duration, Utc};
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -37,6 +36,8 @@ use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::fx::revaluation_run::UnrealizedRevaluationRun;
 use crate::infra::storage::repo::{FxRevaluationModeRepo, FxRevaluationRunRepo, ReferenceRepo};
+use time::Duration;
+use time::OffsetDateTime;
 
 /// Outcome of one revaluation tick (returned for testability; the serve loop only
 /// logs a tick error).
@@ -110,7 +111,7 @@ impl RevaluationRunJob {
         // Period-end detection: a tick is a period-end tick when tomorrow falls in
         // a different period (the last UTC day of the current period). Plain UTC
         // month arithmetic (decision 1).
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let today = period_id_for(now);
         let is_period_end = period_id_for(now + Duration::days(1)) != today;
         let prev = previous_period_id(&today);

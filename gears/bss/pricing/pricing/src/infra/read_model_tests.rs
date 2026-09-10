@@ -11,11 +11,11 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{ProjectedSubject, outstanding_subjects, subject_of};
 use crate::domain::error::DomainError;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::read_model::{OverlayIndexShard, SubjectKind, SubjectRef};
 use crate::infra::storage::repo::PendingVersionRow;
@@ -27,7 +27,7 @@ fn ref_row(handle: &str, subject: &SubjectRef) -> PendingVersionRow {
         subject,
         Some(0),
         Some(LifecycleState::Published),
-        Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
+        utc_ymd_hms(2026, 8, 3, 12, 0, 0),
     )
 }
 
@@ -144,7 +144,7 @@ fn a_membership_subject_resolves_to_the_state_its_publish_judged() {
         id,
         0,
         None,
-        Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap(),
+        utc_ymd_hms(2026, 8, 12, 12, 0, 0),
     );
     let resolved =
         subject_of(&row).expect("a membership subject names the membership it publishes");
@@ -180,7 +180,7 @@ fn a_membership_subject_with_no_pinned_row_version_is_refused_rather_than_read_l
         id,
         3,
         None,
-        Utc.with_ymd_and_hms(2026, 8, 12, 12, 0, 0).unwrap(),
+        utc_ymd_hms(2026, 8, 12, 12, 0, 0),
     );
     row.subject_revision = None;
 

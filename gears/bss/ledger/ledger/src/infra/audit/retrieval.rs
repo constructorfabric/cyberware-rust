@@ -14,7 +14,6 @@
 //! index-backed scoped reads here meet it; the §9 latency is observed via the
 //! shared posting/inquiry latency instruments (`infra::metrics`).
 
-use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{AccessScope, DbTx, SecureEntityExt};
 use toolkit_db::{DBProvider, DbError};
@@ -22,6 +21,7 @@ use uuid::Uuid;
 
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::{journal_entry, scope_freeze};
+use time::OffsetDateTime;
 
 /// The audit who/when/source/correlation dims of one posted journal entry
 /// (AC #8). A pure read projection of `journal_entry`; carries no lines.
@@ -32,7 +32,7 @@ pub struct AuditEntryRecord {
     pub period_id: String,
     pub posted_by_actor_id: Uuid,
     pub origin: String,
-    pub posted_at_utc: DateTime<Utc>,
+    pub posted_at_utc: OffsetDateTime,
     pub source_doc_type: String,
     pub source_business_id: String,
     pub correlation_id: Uuid,
@@ -64,10 +64,10 @@ pub struct FreezeRecord {
     pub scope: String,
     pub period_id: String,
     pub reason: String,
-    pub frozen_at: DateTime<Utc>,
+    pub frozen_at: OffsetDateTime,
     pub set_by: String,
     pub cleared_by: Option<String>,
-    pub cleared_at: Option<DateTime<Utc>>,
+    pub cleared_at: Option<OffsetDateTime>,
 }
 
 impl From<scope_freeze::Model> for FreezeRecord {

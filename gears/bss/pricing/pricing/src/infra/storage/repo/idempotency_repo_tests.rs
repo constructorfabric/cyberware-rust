@@ -22,7 +22,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use sea_orm_migration::MigratorTrait;
@@ -33,9 +32,11 @@ use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
 use super::{ClaimOutcome, IdempotencyGate, take_over};
+use crate::domain::instant::utc_ymd_hms;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::idempotency_dedup;
 use crate::infra::storage::migrations::Migrator;
+use time::OffsetDateTime;
 
 /// The width of a SHA-256 digest, in bytes.
 const SHA256_BYTES: usize = 32;
@@ -85,8 +86,8 @@ fn tenant() -> Uuid {
 }
 
 /// Hours after a fixed origin instant.
-fn at(hours: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap() + TimeDelta::hours(hours)
+fn at(hours: i64) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, 10, 0, 0) + time::Duration::hours(hours)
 }
 
 /// A migrated in-memory database holding one **answered** claim stamped `at(0)`,

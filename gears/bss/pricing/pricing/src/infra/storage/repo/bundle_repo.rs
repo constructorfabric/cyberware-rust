@@ -68,11 +68,15 @@
 
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{
     AccessScope, DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertExt,
 };
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
+
+use bss_pricing_sdk::odata::BundleFilterField;
 
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use crate::domain::bundle::{
@@ -84,6 +88,10 @@ use crate::domain::scope_key::PlanId;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::{
     bundle, bundle_component, bundle_revshare, bundle_revshare_group,
+};
+use crate::infra::storage::odata_mapping::{
+    BundleODataMapper, LIST_LIMIT_CFG, OdataPageError, domain_page, map_odata_err,
+    query_with_default_order,
 };
 use crate::infra::storage::repo::plan_repo::{
     self, load_revision, mutable_draft, not_found, record_revision_mutation, refuse, swap_guard,
@@ -558,6 +566,24 @@ impl BundleRepo {
         list_page(&conn, scope, tenant_id, plan_id, after, limit).await
     }
 
+    /// One `OData` page of the tenant's bundles. Default order is `bundle_id asc`.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor.
+    pub async fn list_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<BundleRecord>, OdataPageError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| OdataPageError::Db(format!("pricing_bundle conn: {e}")))?;
+        list_odata(&conn, scope, tenant_id, query).await
+    }
+
     /// The plan a bundle rides, by the bundle's own id.
     ///
     /// The composition routes address a **bundle** and every guard downstream
@@ -727,6 +753,42 @@ pub async fn list_page(
         .iter()
         .map(record_of)
         .collect()
+}
+
+/// One `OData` page of the tenant's bundles. Default order is `bundle_id asc`.
+///
+/// # Errors
+/// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+/// malformed `$filter` / `$orderby` / cursor.
+pub async fn list_odata(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    query: &ODataQuery,
+) -> Result<Page<BundleRecord>, OdataPageError> {
+    let base_select = bundle::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(bundle::Column::TenantId.eq(tenant_id)));
+    let query = query_with_default_order(query, &[BundleFilterField::BundleId]);
+    let page = paginate_odata::<
+        BundleFilterField,
+        BundleODataMapper,
+        bundle::Entity,
+        bundle::Model,
+        _,
+        _,
+    >(
+        base_select,
+        runner,
+        &query,
+        ("bundle_id", SortDir::Asc),
+        LIST_LIMIT_CFG,
+        |m| m,
+    )
+    .await
+    .map_err(map_odata_err)?;
+    domain_page(page, |m| record_of(&m))
 }
 
 /// [`BundleRepo::load_composition`]'s read on a runner the caller owns.

@@ -18,10 +18,10 @@
 //! text, so it cannot have moved between submit and decide the way a plan's
 //! rows can.
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use time::OffsetDateTime;
 
 /// One payer's proposed membership change: end whatever membership they hold
 /// active at `effective_from` and enroll them into `group_value`, both at that
@@ -45,7 +45,7 @@ pub struct MembershipMoveProposal {
     /// built this proposal (`customer_groups::required_group`'s shape).
     pub group_value: String,
     /// The instant the move pivots on.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
 }
 
 /// A non-empty, payer-deduplicated set of [`MembershipMoveProposal`]s — the

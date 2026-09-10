@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use crate::domain::instant::from_unix;
 
 /// A valid `snake_case` `POST /journal-entries` body deserializes into the
 /// request DTO and `into_domain` yields the expected `PostedInvoice`.
@@ -881,7 +882,7 @@ fn refund_view_from_model_maps_all_fields() {
         clearing_state: "SETTLED".to_owned(),
         relates_to_refund_id: Some("RFND-0".to_owned()),
         reverses_entry_id: Some(uuid::uuid!("22222222-2222-2222-2222-222222222222")),
-        created_at_utc: chrono::DateTime::from_timestamp(1_700_000_001, 0).expect("ts"),
+        created_at_utc: from_unix(1_700_000_001, 0).expect("ts"),
         version: 7,
     };
     let view = RefundView::from(model);
@@ -905,7 +906,7 @@ fn refund_view_from_model_maps_all_fields() {
 /// (including `created_at_utc`); the entity's `tenant_id` is NOT on the view.
 #[test]
 fn credit_note_view_from_model_maps_all_fields() {
-    let created = chrono::DateTime::from_timestamp(1_700_000_002, 0).expect("ts");
+    let created = from_unix(1_700_000_002, 0).expect("ts");
     let model = crate::infra::storage::entity::credit_note::Model {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
         credit_note_id: "CN-1".to_owned(),
@@ -939,7 +940,7 @@ fn credit_note_view_from_model_maps_all_fields() {
 /// (no `revenue_stream` / `reason_code` / item ref).
 #[test]
 fn debit_note_view_from_model_maps_all_fields() {
-    let created = chrono::DateTime::from_timestamp(1_700_000_003, 0).expect("ts");
+    let created = from_unix(1_700_000_003, 0).expect("ts");
     let model = crate::infra::storage::entity::debit_note::Model {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
         debit_note_id: "DN-1".to_owned(),
@@ -992,7 +993,7 @@ fn dispute_view_from_model_maps_all_fields() {
 /// the entity's `tenant_id` is NOT on the view.
 #[test]
 fn recognition_run_view_from_model_maps_all_fields() {
-    let started = chrono::DateTime::from_timestamp(1_700_000_004, 0).expect("ts");
+    let started = from_unix(1_700_000_004, 0).expect("ts");
     let run_id = uuid::uuid!("33333333-3333-3333-3333-333333333333");
     let model = crate::infra::storage::entity::recognition_run::Model {
         tenant_id: uuid::uuid!("11111111-1111-1111-1111-111111111111"),
@@ -1043,7 +1044,7 @@ fn settlement_view_from_model_maps_all_fields() {
 /// `prev_entry_id` / `prev_period_id`) are NOT on the lightweight header view.
 #[test]
 fn entry_header_view_from_model_maps_all_fields() {
-    let posted = chrono::DateTime::from_timestamp(1_700_000_005, 0).expect("ts");
+    let posted = from_unix(1_700_000_005, 0).expect("ts");
     let effective = chrono::NaiveDate::from_ymd_opt(2026, 6, 27).expect("date");
     let entry_id = uuid::uuid!("44444444-4444-4444-4444-444444444444");
     let reverses = uuid::uuid!("55555555-5555-5555-5555-555555555555");
@@ -1086,7 +1087,7 @@ fn entry_header_view_from_model_maps_all_fields() {
 /// entity's `tenant_id` is NOT on the view.
 #[test]
 fn payer_state_view_from_model_maps_all_fields() {
-    let changed = chrono::DateTime::from_timestamp(1_700_000_006, 0).expect("ts");
+    let changed = from_unix(1_700_000_006, 0).expect("ts");
     let approver = uuid::uuid!("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
     let payer = uuid::uuid!("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
     let model = crate::infra::storage::entity::payer_state::Model {
@@ -1109,7 +1110,7 @@ fn payer_state_view_from_model_maps_all_fields() {
 /// thresholds + `version`/`effective_from` provenance and is NOT flagged default.
 #[test]
 fn dual_control_policy_view_from_configured_version() {
-    let eff = DateTime::from_timestamp(1_700_000_000, 0).expect("ts");
+    let eff = from_unix(1_700_000_000, 0).expect("ts");
     let view = DualControlPolicyView::from_effective(Some(PolicyVersion {
         effective_from: eff,
         version: 3,

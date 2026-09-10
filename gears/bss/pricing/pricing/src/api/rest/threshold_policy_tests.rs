@@ -10,6 +10,7 @@
 use super::{MAX_PERCENT_BP, ThresholdEntryView, parse_entries};
 use crate::domain::error::DomainError;
 use crate::domain::materiality::ThresholdBasis;
+use time::OffsetDateTime;
 
 /// One authored entry, with both bases spelled explicitly so a case that means to
 /// set neither has to say so.
@@ -186,8 +187,9 @@ fn an_empty_entry_list_parses_here_and_is_refused_one_layer_in() {
     // refusal one layer in. Asserted here as well as in `domain::materiality_tests`
     // because it is the half that makes the acceptance above safe rather than a
     // hole, and a reader of this file has no way to reach the other suite.
-    let refusal = crate::domain::materiality::ThresholdVersion::new(0, chrono::Utc::now(), vec![])
-        .expect_err("an empty set is refused where the rule lives");
+    let refusal =
+        crate::domain::materiality::ThresholdVersion::new(0, OffsetDateTime::now_utc(), vec![])
+            .expect_err("an empty set is refused where the rule lives");
     assert!(
         matches!(
             refusal,

@@ -472,6 +472,20 @@ pub enum DomainError {
     /// a spelling rather than inventing one.
     #[error("taxonomy value in use: {0}")]
     TaxonomyValueInUse(String),
+    /// `POST …/taxonomies/{class}/values` named a value the tenant already
+    /// declares — with other content, or retired (**409**).
+    ///
+    /// A conflict rather than a bad request: the body was well-formed, and what
+    /// refused it is a row the caller did not send. The value is the resource's
+    /// natural key, so the remedy is to address the row that exists — `PATCH` on
+    /// it — rather than to re-spell the create. An identical body is **not** this
+    /// refusal: it replays the create (200), the way every guarded create here
+    /// answers its own retry.
+    ///
+    /// The code is §5's: `TAXONOMY_VALUE_EXISTS`, declared beside
+    /// `TAXONOMY_VALUE_IN_USE` in `04-currency-tax.md`'s problem-response list.
+    #[error("taxonomy value exists: {0}")]
+    TaxonomyValueExists(String),
     /// A plan cannot retire while something composes or overrides it
     /// (`11-lifecycle.md` §5, `inst-re-references`, **409**).
     ///

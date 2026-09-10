@@ -19,6 +19,16 @@
 //! functions answering "is this value declared" would be two predicates to keep
 //! in step, and the one that drifted would be the one nobody was looking at.
 //!
+//! # The region universe is never empty (D-354)
+//!
+//! A tenant that holds no region row reads `{global: active}` from every region
+//! reader here — the list, the active universe, the two readiness reads — and
+//! nothing is written on a read. The tenant's first region write, whatever door
+//! it comes through, calls `materialise_region_seed` first, inside its own
+//! transaction, so the row it goes on to touch is the one the reads answered.
+//! "No row" is the predicate, not "no active row": a tenant that retired every
+//! region holds rows and has the empty universe it asked for.
+//!
 //! # The `PUT` is the whole set, and absence is retirement rather than deletion
 //!
 //! §5 gives this resource an `ETag` and §6 gives its rows a `state` with a
@@ -61,8 +71,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, Set};
+use sea_orm::sea_query::Expr;
+use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, QuerySelect, Set};
+use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
@@ -75,17 +86,24 @@ use crate::domain::lifecycle::LifecycleState;
 use crate::domain::overlay::{OverlayLifecycle, ScopeClass, ScopeValue};
 use crate::domain::scope_key::Region;
 use crate::domain::taxonomy::{
-    RegionTaxMarkers, TAXONOMY_VALUE_IN_USE, TaxonomyClass, TaxonomyEntry, TaxonomyState,
-    ValueReferences, check_retirable, check_tax_category_removable, tag_of,
+    RegionTaxMarkers, SEEDED_REGION, TAXONOMY_VALUE_IN_USE, TaxonomyClass, TaxonomyEntry,
+    TaxonomyState, ValueReferences, check_retirable, check_tax_category_removable, seeded_region,
+    tag_of,
 };
 use crate::domain::validation::ValidationReport;
 use crate::infra::storage::entity::{
-    brand_taxonomy, customer_group_taxonomy, group_membership, org_tier_taxonomy, partner_taxonomy,
-    policy_object, price, price_overlay, region_taxonomy, rounding_policy_taxonomy,
+    brand_taxonomy, customer_group_taxonomy, gl_code_taxonomy, group_membership, org_tier_taxonomy,
+    partner_taxonomy, plan, plan_descriptor_set, policy_object, price, price_overlay,
+    region_taxonomy, rounding_policy_taxonomy,
 };
 use crate::infra::storage::{RepoError, contention_or_db};
 
 use super::audit_repo::{self, NewAuditEntry};
+
+/// Bind-list ceiling for an `is_in` predicate, as `price_repo` uses it: an
+/// oversized list is a driver parameter-limit error the caller reads as a 500,
+/// and the declared-value set this file chunks has no request-side bound.
+const MAX_IN_BINDS: usize = 8192;
 
 // ---------------------------------------------------------------------------
 // The repository.
@@ -174,6 +192,65 @@ impl TaxonomyRepo {
         // way for exactly that reason.
         outcome
             .map_err(|e| e.into_domain(|infra| RepoError::Db(format!("taxonomy replace: {infra}"))))
+    }
+
+    /// One declared value of one class, `active` or `retired`; `None` when the
+    /// tenant has never declared it.
+    ///
+    /// Read through [`list_on`] rather than by a keyed select, so the row is
+    /// decoded by the one reader that owns the `CHECK`-to-enum translation; the
+    /// sets are tens of values and the read is on the config plane.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure;
+    /// [`RepoError::CorruptRow`] on an unreadable stored row.
+    pub async fn find_value(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        class: TaxonomyClass,
+        value: &ScopeValue,
+    ) -> Result<Option<TaxonomyEntry>, RepoError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| RepoError::Db(format!("taxonomy conn: {e}")))?;
+        find_value_on(&conn, scope, tenant_id, class, value).await
+    }
+
+    /// Declare **one** value (§5's `POST …/values`).
+    ///
+    /// The value is the resource's natural key, so the create is idempotent on
+    /// it: a body identical to what is held is a **replay** and writes nothing;
+    /// a body naming a held value with other content, or a retired one, is
+    /// refused as [`Declared::Exists`] — the remedy is `PATCH` on that value. One
+    /// transaction: the read that decides and the insert it decides on cannot
+    /// be interleaved by a second declaration, and a concurrent insert of the
+    /// same key surfaces as `ConcurrentMutation` through `contention_or_db`.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure;
+    /// [`RepoError::CorruptRow`] on an unreadable stored row.
+    pub async fn declare_value(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        class: TaxonomyClass,
+        entry: TaxonomyEntry,
+        stamp: AuditStamp,
+    ) -> Result<Declared, RepoError> {
+        let scope = scope.clone();
+        let (_, outcome) = self
+            .db
+            .db()
+            .in_transaction::<Declared, RepoError, _>(move |txn| {
+                Box::pin(
+                    async move { apply_declare(txn, &scope, tenant_id, class, entry, stamp).await },
+                )
+            })
+            .await;
+        outcome
+            .map_err(|e| e.into_domain(|infra| RepoError::Db(format!("taxonomy declare: {infra}"))))
     }
 
     /// Every declared customer-group value, `active` and `retired` alike,
@@ -308,6 +385,62 @@ impl TaxonomyRepo {
             e.into_domain(|infra| RepoError::Db(format!("rounding taxonomy replace: {infra}")))
         })
     }
+
+    /// The tenant's declared GL-code vocabulary, active and retired alike
+    /// (D-356).
+    ///
+    /// [`Self::list_rounding_policies`]' shape and its reason, one vocabulary
+    /// over: a parallel one-table method, because a fifth [`TaxonomyClass`] would
+    /// declare that an overlay may be scoped by GL code.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure; [`RepoError::CorruptRow`]
+    /// when a stored `state` or `value` is outside what its `CHECK` admits.
+    pub async fn list_gl_codes(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Vec<TaxonomyEntry>, RepoError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| RepoError::Db(format!("gl-code taxonomy conn: {e}")))?;
+        list_gl_code_on(&conn, scope, tenant_id).await
+    }
+
+    /// Replace the declared GL-code vocabulary wholesale, gated on the tag the
+    /// caller read (D-356).
+    ///
+    /// [`Self::replace_rounding_policies`]' shape, including the reason the
+    /// premise is tested **inside** the transaction: a `PUT` replaces the whole
+    /// set, so two callers whose reads both precede either commit would each pass
+    /// and the second would silently drop what the first added.
+    ///
+    /// # Errors
+    /// [`RepoError::Db`] on a scope or storage failure.
+    pub async fn replace_gl_codes(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        entries: Vec<TaxonomyEntry>,
+        asserted: &PolicyTag,
+        stamp: AuditStamp,
+    ) -> Result<Replaced, RepoError> {
+        let scope = scope.clone();
+        let asserted = asserted.clone();
+        let (_, outcome) = self
+            .db
+            .db()
+            .in_transaction::<Replaced, RepoError, _>(move |txn| {
+                Box::pin(async move {
+                    apply_replace_gl_code(txn, &scope, tenant_id, entries, &asserted, stamp).await
+                })
+            })
+            .await;
+        outcome.map_err(|e| {
+            e.into_domain(|infra| RepoError::Db(format!("gl-code taxonomy replace: {infra}")))
+        })
+    }
 }
 
 /// What a `PUT` did, or refused to do.
@@ -330,6 +463,19 @@ pub struct Replaced {
     /// taxonomy either way — on refusal it is the one the operator must
     /// re-author against.
     pub stale: bool,
+}
+
+/// What a `POST …/values` did.
+#[derive(Clone, Debug)]
+pub enum Declared {
+    /// A new row; the entry as stored.
+    Created(TaxonomyEntry),
+    /// The value was already held with **this exact** content: nothing was
+    /// written, and the caller answers the create's replay.
+    Replayed(TaxonomyEntry),
+    /// The value is held with other content, or retired. Nothing was written;
+    /// the entry is the one the caller is told to `PATCH`.
+    Exists(TaxonomyEntry),
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +504,14 @@ pub async fn active_regions(
     scope: &AccessScope,
     tenant_id: Uuid,
 ) -> Result<BTreeSet<Region>, RepoError> {
+    // D-354: the seed is the universe until the tenant declares its own. "No row
+    // at all", not "no active row": a tenant that retired everything has rows and
+    // an empty universe, which is what it asked for.
+    if !holds_a_region_row(runner, scope, tenant_id).await? {
+        return Region::new(SEEDED_REGION)
+            .map(|region| std::iter::once(region).collect())
+            .map_err(|e| RepoError::CorruptRow(format!("seeded region `{SEEDED_REGION}`: {e}")));
+    }
     let rows = region_taxonomy::Entity::find()
         .secure()
         .scope_with(scope)
@@ -414,6 +568,42 @@ pub async fn active_rounding_policies(
     Ok(rows.into_iter().map(|row| row.value).collect())
 }
 
+/// The tenant's **active** GL codes — `inst-ds-glcode`'s universe (D-356).
+///
+/// [`active_rounding_policies`]' shape and its reasons: a runner rather than a
+/// provider so `rule_params` resolves it inside the commit transaction, and
+/// `active` only so a retired code cannot validate a new descriptor set against
+/// itself. Plain strings for the same reason too: this gear persists a
+/// reference to an account it neither defines nor posts to, so it has nothing to
+/// validate the *shape* of a code against.
+///
+/// **This read is the provider seam D-356 names.** The publish rule is handed
+/// the set and never learns where it came from; today the set is what the
+/// tenant declared through `PUT /bss-pricing/v1/config/gl-codes`, and a future
+/// ERP gear that populates or reconciles `pricing_gl_code_taxonomy` changes
+/// nothing on this side of the seam.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure.
+pub async fn active_gl_codes(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+) -> Result<BTreeSet<String>, RepoError> {
+    let rows = gl_code_taxonomy::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(gl_code_taxonomy::Column::TenantId.eq(tenant_id))
+                .add(gl_code_taxonomy::Column::State.eq(TaxonomyState::Active.as_str())),
+        )
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("read pricing_gl_code_taxonomy: {e}")))?;
+    Ok(rows.into_iter().map(|row| row.value).collect())
+}
+
 /// C4's `RegionTaxReadiness` lookup: `(tenant, region) -> { taxCategory, ratePresent }`.
 ///
 /// **`None` is an unknown region and C4 fails closed on it** — *"Readiness is
@@ -435,6 +625,10 @@ pub async fn region_readiness(
     tenant_id: Uuid,
     region: &Region,
 ) -> Result<Option<RegionTaxMarkers>, RepoError> {
+    // D-354: the seed reads as declared, with its fail-closed markers.
+    if region.as_str() == SEEDED_REGION && !holds_a_region_row(runner, scope, tenant_id).await? {
+        return Ok(seeded_region().tax);
+    }
     let found = region_taxonomy::Entity::find()
         .secure()
         .scope_with(scope)
@@ -466,6 +660,15 @@ pub async fn region_readiness_map(
     scope: &AccessScope,
     tenant_id: Uuid,
 ) -> Result<BTreeMap<String, RegionTaxMarkers>, RepoError> {
+    // D-354, as `region_readiness` reads it, over the whole (one-member) universe.
+    if !holds_a_region_row(runner, scope, tenant_id).await? {
+        let seed = seeded_region();
+        return Ok(seed
+            .tax
+            .into_iter()
+            .map(|markers| (seed.value.as_str().to_owned(), markers))
+            .collect());
+    }
     let rows = region_taxonomy::Entity::find()
         .secure()
         .scope_with(scope)
@@ -492,20 +695,83 @@ pub async fn region_readiness_map(
 }
 
 // ---------------------------------------------------------------------------
+// D-354 — the seeded region.
+// ---------------------------------------------------------------------------
+
+/// Does the tenant hold **any** region row, active or retired?
+///
+/// The seed's predicate. Not "any active row": a tenant that declared regions
+/// and retired them all holds rows and has, deliberately, an empty universe.
+async fn holds_a_region_row(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+) -> Result<bool, RepoError> {
+    let count = region_taxonomy::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(region_taxonomy::Column::TenantId.eq(tenant_id)))
+        .count(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("count pricing_region_taxonomy: {e}")))?;
+    Ok(count > 0)
+}
+
+/// Write the seeded `global` row for a tenant that holds no region row yet —
+/// the first step of **every** region write (D-354), inside that write's own
+/// transaction, so the row the write goes on to touch is the one the reads have
+/// been answering. A no-op once the tenant holds any row. Writes no audit
+/// record: the seed is the gear's declared default, not a tenant's act.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure.
+pub async fn materialise_region_seed(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+) -> Result<(), RepoError> {
+    if holds_a_region_row(runner, scope, tenant_id).await? {
+        return Ok(());
+    }
+    insert_entry(
+        runner,
+        scope,
+        tenant_id,
+        TaxonomyClass::Region,
+        &seeded_region(),
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
 // The reference counts behind `inst-tx-mutation`.
 // ---------------------------------------------------------------------------
 
 /// What still names `value`, across both planes §3 step 3 enumerates.
 ///
+/// # Why the operand is a tenant scope and not the caller's
+///
+/// This counts the tenant's published rows, which is a fact about the data and
+/// not about who is asking: it is the operand of D-355's governance predicate
+/// and of the retirement guard, so an answer that varies with the caller's grant
+/// is a control that varies with the caller's grant. The caller's scope cannot
+/// be used even when it is honest — a `config` grant compiles against
+/// `resource_col = "tenant_id"`, while `pricing_price` and
+/// `pricing_price_overlay` declare `price_id` and `price_overlay_id`, so a
+/// resource-pinned grant matches nothing here and reads zero references. Nor can
+/// it be projected with `tenant_only()`: that is deny-all on an unconstrained
+/// scope, which reads zero the same way. `price_repo::aggregate_rows_for_authorized_plans`
+/// mints its operand for this reason and states it the same way.
+///
 /// # Errors
 /// [`RepoError::Db`] on a scope or storage failure.
 pub async fn references_to(
     runner: &impl DBRunner,
-    scope: &AccessScope,
     tenant_id: Uuid,
     class: TaxonomyClass,
     value: &ScopeValue,
 ) -> Result<ValueReferences, RepoError> {
+    let scope = &AccessScope::for_tenant(tenant_id);
     // Only `region` is an axis of a price row: §3 step 2 is explicit that
     // `brand` is "**not** a price-row field (Foundation §4.1)", and the same is
     // true of the two D-120 classes. Counting the row plane for them would be a
@@ -549,6 +815,111 @@ pub async fn references_to(
     })
 }
 
+/// Reference counts for every declared value, including unreferenced values.
+///
+/// Both list `references` and `edit_governed` use these same counts, and they
+/// are the write gate's own predicate, so the two doors cannot disagree.
+///
+/// **Two grouped reads, not one per value.** Folding [`references_to`] over the
+/// list was bounded by the declared taxonomy rather than by the price-row table,
+/// which is the bound that was checked — but not by the request: nothing caps how
+/// many values a tenant declares, `GET /config/taxonomies/{class}` lists the class
+/// whole with no `limit`, and D-353 made declaring one at a time the only door, so
+/// the loop grew one or two sequential round trips per declared value with the
+/// tenant's own authoring as the only ceiling.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure.
+pub async fn references_for_values(
+    runner: &impl DBRunner,
+    tenant_id: Uuid,
+    class: TaxonomyClass,
+    values: &[TaxonomyEntry],
+) -> Result<BTreeMap<String, ValueReferences>, RepoError> {
+    #[derive(sea_orm::FromQueryResult)]
+    struct Group {
+        value: String,
+        cnt: i64,
+    }
+
+    let mut references: BTreeMap<String, ValueReferences> = values
+        .iter()
+        .map(|entry| (entry.value.as_str().to_owned(), ValueReferences::default()))
+        .collect();
+    if references.is_empty() {
+        return Ok(references);
+    }
+    let scope = &AccessScope::for_tenant(tenant_id);
+    let names: Vec<String> = references.keys().cloned().collect();
+
+    // The overlay plane, for every class: one `GROUP BY scope_value` restricted
+    // to the declared values, rather than one COUNT per value.
+    for chunk in names.chunks(MAX_IN_BINDS) {
+        let groups: Vec<Group> = price_overlay::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(price_overlay::Column::TenantId.eq(tenant_id))
+                    .add(price_overlay::Column::ScopeClass.eq(class.scope_class().as_str()))
+                    .add(price_overlay::Column::ScopeValue.is_in(chunk.to_vec()))
+                    .add(
+                        price_overlay::Column::LifecycleState
+                            .eq(OverlayLifecycle::Published.as_str()),
+                    ),
+            )
+            .project_all(runner, |q| {
+                q.select_only()
+                    .column_as(Expr::col(price_overlay::Column::ScopeValue), "value")
+                    .column_as(
+                        Expr::col(price_overlay::Column::PriceOverlayId).count(),
+                        "cnt",
+                    )
+                    .group_by(price_overlay::Column::ScopeValue)
+                    .into_model::<Group>()
+            })
+            .await
+            .map_err(|e| RepoError::Db(format!("group pricing_price_overlay: {e}")))?;
+        for group in groups {
+            if let Some(entry) = references.get_mut(&group.value) {
+                entry.active_overlay_scopes = u64::try_from(group.cnt).unwrap_or(0);
+            }
+        }
+    }
+
+    // The row plane, only for `region` — [`references_to`] says why the other
+    // three classes cannot have a price-row reference at all.
+    if class == TaxonomyClass::Region {
+        for chunk in names.chunks(MAX_IN_BINDS) {
+            let groups: Vec<Group> = price::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .filter(
+                    Condition::all()
+                        .add(price::Column::TenantId.eq(tenant_id))
+                        .add(price::Column::Region.is_in(chunk.to_vec()))
+                        .add(price::Column::LifecycleState.eq(LifecycleState::Published.as_str())),
+                )
+                .project_all(runner, |q| {
+                    q.select_only()
+                        .column_as(Expr::col(price::Column::Region), "value")
+                        .column_as(Expr::col(price::Column::PriceId).count(), "cnt")
+                        .group_by(price::Column::Region)
+                        .into_model::<Group>()
+                })
+                .await
+                .map_err(|e| RepoError::Db(format!("group pricing_price: {e}")))?;
+            for group in groups {
+                if let Some(entry) = references.get_mut(&group.value) {
+                    entry.published_price_rows = u64::try_from(group.cnt).unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    Ok(references)
+}
+
 /// Published rows in one region that state **no category of their own** — the
 /// set D-245's marker guard counts.
 ///
@@ -562,10 +933,10 @@ pub async fn references_to(
 /// [`RepoError::Db`] when the count fails.
 pub async fn rows_resolving_category_through(
     runner: &impl DBRunner,
-    scope: &AccessScope,
     tenant_id: Uuid,
     value: &ScopeValue,
 ) -> Result<u64, RepoError> {
+    let scope = &AccessScope::for_tenant(tenant_id);
     price::Entity::find()
         .secure()
         .scope_with(scope)
@@ -594,6 +965,9 @@ async fn apply_replace(
     asserted: &PolicyTag,
     stamp: AuditStamp,
 ) -> Result<Replaced, RepoError> {
+    if class == TaxonomyClass::Region {
+        materialise_region_seed(runner, scope, tenant_id).await?;
+    }
     let held = list_on(runner, scope, tenant_id, class).await?;
 
     // **The `If-Match` premise is tested here, and only here** — D-186's division
@@ -639,7 +1013,7 @@ async fn apply_replace(
             // with one guarded retirement permanently un-`PUT`-able.
             continue;
         }
-        let references = references_to(runner, scope, tenant_id, class, &existing.value).await?;
+        let references = references_to(runner, tenant_id, class, &existing.value).await?;
         report.absorb(check_retirable(class, &existing.value, references));
     }
 
@@ -667,8 +1041,7 @@ async fn apply_replace(
             let keeps = entry.tax.as_ref().and_then(|t| t.tax_category.as_deref());
             if had.is_some() && keeps.is_none() {
                 let dependents =
-                    rows_resolving_category_through(runner, scope, tenant_id, &existing.value)
-                        .await?;
+                    rows_resolving_category_through(runner, tenant_id, &existing.value).await?;
                 report.absorb(check_tax_category_removable(&existing.value, dependents));
             }
         }
@@ -691,6 +1064,198 @@ async fn apply_replace(
         entries: now,
         report,
         stale: false,
+    })
+}
+
+/// [`TaxonomyRepo::declare_value`]'s transaction body.
+async fn apply_declare(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    class: TaxonomyClass,
+    entry: TaxonomyEntry,
+    stamp: AuditStamp,
+) -> Result<Declared, RepoError> {
+    if class == TaxonomyClass::Region {
+        materialise_region_seed(runner, scope, tenant_id).await?;
+    }
+    let held = list_on(runner, scope, tenant_id, class).await?;
+    if let Some(existing) = held.into_iter().find(|h| h.value == entry.value) {
+        return Ok(if existing == entry {
+            Declared::Replayed(existing)
+        } else {
+            Declared::Exists(existing)
+        });
+    }
+    insert_entry(runner, scope, tenant_id, class, &entry).await?;
+    record_value_mutation(
+        runner,
+        scope,
+        tenant_id,
+        class,
+        &entry.value,
+        AuditAction::Create,
+        None,
+        Some(&entry),
+        None,
+        stamp,
+    )
+    .await?;
+    Ok(Declared::Created(entry))
+}
+
+/// One declared value, read on the caller's runner — [`TaxonomyRepo::find_value`]
+/// for a transaction, and the read every arm of the per-value `PATCH` works from.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure;
+/// [`RepoError::CorruptRow`] on an unreadable stored row.
+pub async fn find_value_on(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    class: TaxonomyClass,
+    value: &ScopeValue,
+) -> Result<Option<TaxonomyEntry>, RepoError> {
+    Ok(list_on(runner, scope, tenant_id, class)
+        .await?
+        .into_iter()
+        .find(|held| held.value == *value))
+}
+
+/// The two guards a value edit must pass, on the caller's runner: the retire
+/// guard (`inst-tx-mutation`) when `next` retires an active value, and D-245's
+/// cleared-category guard when a region default goes away under rows that
+/// resolve through it. Empty when the edit is admissible.
+///
+/// Run at **submit** — so a unit that could never commit is refused rather than
+/// opened (D-350's lesson, one plane over) — and again at **commit**, because
+/// the world may have moved between the two.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure.
+pub async fn judge_value_patch(
+    runner: &impl DBRunner,
+    tenant_id: Uuid,
+    class: TaxonomyClass,
+    held: &TaxonomyEntry,
+    next: &TaxonomyEntry,
+) -> Result<ValidationReport, RepoError> {
+    let mut report = ValidationReport::default();
+    if held.state == TaxonomyState::Active && next.state == TaxonomyState::Retired {
+        let references = references_to(runner, tenant_id, class, &held.value).await?;
+        report.absorb(check_retirable(class, &held.value, references));
+    }
+    if class.carries_tax_markers() && next.state != TaxonomyState::Retired {
+        let had = held.tax.as_ref().and_then(|t| t.tax_category.as_deref());
+        let keeps = next.tax.as_ref().and_then(|t| t.tax_category.as_deref());
+        if had.is_some() && keeps.is_none() {
+            let dependents =
+                rows_resolving_category_through(runner, tenant_id, &held.value).await?;
+            report.absorb(check_tax_category_removable(&held.value, dependents));
+        }
+    }
+    Ok(report)
+}
+
+/// Write an admitted edit: the row, and the audit record naming the value with
+/// its state before and after — and, on a governed commit, the approval it ran
+/// under.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the edit's operands and its provenance, each a fact only the caller holds; a struct \
+              for one call site would name nothing"
+)]
+pub async fn write_value_patch(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    class: TaxonomyClass,
+    held: &TaxonomyEntry,
+    next: &TaxonomyEntry,
+    approval_ref: Option<Uuid>,
+    stamp: AuditStamp,
+) -> Result<(), RepoError> {
+    if class == TaxonomyClass::Region {
+        materialise_region_seed(runner, scope, tenant_id).await?;
+    }
+    update_entry(runner, scope, tenant_id, class, next).await?;
+    record_value_mutation(
+        runner,
+        scope,
+        tenant_id,
+        class,
+        &held.value,
+        AuditAction::Update,
+        Some(held),
+        Some(next),
+        approval_ref,
+        stamp,
+    )
+    .await
+}
+
+/// The per-value audit record: `create` on a declaration, `update` on a patch,
+/// subject `taxonomy/{class}/{value}`, and — unlike the whole-set `PUT`'s record —
+/// **with** the before and after states, because one value is bounded where a
+/// whole list was not. This is what lets an auditor answer *who retired `EU`,
+/// and when* from the chain rather than by diffing two snapshots.
+///
+/// Same chain as the set ([`audit_repo::policy_chain`]): the value is a row of the
+/// tenant's config object, and its records sort beside the set's. Its **own**
+/// subject kind, `taxonomy_value` (D-353), so an auditor filters the trail to
+/// exactly these records and the approval unit that authorised an edit names the
+/// same kind as the record the commit wrote.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an audit record's fields, each a fact only the caller holds"
+)]
+async fn record_value_mutation(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    class: TaxonomyClass,
+    value: &ScopeValue,
+    action: AuditAction,
+    before: Option<&TaxonomyEntry>,
+    after: Option<&TaxonomyEntry>,
+    approval_ref: Option<Uuid>,
+    stamp: AuditStamp,
+) -> Result<(), RepoError> {
+    audit_repo::append(
+        runner,
+        scope,
+        NewAuditEntry {
+            tenant_id,
+            chain_id: audit_repo::policy_chain(),
+            recorded_at: stamp.recorded_at,
+            actor_principal_id: stamp.actor_principal_id,
+            action,
+            subject_kind: AuditSubjectKind::TaxonomyValue,
+            subject_ref: taxonomy_value_ref(class, value),
+            before_state: before.map(value_state),
+            after_state: after.map(value_state),
+            // A declaration runs under no unit (D-353: adding a value is not the
+            // governed act); an edit's commit names the unit that authorised it.
+            approval_ref,
+            correlation_id: stamp.correlation_id,
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+/// One value's state as the audit trail renders it: every field the `GET`
+/// serves, so a `before`/`after` pair reads as the diff it is.
+fn value_state(entry: &TaxonomyEntry) -> serde_json::Value {
+    serde_json::json!({
+        "state": entry.state.as_str(),
+        "display_name": entry.display_name,
+        "tax_category": entry.tax.as_ref().and_then(|t| t.tax_category.as_deref()),
+        "tax_rate_present": entry.tax.as_ref().map(|t| t.tax_rate_present),
     })
 }
 
@@ -804,6 +1369,12 @@ pub fn taxonomy_ref(class: TaxonomyClass) -> String {
     format!("taxonomy/{}", class.path_segment())
 }
 
+/// The audited subject: one value of one taxonomy of one tenant.
+#[must_use]
+pub fn taxonomy_value_ref(class: TaxonomyClass, value: &ScopeValue) -> String {
+    format!("{}/{}", taxonomy_ref(class), value.as_str())
+}
+
 // ---------------------------------------------------------------------------
 // Per-table statements.
 //
@@ -872,6 +1443,12 @@ async fn list_on(
             .map(|r| (r.value, r.display_name, r.state, None))
             .collect(),
     };
+    // D-354: a tenant that holds **no** region row reads the seeded `global`.
+    // Virtual — nothing is written on a read; the first region write
+    // materialises it (`materialise_region_seed`).
+    if class == TaxonomyClass::Region && rows.is_empty() {
+        return Ok(vec![seeded_region()]);
+    }
 
     rows.into_iter()
         .map(|(value, display_name, state, tax)| {
@@ -1229,7 +1806,7 @@ fn customer_group_entry(row: customer_group_taxonomy::Model) -> Result<TaxonomyE
 /// [`group_membership_repo::resolve_active_membership`](super::group_membership_repo::resolve_active_membership)
 /// and every interval check in that module hold to: the guard judges
 /// liveness against the instant the mutation is recorded at, not a second,
-/// unpinned `Utc::now()` read mid-transaction.
+/// unpinned `OffsetDateTime::now_utc()` read mid-transaction.
 ///
 /// # Errors
 /// [`RepoError::Db`] on a scope or storage failure.
@@ -1238,7 +1815,7 @@ async fn references_to_customer_group(
     scope: &AccessScope,
     tenant_id: Uuid,
     value: &ScopeValue,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<CustomerGroupReferences, RepoError> {
     let active_overlay_scopes = price_overlay::Entity::find()
         .secure()
@@ -1571,6 +2148,147 @@ async fn update_rounding_policy_entry(
         .map_err(|e| RepoError::Db(format!("update pricing_rounding_policy_taxonomy: {e}")))
 }
 
+/// The GL-code vocabulary's `PUT`, inside its transaction (D-356).
+///
+/// [`apply_replace_rounding_policy`]'s shape exactly: premise tested here and
+/// only here against the same `held` the write works from, retirement guarded
+/// per value, and nothing written when either refuses.
+async fn apply_replace_gl_code(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    entries: Vec<TaxonomyEntry>,
+    asserted: &PolicyTag,
+    stamp: AuditStamp,
+) -> Result<Replaced, RepoError> {
+    let held = list_gl_code_on(runner, scope, tenant_id).await?;
+
+    if gl_code_tag_of(&held) != *asserted {
+        return Ok(Replaced {
+            entries: held,
+            report: ValidationReport::default(),
+            stale: true,
+        });
+    }
+
+    let submitted: BTreeMap<String, TaxonomyEntry> = entries
+        .into_iter()
+        .map(|entry| (entry.value.as_str().to_owned(), entry))
+        .collect();
+
+    let mut report = ValidationReport::default();
+    for existing in &held {
+        let key = existing.value.as_str();
+        let retiring = submitted
+            .get(key)
+            .is_none_or(|entry| entry.state == TaxonomyState::Retired);
+        if !retiring || existing.state == TaxonomyState::Retired {
+            continue;
+        }
+        let revisions = references_to_gl_code(runner, tenant_id, &existing.value).await?;
+        report.absorb(check_gl_code_retirable(&existing.value, revisions));
+    }
+
+    if !report.is_publishable() {
+        return Ok(Replaced {
+            entries: held,
+            report,
+            stale: false,
+        });
+    }
+
+    write_gl_code_set(runner, scope, tenant_id, &held, &submitted).await?;
+    let now = list_gl_code_on(runner, scope, tenant_id).await?;
+    record_single_table_mutation(runner, scope, tenant_id, GL_CODE_RESOURCE, stamp).await?;
+    Ok(Replaced {
+        entries: now,
+        report,
+        stale: false,
+    })
+}
+
+/// [`write_rounding_policy_set`]'s shape on this table.
+async fn write_gl_code_set(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    held: &[TaxonomyEntry],
+    submitted: &BTreeMap<String, TaxonomyEntry>,
+) -> Result<(), RepoError> {
+    let held_keys: BTreeSet<&str> = held.iter().map(|e| e.value.as_str()).collect();
+
+    for entry in submitted.values() {
+        let row = gl_code_taxonomy::ActiveModel {
+            tenant_id: Set(tenant_id),
+            value: Set(entry.value.as_str().to_owned()),
+            display_name: Set(entry.display_name.clone()),
+            state: Set(entry.state.as_str().to_owned()),
+        };
+        if held_keys.contains(entry.value.as_str()) {
+            update_gl_code_entry(runner, scope, tenant_id, entry).await?;
+        } else {
+            let inserted = row.clone();
+            gl_code_taxonomy::Entity::insert(inserted.clone())
+                .secure()
+                .scope_with_model(scope, &inserted)
+                .map_err(|e| RepoError::Db(format!("scope pricing_gl_code_taxonomy: {e}")))?
+                .exec(runner)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    contention_or_db(
+                        &e,
+                        "pricing_gl_code_taxonomy",
+                        "insert pricing_gl_code_taxonomy",
+                    )
+                })?;
+        }
+    }
+    // A value the caller omitted is **retired, never deleted** — the taxonomies'
+    // rule: a published descriptor set may still name it, and a deletion would
+    // make that reference dangle rather than merely unauthorable.
+    for existing in held {
+        if submitted.contains_key(existing.value.as_str()) {
+            continue;
+        }
+        let retired = TaxonomyEntry {
+            state: TaxonomyState::Retired,
+            ..existing.clone()
+        };
+        update_gl_code_entry(runner, scope, tenant_id, &retired).await?;
+    }
+    Ok(())
+}
+
+/// [`update_rounding_policy_entry`]'s shape on this table.
+async fn update_gl_code_entry(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    entry: &TaxonomyEntry,
+) -> Result<(), RepoError> {
+    gl_code_taxonomy::Entity::update_many()
+        .secure()
+        .scope_with(scope)
+        .col_expr(
+            gl_code_taxonomy::Column::DisplayName,
+            sea_orm::sea_query::Expr::value(entry.display_name.clone()),
+        )
+        .col_expr(
+            gl_code_taxonomy::Column::State,
+            sea_orm::sea_query::Expr::value(entry.state.as_str().to_owned()),
+        )
+        .filter(
+            Condition::all()
+                .add(gl_code_taxonomy::Column::TenantId.eq(tenant_id))
+                .add(gl_code_taxonomy::Column::Value.eq(entry.value.as_str().to_owned())),
+        )
+        .exec(runner)
+        .await
+        .map(|_| ())
+        .map_err(|e| RepoError::Db(format!("update pricing_gl_code_taxonomy: {e}")))
+}
+
 async fn write_customer_group_set(
     runner: &impl DBRunner,
     scope: &AccessScope,
@@ -1683,6 +2401,37 @@ async fn list_rounding_policy_on(
                         "pricing_rounding_policy_taxonomy.state `{}`",
                         row.state
                     ))
+                })?,
+                tax: None,
+            })
+        })
+        .collect()
+}
+
+/// The declared GL-code vocabulary, ordered by value.
+async fn list_gl_code_on(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+) -> Result<Vec<TaxonomyEntry>, RepoError> {
+    let rows = gl_code_taxonomy::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(gl_code_taxonomy::Column::TenantId.eq(tenant_id)))
+        .order_by(gl_code_taxonomy::Column::Value, sea_orm::Order::Asc)
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("read pricing_gl_code_taxonomy: {e}")))?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(TaxonomyEntry {
+                value: ScopeValue::new(&row.value).ok_or_else(|| {
+                    RepoError::CorruptRow("pricing_gl_code_taxonomy.value is blank".into())
+                })?,
+                display_name: row.display_name,
+                state: TaxonomyState::parse(&row.state).ok_or_else(|| {
+                    RepoError::CorruptRow(format!("pricing_gl_code_taxonomy.state `{}`", row.state))
                 })?,
                 tax: None,
             })
@@ -1807,6 +2556,114 @@ const ROUNDING_POLICY_RESOURCE: &str = "rounding-policies";
 pub fn rounding_policy_tag_of(entries: &[TaxonomyEntry]) -> PolicyTag {
     PolicyTag::of_taxonomy(
         ROUNDING_POLICY_RESOURCE,
+        entries.iter().map(|entry| TaxonomyTagEntry {
+            value: entry.value.as_str(),
+            state: entry.state.as_str(),
+            display_name: entry.display_name.as_str(),
+            tax_category: None,
+            tax_rate_present: false,
+        }),
+    )
+}
+
+/// How many **published** plan revisions name this GL code in their billing
+/// descriptor set (D-356).
+///
+/// The retirement guard's operand, [`references_to_rounding_policy`]'s
+/// arrangement on the descriptor plane. Draft revisions are deliberately **not**
+/// counted, for the same reason: a draft is being authored and its author can
+/// change the code, while a published revision's descriptor set is frozen into a
+/// `CatalogVersion` an ERP posts against — the dangling reference
+/// [`check_gl_code_retirable`]'s message exists to prevent.
+///
+/// `pricing_plan_descriptor_set` carries no lifecycle of its own (its entity doc
+/// says why), so the revisions that name the code are read first and the
+/// **parent** `pricing_plan` rows decide which of them are published. Two reads
+/// rather than a join because the scoping wrapper exposes no join, and the first
+/// read is bounded by how many revisions name one code — not by the tenant's
+/// catalog.
+async fn references_to_gl_code(
+    runner: &impl DBRunner,
+    tenant_id: Uuid,
+    value: &ScopeValue,
+) -> Result<u64, RepoError> {
+    let scope = &AccessScope::for_tenant(tenant_id);
+    let naming = plan_descriptor_set::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(plan_descriptor_set::Column::TenantId.eq(tenant_id))
+                .add(plan_descriptor_set::Column::GlCode.eq(value.as_str())),
+        )
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("read pricing_plan_descriptor_set: {e}")))?;
+    if naming.is_empty() {
+        return Ok(0);
+    }
+
+    let mut any_named = Condition::any();
+    for row in &naming {
+        any_named = any_named.add(
+            Condition::all()
+                .add(plan::Column::PlanId.eq(row.plan_id))
+                .add(plan::Column::Revision.eq(row.plan_revision)),
+        );
+    }
+    plan::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(plan::Column::TenantId.eq(tenant_id))
+                .add(plan::Column::LifecycleState.eq(LifecycleState::Published.as_str()))
+                .add(any_named),
+        )
+        .count(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("count pricing_plan: {e}")))
+}
+
+/// `TAXONOMY_VALUE_IN_USE`, when a published descriptor set still names the code.
+///
+/// [`check_rounding_policy_retirable`]'s message on the descriptor plane, with
+/// one reference kind rather than two: a GL code has no tenant default to fall
+/// back to.
+fn check_gl_code_retirable(value: &ScopeValue, published_revisions: u64) -> ValidationReport {
+    let mut report = ValidationReport::default();
+    if published_revisions == 0 {
+        return report;
+    }
+    report.violate(
+        TAXONOMY_VALUE_IN_USE,
+        value.as_str().to_owned(),
+        format!(
+            "GL code `{}` cannot be retired: {published_revisions} published plan revision(s) \
+             name it in their billing descriptor set. Re-point them first - a retired value \
+             stops being authorable and what already resolves against it would have no declared \
+             vocabulary entry",
+            value.as_str(),
+        ),
+    );
+    report
+}
+
+/// The GL-code vocabulary's resource name.
+///
+/// `PUT /bss-pricing/v1/config/gl-codes`' own last segment, written once for
+/// [`ROUNDING_POLICY_RESOURCE`]'s reason: the entity tag [`gl_code_tag_of`]
+/// hashes it and the `taxonomy/…` audit ref [`record_single_table_mutation`]
+/// writes it, and a taxonomy spelled two ways there is a tag that names one
+/// resource and a trail that names another.
+const GL_CODE_RESOURCE: &str = "gl-codes";
+
+/// The GL-code vocabulary's tag — [`rounding_policy_tag_of`]'s shape over its
+/// own resource name.
+#[must_use]
+pub fn gl_code_tag_of(entries: &[TaxonomyEntry]) -> PolicyTag {
+    PolicyTag::of_taxonomy(
+        GL_CODE_RESOURCE,
         entries.iter().map(|entry| TaxonomyTagEntry {
             value: entry.value.as_str(),
             state: entry.state.as_str(),

@@ -39,9 +39,9 @@
 //! driven from an exhaustive [`ScopeKeyParts`] destructure, so an eleventh axis
 //! makes this file stop compiling in the same commit that adds it.
 
-use chrono::{TimeZone, Utc};
-
 use super::{check_update_keeps_the_line, market_columns, scope_key_columns, to_scope_key};
+use crate::domain::instant::from_unix;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::money::CurrencyCode;
 use crate::domain::scope_key::{
     ChargeKind, Cohort, DimensionKey, Meter, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
@@ -70,7 +70,7 @@ fn base_key() -> ScopeKey {
         PhaseId::new(PHASE),
         PriceEligibility::ExistingGrandfathered,
         ChargeKind::Usage,
-        Cohort::Generation(Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()),
+        Cohort::Generation(utc_ymd_hms(2099, 8, 20, 0, 0, 0)),
     )
     .expect("the grandfathered class pairs with a generation cohort")
     .with_usage_line(
@@ -133,7 +133,7 @@ fn row_of(key: &ScopeKey) -> price::Model {
         supersedes_price_id: None,
         lifecycle_state: "published".to_owned(),
         created_by: ACTOR,
-        created_at_utc: Utc.with_ymd_and_hms(2099, 8, 5, 0, 0, 0).unwrap(),
+        created_at_utc: utc_ymd_hms(2099, 8, 5, 0, 0, 0),
         row_version: 0,
     }
 }
@@ -342,8 +342,7 @@ fn the_history_cursor_breaks_a_shared_instant_by_price_id_on_both_engines() {
     select
         .expr(sea_orm::sea_query::Expr::cust("1"))
         .cond_where(super::after_history_position(super::HistoryPosition {
-            authored_at: chrono::DateTime::from_timestamp(1_700_000_000, 0)
-                .expect("a valid instant"),
+            authored_at: from_unix(1_700_000_000, 0).expect("a valid instant"),
             price_id: uuid::Uuid::from_u128(0xb0b),
         }));
     let sqlite = select.to_string(SqliteQueryBuilder);

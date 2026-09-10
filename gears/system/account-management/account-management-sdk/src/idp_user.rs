@@ -1075,6 +1075,30 @@ pub struct ListUsersQuery {
 }
 
 impl ListUsersQuery {
+    /// Build one bounded ID-set lookup through the authorized `list_users` API.
+    /// IDs are sorted and deduplicated; providers must apply the exact UUID set,
+    /// not return an unfiltered page. Follow any returned cursor with the same
+    /// filter before interpreting missing IDs as absent. Unsupported providers
+    /// must return an explicit error, not ignore the filter.
+    ///
+    /// # Errors
+    /// Empty sets or more than `IdpUserPagination::MAX_TOP` distinct IDs violate
+    /// the pagination bounds. Consumers should chunk larger sets.
+    pub fn with_ids(ids: impl IntoIterator<Item = Uuid>) -> Result<Self, IdpUserPaginationError> {
+        let ids: std::collections::BTreeSet<_> = ids.into_iter().collect();
+        let top = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+        let pagination = IdpUserPagination::new(top, None)?;
+        Ok(
+            Self::new(pagination).with_filter(toolkit_odata::filter::FilterNode::InList {
+                field: IdpUserFilterField::Id,
+                values: ids
+                    .into_iter()
+                    .map(toolkit_odata::filter::ODataValue::Uuid)
+                    .collect(),
+            }),
+        )
+    }
+
     /// Construct a query with the given pagination and no filter / order.
     #[must_use]
     pub const fn new(pagination: IdpUserPagination) -> Self {
@@ -1160,3 +1184,7 @@ pub use IdpUserQueryFilterField as IdpUserFilterField;
 #[cfg(test)]
 #[path = "idp_user_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "idp_user_query_tests.rs"]
+mod query_tests;

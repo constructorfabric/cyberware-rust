@@ -29,7 +29,7 @@
 use std::sync::Arc;
 
 use bss_ledger_sdk::SourceDocType;
-use chrono::{DateTime, Duration, Utc};
+
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, TxConfig, is_unique_violation};
 use toolkit_db::{DBProvider, DbError};
@@ -45,12 +45,16 @@ use crate::domain::approval::policy::{
 };
 use crate::domain::error::DomainError;
 use crate::domain::fx::translate::translate_amount;
+use crate::domain::instant::format_rfc3339;
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::RepoError;
 use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::fx::rate_source::RateSource;
 use crate::infra::storage::repo::{
     ApprovalRepo, FxRepo, JournalRepo, NewPendingApproval, NewPolicyVersion, ReferenceRepo,
 };
+use time::Duration;
+use time::OffsetDateTime;
 
 /// The seam through which an approved governed mutation is actually executed.
 /// `ApprovalService` reconstructs the [`ApprovalIntent`] from the stored row and
@@ -135,7 +139,7 @@ impl ApprovalService {
         let kind = intent.kind();
         let business_key = intent.business_key();
 
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         if let Some(existing) = self
             .repo
             .read_active(scope, tenant, kind.as_str(), &business_key, now)
@@ -198,7 +202,13 @@ impl ApprovalService {
             if as_db_err(&e).is_some_and(is_unique_violation)
                 && let Some(existing) = self
                     .repo
-                    .read_active(scope, tenant, kind.as_str(), &business_key, Utc::now())
+                    .read_active(
+                        scope,
+                        tenant,
+                        kind.as_str(),
+                        &business_key,
+                        OffsetDateTime::now_utc(),
+                    )
                     .await?
             {
                 return Ok(existing.approval_id);
@@ -231,7 +241,7 @@ impl ApprovalService {
             .repo
             .read_policy_versions(scope, ctx.subject_tenant_id())
             .await?;
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let policy = resolve_policy(&versions, now);
         // DC10 / FX: value the comparand in the tenant's FUNCTIONAL (reporting)
         // currency before the threshold compare — the threshold is denominated in
@@ -253,7 +263,7 @@ impl ApprovalService {
                 locked_rate_micro,
             )
             .await?;
-        if !requires_dual_control(&facts, policy, now.date_naive()) {
+        if !requires_dual_control(&facts, policy, to_naive_date(now)) {
             return Ok(None);
         }
         let snapshot = threshold_snapshot(&policy, now);
@@ -327,7 +337,7 @@ impl ApprovalService {
         tenant: Uuid,
         facts: OperationFacts,
         txn_currency: Option<&str>,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
         locked_rate_micro: Option<i64>,
     ) -> Result<OperationFacts, DomainError> {
         let (Some(amount), Some(txn_ccy)) = (facts.amount_usd_eq_minor, txn_currency) else {
@@ -381,7 +391,7 @@ impl ApprovalService {
         &self,
         scope: &AccessScope,
         tenant: Uuid,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<PolicyVersion>, DomainError> {
         let versions = self.repo.read_policy_versions(scope, tenant).await?;
         Ok(effective_version(&versions, now))
@@ -404,7 +414,7 @@ impl ApprovalService {
         d2_threshold_minor: i64,
         a6_backdating_biz_days: i32,
         pending_ttl_seconds: i64,
-        effective_from: DateTime<Utc>,
+        effective_from: OffsetDateTime,
     ) -> Result<i64, DomainError> {
         validate_config(
             d2_threshold_minor,
@@ -413,7 +423,7 @@ impl ApprovalService {
         )
         .map_err(policy_config_to_domain)?;
         let tenant = ctx.subject_tenant_id();
-        let created_at_utc = Utc::now();
+        let created_at_utc = OffsetDateTime::now_utc();
         let scope_c = scope.clone();
         let version = self
             .db
@@ -748,7 +758,7 @@ impl ApprovalService {
         // never silently dropped (it always returns to PENDING, so an approver is
         // still required even if the edited amount is now below threshold).
         let versions = self.repo.read_policy_versions(scope, tenant).await?;
-        let resolved_at = Utc::now();
+        let resolved_at = OffsetDateTime::now_utc();
         let policy = resolve_policy(&versions, resolved_at);
         let new_threshold_snapshot = threshold_snapshot(&policy, resolved_at);
         let new_amount_usd_eq_minor = new_intent.amount_minor();
@@ -764,7 +774,7 @@ impl ApprovalService {
             None,
         );
         let scope_c = scope.clone();
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let comment_id = Uuid::now_v7();
         let applied = self
             .db
@@ -839,7 +849,7 @@ impl ApprovalService {
             .ok_or_else(|| DomainError::ApprovalNotFound(format!("approval {approval_id}")))?;
         let revision = row.revision;
         let scope_c = scope.clone();
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let comment_id = Uuid::now_v7();
         self.db
             .db()
@@ -931,7 +941,7 @@ impl ApprovalService {
             .ok_or_else(|| DomainError::ApprovalNotFound(format!("approval {approval_id}")))?;
         match parse_state(&row.state)? {
             ApprovalState::Pending => {
-                if row.expires_at <= Utc::now() {
+                if row.expires_at <= OffsetDateTime::now_utc() {
                     return Err(DomainError::ApprovalNotActionable(format!(
                         "approval {approval_id} expired at {}",
                         row.expires_at
@@ -1013,7 +1023,7 @@ impl ApprovalService {
                 row.state
             )));
         }
-        if row.expires_at <= Utc::now() {
+        if row.expires_at <= OffsetDateTime::now_utc() {
             return Err(DomainError::ApprovalNotActionable(format!(
                 "approval {approval_id} expired at {}",
                 row.expires_at
@@ -1047,7 +1057,7 @@ impl ApprovalService {
         // and trip the `approved_by <> prepared_by` CHECK (surfacing as a 500). The
         // audit comment below records who acted regardless of the lifecycle state.
         let approved_by = (new_state == ApprovalState::Approved).then_some(decider);
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let comment_id = Uuid::now_v7();
         let applied = self
             .db
@@ -1109,12 +1119,12 @@ fn parse_state(s: &str) -> Result<ApprovalState, DomainError> {
 /// applied + when resolved (audit trail; DC8/DC17). Built identically by `gate`
 /// (on create) and `resubmit` (on re-evaluation against the edited intent), so the
 /// recorded snapshot is never a stub.
-fn threshold_snapshot(policy: &DualControlPolicy, now: DateTime<Utc>) -> serde_json::Value {
+fn threshold_snapshot(policy: &DualControlPolicy, now: OffsetDateTime) -> serde_json::Value {
     serde_json::json!({
         "d2_threshold_minor": policy.d2_threshold_minor,
         "a6_backdating_biz_days": policy.a6_backdating_biz_days,
         "pending_ttl_seconds": policy.pending_ttl_seconds,
-        "resolved_at": now.to_rfc3339(),
+        "resolved_at": format_rfc3339(now),
     })
 }
 

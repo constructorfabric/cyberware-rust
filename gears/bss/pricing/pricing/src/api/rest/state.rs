@@ -123,6 +123,8 @@ pub struct GovernanceState {
     pub prices: PriceRepo,
     /// The approval workflow: open a pinned unit, read it, decide it.
     pub approvals: ApprovalService,
+    /// Live participant names on approval GETs, independently authorized by AM.
+    pub participants: crate::infra::approval_participants::ApprovalParticipants,
     /// The publish engine. Its `commit` is the act an approval authorizes, and it
     /// requests the `CatalogVersion` the rest are measured against; its handle's
     /// first segment is `plan-publish/…`.

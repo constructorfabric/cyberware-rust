@@ -1,7 +1,7 @@
 //! API-level (router) tests for the journal-entry / balance REST surface:
 //! `POST /journal-entries` (target tenant in the body),
 //! `POST /journal-entries/{entryId}/reversals` (tenant from context),
-//! and the read endpoints (`GET /balances?tenant_id=…`).
+//! and the read endpoints (`GET /balances`).
 //!
 //! Drives the router via `tower::ServiceExt::oneshot` against a stub
 //! `LedgerClientV1` + a stub `InvoicePoster` (no DB) and an in-test
@@ -42,6 +42,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use bss_ledger::api::rest::journal_entries::{ApiState, router};
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::invoice::builder::PostedInvoice;
 use bss_ledger::infra::invoice_post::InvoicePoster;
 use bss_ledger_sdk::api::LedgerClientV1;
@@ -49,7 +50,7 @@ use bss_ledger_sdk::posting::{
     ArInvoiceBalanceView, BalanceView, EntryView, LineView, ODataQuery, Page, PostEntry, PostingRef,
 };
 use bss_ledger_sdk::{ProvisionOutcome, ProvisionRequest, SourceDocType};
-use chrono::Utc;
+use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::AccessScope;
 use toolkit_gts::gts_id;
@@ -163,8 +164,8 @@ impl LedgerClientV1 for StubClient {
             source_business_id: "reverses=00000000-0000-0000-0000-000000000001".to_owned(),
             reverses_entry_id: Some(uuid::uuid!("00000000-0000-0000-0000-000000000001")),
             reverses_period_id: Some("202606".to_owned()),
-            posted_at_utc: Utc::now(),
-            effective_at: Utc::now().date_naive(),
+            posted_at_utc: OffsetDateTime::now_utc(),
+            effective_at: to_naive_date(OffsetDateTime::now_utc()),
             posted_by_actor_id: tenant_id,
             origin: "SYSTEM".to_owned(),
             correlation_id: tenant_id,
@@ -543,8 +544,8 @@ impl LedgerClientV1 for ReadStubClient {
             source_business_id: AUDIT_BUSINESS_ID.to_owned(),
             reverses_entry_id: None,
             reverses_period_id: None,
-            posted_at_utc: Utc::now(),
-            effective_at: Utc::now().date_naive(),
+            posted_at_utc: OffsetDateTime::now_utc(),
+            effective_at: to_naive_date(OffsetDateTime::now_utc()),
             posted_by_actor_id: AUDIT_ACTOR,
             origin: AUDIT_ORIGIN.to_owned(),
             correlation_id: AUDIT_CORRELATION,
@@ -577,7 +578,7 @@ impl LedgerClientV1 for ReadStubClient {
                 currency: "USD".to_owned(),
                 currency_scale: 2,
                 invoice_id: Some("INV-1".to_owned()),
-                due_date: Some(Utc::now().date_naive()),
+                due_date: Some(to_naive_date(OffsetDateTime::now_utc())),
                 revenue_stream: None,
                 mapping_status: bss_ledger_sdk::MappingStatus::Resolved,
                 functional_amount_minor: None,
@@ -612,7 +613,7 @@ impl LedgerClientV1 for ReadStubClient {
         // Two open AR invoices for one payer: one ~45 days past due (1-30? no —
         // 31-60) and one ~10 days past due (1-30). The handler folds these into
         // the domain aging buckets; the test asserts the bucketed shape.
-        let today = Utc::now().date_naive();
+        let today = to_naive_date(OffsetDateTime::now_utc());
         Ok(vec![
             ArInvoiceBalanceView {
                 payer_tenant_id: AGING_PAYER,
@@ -1081,9 +1082,7 @@ async fn list_balances_returns_stub_rows() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!(
-                    "/bss-ledger/v1/balances?tenant_id={SUBJECT_TENANT}"
-                ))
+                .uri("/bss-ledger/v1/balances")
                 .body(Body::empty())
                 .expect("build req"),
         )
@@ -1161,7 +1160,7 @@ async fn list_lines_threads_filter_and_surfaces_page() {
         Arc::new(StubPoster) as Arc<dyn InvoicePoster>,
     )
     .layer(axum::Extension(authed_context()));
-    // `$filter` carries the payer equality; `tenant_id` stays a plain param;
+    // `$filter` carries the payer equality; seller is the caller when omitted.
     // `limit` is the plain pagination cap. `%20` encodes the spaces in the
     // OData expression `payer_tenant_id eq <uuid>`.
     let filter = format!("payer_tenant_id%20eq%20{payer}");
@@ -1170,7 +1169,7 @@ async fn list_lines_threads_filter_and_surfaces_page() {
             Request::builder()
                 .method("GET")
                 .uri(format!(
-                    "/bss-ledger/v1/journal-lines?tenant_id={SUBJECT_TENANT}&$filter={filter}&limit=1"
+                    "/bss-ledger/v1/journal-lines?$filter={filter}&limit=1"
                 ))
                 .body(Body::empty())
                 .expect("build req"),
@@ -1194,6 +1193,49 @@ async fn list_lines_threads_filter_and_surfaces_page() {
         serde_json::json!(NEXT_CURSOR),
         "the page's next_cursor must reach the wire under page_info"
     );
+}
+
+#[tokio::test]
+async fn list_lines_named_tenant_id_returns_400() {
+    let router = router_with_stubs(
+        Arc::new(ReadStubClient) as Arc<dyn LedgerClientV1>,
+        Arc::new(StubPoster) as Arc<dyn InvoicePoster>,
+    )
+    .layer(axum::Extension(authed_context()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/bss-ledger/v1/journal-lines?tenant_id={SUBJECT_TENANT}"
+                ))
+                .body(Body::empty())
+                .expect("build req"),
+        )
+        .await
+        .expect("send");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_journal_entries_ungranted_filter_tenant_returns_403() {
+    let other = uuid::uuid!("dddddddd-eeee-ffff-0000-111111111111");
+    let router = base_router().layer(axum::Extension(authed_context()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/bss-ledger/v1/journal-entries?$filter=tenant_id%20eq%20{other}"
+                ))
+                .body(Body::empty())
+                .expect("build req"),
+        )
+        .await
+        .expect("send");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 /// `GET /balances/ar-aging` returns the bucketed AR shape: the stub

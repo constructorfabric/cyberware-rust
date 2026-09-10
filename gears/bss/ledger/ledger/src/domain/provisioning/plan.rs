@@ -3,9 +3,9 @@
 //! no infrastructure imports (DE0301).
 
 use bss_ledger_sdk::{FiscalCalendarSpec, Granularity};
-use chrono::{DateTime, Utc};
 
 use crate::domain::error::DomainError;
+use time::OffsetDateTime;
 
 /// Validate a fiscal-calendar spec before any DB work: reject an empty
 /// timezone, a fiscal-year start month outside `1..=12`, and (defensively)
@@ -48,13 +48,13 @@ pub fn validate_calendar(spec: &FiscalCalendarSpec) -> Result<(), DomainError> {
 /// Derive the initial `period_id` from a UTC instant as `"%Y%m"` (decision 4 —
 /// UTC-derived; tz-precise month boundaries are refined by the P6 automation).
 #[must_use]
-pub fn initial_period_id(now: DateTime<Utc>) -> String {
+pub fn initial_period_id(now: OffsetDateTime) -> String {
     crate::domain::period::period_id_for(now)
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
+    use crate::domain::instant::utc_ymd_hms;
 
     use super::*;
 
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn initial_period_id_formats_year_month() {
-        let now = Utc.with_ymd_and_hms(2026, 6, 19, 10, 30, 0).unwrap();
+        let now = utc_ymd_hms(2026, 6, 19, 10, 30, 0);
         assert_eq!(initial_period_id(now), "202606");
     }
 }

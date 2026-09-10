@@ -10,7 +10,6 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -25,6 +24,7 @@ use crate::domain::audit::AuditSubjectKind;
 use crate::domain::concurrency::RowVersion;
 use crate::domain::contracts::{BillingAnchorPolicy, ProrationBasis, ProrationContract};
 use crate::domain::error::DomainError;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::CurrencyCode;
 use crate::domain::plan_shape::PlanShape;
@@ -49,7 +49,7 @@ fn record_with_subject(subject_ref: &str) -> ApprovalRecord {
         approver_principal: None,
         reason: None,
         materiality: json!({}),
-        submitted_at: Utc.with_ymd_and_hms(2026, 8, 3, 9, 0, 0).unwrap(),
+        submitted_at: utc_ymd_hms(2026, 8, 3, 9, 0, 0),
         decided_at: None,
     }
 }
@@ -145,17 +145,13 @@ fn row(market: &str) -> PriceRecord {
         supersedes_price_id: None,
         lifecycle_state: LifecycleState::Draft,
         created_by: Uuid::from_u128(0xac10),
-        created_at_utc: Utc.with_ymd_and_hms(2026, 8, 3, 9, 0, 0).unwrap(),
+        created_at_utc: utc_ymd_hms(2026, 8, 3, 9, 0, 0),
         row_version: RowVersion::new(0),
     }
 }
 
 fn shape_over(markets: &[&str]) -> PlanShape {
-    let mut shape = PlanShape::new(
-        PlanId::new(PLAN),
-        3,
-        Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap(),
-    );
+    let mut shape = PlanShape::new(PlanId::new(PLAN), 3, utc_ymd_hms(2026, 8, 3, 12, 0, 0));
     shape.rows = markets.iter().map(|market| row(market)).collect();
     shape
 }
@@ -335,7 +331,7 @@ fn approved_by(submitter: Uuid, approver: Option<Uuid>) -> ApprovalRecord {
         state: ApprovalState::Approved,
         submitter_principal: submitter,
         approver_principal: approver,
-        decided_at: Some(Utc.with_ymd_and_hms(2026, 8, 3, 10, 0, 0).unwrap()),
+        decided_at: Some(utc_ymd_hms(2026, 8, 3, 10, 0, 0)),
         ..record_with_subject("019fd000-0000-7000-8000-000000000000/0")
     }
 }

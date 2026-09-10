@@ -40,10 +40,13 @@ use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::entity::price;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::window_repo::{self, NewWindow, WindowRecord};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::format_rfc3339;
+use bss_pricing::domain::instant::{truncate_millis, utc_ymd_hms};
 use sea_orm::ActiveValue::Set;
 use sea_orm::EntityTrait;
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureInsertExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -67,7 +70,7 @@ const OTHER_KEY_ROW: Uuid = Uuid::from_u128(0xa0_03);
 /// where the value the HTTP edge would have established has no producer.
 const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_c0_11_a7_10);
 
-fn stamp_at(when: DateTime<Utc>) -> AuditStamp {
+fn stamp_at(when: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: ACTOR,
         recorded_at: when,
@@ -84,8 +87,8 @@ fn stamp_at(when: DateTime<Utc>) -> AuditStamp {
 /// "future" here has to be a **fact rather than a fixture that ages**. With the
 /// 2026-09 base these instants carried until 2026-08-04, this suite began failing
 /// from 2026-09-15 — six weeks out — and every later group builds on this helper.
-fn t(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, day, 0, 0, 0).unwrap()
+fn t(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, day, 0, 0, 0)
 }
 
 async fn harness() -> DBProvider<DbError> {
@@ -158,11 +161,11 @@ fn scope() -> AccessScope {
 }
 
 /// A window on [`ROW`] over `[from, to)`.
-fn window(id: u128, from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> NewWindow {
+fn window(id: u128, from: OffsetDateTime, to: Option<OffsetDateTime>) -> NewWindow {
     on_row(id, ROW, from, to)
 }
 
-fn on_row(id: u128, price_id: Uuid, from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> NewWindow {
+fn on_row(id: u128, price_id: Uuid, from: OffsetDateTime, to: Option<OffsetDateTime>) -> NewWindow {
     NewWindow {
         window_id: Uuid::from_u128(id),
         tenant_id: TENANT,
@@ -318,13 +321,14 @@ async fn an_overlapping_window_is_refused() {
                  not the price row; got {key}"
             );
             assert!(
-                requested.contains(&t(15).to_rfc3339()) && requested.contains(&t(25).to_rfc3339()),
+                requested.contains(&format_rfc3339(t(15)))
+                    && requested.contains(&format_rfc3339(t(25))),
                 "the refusal must echo the interval that was asked for, both ends; \
                  got {requested}"
             );
             assert!(
                 conflicting.contains(&Uuid::from_u128(0x07).to_string())
-                    && conflicting.contains(&t(10).to_rfc3339()),
+                    && conflicting.contains(&format_rfc3339(t(10))),
                 "the refusal must name the window that was already there and the \
                  interval it holds, which is the pair an operator can act on; got \
                  {conflicting}"
@@ -694,7 +698,7 @@ async fn a_window_does_not_activate_before_its_effective_from() {
         } => {
             assert_eq!(state, "scheduled");
             assert!(
-                attempted.contains(&t(10).to_rfc3339()),
+                attempted.contains(&format_rfc3339(t(10))),
                 "the refusal must name the start that has not arrived, because the \
                  remedy is to wait until it has: {attempted}"
             );
@@ -751,7 +755,7 @@ async fn an_active_window_does_not_expire_before_its_effective_to() {
         } => {
             assert_eq!(state, "active");
             assert!(
-                attempted.contains(&t(20).to_rfc3339()),
+                attempted.contains(&format_rfc3339(t(20))),
                 "the refusal must name the end that has not arrived: {attempted}"
             );
         }
@@ -811,7 +815,7 @@ async fn an_open_ended_window_never_expires() {
 /// §5 scopes the millisecond quantum to `effectiveFrom`/`effectiveTo`, the cutover
 /// instant, the D-88 changeover instant and `grandfatherUntil` — every one of them a
 /// value an operator wrote on a request. A transition's `at` is machine-generated:
-/// the activation sweep's `Utc::now()`, which carries sub-millisecond precision on
+/// the activation sweep's `OffsetDateTime::now_utc()`, which carries sub-millisecond precision on
 /// every platform this runs on. Until 2026-08-04 [`window_repo::transition`] ran the
 /// authoring check over it, so **every flip an activation sweep would ever attempt**
 /// failed with `TIMESTAMP_PRECISION_EXCEEDED`, and no test in 1118 saw it.
@@ -825,7 +829,7 @@ async fn a_flip_instant_finer_than_the_quantum_is_not_refused() {
     must_schedule(&provider, window(0x24, t(10), Some(t(20)))).await;
     let conn = provider.conn().expect("scoped connection");
     let id = Uuid::from_u128(0x24);
-    let sweep_instant = t(10) + chrono::Duration::microseconds(1);
+    let sweep_instant = t(10) + time::Duration::microseconds(1);
 
     let flipped = window_repo::transition(
         &conn,
@@ -839,12 +843,18 @@ async fn a_flip_instant_finer_than_the_quantum_is_not_refused() {
     .await
     .expect("a machine flip instant is not an authored one");
     assert_eq!(flipped.state, WindowState::Active);
-    assert_eq!(flipped.activated_at, Some(sweep_instant));
-    // **Read back from the store.** The `WindowRecord` above is the one
-    // `transition` builds from its own arguments, so the two assertions on it hold
-    // whether or not the sub-millisecond instant survived the column - which is
-    // exactly the claim this case is named for. The sibling
-    // `the_sanctioned_flips_land_and_stamp_their_own_column` already reads back.
+    assert_eq!(
+        flipped.activated_at,
+        Some(truncate_millis(sweep_instant)),
+        "the flip lands; the stamp is persisted at the millisecond quantum"
+    );
+    // **Read back from the store.** SeaORM's `time` TEXT form writes a
+    // millisecond bound as `…00.000Z`. A later machine instant with extra
+    // fractional digits (`…00.000001Z`) then compares *smaller* as SQLite TEXT,
+    // so `chk_pricing_price_window_activation_order` (`activated_at >=
+    // effective_from`) would refuse a same-millisecond sweep. The stamp is
+    // therefore stored at the bound's quantum. The flip itself is what this
+    // case is named for: D-144 does not apply to a machine instant.
     let stored = window_repo::find(&conn, &scope(), TENANT, flipped.window_id)
         .await
         .expect("read the flipped window")
@@ -852,8 +862,8 @@ async fn a_flip_instant_finer_than_the_quantum_is_not_refused() {
     assert_eq!(stored.state, WindowState::Active);
     assert_eq!(
         stored.activated_at,
-        Some(sweep_instant),
-        "the stored instant keeps the sub-millisecond digits the sweep wrote"
+        Some(truncate_millis(sweep_instant)),
+        "the stored stamp is the quantum the activation-order CHECK can compare"
     );
     // And `schedule` still refuses the same precision on an authored instant, which
     // is what says the quantum was scoped rather than removed.
@@ -1090,7 +1100,7 @@ async fn an_end_that_has_already_passed_cannot_be_moved_forward() {
     .expect_err("a passed end is history whichever way it is moved");
     match refusal {
         RepoError::WindowHistorical { frozen, .. } => assert!(
-            frozen.contains(&t(20).to_rfc3339()),
+            frozen.contains(&format_rfc3339(t(20))),
             "the refusal must name the end that had already passed: {frozen}"
         ),
         other => panic!("expected the historical-immutability refusal, got {other:?}"),
@@ -1129,7 +1139,7 @@ async fn an_end_may_not_be_moved_to_an_instant_that_has_passed() {
     .expect_err("a shorten into the past is a retroactive reprice");
     match refusal {
         RepoError::WindowHistorical { frozen, .. } => assert!(
-            frozen.contains(&t(19).to_rfc3339()),
+            frozen.contains(&format_rfc3339(t(19))),
             "the refusal must name the target an author has to correct: {frozen}"
         ),
         other => panic!("expected the historical-immutability refusal, got {other:?}"),
@@ -1160,7 +1170,7 @@ async fn an_empty_or_inverted_interval_is_refused_before_the_check_constraint() 
                 .expect_err("an interval that is not an interval");
         match refusal {
             RepoError::WindowIntervalEmpty { requested } => assert!(
-                requested.contains(&to.to_rfc3339()),
+                requested.contains(&format_rfc3339(to)),
                 "the refusal must render the interval so an author can see which \
                  end to move: {requested}"
             ),
@@ -1206,7 +1216,7 @@ async fn an_adjustment_may_not_leave_an_empty_interval() {
 async fn an_instant_finer_than_the_quantum_is_refused_at_the_boundary() {
     let provider = harness().await;
     let conn = provider.conn().expect("scoped connection");
-    let sub_millisecond = t(10) + chrono::Duration::microseconds(1);
+    let sub_millisecond = t(10) + time::Duration::microseconds(1);
     let refusal = window_repo::schedule(
         &conn,
         &scope(),

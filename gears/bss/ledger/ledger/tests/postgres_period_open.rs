@@ -17,10 +17,10 @@
 
 use bss_ledger::infra::jobs::period_open::PeriodOpenJob;
 use bss_ledger::infra::storage::migrations::Migrator;
-use chrono::Utc;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
@@ -58,7 +58,7 @@ async fn period_open_creates_current_and_next_and_is_idempotent() {
 
     let tenant = Uuid::now_v7();
     let legal_entity = Uuid::now_v7();
-    let cur = Utc::now().format("%Y%m").to_string();
+    let cur = bss_ledger::domain::instant::yyyymm(OffsetDateTime::now_utc());
     let next = {
         // Local YYYYMM +1-month (mirrors `domain::period::next_period_id`) so
         // the assertion is independent of the job's own logic.

@@ -25,11 +25,13 @@
 use bss_ledger::domain::fx::revaluation_mode::RevaluationMode;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::FxRevaluationModeRepo;
-use chrono::{Duration, Utc};
+
 use sea_orm::Database;
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::Duration;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -61,7 +63,7 @@ async fn no_row_defaults_to_mode_a_fail_safe() {
     let scope = AccessScope::for_tenant(tenant);
 
     let mode = repo
-        .read_effective_mode(&scope, tenant, Utc::now())
+        .read_effective_mode(&scope, tenant, OffsetDateTime::now_utc())
         .await
         .expect("read mode");
     assert_eq!(mode, None, "an un-configured tenant has no row");
@@ -86,14 +88,14 @@ async fn write_then_read_mode_b() {
             &scope,
             tenant,
             RevaluationMode::ModeB,
-            Utc::now() - Duration::hours(1),
+            OffsetDateTime::now_utc() - Duration::hours(1),
         )
         .await
         .expect("write ModeB");
     assert_eq!(version, 0, "the first version is 0");
 
     let mode = repo
-        .read_effective_mode(&scope, tenant, Utc::now())
+        .read_effective_mode(&scope, tenant, OffsetDateTime::now_utc())
         .await
         .expect("read mode");
     assert_eq!(mode, Some(RevaluationMode::ModeB));
@@ -114,7 +116,7 @@ async fn latest_effective_version_wins_and_future_not_yet() {
             &scope,
             tenant,
             RevaluationMode::ModeB,
-            Utc::now() - Duration::hours(2),
+            OffsetDateTime::now_utc() - Duration::hours(2),
         )
         .await
         .expect("v0"),
@@ -126,7 +128,7 @@ async fn latest_effective_version_wins_and_future_not_yet() {
             &scope,
             tenant,
             RevaluationMode::ModeA,
-            Utc::now() - Duration::hours(1),
+            OffsetDateTime::now_utc() - Duration::hours(1),
         )
         .await
         .expect("v1"),
@@ -138,7 +140,7 @@ async fn latest_effective_version_wins_and_future_not_yet() {
             &scope,
             tenant,
             RevaluationMode::ModeB,
-            Utc::now() + Duration::days(1),
+            OffsetDateTime::now_utc() + Duration::days(1),
         )
         .await
         .expect("v2"),
@@ -146,7 +148,7 @@ async fn latest_effective_version_wins_and_future_not_yet() {
     );
 
     let mode = repo
-        .read_effective_mode(&scope, tenant, Utc::now())
+        .read_effective_mode(&scope, tenant, OffsetDateTime::now_utc())
         .await
         .expect("read mode");
     assert_eq!(
@@ -168,7 +170,7 @@ async fn cross_tenant_read_is_blocked_at_sql_level() {
         &AccessScope::for_tenant(tenant_a),
         tenant_a,
         RevaluationMode::ModeB,
-        Utc::now() - Duration::hours(1),
+        OffsetDateTime::now_utc() - Duration::hours(1),
     )
     .await
     .expect("tenant A writes ModeB");
@@ -176,7 +178,11 @@ async fn cross_tenant_read_is_blocked_at_sql_level() {
     // Tenant B's scope attempts to read tenant A's mode: SQL-level BOLA yields no
     // rows, so the read falls back to the fail-safe default — never A's ModeB.
     let leaked = repo
-        .read_effective_mode(&AccessScope::for_tenant(tenant_b), tenant_a, Utc::now())
+        .read_effective_mode(
+            &AccessScope::for_tenant(tenant_b),
+            tenant_a,
+            OffsetDateTime::now_utc(),
+        )
         .await
         .expect("scoped read");
     assert_eq!(

@@ -23,6 +23,7 @@ use rest_support::{
 };
 use sea_orm::ActiveValue::Set;
 use sea_orm::EntityTrait;
+use time::OffsetDateTime;
 use toolkit_db::secure::{SecureEntityExt, SecureInsertExt};
 use uuid::Uuid;
 
@@ -298,7 +299,7 @@ async fn a_run_opened_before_the_digest_existed_still_replays() {
             request_hash: Vec::new(),
             report: serde_json::json!({ "rows": [] }),
             submitted_by: Uuid::from_u128(0xac_12),
-            submitted_at: chrono::Utc::now(),
+            submitted_at: OffsetDateTime::now_utc(),
         },
     )
     .await
@@ -492,7 +493,7 @@ async fn a_run_stalled_committing(harness: &Harness, client_key: &str) -> Uuid {
             request_hash: b"digest".to_vec(),
             report: serde_json::json!({ "rows": [] }),
             submitted_by: Uuid::from_u128(0xac_13),
-            submitted_at: chrono::Utc::now(),
+            submitted_at: OffsetDateTime::now_utc(),
         },
     )
     .await
@@ -505,7 +506,7 @@ async fn a_run_stalled_committing(harness: &Harness, client_key: &str) -> Uuid {
         BulkState::Validating,
         BulkState::Committing,
         serde_json::json!({ "rows": [] }),
-        chrono::Utc::now(),
+        OffsetDateTime::now_utc(),
     )
     .await
     .expect("hold the run in committing");
@@ -1142,7 +1143,7 @@ async fn poison_the_published_read(harness: &Harness, plan_id: Uuid) {
         model_kind: Set(Some("flat".to_owned())),
         lifecycle_state: Set("published".to_owned()),
         created_by: Set(Uuid::from_u128(0xac_11)),
-        created_at_utc: Set(chrono::Utc::now()),
+        created_at_utc: Set(OffsetDateTime::now_utc()),
         ..price::ActiveModel::default()
     };
     price::Entity::insert(row.clone())
