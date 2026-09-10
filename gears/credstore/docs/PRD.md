@@ -236,7 +236,7 @@ The system **MUST** allow a tenant to store a secret with a reference (key), a v
 <!-- cpt-cf-id-content -->
 The system **MUST** allow a caller to retrieve the decrypted value of an accessible secret by reference, together with access metadata: owning tenant, sharing mode, whether the secret was inherited from an ancestor, and its version. Only fully provisioned (`active`) secrets are visible. Not-found and inaccessible are indistinguishable in the response (a single not-found surface).
 
-**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the capability and the single not-found surface still hold, but the value moves to its own address (`cpt-cf-credstore-fr-read-secret`) and the metadata becomes independently readable without it (`cpt-cf-credstore-fr-get-credential`), so "value together with metadata" is no longer the only way to obtain either half.
+**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the capability and the single not-found surface still hold, but the value moves to its own address (`cpt-cf-credstore-fr-read-secret`) and the metadata becomes independently readable without it (`cpt-cf-credstore-fr-get-credential`), so "value together with metadata" is no longer the only way to obtain either half. The metadata half also changes shape: it no longer names the owning tenant, and a three-state inheritance status (`cpt-cf-credstore-fr-inheritance-status`) replaces the inherited flag.
 
 **Rationale**: Consumers need the value plus enough metadata to understand inheritance and support concurrency control. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`, `cpt-cf-credstore-actor-oagw`
 <!-- cpt-cf-id-content -->
@@ -430,7 +430,7 @@ The system **MUST** provide at least one production-grade value-store plugin (ex
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-credential-record`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** address a credential as a **record** whose representation contains metadata only — reference, owning tenant, sharing mode, type, category, version, expiry, and inheritance status — and never the secret value. The secret value **MUST** be a separate addressable sub-resource of that record.
+The system **MUST** address a credential as a **record** whose representation contains metadata only — reference, sharing mode, type, category, version, expiry, and inheritance status — and never the secret value. The representation **MUST NOT** name the owning tenant: for an inherited credential that would disclose an ancestor's identifier the caller cannot obtain by any authorized route, and the inheritance status already answers whether the record is the caller's own ([ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), "What a response says about tenants above"). The secret value **MUST** be a separate addressable sub-resource of that record.
 
 **Rationale**: A metadata surface cannot leak a value it structurally does not contain; separating the two makes a value-blind administrator role possible. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -590,7 +590,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - [ ] `p1` - **ID**: `cpt-cf-credstore-interface-client`
 
 <!-- cpt-cf-id-content -->
-**Type**: Rust trait (async) **Stability**: stable **Description**: Public API for platform gears. Registered in ClientHub without scope. Operations: `get` (hierarchical read returning value + metadata: owning tenant, sharing, inherited flag, version, secret type, expiry), `put`/`create` (precondition-guarded update / create-only) plus typed-options variants accepting write options (secret type, expiry), `delete` (precondition-guarded), `metadata` (point read of one credential record, value-free), `list_metadata` (paginated, deterministically ordered listing of credential records, value-free), `read_secrets` (bulk read of values for an explicit set of references or a metadata filter, capped and non-paginated). Creating a credential record and setting its value are separate calls; no single operation does both. Hierarchical resolution is internal to the gear. **Breaking Change Policy**: Major version bump required
+**Type**: Rust trait (async) **Stability**: stable **Description**: Public API for platform gears. Registered in ClientHub without scope. Operations: `get` (hierarchical read returning value + the credential record: sharing, inheritance status, version, secret type, expiry — the owning tenant is not named, per ADR-0004), `put`/`create` (precondition-guarded update / create-only) plus typed-options variants accepting write options (secret type, expiry), `delete` (precondition-guarded), `metadata` (point read of one credential record, value-free), `list_metadata` (paginated, deterministically ordered listing of credential records, value-free), `read_secrets` (bulk read of values for an explicit set of references or a metadata filter, capped and non-paginated). Creating a credential record and setting its value are separate calls; no single operation does both. Hierarchical resolution is internal to the gear. **Breaking Change Policy**: Major version bump required
 <!-- cpt-cf-id-content -->
 
 #### CredStorePluginClientV1
@@ -665,7 +665,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 3. Gear obtains the customer's full ancestor chain (cached)
 4. Gear resolves the reference against the whole chain in one metadata query → partner's `shared` row wins (customer has none)
 5. Gear reads the value from the plugin for the winning row only
-6. OAGW receives the value plus metadata (owning tenant = partner, inherited = true, version)
+6. OAGW receives the value plus the credential record (inheritance status = inherited, version; the owning tenant is not named — ADR-0004)
 
 **Postconditions**:
 - OAGW has the decrypted secret; the customer never sees the value

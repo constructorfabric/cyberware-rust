@@ -4,7 +4,7 @@ date: 2026-09-08
 ---
 
 Created:  2026-09-08 by Constructor Tech
-Updated:  2026-09-09 by Constructor Tech
+Updated:  2026-09-10 by Constructor Tech
 
 # ADR-0004: Credential Record and Secret Value as Separate Resources
 
@@ -17,10 +17,12 @@ Updated:  2026-09-09 by Constructor Tech
   - [Axis B — how a value is asked for](#axis-b--how-a-value-is-asked-for)
 - [Decision Outcome](#decision-outcome)
   - [Resulting surface](#resulting-surface)
+  - [Why one address per thing, in three arguments](#why-one-address-per-thing-in-three-arguments)
   - [Why `credentials` and not `secrets`](#why-credentials-and-not-secrets)
   - [Why the path key stays a reference, not a UUID](#why-the-path-key-stays-a-reference-not-a-uuid)
   - [One write verb per resource: no `PATCH`, no `POST`](#one-write-verb-per-resource-no-patch-no-post)
   - [Consequence: no single-request create of record and value](#consequence-no-single-request-create-of-record-and-value)
+  - [What a response says about tenants above: `owner_tenant_id` is dropped](#what-a-response-says-about-tenants-above-owner_tenant_id-is-dropped)
   - [Bulk secret read: two selectors, no pagination](#bulk-secret-read-two-selectors-no-pagination)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
@@ -53,6 +55,17 @@ Updated:  2026-09-09 by Constructor Tech
 **ID**: `cpt-cf-credstore-adr-secret-value-exposure`
 
 ## Context and Problem Statement
+
+**What ships today.** Four addresses, one collection, and the value and its metadata inseparable:
+
+| Method and path | `operation_id` |
+|---|---|
+| `POST /credstore/v1/secrets` | `credstore.create_secret` |
+| `PUT /credstore/v1/secrets/{ref}` | `credstore.put_secret` |
+| `GET /credstore/v1/secrets/{ref}` | `credstore.get_secret` |
+| `DELETE /credstore/v1/secrets/{ref}` | `credstore.delete_secret` |
+
+Three PDP actions cover all four: `read`, `write`, `delete`. `{ref}` is the caller-chosen name, never the row id. There is no collection read at all — the PRD lists listing as a non-goal and DESIGN §4.4 states flatly that "there is no LIST".
 
 The gear ships one read surface: `GET /credstore/v1/secrets/{ref}` returns the secret value together with its access metadata, and there is no collection read at all (the PRD lists secret listing as a non-goal; DESIGN §4.4 states "there is no LIST"). One PDP action, `read`, covers all of it.
 
@@ -105,6 +118,20 @@ The deciding arguments are D8 (metadata surfaces cannot carry a value because th
 
 ### Resulting surface
 
+At a glance, seven addresses replacing the four above:
+
+| Method and path | Returns | PDP action |
+|---|---|---|
+| `GET /credstore/v1/credentials` | the list of records, no values, paginated | `list_meta` |
+| `GET /credstore/v1/credentials/{ref}` | one record (metadata), carries the `ETag` | `read_meta` |
+| `PUT /credstore/v1/credentials/{ref}` | create or replace the record | `write_meta` |
+| `DELETE /credstore/v1/credentials/{ref}` | delete the record | `delete` |
+| `GET /credstore/v1/credentials/{ref}/secret` | the value | `read_value` |
+| `PUT /credstore/v1/credentials/{ref}/secret` | set or rotate the value | `write_value` |
+| `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection, in one request | `read_value`, per item |
+
+Read against the four shipped addresses in the Context above, three things changed: the collection is named for the record rather than the payload, the value moved to a sub-resource of its own, and every address answers to exactly one action instead of three actions covering everything. The same table with the headers, preconditions and cache rules each address carries:
+
 | Address | Returns | PDP action | Notes |
 |---|---|---|---|
 | `GET /credstore/v1/credentials` | credential records (metadata), paginated | `list_meta` | value-free by construction; `Cache-Control: no-store`, because the body varies by tenant and subject; OData filter/order per `guidelines/DNA/REST/PAGINATION.md` |
@@ -114,6 +141,22 @@ The deciding arguments are D8 (metadata surfaces cannot carry a value because th
 | `GET /credstore/v1/credentials/{ref}/secret` | the value + the record | `read_value` | `Cache-Control: no-store`; audited |
 | `PUT /credstore/v1/credentials/{ref}/secret` | — (204) | `write_value` | set or rotate; `If-Match` required and evaluated against the **record's** validator (see below); never creates a record |
 | `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection | `read_value`, per item | bulk; see below |
+
+### Why one address per thing, in three arguments
+
+The table above spends seven addresses where four would do. That is the cost, and each of the three reasons below is on its own sufficient to pay it.
+
+**One address, one schema.** A response body is fixed by the URL, not by who asked or by what was sent. A generated client gets one type per address; an OpenAPI reader sees one shape; a reviewer checking "can this path emit a secret" reads the schema rather than the handler. The alternative — one address whose body sometimes carries a value — makes the schema a function of the caller's grants, which is untypeable, and turns "does this leak" into a question about runtime state instead of about a document.
+
+**One address, one PDP action.** Route policy at the gateway, rate limits and audit selectors all match on paths, and the audit record has to say "this subject read this value" as a property of the operation rather than of the payload. Collapse the value into the record's address and the required privilege becomes a function of the request body: the server would have to inspect what was sent to decide which action to authorize, and the gateway could no longer throttle value reads separately at all. Deriving a privilege from a payload is the shape of an authorization bug, not an optimization.
+
+**One address, one intent — and this is the decisive one.** `PUT` is a whole-value replace: fields absent from the body reset to their defaults. Put the value and the metadata behind one `PUT` and every write has to answer a question with no good answer.
+
+Change a category and omit the value: does the value get cleared, or preserved? Clear it and an innocent metadata edit destroys a credential. Preserve it and `PUT` is no longer a whole replace, so the same body means "reset" for one field and "leave alone" for another — exactly the ambiguity that made us refuse `PATCH`. The way out — "then send the value back" — is closed to the one caller this ADR exists for. The integration administrator holds `write_meta` and `read_meta` and not `read_value`: it can read every field of the record except the value, so it can never construct a body that preserves it. Under a merged `PUT` that administrator either cannot change a category at all or destroys the credential by changing it. The value-blind metadata edit — the whole point of the split — is unexpressible.
+
+Rotation suffers too, though less. The rotator does hold `read_meta` — D4 has it read the record for the `ETag` before a guarded write — so it *can* send the metadata back verbatim; but every rotation becomes a read-modify-write of fields it never meant to touch. That bites under the `If-Match: *` this ADR keeps for provisioning and healing flows: a routine rotation then overwrites a concurrent `sharing` or expiry change with the stale copy it read a moment earlier. With the value at its own address the same `If-Match: *` rotation cannot touch a metadata field, because none is in the body.
+
+Two addresses answer both without a rule to remember: each `PUT` carries the complete state of its own resource, absence means default, and the privilege is whatever that address requires. The record write cannot touch the value because the value is not in that resource, and the value write cannot reset the metadata for the same reason.
 
 Suppression (the "disabled here" tombstone, if adopted) attaches to the record: `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression`.
 
@@ -169,6 +212,20 @@ Between them the record exists **without a value**, so that state has to be lega
 
 If atomic creation is later required — for instance because empty records start appearing in production catalogues — it returns as a collection-level `POST` carrying both parts, and this ADR is amended rather than reinterpreted (see [Revisit Triggers](#revisit-triggers)).
 
+### What a response says about tenants above: `owner_tenant_id` is dropped
+
+Today's metadata carries `owner_tenant_id`, and for an inherited credential that is the identifier of an **ancestor** tenant. Both it and the `is_inherited` boolean beside it are dropped; `inheritance` (`own` / `inherited` / `overridden`) is the single field that answers the question either of them answered, and it answers it better — `is_inherited` cannot tell "mine, and nothing above" from "mine, and shadowing something above", which is precisely the distinction that decides what happens if the record is deleted.
+
+The tenant identifier is a different matter, and it is dropped for a reason worth writing down rather than for tidiness.
+
+**The caller has no other way to obtain it.** The gear reads the ancestor chain from the Tenant Resolver, in-process and with barriers ignored, which is a privilege it holds as a gear and the caller does not. The Tenant Resolver publishes no HTTP surface at all — no `RestApiCapability`, no routes, no OpenAPI document — so nothing outside the process can ask it for a chain, and it performs no authorization of its own, trusting the calling gear to have decided. Account Management does expose a tenant's `parent_id`, but one record at a time and under its own PDP: a caller learns its immediate parent only if it may read its own tenant record, and reaching a grandparent needs a grant on the parent's record first. So a chain is walkable only by someone already entitled to each step.
+
+Putting the owning tenant in a credential response bypasses that, and it does so for any ancestor at any depth. The identifier is also the by-product of a privilege the caller does not hold: the gear fetches the chain with barriers ignored (`cpt-cf-credstore-adr-upward-collection-read`), and it may do so because a `shared` value is published downward regardless of barriers. A barrier-respecting traversal stops at a `self_managed` tenant, so a tenant at or below a barrier is never shown the tenants above that barrier; the gear sees them only because it looks past the barrier on the caller's behalf. Nothing here changes what a barrier means — it still isolates a customer's management from its parent, and data published as `shared` still flows down through it, exactly as ADR-0005 states — it only says that what the gear learned by looking past the barrier is not the caller's to keep. Handing it out would be the gear using its trusted position to disclose what the position was granted for, which is the confused-deputy shape.
+
+**It can be reconstructed, by whoever is entitled to.** Nothing is permanently lost. A caller that holds the grants can walk Account Management upward, one authorized read per level, and match a reference against each tenant's catalogue to find where it lives. An operator investigating "where did this credential come from" works with operator rights and can do exactly that. What the removal takes away is the shortcut that skipped the authorization at every level; what it costs is several requests instead of one field, paid by the party that has the rights to make them.
+
+**Open question for the platform, not for this gear.** This reasoning holds only while the ancestor chain stays unpublished. If a Tenant Resolver HTTP API is added later and exposes `get_ancestors` to callers, the chain becomes obtainable directly and the argument above weakens or disappears — at which point re-adding `owner_tenant_id` would cost nothing and would be a convenience worth having. **This needs confirming with the Tenant Resolver's owners before this ADR is accepted:** is the upward chain intended to stay unavailable to a caller with minimal rights once that gear grows an API, or is it planned to be public? The answer changes nothing about the split itself, only about this one field.
+
 ### Bulk secret read: two selectors, no pagination
 
 `POST /credstore/v1/credentials:read-secrets` accepts exactly one of two selectors. The filtered form uses the **platform OData syntax**, declared through `OperationBuilderODataExt::with_odata_filter`, not a bespoke JSON object — a hand-rolled `$`-parameter would also trip the `de0802_use_odata_ext` lint:
@@ -214,9 +271,9 @@ Cache-Control: no-store
       "outcome": "ok",
       "secret": "…",
       "credential": {
-        "owner_tenant_id": "…partner-a…",
+        // No `owner_tenant_id` and no `is_inherited`: `inheritance` carries
+        // the whole answer, and naming the ancestor is what this ADR drops.
         "sharing": "shared",
-        "is_inherited": true,
         "inheritance": "inherited",
         "version": 3,
         "type": "gts.cf.core.credstore.secret.v1~cf.core.credstore.basic_auth.v1~",
@@ -273,6 +330,8 @@ Compatibility is recorded here, not optimized for (D1).
 | Value read | **no — moves** | `GET /credstore/v1/secrets/{ref}` becomes `GET /credstore/v1/credentials/{ref}/secret`. Every consumer of a value changes its URL. Same body plus the record, same `ETag` and `no-store`. |
 | Entity URL semantics | **no — inverts** | The item URL used to return the secret; it now returns the record. A client that keeps calling the old shape gets metadata, never a value, so the failure is a missing field rather than a silent disclosure. |
 | Collection name | **no — renamed** | `secrets` → `credentials`. |
+| `is_inherited` in the metadata | **no — replaced** | Superseded by `inheritance`, which distinguishes `own` from `overridden` where the boolean could not. A client reading the boolean reads one field's worth of a three-state answer. |
+| `owner_tenant_id` in the metadata | **no — removed** | For an inherited credential this named an ancestor tenant the caller cannot learn by any other route, including ancestors above a barrier that a barrier-respecting traversal would never show it. Recoverable by an entitled caller through Account Management, one authorized read per level. Pending confirmation with the Tenant Resolver's owners that the upward chain stays unpublished. |
 | Create | **no — removed** | `POST /credstore/v1/secrets` with a value in the body disappears. Creation becomes `PUT /credentials/{ref}` + `If-None-Match: *` for the record, then `PUT …/secret` for the value: **two requests, no atomicity**. |
 | Rotation | **no — moves** | `PUT /credstore/v1/secrets/{ref}` becomes `PUT /credstore/v1/credentials/{ref}/secret`; the `If-Match` contract itself is unchanged. |
 | Metadata edit | n/a — new | Previously impossible without rewriting the value; now `PUT /credentials/{ref}`. |
@@ -360,6 +419,7 @@ Compatibility is recorded here, not optimized for (D1).
 - A caller needs more credentials per request than the cap can serve, or needs a selector richer than `eq`/`in` over category, type and reference — prefix or range matching on `reference` is the likely first ask, and it is out of the grammar above on purpose, because a prefix scan over names is the enumeration primitive this ADR exists to withhold.
 - The gateway gains query-aware or header-aware route policies, which would remove the main argument against a flag-based opt-in (B2, B3).
 - Audit starts deriving "value read" from response bodies rather than from the operation, which would remove the second argument.
+- The Tenant Resolver grows an HTTP API that exposes the ancestor chain to callers. The `owner_tenant_id` removal rests on that chain being unobtainable outside the process; once it is obtainable, the field costs nothing and can come back.
 - The metadata collection acquires a use case that genuinely needs values inline; that would reopen B5 and require a new answer to walkability.
 - Empty records start accumulating in production because clients abandon the two-step create; the fix is a collection-level `POST` that carries record and value together, restoring atomicity.
 - False conflicts between metadata edits and value rotations become a real annoyance; the fix is an independent `ETag` per sub-resource instead of one shared `version`.
