@@ -152,6 +152,56 @@ mod owned {
     }
 }
 
+/// Two property names for one column — an entity where an extra authorization
+/// property is another way to ask about the tenant. The column appears twice in
+/// `scope_columns()` by design (see the trait's documentation), which is what
+/// makes this the fixture that can observe the declaration deduplicating.
+mod aliased {
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+    #[sea_orm(table_name = "aliased_thing")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: i64,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+
+    impl crate::secure::ScopableEntity for Entity {
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+            (
+                toolkit_security::access_scope::pep_properties::OWNER_TENANT_ID,
+                Column::TenantId,
+            ),
+            // A second name for the same column.
+            ("home_tenant_id", Column::TenantId),
+            (
+                toolkit_security::access_scope::pep_properties::RESOURCE_ID,
+                Column::Id,
+            ),
+        ];
+
+        fn tenant_col() -> Option<Column> {
+            Some(Column::TenantId)
+        }
+        fn resource_col() -> Option<Column> {
+            Some(Column::Id)
+        }
+        fn owner_col() -> Option<Column> {
+            None
+        }
+        fn type_col() -> Option<Column> {
+            None
+        }
+    }
+}
+
 /// A closure table, shaped exactly like the platform's real ones: a pair of
 /// foreign keys and no scope dimension of its own. Correct for that table and
 /// consequently ineligible as a graph element.
@@ -266,6 +316,54 @@ fn a_scope_column_outside_the_key_still_reaches_the_properties_list() {
     assert!(
         props.contains(&"owner_id".to_owned()),
         "the owner column must be filterable inside a pattern: {props:?}"
+    );
+}
+
+/// A column two properties both name reaches `PROPERTIES` **once**.
+///
+/// `scope_columns()` reports it per table entry, so the declaration is the one
+/// place that has to collapse the repeat, and `CREATE PROPERTY GRAPH` is where
+/// a repeat would be wrong: a column listed twice in one element's
+/// `PROPERTIES` is a DDL `PostgreSQL` rejects. The trait's own test covers the
+/// table and the list; this one covers the consumer, so removing the guard in
+/// `GraphDeclaration::element` fails a test rather than only contradicting a
+/// doc comment.
+#[test]
+fn a_column_two_properties_name_reaches_properties_once() {
+    struct Aliased;
+    impl PropertyGraph for Aliased {
+        const GRAPH_NAME: &'static str = "aliased";
+        fn declaration() -> Result<GraphDeclaration, ScopeError> {
+            GraphDeclaration::new::<Self>().vertex::<Self, aliased::Entity>(&["tenant_id", "id"])
+        }
+    }
+    impl VertexOf<Aliased> for aliased::Entity {
+        const LABEL: &'static str = "aliased";
+    }
+
+    // The list the declaration is built from does carry the repeat.
+    let listed: Vec<&str> = <aliased::Entity as ScopeProperties>::scope_columns()
+        .iter()
+        .map(sea_orm::IdenStatic::as_str)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["tenant_id", "tenant_id", "id"],
+        "the fixture must actually repeat a column, or this test proves nothing"
+    );
+
+    let declaration = Aliased::declaration().expect("declares");
+    let props = declaration.properties_of("aliased").expect("declared");
+    assert_eq!(
+        props,
+        ["tenant_id".to_owned(), "id".to_owned()],
+        "each column belongs in PROPERTIES once"
+    );
+
+    let sql = declaration.create_statement().expect("renders");
+    assert!(
+        sql.contains(r#"LABEL "aliased" PROPERTIES ("tenant_id", "id")"#),
+        "{sql}"
     );
 }
 
