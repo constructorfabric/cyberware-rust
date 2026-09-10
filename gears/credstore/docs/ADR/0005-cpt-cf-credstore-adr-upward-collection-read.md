@@ -130,7 +130,8 @@ A caller's own `$filter` obeys the same invariance rule as the policy clamp, for
 | `category` | SQL clamp | invariant by `cpt-cf-credstore-fr-override-category-consistency` |
 | `secret_type_uuid` | SQL clamp | invariant by `cpt-cf-credstore-fr-override-type-consistency` |
 | `sharing` | after reduction | the caller's own row is `tenant` where the ancestor's is `shared`; that difference *is* the group |
-| `updated_at`, `expires_at` | after reduction | rows of one reference carry different values |
+| `expires_at` | after reduction | rows of one reference carry different values |
+| `updated_at` | **not filterable or orderable** | withheld from inherited items by ADR-0004 (it describes an ancestor's write activity), so a mixed page has no total order on it |
 | `owner_tenant_id` | **not filterable** | it is the dimension a chain varies along, so it can never be a clamp — and it names an ancestor tenant, which the catalogue has no reason to let a caller query by |
 | `inheritance` | never | not a column; see above |
 
@@ -157,7 +158,7 @@ Every field offered for filtering or ordering must be backed by an index. Today 
 - E2E: a reference whose rows exist in three tenants of one chain yields exactly one item, and a page boundary placed inside that group still yields exactly one item across the two pages.
 - E2E: a reference with a `declared` row in the caller's tenant and a resolvable `shared` row in an ancestor yields the **inherited** item, matching what a value read of that reference returns; the same reference with no ancestor row yields the `declared` item with its state visible.
 - E2E: rows of a type the caller cannot read are absent while `next_cursor` still advances, and paging to exhaustion visits every readable reference exactly once.
-- E2E: `$filter` on `inheritance` and on `owner_tenant_id` are both rejected as unsupported fields; `$filter` on `category` narrows in SQL, and `$filter` on `sharing` narrows after reduction.
+- E2E: `$filter` on `inheritance`, on `owner_tenant_id` and on `updated_at` are all rejected as unsupported fields; `$filter` on `category` narrows in SQL, and `$filter` on `sharing` narrows after reduction.
 - E2E: a record write whose category differs from the ancestor credential it overrides is refused as a conflict, and so is a later change of that category.
 - E2E: the disclosure case the clamp criterion exists for. With the invariant enforced, a caller granted one category sees no entry for a reference whose effective row carries another, and a point read of that reference refuses it too: the two surfaces agree. Forcing a mismatch past the write check (by mutating the row directly) must drop the entry and raise the violation metric, never surface the ancestor's row as the effective one.
 - Unit: a clamp over `category` keeps or removes a reference's whole group, and the winner computed over the clamped set equals the winner computed over the unclamped set.

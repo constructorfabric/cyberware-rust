@@ -375,6 +375,8 @@ A secret write that spans metadata and backend **MUST** be crash-safe: a new sec
 <!-- cpt-cf-id-content -->
 Each secret **MUST** carry a monotonic version, exposed on retrieval. Update and delete **MUST** require a caller-supplied precondition ("must exist", or "the specified generation must still be current"), enforced atomically with the metadata commit — every write states its concurrency stance, there are no unconditional overwrites; creation is the only preconditionless write. A failed precondition surfaces as a conflict (lost-update detection); a malformed precondition is a validation error; a missing precondition is a validation error with its own distinct reason.
 
+**Superseded in part** by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md): the version is exposed only on the caller's own record; an inherited record carries a weak, opaque validator that changes when the ancestor writes but cannot be used in a write precondition. A record write that changes nothing does not advance the version; a value write always does. All failed preconditions surface as one conflict code.
+
 **Rationale**: Lost-update detection for concurrent secret management. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
@@ -430,7 +432,7 @@ The system **MUST** provide at least one production-grade value-store plugin (ex
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-credential-record`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** address a credential as a **record** whose representation contains metadata only — reference, sharing mode, type, category, version, expiry, and inheritance status — and never the secret value. The representation **MUST NOT** name the owning tenant: for an inherited credential that would disclose an ancestor's identifier the caller cannot obtain by any authorized route, and the inheritance status already answers whether the record is the caller's own ([ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), "What a response says about tenants above"). The secret value **MUST** be a separate addressable sub-resource of that record.
+The system **MUST** address a credential as a **record** whose representation contains metadata only — reference, sharing mode, type, category, lifecycle status (declared or active), expiry, inheritance status, and, for the caller's own record only, version and last-update time — and never the secret value. The representation **MUST NOT** name the owning tenant: for an inherited credential that would disclose an ancestor's identifier the caller cannot obtain by any authorized route, and the inheritance status already answers whether the record is the caller's own ([ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md), "What a response says about tenants above"). The secret value **MUST** be a separate addressable sub-resource of that record.
 
 **Rationale**: A metadata surface cannot leak a value it structurally does not contain; separating the two makes a value-blind administrator role possible. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -470,7 +472,7 @@ The system **MUST** allow creating and replacing a credential record without tou
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-read-secret`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow an authorized caller to read the value of a credential resolved through the tenant hierarchy, at an address distinct from the record, with caching disabled and one audit record per returned value.
+The system **MUST** allow an authorized caller to read the value of a credential resolved through the tenant hierarchy, at an address distinct from the record, with caching disabled and one audit record per returned value. The response **MUST** carry, besides the value, only what is needed to use it — the reference, the type and the expiry — plus the record's validator; administrative metadata (sharing mode, category, inheritance status, lifecycle status) **MUST NOT** accompany a value, so that reading a value and reading a record remain distinct privileges in fact.
 
 **Rationale**: Value disclosure is its own privilege with its own auditable, throttleable path, separate from reading or listing metadata. **Actors**: `cpt-cf-credstore-actor-integration-app`, `cpt-cf-credstore-actor-oagw`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -480,7 +482,7 @@ The system **MUST** allow an authorized caller to read the value of a credential
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-write-secret`
 
 <!-- cpt-cf-id-content -->
-The system **MUST** allow an authorized caller to set or rotate a credential's value at the same address the value is read from, under a required precondition, without granting the ability to read that value. The precondition **MUST** be evaluated against the record's validator, since the record and its value share one version; a write to a reference that has no record **MUST** be a not-found rather than a create. The write **MUST NOT** be permitted for a record owned by an ancestor: a tenant that wants its own value declares its own record first.
+The system **MUST** allow an authorized caller to set or rotate a credential's value at the same address the value is read from, under a required precondition, without granting the ability to read that value. The precondition **MUST** be evaluated against the record's validator, since the record and its value share one version; a write to a reference that has no record **MUST** be a not-found rather than a create. The write **MUST NOT** be permitted for a record owned by an ancestor: a tenant that wants its own value declares its own record first. The same address **MUST** support a set-once precondition that succeeds only while the record holds no value, and **MUST** allow clearing the value so that the record returns to its value-less state with its metadata intact, both under the same action as rotation. A value write **MUST** always write and always advance the version, even when the submitted value equals the stored one.
 
 **Rationale**: This is the requirement that makes the value-blind configurator possible — the persona who provisions and rotates an integration's credentials without ever being able to read one. It is also the half of the old combined write that the record write does not cover, and it was missing from this section while both the endpoint and the `write_secret` action already referenced it. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
@@ -868,7 +870,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 
 **Main Flow**:
 1. Application issues one bulk read request selecting category `email-sender`
-2. The system resolves and authorizes each matching credential individually and returns all of them in one response, each item stating whether its value is the tenant's own or inherited from an ancestor
+2. The system resolves and authorizes each matching credential individually and returns all of them in one response, each item carrying the value with its type and expiry and nothing administrative
 3. Credentials of other categories are not evaluated and do not appear in the result
 
 **Postconditions**:

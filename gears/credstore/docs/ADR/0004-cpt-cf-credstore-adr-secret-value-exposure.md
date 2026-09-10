@@ -116,7 +116,7 @@ The deciding arguments are D8 (metadata surfaces cannot carry a value because th
 
 ### Resulting surface
 
-At a glance, seven addresses replacing the four above:
+At a glance, eight addresses replacing the four above:
 
 | Method and path | Returns | PDP action |
 |---|---|---|
@@ -126,6 +126,7 @@ At a glance, seven addresses replacing the four above:
 | `DELETE /credstore/v1/credentials/{ref}` | delete the record | `delete` |
 | `GET /credstore/v1/credentials/{ref}/secret` | the value | `read_secret` |
 | `PUT /credstore/v1/credentials/{ref}/secret` | set or rotate the value | `write_secret` |
+| `DELETE /credstore/v1/credentials/{ref}/secret` | clear the value; the record stays, `declared` | `write_secret` |
 | `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection, in one request | `read_secret`, per item |
 
 Read against the four shipped addresses in the Context above, three things changed: the collection is named for the record rather than the payload, the value moved to a sub-resource of its own, and the three actions on the shipped `secret.v1~` type become six on the renamed `credential.v1~` type — plain verbs for the record, `_secret`-suffixed verbs for the value — with every address answering to exactly one of them. The same table with the headers, preconditions and cache rules each address carries:
@@ -133,16 +134,17 @@ Read against the four shipped addresses in the Context above, three things chang
 | Address | Returns | PDP action | Notes |
 |---|---|---|---|
 | `GET /credstore/v1/credentials` | credential records (metadata), paginated | `list` | value-free by construction; `Cache-Control: no-store`, because the body varies by tenant and subject; OData filter/order per `guidelines/DNA/REST/PAGINATION.md` |
-| `GET /credstore/v1/credentials/{ref}` | one credential record (metadata) | `read` | carries the `ETag` — the CAS validator source (D4); `ETag` only for the tenant's own row; `Cache-Control: no-store` |
-| `PUT /credstore/v1/credentials/{ref}` | — (201 on create with `ETag`, 204 on replace) | `write` | create-or-replace of the **record only**: sharing, type, category, expiry. Preconditions carry the intent: `If-None-Match: *` create-only, `If-Match: "<etag>"` guarded replace, `If-Match: *` last-writer-wins |
+| `GET /credstore/v1/credentials/{ref}` | one `Credential` (metadata) | `read` | carries the `ETag` — the CAS validator source (D4): a strong `"<id>.<version>"` for the tenant's own row, a weak opaque `W/"…"` for an inherited one (see "What a response says about tenants above"); `Cache-Control: no-store` |
+| `PUT /credstore/v1/credentials/{ref}` | — (201 on create with `ETag`, 204 on replace) | `write` | create-or-replace of the **record only**: sharing, type, category, expiry. Preconditions carry the intent: `If-None-Match: *` create-only, `If-Match: "<etag>"` guarded replace, `If-Match: *` last-writer-wins. A body equal to the current record is a no-op: 204, same `ETag`, no version bump |
 | `DELETE /credstore/v1/credentials/{ref}` | — (204) | `delete` | `If-Match` required; releases the reference |
-| `GET /credstore/v1/credentials/{ref}/secret` | the value + the record | `read_secret` | `Cache-Control: no-store`; audited |
-| `PUT /credstore/v1/credentials/{ref}/secret` | — (204) | `write_secret` | set or rotate; `If-Match` required and evaluated against the **record's** validator (see below); never creates a record |
+| `GET /credstore/v1/credentials/{ref}/secret` | one `Secret`: the value plus `reference`, `type`, `expires_at` | `read_secret` | `Cache-Control: no-store`; audited; carries the record's `ETag` so a self-rotating caller needs no second read |
+| `PUT /credstore/v1/credentials/{ref}/secret` | — (204) | `write_secret` | set or rotate; a precondition is required and evaluated against the **record's** validator (see below); `If-None-Match: *` means "only while no value is set"; never creates a record; always writes and always bumps the version, even for identical bytes |
+| `DELETE /credstore/v1/credentials/{ref}/secret` | — (204) | `write_secret` | clears the value and returns the record to `declared`: metadata, category and sharing survive, the reference stays reserved, and — as for any `declared` record — the reference stops resolving and stops shadowing an inherited value; `If-Match` required |
 | `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection | `read_secret`, per item | bulk; see below |
 
 ### Why one address per thing, in three arguments
 
-The table above spends seven addresses where four would do. That is the cost, and each of the three reasons below is on its own sufficient to pay it.
+The table above spends eight addresses where four would do. That is the cost, and each of the three reasons below is on its own sufficient to pay it.
 
 **One address, one schema.** A response body is fixed by the URL, not by who asked or by what was sent. A generated client gets one type per address; an OpenAPI reader sees one shape; a reviewer checking "can this path emit a secret" reads the schema rather than the handler. The alternative — one address whose body sometimes carries a value — makes the schema a function of the caller's grants, which is untypeable, and turns "does this leak" into a question about runtime state instead of about a document.
 
@@ -157,6 +159,8 @@ Rotation suffers too, though less. The rotator does hold `read` — D4 has it re
 Two addresses answer both without a rule to remember: each `PUT` carries the complete state of its own resource, absence means default, and the privilege is whatever that address requires. The record write cannot touch the value because the value is not in that resource, and the value write cannot reset the metadata for the same reason.
 
 Suppression (the "disabled here" tombstone, if adopted) attaches to the record: `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression`.
+
+**Two representations, and what each carries.** `Credential` is the record: `reference`, `type`, `category`, `sharing`, `status` (`declared` or `active`, so a console can show a half-finished create), `expires_at`, `inheritance` (`own` / `inherited` / `overridden`), and — for the caller's own record only — `version` and `updated_at`. `Secret` is the value with exactly what is needed to use it: `reference`, `type` (a consumer must know whether it is parsing a `basic_auth` object or an `api_key` string), `expires_at` (when to come back), and the value itself; the record's `ETag` travels in the header so that a caller which reads and rotates its own credential never needs the record address. Nothing administrative rides along with a value: `sharing`, `category`, `inheritance`, `status` stay behind `read`. That is what keeps `read_secret` and `read` two different privileges instead of one nested inside the other, and it is why the question "should the value address require both actions" never arises — each address discloses one representation, and one action covers it.
 
 ### Why `credentials` and not `secrets`
 
@@ -182,10 +186,16 @@ Each resource has exactly one write verb, `PUT`, and the intent of a write is ca
 
 | Intent | Request |
 |---|---|
-| create the record, fail if it exists | `PUT /credentials/{ref}` + `If-None-Match: *` → 201, or 412 if present |
+| create the record, fail if it exists | `PUT /credentials/{ref}` + `If-None-Match: *` → 201, or 409 if the caller's tenant already holds a record under that reference |
 | replace the record, only if unchanged since I read it | `PUT /credentials/{ref}` + `If-Match: "<id>.<version>"` → 204, or 409 |
 | replace the record, last writer wins | `PUT /credentials/{ref}` + `If-Match: *` → 204 |
-| set or rotate the value | `PUT /credentials/{ref}/secret` + one of the same three preconditions |
+| set the value only if none is set yet | `PUT /credentials/{ref}/secret` + `If-None-Match: *` → 204, or 409 if the record already holds a value |
+| set or rotate the value | `PUT /credentials/{ref}/secret` + `If-Match: "<id>.<version>"` or `If-Match: *` → 204, or 409 |
+| clear the value, keep the record | `DELETE /credentials/{ref}/secret` + `If-Match` → 204; the record is `declared` again |
+
+**"If it exists" is judged against the caller's own tenant.** `GET /credentials/{ref}` may well return 200 for a reference the caller has never declared — an ancestor's `shared` credential is a current representation of that URL — and RFC 9110 read literally would then fail `If-None-Match: *`. That reading would make the override flow unexpressible: the case in which a tenant declares its own record is precisely the case in which the reference already resolves to an ancestor's. So the create-only precondition asks "does *my* tenant hold a row under this reference", inherited representations do not count, and the deviation is stated here rather than discovered in a test.
+
+**One status code for every failed precondition: 409.** RFC 9110 offers 412 for a failed `If-None-Match` and the platform maps a version conflict (`OPTIMISTIC_LOCK_FAILURE`) to 409; using both would make "your precondition did not hold" two different codes depending on which precondition it was. The platform mapping wins, and the reason code in the body says which precondition failed.
 
 `PATCH` is deliberately absent. A partial-update verb needs its own merge semantics and its own conflict rules on top of the ones `PUT` already has, and it invites the pattern where a client mutates one field without ever holding the whole record — which is precisely how a `sharing` change gets made without noticing the expiry it left behind. `PUT` on the record is a whole-value replace: fields absent from the body are reset to their defaults, exactly as today's value `PUT` already clears an omitted expiry.
 
@@ -194,6 +204,10 @@ Each resource has exactly one write verb, `PUT`, and the intent of a write is ca
 The record's `type` remains immutable: a `PUT` whose body names a different type is rejected rather than applied, so "whole-value replace" covers the mutable metadata only.
 
 **Versioning across the two resources.** One monotonic `version` lives on the record, and both writes bump it. A validator read from the record therefore guards value writes as well, and a concurrent rotation invalidates a pending metadata edit. That is conservative — a metadata edit can be rejected because someone rotated the value — but it keeps one validator, one counter and one `ETag` in the system. Independent per-sub-resource `ETag`s would be more precise and are the obvious extension if the false conflicts ever hurt.
+
+**A record write that changes nothing bumps nothing.** `PUT /credentials/{ref}` with a body equal to the current record — after normalization, expiry included — returns 204 with the unchanged `ETag`, leaves `version` and `updated_at` where they were, and writes no row. A retried or idempotently re-sent record write therefore cannot invalidate a concurrent writer's validator or fake a change in the catalogue. Validation still runs first: a re-sent record naming a category that has since been deprecated is refused, not waved through as a no-op.
+
+**A value write never takes that shortcut.** `PUT /credentials/{ref}/secret` writes the backend and bumps the version every time, identical bytes included, for two reasons that are each sufficient. First, deciding "unchanged" would mean comparing the submitted value against the stored fingerprint, and the outcome would be observable — through the version, the `ETag`, or `updated_at`, all readable under `read` — by a caller holding `write_secret` and not `read_secret`. That caller could then submit guesses and watch whether the version moved: an equality oracle on a value it is not allowed to read, which is exactly the disclosure class this ADR exists to close. Skipping the backend write would add a timing channel on top. Second, the `If-Match: *` re-write of the *same* value is the recovery path for a fence-poisoned row (ADR-0003): the row's fingerprint no longer matches what the backend holds, the caller re-injects the value it knows to be right, and a fingerprint-based no-op check would see "unchanged" and leave the poison in place. The value path stays oblivious to content equality.
 
 ### Consequence: no single-request create of record and value
 
@@ -208,6 +222,8 @@ PUT /credstore/v1/credentials/smtp-default/secret If-Match: *        → 204
 
 This is a deliberate deviation from RFC 9110, which evaluates a precondition against the target resource's own current representation, and it is stated rather than left to be inferred: read the other way, `If-Match` on a value that has never been written would be evaluated against an absent representation and could not succeed, which would make the first of the two writes above unexpressible. The record's `ETag` exists from the moment the record is created — which is why record creation returns it, rather than making the client insert a metadata `GET` between the two calls — so a guarded first value write is available immediately, and `If-Match: *` on the sub-resource means "the record must exist". A value write against a reference with no record is a 404, not a create: the record is the thing that gets created, and only by its own `PUT`.
 
+**`If-None-Match: *` on the value means "only while no value is set".** Evaluated against the record's representation it could never succeed — the record always exists for a legal value write — so it is given the one meaning that is useful here: the write succeeds while the record is `declared` and is refused with 409 once a value is present. That is the set-once a provisioning pipeline wants ("initialize if empty, never overwrite a rotation someone else made"), and it is the only precondition a writer holding no read action at all can use meaningfully besides `If-Match: *`, since it can obtain no validator.
+
 Between them the record exists **without a value**, so that state has to be legal and defined rather than transient:
 
 - **A value-less record does not resolve and does not shadow.** "Does not resolve" means it is not a candidate, not that the read returns 404: the walk continues past it, so a `GET .../secret` returns an ancestor's `shared` value when the chain offers one and the canonical 404 only when nothing in the chain does. That is the whole point — critically, the record does **not** hide an inherited value from an ancestor. A half-finished create in a child tenant must not silently break inheritance that was working before it started. This is the one rule with a claim on a *second* surface: the collection read reduces a reference's rows to the one a value read would resolve, so its reduction has to skip a `declared` local row in favour of a resolvable inherited one, or the listing would report the empty local record while the point read serves the ancestor's value ([ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md) "Reducing a reference to one item").
@@ -215,6 +231,7 @@ Between them the record exists **without a value**, so that state has to be lega
 - **The reaper must not sweep it.** With `declared` as its own status this falls out rather than being enforced: the sweep selects `provisioning` rows past their timeout, and a `declared` record is not one. Had the state been folded into `provisioning`, the sweep would have needed a timeout exception for a record whose value write may legitimately arrive days later — or never — and a slow operator would lose their record between the two calls.
 - **Atomicity moves to the client.** The gear no longer guarantees "either both parts exist or neither"; a client that abandons the sequence leaves an empty record behind. The value write remains crash-safe on its own (backend write plus fingerprint stamp in one saga), so what is lost is only the coupling between the two requests.
 - **The UI consequence is real**: an administrator who creates a credential in a console sees a two-step flow, and the console must either drive both calls or show the record as incomplete.
+- **The state is reachable again, on purpose.** `DELETE /credentials/{ref}/secret` clears the value and returns an `active` record to `declared`, keeping its metadata, its category, its sharing and its reserved reference. It is the "reset" the integration administrator persona asks for and the kill switch a value-blind role needs: revoke a leaked credential now, re-inject a replacement later, without deleting and redeclaring the record. Its consequence is the one every `declared` record has — the reference stops resolving and stops shadowing, so a descendant that was receiving this tenant's override falls back to the ancestor's `shared` value, if any. Deleting the whole record would do the same and lose the metadata too.
 
 If atomic creation is later required — for instance because empty records start appearing in production catalogues — it returns as a collection-level `POST` carrying both parts, and this ADR is amended rather than reinterpreted (see [Revisit Triggers](#revisit-triggers)).
 
@@ -229,6 +246,8 @@ The tenant identifier is a different matter, and it is dropped for a reason wort
 Putting the owning tenant in a credential response bypasses that, and it does so for any ancestor at any depth. The identifier is also the by-product of a privilege the caller does not hold: the gear fetches the chain with barriers ignored (`cpt-cf-credstore-adr-upward-collection-read`), and it may do so because a `shared` value is published downward regardless of barriers. A barrier-respecting traversal stops at a `self_managed` tenant, so a tenant at or below a barrier is never shown the tenants above that barrier; the gear sees them only because it looks past the barrier on the caller's behalf. Nothing here changes what a barrier means — it still isolates a customer's management from its parent, and data published as `shared` still flows down through it, exactly as ADR-0005 states — it only says that what the gear learned by looking past the barrier is not the caller's to keep. Handing it out would be the gear using its trusted position to disclose what the position was granted for, which is the confused-deputy shape.
 
 **It can be reconstructed, by whoever is entitled to.** Nothing is permanently lost. A caller that holds the grants can walk Account Management upward, one authorized read per level, and match a reference against each tenant's catalogue to find where it lives. An operator investigating "where did this credential come from" works with operator rights and can do exactly that. What the removal takes away is the shortcut that skipped the authorization at every level; what it costs is several requests instead of one field, paid by the party that has the rights to make them.
+
+**`version` and `updated_at` go the same way for an inherited record.** Both describe the ancestor's write activity — how many times it has rotated or edited the credential, and when it last did — which is operational detail about a tenant the caller cannot otherwise observe, and neither serves the caller: the CAS validator of an inherited record is useless to it, since it cannot write that record, and D4's guarantee is about the caller's *own* row. A weaker class of disclosure than the identifier, but the same shape, and dropping one while keeping the other would be inconsistent. So an inherited `Credential` carries neither field, and instead of the strong `"<id>.<version>"` its `ETag` is a **weak, opaque** validator: `W/"<hmac(id.version)>"` under a key kept for this purpose and nothing else. Two properties follow by construction. It still changes exactly when the ancestor writes, so a consumer can still ask "has this changed since I last looked" cheaply under `read`. And RFC 9110 requires the strong comparison for `If-Match`, so a weak validator can never be used to write — a client that tries gets the same refusal it would get for writing an ancestor's record anyway. The caller's own record keeps the strong validator and both fields. The collection read follows: `updated_at` is present on `own` and `overridden` items and absent on `inherited` ones, which is why ADR-0005 offers no ordering or filtering on it.
 
 **Open question for the platform, not for this gear.** This reasoning holds only while the ancestor chain stays unpublished. If a Tenant Resolver HTTP API is added later and exposes `get_ancestors` to callers, the chain becomes obtainable directly and the argument above weakens or disappears — at which point re-adding `owner_tenant_id` would cost nothing and would be a convenience worth having. **This needs confirming with the Tenant Resolver's owners before this ADR is accepted:** is the upward chain intended to stay unavailable to a caller with minimal rights once that gear grows an API, or is it planned to be public? The answer changes nothing about the split itself, only about this one field.
 
@@ -262,7 +281,7 @@ Rules, all of which follow from D6:
 - **`Cache-Control: no-store`**, one audit record per value actually returned, and its own gateway rate-limit rule on its own path.
 - **The cap is enforced by fetching `cap + 1`, never by counting.** No `COUNT` query is issued: if a `cap + 1`-th row comes back, the request fails; otherwise the rows fetched are the answer. This matches the platform rule against counting queries and keeps the check one indexed read.
 
-One response shape serves both selectors — a per-item outcome, and the record alongside each value so the caller can see whether it got its own or an inherited credential:
+One response shape serves both selectors — a per-item outcome, and beside each value the same usage envelope the point read carries (`type`, `expires_at`), nothing administrative:
 
 ```jsonc
 POST /credstore/v1/credentials:read-secrets?$filter=category eq 'email-sender'
@@ -276,16 +295,11 @@ Cache-Control: no-store
       "reference": "smtp-default",
       "outcome": "ok",
       "secret": "…",
-      "credential": {
-        // No `owner_tenant_id` and no `is_inherited`: `inheritance` carries
-        // the whole answer, and naming the ancestor is what this ADR drops.
-        "sharing": "shared",
-        "inheritance": "inherited",
-        "version": 3,
-        "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~",
-        "category": "email-sender",
-        "expires_at": null
-      }
+      // The usage envelope only. `sharing`, `category`, `inheritance` and
+      // `status` are the record's business and stay behind `read`; a value
+      // reader learns what it needs to use the value and nothing more.
+      "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~",
+      "expires_at": null
     },
     // No `not_found` entry appears under a filtered selector: a reference the
     // filter found but the caller may not read is omitted entirely, because
@@ -308,6 +322,7 @@ Cache-Control: no-store
 - A value-blind administrator rotates by reading the record for its `ETag` and writing the sub-resource; it never touches an address that returns a secret (D4).
 - The frequent "give me my whole credential set" pattern is served in one call, with disclosure bounded by the caller's own grant, a cap, and the absence of pagination (D6).
 - The list item and the point record share one schema, which is what clients expect and what generated SDKs can type.
+- The value carries only its usage envelope (`type`, `expires_at`), so `read_secret` discloses a different representation from `read` rather than a superset of it; the two privileges stay distinct in fact, not only in name.
 - Cost: this renames the shipped collection and moves the value read to a sub-resource. Every current consumer of the value changes. That is accepted under D1 and recorded below.
 - Cost: one more endpoint than a flag-based design, and a `POST` used for a read. The latter has precedent in this codebase (`POST /usage-collector/v1/records/aggregate`) and has a side benefit for secrets: a `POST` response is not cached by intermediaries.
 - Cost: the bulk endpoint performs up to the cap backend reads and fence verifications per request, plus one PDP evaluation per distinct type; it needs its own latency budget.
@@ -322,7 +337,11 @@ Cache-Control: no-store
 - E2E: the bulk endpoint rejects a selector matching more than the cap with `TOO_MANY_MATCHES`; an item the caller may not read is reported identically to an item that does not exist; a fence-poisoned item does not affect its siblings.
 - E2E: an application granted `read_secret` on one category receives exactly its own credentials for a `$filter` on that category, and an empty result for another category.
 - E2E: the bulk endpoint accepts `$filter` but rejects `cursor`, `$orderby`, `$top` and `limit`; its response carries no `page_info`.
-- E2E: `PUT /credentials/{ref}` with `If-None-Match: *` returns 201 the first time and 412 the second; a `PUT` naming a different type is rejected; a `PUT` that omits expiry clears it.
+- E2E: `PUT /credentials/{ref}` with `If-None-Match: *` returns 201 the first time and 409 the second; a `PUT` naming a different type is rejected; a `PUT` that omits expiry clears it; a `PUT` whose body equals the current record returns 204 with the same `ETag` and does not bump `version`.
+- E2E: `PUT /credentials/{ref}` with `If-None-Match: *` returns 201 for a reference that currently resolves to an ancestor's `shared` credential — the override flow — and the record's `inheritance` reads `overridden` once its value is set.
+- E2E: `PUT …/secret` with `If-None-Match: *` returns 204 on a `declared` record and 409 once a value exists; `PUT …/secret` with identical bytes still bumps `version`; `DELETE …/secret` returns the record to `declared`, keeps its metadata, and an inherited value resolves for descendants again.
+- E2E: an inherited `Credential` carries neither `version` nor `updated_at`, its `ETag` is weak, that `ETag` changes when the ancestor rotates, and sending it in `If-Match` is refused; the caller's own record carries both fields and a strong `ETag`.
+- Contract tests: the `Secret` schema contains exactly `reference`, `type`, `expires_at` and the value; `sharing`, `category`, `inheritance` and `status` appear in `Credential` only.
 - E2E: a record created without a value returns 404 on its secret **and** an ancestor's inherited value keeps resolving for descendants while the record stays empty.
 - E2E: the reaper leaves a deliberately empty record untouched across at least two sweep intervals.
 - Audit: one record per value returned by both the point read and the bulk read; no record claims a disclosure when the response carried none.
@@ -333,10 +352,12 @@ Compatibility is recorded here, not optimized for (D1).
 
 | Surface / mode | Compatible with what ships today | Detail |
 |---|---|---|
-| Value read | **no — moves** | `GET /credstore/v1/secrets/{ref}` becomes `GET /credstore/v1/credentials/{ref}/secret`. Every consumer of a value changes its URL. Same body plus the record, same `ETag` and `no-store`. |
+| Value read | **no — moves and slims** | `GET /credstore/v1/secrets/{ref}` becomes `GET /credstore/v1/credentials/{ref}/secret`. Every consumer of a value changes its URL. The body becomes the `Secret` envelope — value, `reference`, `type`, `expires_at` — so `sharing`, `is_inherited` and `owner_tenant_id` no longer accompany a value; same `ETag`, same `no-store`. |
 | Entity URL semantics | **no — inverts** | The item URL used to return the secret; it now returns the record. A client that keeps calling the old shape gets metadata, never a value, so the failure is a missing field rather than a silent disclosure. |
 | Collection name | **no — renamed** | `secrets` → `credentials`. |
 | `is_inherited` in the metadata | **no — replaced** | Superseded by `inheritance`, which distinguishes `own` from `overridden` where the boolean could not. A client reading the boolean reads one field's worth of a three-state answer. |
+| `version`, `updated_at` on an inherited record | **no — removed** | Both described an ancestor's write activity. An inherited `Credential` carries a weak opaque `ETag` for change detection instead; own records keep both fields and the strong validator. |
+| Clear value (`DELETE …/secret`) | n/a — new | Returns a record to `declared` without deleting it. |
 | `owner_tenant_id` in the metadata | **no — removed** | For an inherited credential this named an ancestor tenant the caller cannot learn by any other route, including ancestors above a barrier that a barrier-respecting traversal would never show it. Recoverable by an entitled caller through Account Management, one authorized read per level. Pending confirmation with the Tenant Resolver's owners that the upward chain stays unpublished. |
 | Create | **no — removed** | `POST /credstore/v1/secrets` with a value in the body disappears. Creation becomes `PUT /credentials/{ref}` + `If-None-Match: *` for the record, then `PUT …/secret` for the value: **two requests, no atomicity**. |
 | Rotation | **no — moves** | `PUT /credstore/v1/secrets/{ref}` becomes `PUT /credstore/v1/credentials/{ref}/secret`; the `If-Match` contract itself is unchanged. |
@@ -399,7 +420,7 @@ Compatibility is recorded here, not optimized for (D1).
 
 ### Data
 
-- **No schema change originates here.** The metadata fields these addresses expose (sharing, version, expiry, and the proposed `category`) come from the companion work.
+- **Schema changes are two, and both are named elsewhere in this ADR.** The fourth `status` value `declared` (the value-less record) and the type-id rename, which changes every stored `secret_type_uuid` ("Why `credentials` and not `secrets`"). No new column originates here; `category` comes from the companion work.
 - **No new personal data.** References and categories are operator-chosen labels; values stay opaque bytes to the gear.
 - **Retention and residency:** unchanged; nothing new is persisted.
 

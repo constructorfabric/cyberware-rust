@@ -129,8 +129,9 @@ curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" 
 ```
 
 **Read the secret value** — demonstrates the value read moved to its own
-sub-resource address, distinct from the record. Requires the `read_secret`
-PDP action.
+sub-resource address, distinct from the record; the body carries the value
+with its type and expiry only, and the record's `ETag` in the header.
+Requires the `read_secret` PDP action.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
