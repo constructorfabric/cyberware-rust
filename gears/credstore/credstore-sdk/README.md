@@ -15,12 +15,16 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
 - **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`GetSecretResponse`** — Domain models
 - **`CredStoreError`** — Error types for all operations
 - **`CredStorePluginSpecV1`** — GTS schema for plugin registration
-- Planned (ADR-0004), not yet implemented — additional `CredStoreClientV1`
-  contracts for the upcoming credential/secret split:
-  - `metadata` — point read of a credential record's metadata only, without
-    its value; also the source of the `ETag` a value-blind writer needs
-  - `list_metadata` — listing of credential records; never carries values,
-    regardless of the caller's grants
+- Planned (ADR-0004), not yet implemented — `CredStoreClientV1` reshaped
+  around the credential record and its secret value, with one noun per
+  resource: `get`, `list`, `put`, `delete` address the record; `get_secret`,
+  `put_secret`, `read_secrets` address the value.
+  - `get` — point read of one credential record, without its value; also the
+    source of the `ETag` a value-blind writer needs
+  - `list` — listing of credential records; never carries values, regardless
+    of the caller's grants
+  - `get_secret` / `put_secret` — read, set or rotate the value at its own
+    address, under the record's validator
   - `read_secrets` — bulk read of secret values for a bounded selection,
     capped and non-paginated. Exactly one of two selectors per call, matching
     the REST contract one-for-one: an explicit list of references, or a filter
@@ -29,16 +33,12 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
     over `reference` — see ADR-0004 for why that one is withheld rather than
     pending
 
-  These methods will ship with default "unsupported" implementations, so
-  existing trait implementors and test doubles keep compiling unchanged.
-
-  `get`, `put` and `delete` keep their names and are re-pointed at the value
-  sub-resource and the record. **`create` does not survive as it is:** it
-  takes a value, and creating a record with its value in one call is exactly
-  what the split removes. It becomes either a convenience wrapper that issues
-  both writes and documents its own non-atomicity, or it is dropped in favour
-  of a record write followed by a value write — the choice is open, and
-  whichever way it goes, a caller that used `create` changes shape.
+  **`get` and `put` change meaning**: `get` returns a `Credential`, which has
+  no `value` field, so every existing caller fails to compile rather than
+  silently reading metadata; value readers move to `get_secret`. **`create`
+  is removed**: it takes a value, and creating a record with its value in one
+  call is exactly what the split removes — a caller declares the record with
+  `put`, then sets the value with `put_secret`.
 
 ## Usage
 

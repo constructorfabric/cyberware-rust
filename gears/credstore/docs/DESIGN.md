@@ -107,7 +107,7 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 | `cpt-cf-credstore-fr-delete-secret` | Deprovisioning saga: mark `deprovisioning` → backend delete → row delete (§6.3). **Superseded in part** by ADR-0004: `DELETE` addresses the credential record (value included), not a standalone secret (§4.3) |
 | `cpt-cf-credstore-fr-tenant-scoping` | Gear derives tenant from `SecurityContext.subject_tenant_id()`; own-tenant gate + SecureORM scope clamp |
 | `cpt-cf-credstore-fr-sharing-modes` | `sharing` column in the gear metadata table; partial unique indexes let private and tenant/shared coexist under one reference |
-| `cpt-cf-credstore-fr-authz-pdp` | PDP `AccessScope` per operation on the secret GTS resource type, enforced in SQL; fail-closed. Shipped action set is `read`/`write`/`delete`; ADR-0004 replaces it with the six actions of `cpt-cf-credstore-fr-authz-action-split` below, with no synonym for the old pair |
+| `cpt-cf-credstore-fr-authz-pdp` | PDP `AccessScope` per operation on the secret GTS resource type, enforced in SQL; fail-closed. Shipped action set is `read`/`write`/`delete` on `gts.cf.core.credstore.secret.v1~`; ADR-0004 renames the type to `…credential.v1~` and replaces the set with the six actions of `cpt-cf-credstore-fr-authz-action-split` below, so no shipped permission matches the new surface |
 | `cpt-cf-credstore-fr-optimistic-concurrency` | Monotonic `version` column; `GET` returns a strong generation-bound `ETag` (`"<id>.<version>"`, §4.10); `PUT`/`DELETE` require `If-Match` (a validator or `*`) |
 | `cpt-cf-credstore-fr-secret-types` | GTS-based secret types with enforceable traits (§5) |
 | `cpt-cf-credstore-fr-deprovisioning` | `deprovisioning` status + compensating delete saga swept by the reaper (§6.3) |
@@ -118,8 +118,8 @@ Authorization is delegated to the platform PDP (`authz-resolver`) via `PolicyEnf
 | `cpt-cf-credstore-fr-read-secret` | `GET /credentials/{ref}/secret`: value-only sub-resource, `Cache-Control: no-store`, one audit record per returned value (§4.3) |
 | `cpt-cf-credstore-fr-write-secret` | `PUT /credentials/{ref}/secret`: set or rotate the value under a required precondition evaluated against the **record's** validator; grants no read of that value, and never creates a record (§4.3.2) |
 | `cpt-cf-credstore-fr-bulk-read-secrets` | `POST /credentials:read-secrets`: explicit-references or scoped `$filter` selector, per-item authorization and fence verification, hard cap enforced by fetching `cap + 1` rows with `TOO_MANY_MATCHES` instead of truncation, no pagination (§4.3, §4.6) |
-| `cpt-cf-credstore-fr-authz-action-split` | PDP actions split into `list_meta` / `read_meta` / `write_meta` / `read_value` / `write_value` / `delete`; no action is accepted as a synonym for the previous single `read` (§4.3, §4.4) |
-| `cpt-cf-credstore-fr-secret-category` | `category` column, validated against a closed registry (and a type's `allowed_categories`, §5.2) on record write; changing it requires `write_meta` and bumps `version` (§4.1, §5.4) |
+| `cpt-cf-credstore-fr-authz-action-split` | Six PDP actions on the renamed resource type `gts.cf.core.credstore.credential.v1~`: `list` / `read` / `write` / `delete` on the record, `read_secret` / `write_secret` on the value; shipped permissions target `secret.v1~` and therefore match nothing on the new surface (§4.3, §4.4) |
+| `cpt-cf-credstore-fr-secret-category` | `category` column, validated against a closed registry (and a type's `allowed_categories`, §5.2) on record write; changing it requires `write` and bumps `version` (§4.1, §5.4) |
 | `cpt-cf-credstore-fr-override-category-consistency` | Record write resolves the reference upward and refuses a category differing from the credential it overrides (`CATEGORY_MISMATCH_WITH_INHERITED`); the reaper scans for chains that slipped past it (§5.4, §6.4) — the invariant the `category` clamp of §4.4 rests on for selectivity, though not for correctness |
 | `cpt-cf-credstore-fr-inheritance-status` | `inheritance` (own / inherited / overridden) computed at resolution/reduction time from the ancestor-chain walk; never a filterable or orderable column (§4.1, §4.4) |
 
@@ -214,9 +214,9 @@ The gear owns all secret metadata in its own `credstore_secrets` table; the back
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-principle-authz-pdp`
 
-Every operation evaluates a PDP `AccessScope` for its action on the secret resource type (`gts.cf.core.credstore.secret.v1~`) and enforces that scope in SQL through SecureORM clamps on the metadata table. The shipped action set is `read`, `write`, `delete`; ADR-0004 splits it into `list_meta`, `read_meta`, `write_meta`, `read_value`, `write_value` and `delete` (`cpt-cf-credstore-fr-authz-action-split`, §4.3.2), and accepts neither `read` nor `write` as a synonym for any of them, so every policy granting the old pair is re-issued. Both read and write paths additionally gate on an explicit own-tenant invariant (`scope_includes_tenant`) and emit a `cross_tenant_denied` metric. Out-of-scope access is fail-closed and surfaces as the canonical 404 (anti-enumeration) or 403. Plugins MUST NOT implement authorization.
+Every operation evaluates a PDP `AccessScope` for its action on the credential resource type (shipped as `gts.cf.core.credstore.secret.v1~`; renamed to `gts.cf.core.credstore.credential.v1~` by ADR-0004, §5.1) and enforces that scope in SQL through SecureORM clamps on the metadata table. The shipped action set is `read`, `write`, `delete`; ADR-0004 replaces it with `list`, `read`, `write`, `delete` on the record and `read_secret`, `write_secret` on the value (`cpt-cf-credstore-fr-authz-action-split`, §4.3.2). Because the resource type is renamed at the same time, no shipped permission matches a new operation, and every policy is re-issued against the new type. Both read and write paths additionally gate on an explicit own-tenant invariant (`scope_includes_tenant`) and emit a `cross_tenant_denied` metric. Out-of-scope access is fail-closed and surfaces as the canonical 404 (anti-enumeration) or 403. Plugins MUST NOT implement authorization.
 
-**The collection read is the exception to "one evaluation per operation"** (§4.4): its resource is a concrete secret type, and a page can span several, so it evaluates `list_meta` once per distinct type the candidate probe found — bounded by the number of types a tenant actually uses, not by the page size, and cacheable per subject. Every other operation addresses exactly one row and therefore one type, so for those the single-evaluation rule holds unchanged.
+**The collection read is the exception to "one evaluation per operation"** (§4.4): its resource is a concrete secret type, and a page can span several, so it evaluates `list` once per distinct type the candidate probe found — bounded by the number of types a tenant actually uses, not by the page size, and cacheable per subject. Every other operation addresses exactly one row and therefore one type, so for those the single-evaluation rule holds unchanged.
 
 #### Tenant from SecurityContext
 
@@ -264,8 +264,8 @@ All trait-boundary and REST errors follow the platform canonical error model ([A
 | `WritePrecondition` | Parsed `If-Match`, mandatory on update/delete: `Exists` (`*`, explicit last-writer-wins) or `Version { id, version }` (quoted `"<id>.<version>"`, generation-bound). |
 | `GetSecretResponse` | SDK read result: `{ value, id, owner_tenant_id, sharing, is_inherited, version }`; `(id, version)` is the strong-validator pair. |
 | `SecretType` | Catalog-resolved secret type binding the enforceable traits (§5); immutable per secret. |
-| `CredentialRecord` (planned, ADR-0004) | The addressable **metadata** resource: reference, sharing, type, `category`, version, expiry, `inheritance` — structurally never the value, and never the owning tenant (ADR-0004, "What a response says about tenants above"). Identified by `SecretRef` in the `credentials` collection (§4.3); the secret value is a separate sub-resource of it, not a field on it. |
-| `Category` (planned, `cpt-cf-credstore-fr-secret-category`) | Operator-chosen label drawn from a closed registry, attached to a `CredentialRecord`; usable as a PDP attribute predicate (§4.4) so an application can be granted values of one category only. Changing it requires the `write_meta` action and bumps `version` (§5.2, §5.4). |
+| `Credential` (planned, ADR-0004; REST schema `Credential`) | The addressable **metadata** resource: reference, sharing, type, `category`, version, expiry, `inheritance` — structurally never the value, and never the owning tenant (ADR-0004, "What a response says about tenants above"). Identified by `SecretRef` in the `credentials` collection (§4.3); the secret value is a separate sub-resource of it, not a field on it. |
+| `Category` (planned, `cpt-cf-credstore-fr-secret-category`) | Operator-chosen label drawn from a closed registry, attached to a `Credential`; usable as a PDP attribute predicate (§4.4) so an application can be granted values of one category only. Changing it requires the `write` action and bumps `version` (§5.2, §5.4). |
 | `InheritanceStatus` (planned, `cpt-cf-credstore-fr-inheritance-status`) | Enum: `Own`, `Inherited`, `Overridden` (a tenant's own record shadows an ancestor's `shared` record under the same reference). `Suppressed` is a P2 addition (§6.1) that would win resolution without altering the ancestor. Computed at resolution/reduction time, never a stored or filterable column (§4.4). |
 
 **Relationships & uniqueness**:
@@ -318,7 +318,7 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-sdk`
 
-`credstore-sdk` — trait definitions (`CredStoreClientV1`, `CredStorePluginClientV1`), models, canonical `CredStoreError`, and the GTS declarations: the plugin spec type (`gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`) and the secret resource type (`gts.cf.core.credstore.secret.v1~`, exported as `SECRET_RESOURCE_TYPE` — the single source of truth pinned by unit tests).
+`credstore-sdk` — trait definitions (`CredStoreClientV1`, `CredStorePluginClientV1`), models, canonical `CredStoreError`, and the GTS declarations: the plugin spec type (`gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`) and the credential resource type (`gts.cf.core.credstore.secret.v1~` as shipped, `gts.cf.core.credstore.credential.v1~` after the ADR-0004 rename; exported as `SECRET_RESOURCE_TYPE` — the single source of truth pinned by unit tests).
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-gear`
 
@@ -367,7 +367,7 @@ Production value-store backends (external secret vault, OS keychain, KMS-backed 
 
 **Design rationale**: the plugin returns **no metadata** — sharing, ownership, inheritance, and version all come from the gear's metadata row resolved *before* the backend is touched. This keeps every policy decision in one place and backends trivially simple.
 
-**Planned (ADR-0004, `cpt-cf-credstore-adr-secret-value-exposure`).** `CredStoreClientV1` gains three record-oriented methods — `metadata` (point read of one record), `list_metadata` (the collection of §4.4) and `read_secrets` (bulk value read) — re-pointed at the addresses in §4.3.2. The same three names appear in `credstore-sdk/README.md`; there is one spelling, not two. `get`, `put` and `delete` keep their names and are re-pointed at the value sub-resource and the record respectively. `create` is the one method that cannot survive unchanged: it carries a value, and a single-request create of record plus value is precisely what the split removes, so it becomes either a documented non-atomic wrapper over both writes or is dropped in favour of them. New methods ship with default "unsupported" implementations so existing implementors and test doubles keep compiling (Backward Compatibility, ADR-0004).
+**Planned (ADR-0004, `cpt-cf-credstore-adr-secret-value-exposure`).** `CredStoreClientV1` is reshaped around the two resources, with the same two nouns the REST surface uses. On the record: `get` (one `Credential`), `list` (the collection of §4.4), `put` (create or replace the record), `delete`. On the value: `get_secret`, `put_secret`, `read_secrets` (bulk). `get` and `put` change meaning — `get` returns a `Credential`, which has no `value` field, so every existing caller fails to compile instead of silently reading metadata — and `create` is removed, because a single-request create of record plus value is precisely what the split takes away. The same names appear in `credstore-sdk/README.md`; there is one spelling, not two (Backward Compatibility, ADR-0004).
 
 #### 4.3.1 REST API (Gear)
 
@@ -438,14 +438,14 @@ The machine-readable API is generated from the handlers: the platform-wide OpenA
 
 | Address | PDP action | Success | Key headers | Preconditions |
 |---|---|---|---|---|
-| `GET /credstore/v1/credentials` | `list_meta` | `200` | `Cache-Control: no-store` — value-free, but the body varies by tenant and by subject | OData `$filter`/`$orderby` on an indexed allowlist (§4.7), opaque cursor, `limit`; no total count |
-| `GET /credstore/v1/credentials/{ref}` | `read_meta` | `200` | `ETag` (the CAS validator source, D4 of the ADR); `Cache-Control: no-store` | — |
-| `PUT /credstore/v1/credentials/{ref}` | `write_meta` | `201` create, `204` replace | `Location` **and `ETag`** on create; `ETag` on replace | `If-None-Match: *` (create-only, **409** if present), `If-Match: "<id>.<version>"` (guarded replace, 409 on mismatch), or `If-Match: *` (last-writer-wins) |
+| `GET /credstore/v1/credentials` | `list` | `200` | `Cache-Control: no-store` — value-free, but the body varies by tenant and by subject | OData `$filter`/`$orderby` on an indexed allowlist (§4.7), opaque cursor, `limit`; no total count |
+| `GET /credstore/v1/credentials/{ref}` | `read` | `200` | `ETag` (the CAS validator source, D4 of the ADR); `Cache-Control: no-store` | — |
+| `PUT /credstore/v1/credentials/{ref}` | `write` | `201` create, `204` replace | `Location` **and `ETag`** on create; `ETag` on replace | `If-None-Match: *` (create-only, **409** if present), `If-Match: "<id>.<version>"` (guarded replace, 409 on mismatch), or `If-Match: *` (last-writer-wins) |
 | `DELETE /credstore/v1/credentials/{ref}` | `delete` | `204` | — | `If-Match` mandatory |
-| `GET /credstore/v1/credentials/{ref}/secret` | `read_value` | `200` | `Cache-Control: no-store`; audited | — |
-| `PUT /credstore/v1/credentials/{ref}/secret` | `write_value` | `204` | — | `If-Match` mandatory; the validator is read from the record, not from the value |
-| `POST /credstore/v1/credentials:read-secrets` | `read_value`, evaluated per item | `200` | `Cache-Control: no-store` | selector-based, capped, no precondition (see below) |
-| `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression` | `write_meta` (P2, not yet designed in full) | — | — | — |
+| `GET /credstore/v1/credentials/{ref}/secret` | `read_secret` | `200` | `Cache-Control: no-store`; audited | — |
+| `PUT /credstore/v1/credentials/{ref}/secret` | `write_secret` | `204` | — | `If-Match` mandatory; the validator is read from the record, not from the value |
+| `POST /credstore/v1/credentials:read-secrets` | `read_secret`, evaluated per item | `200` | `Cache-Control: no-store` | selector-based, capped, no precondition (see below) |
+| `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression` | `write` (P2, not yet designed in full) | — | — | — |
 
 **Metadata responses are `no-store` too, not only value responses.** A record and a page of records carry no secret, but both vary by requesting tenant and by subject: the same URL legitimately yields a different catalogue to two callers, and an inherited entry depends on the caller's ancestor chain. An intermediary that cached one and served it to the other would disclose one tenant's catalogue to another — reconnaissance rather than value disclosure, but disclosure. The alternative, an identity-aware cache partition, would have to key on tenant *and* subject *and* the resolved chain, which is more contract than a catalogue read is worth. So every credential address, metadata included, is `no-store`; only the value addresses additionally carry per-value audit.
 
@@ -476,7 +476,7 @@ The consequence is that the first value write needs no special case. The record'
 
 **Type**: platform service (in-process client via ClientHub)
 
-Every operation calls `PolicyEnforcer.access_scope_with(ctx, resource, action, …)` **once**, with the `owner_tenant_id` PEP property and `action ∈ {read, write, delete}` as shipped — `∈ {list_meta, read_meta, write_meta, read_value, write_value, delete}` once ADR-0004 lands, where the per-address mapping in §4.3.2 is authoritative. The `resource` is always the secret's **full concrete type** — including `generic` (`…secret.v1~cf.core.credstore.generic.v1~`) — so policies can target any type without a separate base-type gate (§5.4). The type is known before the evaluation via a prefetch (post-resolution on read, post-lookup on overwrite/delete, from the requested/default type on create) followed by a types-registry resolution of the stored `secret_type_uuid` to its GTS type id (§5.4); the returned `AccessScope` is enforced in SQL. Enforcement is fail-closed: `Denied`/`CompileFailed` → 403 (404 on read, anti-enumeration), `EvaluationFailed` → 503.
+Every operation calls `PolicyEnforcer.access_scope_with(ctx, resource, action, …)` **once**, with the `owner_tenant_id` PEP property and `action ∈ {read, write, delete}` on `secret.v1~` as shipped — `∈ {list, read, write, delete, read_secret, write_secret}` on `credential.v1~` once ADR-0004 lands, where the per-address mapping in §4.3.2 is authoritative. The `resource` is always the credential's **full concrete type** — including `generic` (`…credential.v1~cf.core.credstore.generic.v1~`; `…secret.v1~…` until the rename lands) — so policies can target any type without a separate base-type gate (§5.4). The type is known before the evaluation via a prefetch (post-resolution on read, post-lookup on overwrite/delete, from the requested/default type on create) followed by a types-registry resolution of the stored `secret_type_uuid` to its GTS type id (§5.4); the returned `AccessScope` is enforced in SQL. Enforcement is fail-closed: `Denied`/`CompileFailed` → 403 (404 on read, anti-enumeration), `EvaluationFailed` → 503.
 
 **No PDP capabilities / no downward projection tables**: the gear advertises no PEP capabilities, so the PDP hands it pre-expanded, flat tenant predicates (`Eq`/`In` on `owner_tenant_id`) and resolves any subtree grant on its own side — the standard no-projection scenarios ([AUTHZ_USAGE_SCENARIOS](../../../docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md) S09–S11). What this rules out is **downward** expansion: the gear has no closure table to enumerate a subtree, so a structured `InTenantSubtree` predicate reaching it is a capability-contract breach and fails closed — unchanged by the collection read below.
 
@@ -507,7 +507,7 @@ In one sentence: data flows down through the barrier; authority does not.
 
 The types-registry is a hard `deps` of the gear (fail-closed `init` when `TypesRegistryClient` is absent from ClientHub) and serves two roles:
 
-**Secret-type resolution** (§5): every operation resolves the secret's stored type UUID via `get_type_schema_by_uuid` — one lookup against the registry client's built-in TTL cache; credstore adds no cache of its own, so type re-registrations take effect within the client TTL. The resolver (`GtsSecretTypeResolver`, mirroring AM's `GtsTenantTypeChecker`) verifies the schema descends from the secret base type (`gts.cf.core.credstore.secret.v1~`), merges the chain's effective traits (`x-gts-traits`, leaf wins, base fills defaults), and deserializes them into `SecretTypeTraits`. Failure mapping is fail-closed: an unregistered/non-secret type is `UNKNOWN_SECRET_TYPE` (400) when the caller named it, 503 when it came from a stored row (deregistration is an operational inconsistency, not a caller error); registry outage / timeout (2 s probe) / malformed traits → 503. Calls are recorded on the `types_registry` dependency-health metrics.
+**Secret-type resolution** (§5): every operation resolves the secret's stored type UUID via `get_type_schema_by_uuid` — one lookup against the registry client's built-in TTL cache; credstore adds no cache of its own, so type re-registrations take effect within the client TTL. The resolver (`GtsSecretTypeResolver`, mirroring AM's `GtsTenantTypeChecker`) verifies the schema descends from the base type (`gts.cf.core.credstore.secret.v1~` as shipped, `…credential.v1~` after the ADR-0004 rename, §5.1), merges the chain's effective traits (`x-gts-traits`, leaf wins, base fills defaults), and deserializes them into `SecretTypeTraits`. Failure mapping is fail-closed: an unregistered/non-secret type is `UNKNOWN_SECRET_TYPE` (400) when the caller named it, 503 when it came from a stored row (deregistration is an operational inconsistency, not a caller error); registry outage / timeout (2 s probe) / malformed traits → 503. Calls are recorded on the `types_registry` dependency-health metrics.
 
 **Plugin discovery**: plugins register GTS instances derived from the plugin spec type (`…~cf.core.credstore.plugin.v1~`). The gear lazily queries instances by type-id prefix, filters by the configured `vendor`, picks the highest-priority active instance, and resolves its scoped `CredStorePluginClientV1` from ClientHub. No plugin available surfaces as a non-retryable 503 ("no storage plugin registered").
 
@@ -585,14 +585,14 @@ sequenceDiagram
     C->>GW: list(ctx, filter, orderby, cursor, limit)
     GW->>TR: ancestor_chain(tenant) [cached, barriers ignored]
     TR-->>GW: [self, parent, ..., root]
-    GW->>PDP: access_scope(list_meta, …)
+    GW->>PDP: access_scope(list, …)
     PDP-->>GW: AccessScope (flat tenant predicate)
     GW->>DB: scope_includes_tenant(caller tenant)?
     GW->>DB: candidate rows across chain, reference ASC, id ASC — no tenant clamp; category/type/sharing/reference as SQL clamps
     DB-->>GW: candidate rows, page extended to the end of the last reference group
     GW->>GTS: get_type_schema_by_uuid per distinct secret_type_uuid on the page [client TTL cache]
     GTS-->>GW: type ids + effective traits
-    GW->>PDP: access_scope(read_meta, per distinct type present)
+    GW->>PDP: access_scope(list, per distinct type present)
     PDP-->>GW: per-type AccessScope
     GW-->>C: reduced items (own/inherited/overridden winner per reference) + next_cursor
 ```
@@ -622,7 +622,7 @@ sequenceDiagram
     DB-->>GW: rows (>cap ⇒ 400 TOO_MANY_MATCHES, no COUNT query)
     loop per resolved item
         GW->>GTS: get_type_schema_by_uuid(secret_type_uuid) [client TTL cache]
-        GW->>PDP: access_scope(read_value, concrete type)
+        GW->>PDP: access_scope(read_secret, concrete type)
         PDP-->>GW: AccessScope
         GW->>DB: scope_includes_tenant(caller tenant)? and item visible?
         GW->>P: get(owner_tenant, key, owner?) — value only
@@ -632,7 +632,7 @@ sequenceDiagram
     GW-->>C: 200, per-item {outcome, secret?, credential?}, no cursor
 ```
 
-**No pagination, per-item outcome.** Each item is authorized (`read_value`) and fenced independently; a refusal, a miss, a suppression and a fence mismatch all surface as the same `not_found` outcome and never abort the rest of the batch (§4.3.2). The response carries `returned` (the length of `items`) and the configured `cap`, never a cursor — the selector cannot be paginated through.
+**No pagination, per-item outcome.** Each item is authorized (`read_secret`) and fenced independently; a refusal, a miss, a suppression and a fence mismatch all surface as the same `not_found` outcome and never abort the rest of the batch (§4.3.2). The response carries `returned` (the length of `items`) and the configured `cap`, never a cursor — the selector cannot be paginated through.
 
 ### 4.7 Database schemas & tables
 
@@ -747,12 +747,14 @@ Today every secret is an opaque byte string with identical semantics. The platfo
 A **secret type** is a GTS type derived from the credstore secret base type (GTS segments are `vendor.package.namespace.type.vN`, so the derived segment carries the type name directly), e.g. for the built-in types:
 
 ```
-gts.cf.core.credstore.secret.v1~cf.core.credstore.<name>.v1~
+gts.cf.core.credstore.credential.v1~cf.core.credstore.<name>.v1~
 ```
+
+> **Renamed by ADR-0004 (planned).** The base type ships today as `gts.cf.core.credstore.secret.v1~`, and every built-in and custom type derives from that id. ADR-0004 renames it to `gts.cf.core.credstore.credential.v1~` so that the type, the `credentials` collection, the `Credential` schema and the PDP actions share one noun for the entity, keeping `secret` for the value alone. Every derived id, `SECRET_RESOURCE_TYPE`, the seeded catalog and `GENERIC_TYPE_UUID_STR` follow; the stored `secret_type_uuid` is the v5 UUID of the type id, so stored values change with it (a constant change while there are no production rows, a migration afterwards). Until the rename lands, every id in this section reads with `secret.v1~` in place of `credential.v1~`.
 
 Each type declares a set of **traits** — machine-readable behavioral properties the gear enforces uniformly. The **types-registry is the runtime source of truth** (mirroring tenant types in Account Management): the base type `SecretV1` carries the trait vocabulary as its `x-gts-traits-schema` (generated from `SecretTypeTraits`, closed to unknown keys), every registered type derived from it declares its `x-gts-traits` values against that shape, and the gear resolves a type's effective traits from the registry per operation (§5.4). The compiled-in SDK catalog (`credstore_sdk::SECRET_TYPE_CATALOG`) only **seeds** the built-in type schemas through the link-time inventory; unit tests pin the seeds to the catalog descriptors so the two views cannot drift.
 
-**Adding a type requires no credstore release**: registering a GTS schema that descends from `gts.cf.core.credstore.secret.v1~` (with its `x-gts-traits`) makes the type immediately writable, trait-enforced, and addressable as a PDP resource type — enabling per-type RBAC (e.g., a role that may read `api-key` secrets but not `certificate` secrets) without new authorization machinery.
+**Adding a type requires no credstore release**: registering a GTS schema that descends from the base type (with its `x-gts-traits`) makes the type immediately writable, trait-enforced, and addressable as a PDP resource type — enabling per-type RBAC (e.g., a role that may read `api-key` secrets but not `certificate` secrets) without new authorization machinery.
 
 The type of a secret is chosen at creation (REST field `type`: the secret type's full GTS type id), defaults to `generic`, and is **immutable** for the lifetime of the secret (rejected with `TYPE_IMMUTABLE`, mirroring the private ↔ non-private rule).
 
@@ -791,13 +793,13 @@ Adding a **built-in** type (shipped with the platform, with a short REST name) =
 
 ### 5.4 Enforcement Points
 
-1. **Type resolution** (every operation): the type UUID — from the stored row (read/overwrite/delete prefetch) or from the request (create; default `generic`) — is resolved through `SecretTypeResolver` against the types-registry: envelope check (must descend from `gts.cf.core.credstore.secret.v1~`) + effective-traits merge (§4.4). Unknown/non-secret type: `UNKNOWN_SECRET_TYPE` (400) on create, 503 for a stored row; registry outage/timeout/malformed traits: 503. No credstore-side cache — the registry client's TTL cache bounds both latency and staleness.
+1. **Type resolution** (every operation): the type UUID — from the stored row (read/overwrite/delete prefetch) or from the request (create; default `generic`) — is resolved through `SecretTypeResolver` against the types-registry: envelope check (must descend from the credential base type, §5.1) + effective-traits merge (§4.4). Unknown/non-secret type: `UNKNOWN_SECRET_TYPE` (400) on create, 503 for a stored row; registry outage/timeout/malformed traits: 503. No credstore-side cache — the registry client's TTL cache bounds both latency and staleness.
 2. **Create / put**: validate `sharing ∈ allow_sharing`, value against the `value_schema` trait (compiled per write), size against `max_size_bytes`, UTF-8 against `utf8_only`, and the expiry gate — all on the **resolved traits**, before any side effect. Violations → 400 (`InvalidArgument`) with the stable per-trait reason (§5.2).
 3. **Update**: type immutable (`TYPE_IMMUTABLE` when an explicit differing `type` is sent — compared by UUID; absent `type` inherits the row's); the new value/sharing/expiry re-validated against the resolved traits. A PUT is a whole-value replace: omitting `expires_at` clears a stored expiry.
 4. **Read**: rows with `expires_at <= now` are filtered out in the resolution SQL (404); `type` (and `expires_at`, when set) are returned in response metadata.
 5. **Authorization**: a **single** PDP evaluation per operation targets the secret's **full concrete GTS type** — including `generic` — as returned by the type resolution (step 1). Its `AccessScope` is enforced in SQL and its gate must include the **caller's** tenant (hierarchical visibility of inherited/shared secrets is decided by the resolver, not the PDP). Denial surfaces as the anti-enumeration 404 on read and 403 on write/delete; a PDP outage is 503. Every type (incl. `generic` and custom types) reaches the PDP, so a per-type policy can be added with no credstore change. On read the PDP is consulted only for a secret that resolves (a missing secret is a 404 without a PDP or registry call).
 6. **Reaper**: each tick first flips expired `active` rows into the ordinary deprovisioning saga (`mark_expired_deprovisioning`), which then cleans the backend value and releases the reference via the pending sweep (§6.4). The reaper never resolves types — sweeping is type-agnostic.
-7. **Category** (planned, record write only, ADR-0004): the `category` field is validated against the registered category instances (§5.5) — a name that is not registered, or whose instance is `deprecated`, is refused and, when the type declares `allowed_categories` (§5.2), against that closed list — a violation is 400. Because changing a record's category changes which application may read its value through a category-scoped grant (and, under the bulk selector, which credentials appear in that application's result), a category change requires the `write_meta` action and bumps `version` like any other metadata edit (§4.3.2, `cpt-cf-credstore-fr-secret-category`). **The category must also match the credential this record overrides**, when the reference currently resolves to an ancestor's `shared` credential (`cpt-cf-credstore-fr-override-category-consistency`, the exact parallel of the type rule above): the write resolves the reference upward, which it must do anyway, and refuses a differing category as a conflict. This is enforced here rather than assumed, because §4.4's `category` clamp is only cheap if a reference's category is constant across its chain. The one path this check cannot cover is an ancestor changing or recreating its own credential, which no upward read can validate against descendants; §4.4 therefore reads the winner back rather than trusting the clamp, and the reaper raises a metric when it finds a chain with mixed categories.
+7. **Category** (planned, record write only, ADR-0004): the `category` field is validated against the registered category instances (§5.5) — a name that is not registered, or whose instance is `deprecated`, is refused and, when the type declares `allowed_categories` (§5.2), against that closed list — a violation is 400. Because changing a record's category changes which application may read its value through a category-scoped grant (and, under the bulk selector, which credentials appear in that application's result), a category change requires the `write` action and bumps `version` like any other metadata edit (§4.3.2, `cpt-cf-credstore-fr-secret-category`). **The category must also match the credential this record overrides**, when the reference currently resolves to an ancestor's `shared` credential (`cpt-cf-credstore-fr-override-category-consistency`, the exact parallel of the type rule above): the write resolves the reference upward, which it must do anyway, and refuses a differing category as a conflict. This is enforced here rather than assumed, because §4.4's `category` clamp is only cheap if a reference's category is constant across its chain. The one path this check cannot cover is an ancestor changing or recreating its own credential, which no upward read can validate against descendants; §4.4 therefore reads the winner back rather than trusting the clamp, and the reaper raises a metric when it finds a chain with mixed categories.
 
 ### 5.5 Category Registry (planned, ADR-0004)
 
@@ -1061,8 +1063,8 @@ Following the ToolKit plugin pattern:
 
 **GTS Types:**
 - Plugin spec: `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.plugin.v1~`
-- Secret resource type: `gts.cf.core.credstore.secret.v1~` (= `SECRET_RESOURCE_TYPE`, the PDP resource type; registered with an empty property set — authorization needs only the type id)
-- Secret types: derived from the secret base type — built-ins `gts.cf.core.credstore.secret.v1~cf.core.credstore.<name>.v1~` (one seed per catalog entry, traits as `x-gts-traits`), plus any custom registered descendant; §5
+- Credential resource type: `gts.cf.core.credstore.secret.v1~` as shipped, renamed to `gts.cf.core.credstore.credential.v1~` by ADR-0004 (= `SECRET_RESOURCE_TYPE`, the PDP resource type; registered with an empty property set — authorization needs only the type id); §5.1
+- Secret types: derived from the base type — built-ins `…credential.v1~cf.core.credstore.<name>.v1~` (`…secret.v1~…` until the rename lands; one seed per catalog entry, traits as `x-gts-traits`), plus any custom registered descendant; §5
 - Category type (planned, ADR-0004): `gts.cf.core.credstore.category.v1~` — the **source of truth for the category vocabulary**. Each category is an *instance* of this type, not a type of its own, so the vocabulary is enumerated the same way the gear already enumerates backend plugins: `list_instances` with the type-id prefix as the pattern (`infra/plugin_select.rs` does exactly this for `CredStorePluginSpecV1`). §5.5
 
 ### Configuration

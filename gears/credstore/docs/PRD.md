@@ -351,7 +351,7 @@ Authorization, sharing-mode enforcement, and hierarchy logic **MUST** live exclu
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-authz-action-split`
 
 <!-- cpt-cf-id-content -->
-Authorization **MUST** distinguish six actions: listing records, reading one record, writing a record, reading a value, writing a value, and deleting a credential. The previous single read action **MUST NOT** be accepted as a synonym for any of the metadata actions; policies granting it **MUST** be re-issued.
+Authorization **MUST** distinguish six actions on the credential resource type: `list`, `read`, `write` and `delete` on the record, and `read_secret` and `write_secret` on the value. The resource type **MUST** be the credential (`gts.cf.core.credstore.credential.v1~` and its derived types), renamed from the shipped `secret.v1~`, so that no shipped permission matches an operation on the new surface; policies granting the shipped actions **MUST** be re-issued against the new type rather than honoured as synonyms.
 
 **Rationale**: Enumerating entries, reading a record's metadata, and reading a secret value have different blast radius and must be separately grantable; an ambiguous grant would defeat that separation. **Actors**: `cpt-cf-credstore-actor-tenant-admin`, `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-integration-app`
 <!-- cpt-cf-id-content -->
@@ -385,7 +385,7 @@ Each secret **MUST** carry a monotonic version, exposed on retrieval. Update and
 - [ ] `p1` - **ID**: `cpt-cf-credstore-fr-secret-types`
 
 <!-- cpt-cf-id-content -->
-Each secret **MUST** have a *secret type* chosen at creation (default: `generic`) and immutable thereafter. Secret types are GTS types derived from the credstore secret base type and registered in the types-registry. Each type declares machine-readable **traits** that the gear enforces uniformly; at minimum:
+Each secret **MUST** have a *secret type* chosen at creation (default: `generic`) and immutable thereafter. Secret types are GTS types derived from the credstore base type and registered in the types-registry. **Amended by [ADR-0004](./ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)**: the base type is renamed from `gts.cf.core.credstore.secret.v1~` to `gts.cf.core.credstore.credential.v1~`, every derived type follows, and the type is also the PDP resource type of the new surface. Each type declares machine-readable **traits** that the gear enforces uniformly; at minimum:
 
 - `allow_sharing`: the set of sharing modes permitted for the type. A write requesting a disallowed mode **MUST** be rejected (e.g., `personal-token` secrets are `private`-only and can never be shared).
 - `value_schema` (optional): structural validation of the value on write.
@@ -482,7 +482,7 @@ The system **MUST** allow an authorized caller to read the value of a credential
 <!-- cpt-cf-id-content -->
 The system **MUST** allow an authorized caller to set or rotate a credential's value at the same address the value is read from, under a required precondition, without granting the ability to read that value. The precondition **MUST** be evaluated against the record's validator, since the record and its value share one version; a write to a reference that has no record **MUST** be a not-found rather than a create. The write **MUST NOT** be permitted for a record owned by an ancestor: a tenant that wants its own value declares its own record first.
 
-**Rationale**: This is the requirement that makes the value-blind configurator possible — the persona who provisions and rotates an integration's credentials without ever being able to read one. It is also the half of the old combined write that the record write does not cover, and it was missing from this section while both the endpoint and the `write_value` action already referenced it. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-platform-gear`
+**Rationale**: This is the requirement that makes the value-blind configurator possible — the persona who provisions and rotates an integration's credentials without ever being able to read one. It is also the half of the old combined write that the record write does not cover, and it was missing from this section while both the endpoint and the `write_secret` action already referenced it. **Actors**: `cpt-cf-credstore-actor-integrations-admin`, `cpt-cf-credstore-actor-platform-gear`
 <!-- cpt-cf-id-content -->
 
 #### Bulk Read Secret Values
@@ -590,7 +590,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 - [ ] `p1` - **ID**: `cpt-cf-credstore-interface-client`
 
 <!-- cpt-cf-id-content -->
-**Type**: Rust trait (async) **Stability**: stable **Description**: Public API for platform gears. Registered in ClientHub without scope. Operations: `get` (hierarchical read returning value + the credential record: sharing, inheritance status, version, secret type, expiry — the owning tenant is not named, per ADR-0004), `put`/`create` (precondition-guarded update / create-only) plus typed-options variants accepting write options (secret type, expiry), `delete` (precondition-guarded), `metadata` (point read of one credential record, value-free), `list_metadata` (paginated, deterministically ordered listing of credential records, value-free), `read_secrets` (bulk read of values for an explicit set of references or a metadata filter, capped and non-paginated). Creating a credential record and setting its value are separate calls; no single operation does both. Hierarchical resolution is internal to the gear. **Breaking Change Policy**: Major version bump required
+**Type**: Rust trait (async) **Stability**: stable **Description**: Public API for platform gears. Registered in ClientHub without scope. Operations, as reshaped by ADR-0004: on the record, `get` (one credential record: sharing, inheritance status, version, type, expiry — never the value and never the owning tenant), `list` (paginated, deterministically ordered listing of records, value-free), `put` (precondition-guarded create or replace of the record) and `delete` (precondition-guarded); on the value, `get_secret` (hierarchical read of the value), `put_secret` (precondition-guarded set or rotate) and `read_secrets` (bulk read of values for an explicit set of references or a metadata filter, capped and non-paginated). Creating a credential record and setting its value are separate calls; no single operation does both. Hierarchical resolution is internal to the gear. **Breaking Change Policy**: Major version bump required
 <!-- cpt-cf-id-content -->
 
 #### CredStorePluginClientV1
@@ -840,7 +840,7 @@ The gear **MUST** emit operational metrics sufficient to detect resolution anoma
 **Actor**: `cpt-cf-credstore-actor-integrations-admin`
 
 **Preconditions**:
-- Administrator holds the list-records, read-record, and write-record actions in their tenant, but not read-value
+- Administrator holds the `list`, `read` and `write` actions in their tenant, but not `read_secret`
 - A partner ancestor publishes a `shared` SMTP credential
 
 **Main Flow**:

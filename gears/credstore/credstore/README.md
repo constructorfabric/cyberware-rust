@@ -43,8 +43,9 @@ and [ADR-0005](https://github.com/constructorfabric/gears-rust/blob/main/gears/c
 (both `proposed`) split the credential record and its secret value into two
 addressable resources, add a metadata listing (upward-rooted through the
 tenant hierarchy, never carrying values) and a capped bulk value read, and
-split the single `read` PDP action into six (`list_meta`, `read_meta`,
-`write_meta`, `read_value`, `write_value`, `delete`). Under that model,
+rename the PDP resource type to `gts.cf.core.credstore.credential.v1~` and
+replace the three shipped actions with six on it (`list`, `read`, `write`,
+`delete` on the record; `read_secret`, `write_secret` on the value). Under that model,
 creating a credential with its value is no longer a single request — a bare
 record and its value are written separately, with no atomicity between the
 two calls.

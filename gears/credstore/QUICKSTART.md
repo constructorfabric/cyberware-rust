@@ -108,7 +108,7 @@ resources, addressed under `/credstore/v1/credentials…`.
 
 **List credential records** — demonstrates the new metadata listing, bounded
 with `limit` and filtered with the platform `$filter` syntax; the response
-never carries a value. Requires the `list_meta` PDP action.
+never carries a value. Requires the `list` PDP action.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0005
@@ -118,7 +118,7 @@ curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials?limit=20&\$filter=cat
 
 **Get one credential record** — demonstrates the point metadata read; the
 response carries no value but does carry the `ETag`, which a value-blind
-caller uses as the CAS validator for a later write. Requires the `read_meta`
+caller uses as the CAS validator for a later write. Requires the `read`
 PDP action.
 
 ```text
@@ -129,7 +129,7 @@ curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key" 
 ```
 
 **Read the secret value** — demonstrates the value read moved to its own
-sub-resource address, distinct from the record. Requires the `read_value`
+sub-resource address, distinct from the record. Requires the `read_secret`
 PDP action.
 
 ```text
@@ -142,8 +142,8 @@ curl -s "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai-key/se
 `ETag` of the **record** (from the record read above, or from the `201` of
 record creation below). The value sub-resource has no validator of its own:
 a record and its value share one version, so the record's `ETag` is what a
-value write is checked against. Requires the `write_value` PDP action, and
-notably not `read_value` — this is the write a value-blind configurator
+value write is checked against. Requires the `write_secret` PDP action, and
+notably not `read_secret` — this is the write a value-blind configurator
 performs.
 
 ```text
@@ -157,7 +157,7 @@ curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai
 
 **Create a record (no value yet)** — demonstrates create-only semantics on
 the record resource, the first of the two calls a new credential needs.
-Requires the `write_meta` PDP action.
+Requires the `write` PDP action.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
@@ -166,7 +166,7 @@ curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai
   -H "Content-Type: application/json" \
   -H 'If-None-Match: *' \
   -i \
-  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.secret.v1~cf.core.credstore.basic_auth.v1~"}'
+  -d '{"sharing": "tenant", "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~"}'
 
 # 201 Created
 # Location: /cf/credstore/v1/credentials/partner-openai-key
@@ -175,7 +175,7 @@ curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/partner-openai
 
 **Bulk read secret values, explicit selector** — demonstrates the bounded,
 non-paginated bulk read with a request body naming exact references.
-Requires the `read_value` PDP action, evaluated per item.
+Requires the `read_secret` PDP action, evaluated per item.
 
 ```text
 # NOT IMPLEMENTED — planned, ADR-0004
@@ -187,7 +187,7 @@ curl -s -X POST "http://127.0.0.1:8087/cf/credstore/v1/credentials:read-secrets"
 
 **Bulk read secret values, filtered selector** — demonstrates the same bulk
 read scoped by `$filter` on an indexed metadata field instead of an explicit
-list; still capped, still per-item authorized. Requires the `read_value` PDP
+list; still capped, still per-item authorized. Requires the `read_secret` PDP
 action, evaluated per item.
 
 ```text

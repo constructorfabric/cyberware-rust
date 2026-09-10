@@ -65,9 +65,7 @@ Updated:  2026-09-10 by Constructor Tech
 | `GET /credstore/v1/secrets/{ref}` | `credstore.get_secret` |
 | `DELETE /credstore/v1/secrets/{ref}` | `credstore.delete_secret` |
 
-Three PDP actions cover all four: `read`, `write`, `delete`. `{ref}` is the caller-chosen name, never the row id. There is no collection read at all — the PRD lists listing as a non-goal and DESIGN §4.4 states flatly that "there is no LIST".
-
-The gear ships one read surface: `GET /credstore/v1/secrets/{ref}` returns the secret value together with its access metadata, and there is no collection read at all (the PRD lists secret listing as a non-goal; DESIGN §4.4 states "there is no LIST"). One PDP action, `read`, covers all of it.
+Three PDP actions cover all four — `read`, `write`, `delete` — evaluated against the resource type `gts.cf.core.credstore.secret.v1~` and its derived types. `{ref}` is the caller-chosen name, never the row id. There is no collection read at all — the PRD lists listing as a non-goal and DESIGN §4.4 states flatly that "there is no LIST".
 
 Product requirements now introduce readers who must **not** see values, and readers who need several values at once:
 
@@ -122,25 +120,25 @@ At a glance, seven addresses replacing the four above:
 
 | Method and path | Returns | PDP action |
 |---|---|---|
-| `GET /credstore/v1/credentials` | the list of records, no values, paginated | `list_meta` |
-| `GET /credstore/v1/credentials/{ref}` | one record (metadata), carries the `ETag` | `read_meta` |
-| `PUT /credstore/v1/credentials/{ref}` | create or replace the record | `write_meta` |
+| `GET /credstore/v1/credentials` | the list of records, no values, paginated | `list` |
+| `GET /credstore/v1/credentials/{ref}` | one record (metadata), carries the `ETag` | `read` |
+| `PUT /credstore/v1/credentials/{ref}` | create or replace the record | `write` |
 | `DELETE /credstore/v1/credentials/{ref}` | delete the record | `delete` |
-| `GET /credstore/v1/credentials/{ref}/secret` | the value | `read_value` |
-| `PUT /credstore/v1/credentials/{ref}/secret` | set or rotate the value | `write_value` |
-| `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection, in one request | `read_value`, per item |
+| `GET /credstore/v1/credentials/{ref}/secret` | the value | `read_secret` |
+| `PUT /credstore/v1/credentials/{ref}/secret` | set or rotate the value | `write_secret` |
+| `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection, in one request | `read_secret`, per item |
 
-Read against the four shipped addresses in the Context above, three things changed: the collection is named for the record rather than the payload, the value moved to a sub-resource of its own, and every address answers to exactly one action instead of three actions covering everything. The same table with the headers, preconditions and cache rules each address carries:
+Read against the four shipped addresses in the Context above, three things changed: the collection is named for the record rather than the payload, the value moved to a sub-resource of its own, and the three actions on the shipped `secret.v1~` type become six on the renamed `credential.v1~` type — plain verbs for the record, `_secret`-suffixed verbs for the value — with every address answering to exactly one of them. The same table with the headers, preconditions and cache rules each address carries:
 
 | Address | Returns | PDP action | Notes |
 |---|---|---|---|
-| `GET /credstore/v1/credentials` | credential records (metadata), paginated | `list_meta` | value-free by construction; `Cache-Control: no-store`, because the body varies by tenant and subject; OData filter/order per `guidelines/DNA/REST/PAGINATION.md` |
-| `GET /credstore/v1/credentials/{ref}` | one credential record (metadata) | `read_meta` | carries the `ETag` — the CAS validator source (D4); `ETag` only for the tenant's own row; `Cache-Control: no-store` |
-| `PUT /credstore/v1/credentials/{ref}` | — (201 on create with `ETag`, 204 on replace) | `write_meta` | create-or-replace of the **record only**: sharing, type, category, expiry. Preconditions carry the intent: `If-None-Match: *` create-only, `If-Match: "<etag>"` guarded replace, `If-Match: *` last-writer-wins |
+| `GET /credstore/v1/credentials` | credential records (metadata), paginated | `list` | value-free by construction; `Cache-Control: no-store`, because the body varies by tenant and subject; OData filter/order per `guidelines/DNA/REST/PAGINATION.md` |
+| `GET /credstore/v1/credentials/{ref}` | one credential record (metadata) | `read` | carries the `ETag` — the CAS validator source (D4); `ETag` only for the tenant's own row; `Cache-Control: no-store` |
+| `PUT /credstore/v1/credentials/{ref}` | — (201 on create with `ETag`, 204 on replace) | `write` | create-or-replace of the **record only**: sharing, type, category, expiry. Preconditions carry the intent: `If-None-Match: *` create-only, `If-Match: "<etag>"` guarded replace, `If-Match: *` last-writer-wins |
 | `DELETE /credstore/v1/credentials/{ref}` | — (204) | `delete` | `If-Match` required; releases the reference |
-| `GET /credstore/v1/credentials/{ref}/secret` | the value + the record | `read_value` | `Cache-Control: no-store`; audited |
-| `PUT /credstore/v1/credentials/{ref}/secret` | — (204) | `write_value` | set or rotate; `If-Match` required and evaluated against the **record's** validator (see below); never creates a record |
-| `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection | `read_value`, per item | bulk; see below |
+| `GET /credstore/v1/credentials/{ref}/secret` | the value + the record | `read_secret` | `Cache-Control: no-store`; audited |
+| `PUT /credstore/v1/credentials/{ref}/secret` | — (204) | `write_secret` | set or rotate; `If-Match` required and evaluated against the **record's** validator (see below); never creates a record |
+| `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection | `read_secret`, per item | bulk; see below |
 
 ### Why one address per thing, in three arguments
 
@@ -152,9 +150,9 @@ The table above spends seven addresses where four would do. That is the cost, an
 
 **One address, one intent — and this is the decisive one.** `PUT` is a whole-value replace: fields absent from the body reset to their defaults. Put the value and the metadata behind one `PUT` and every write has to answer a question with no good answer.
 
-Change a category and omit the value: does the value get cleared, or preserved? Clear it and an innocent metadata edit destroys a credential. Preserve it and `PUT` is no longer a whole replace, so the same body means "reset" for one field and "leave alone" for another — exactly the ambiguity that made us refuse `PATCH`. The way out — "then send the value back" — is closed to the one caller this ADR exists for. The integration administrator holds `write_meta` and `read_meta` and not `read_value`: it can read every field of the record except the value, so it can never construct a body that preserves it. Under a merged `PUT` that administrator either cannot change a category at all or destroys the credential by changing it. The value-blind metadata edit — the whole point of the split — is unexpressible.
+Change a category and omit the value: does the value get cleared, or preserved? Clear it and an innocent metadata edit destroys a credential. Preserve it and `PUT` is no longer a whole replace, so the same body means "reset" for one field and "leave alone" for another — exactly the ambiguity that made us refuse `PATCH`. The way out — "then send the value back" — is closed to the one caller this ADR exists for. The integration administrator holds `write` and `read` and not `read_secret`: it can read every field of the record except the value, so it can never construct a body that preserves it. Under a merged `PUT` that administrator either cannot change a category at all or destroys the credential by changing it. The value-blind metadata edit — the whole point of the split — is unexpressible.
 
-Rotation suffers too, though less. The rotator does hold `read_meta` — D4 has it read the record for the `ETag` before a guarded write — so it *can* send the metadata back verbatim; but every rotation becomes a read-modify-write of fields it never meant to touch. That bites under the `If-Match: *` this ADR keeps for provisioning and healing flows: a routine rotation then overwrites a concurrent `sharing` or expiry change with the stale copy it read a moment earlier. With the value at its own address the same `If-Match: *` rotation cannot touch a metadata field, because none is in the body.
+Rotation suffers too, though less. The rotator does hold `read` — D4 has it read the record for the `ETag` before a guarded write — so it *can* send the metadata back verbatim; but every rotation becomes a read-modify-write of fields it never meant to touch. That bites under the `If-Match: *` this ADR keeps for provisioning and healing flows: a routine rotation then overwrites a concurrent `sharing` or expiry change with the stale copy it read a moment earlier. With the value at its own address the same `If-Match: *` rotation cannot touch a metadata field, because none is in the body.
 
 Two addresses answer both without a rule to remember: each `PUT` carries the complete state of its own resource, absence means default, and the privilege is whatever that address requires. The record write cannot touch the value because the value is not in that resource, and the value write cannot reset the metadata for the same reason.
 
@@ -165,6 +163,14 @@ Suppression (the "disabled here" tombstone, if adopted) attaches to the record: 
 Under A2 the collection name has to describe the record, not the payload. "Credential" is the record — a named, typed, tenant-scoped entry with sharing, version and expiry; "secret" is the sensitive value it holds. That vocabulary is the one this project already uses when talking about the two read classes, and it removes the sentence A1 forces you to write: *"`GET /secrets` returns no secrets."*
 
 It also converges with the platform: the Constructor service that already implements a version of this domain is `credentials-storage`, whose collections are `credential-definitions` and `credentials`. If the gear becomes its successor, a shared noun makes the migration and any compatibility facade legible instead of a translation exercise.
+
+**The GTS type follows the noun.** A permission is a pair of resource type and action, and the resource type is the GTS type of the entity. Leaving it at `gts.cf.core.credstore.secret.v1~` while the collection says `credentials` would put two nouns for one thing into every policy — "on resource *secret*, action *read the credential*" — and would leave the type naming the payload rather than the entity it types: a type's traits (`allow_sharing`, `expirable`, `value_schema`) describe the credential as a whole, not its bytes. So the base type is renamed to `gts.cf.core.credstore.credential.v1~`, and every derived type follows (`…credential.v1~cf.core.credstore.basic_auth.v1~`). `SECRET_RESOURCE_TYPE`, the seeded catalog and `GENERIC_TYPE_UUID_STR` change with it; the stored `secret_type_uuid` is the v5 UUID of the type id, so every stored value changes too. Nothing outside the credstore crates references the old id. While the gear has no production rows this is a constant change; afterwards it is a data migration and a re-registration of every custom type, which is why the rename is decided here and not later.
+
+One consequence is worth stating because it removes a rule this ADR would otherwise need. Shipped permissions target `secret.v1~`; the new surface authorizes against `credential.v1~`. No shipped grant can match any new operation, so the authorization break below is structural rather than a convention ("the old `read` is not a synonym") that reviewers would have to police.
+
+**"Credential" is used in its broad sense**: evidence of identity or authority — passwords, API keys, tokens, OAuth clients, certificates, webhook signing secrets. Nearly every type in the catalog is one. `generic` is the documented exception for opaque material, kept because a store that types its entries still needs a type for the untyped, not because the noun fits it.
+
+With the type renamed, every layer says the same two words: the type, the `credentials` collection, the `Credential` and `Secret` schemas, the `read`/`read_secret` actions, and the SDK's `get`/`get_secret`.
 
 ### Why the path key stays a reference, not a UUID
 
@@ -245,7 +251,7 @@ POST /credstore/v1/credentials:read-secrets?$filter=category eq 'email-sender'
 Rules, all of which follow from D6:
 
 - **A selector narrows; resolution decides.** Both the caller's `$filter` and the policy's own `category` clamp are pushed into SQL, but only as a way to pick candidate *references* cheaply. Each candidate is then resolved over **all** its rows across the chain, exactly as a point read would, and the winner is authorized. Applying either predicate below the resolution would change which row wins and could report an ancestor's credential as the effective one where the point read refuses it; [ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md) "How authorization applies to a collection" sets out that failure and the invariance rule that bounds it. Only `category`, `type` and `reference` are eligible for the SQL step, because only those are invariant across a chain by requirement.
-- **The selector cannot widen scope.** Each match resolves through the ancestor chain exactly as a point read does, and every item is authorized as `read_value` on its own resolved type and category. A filter therefore returns a subset of what N point reads would return; it saves round-trips, never privileges. For an application whose grant *is* "values of category `email-sender`", "all my SMTP secrets" discloses nothing it could not already fetch by name.
+- **The selector cannot widen scope.** Each match resolves through the ancestor chain exactly as a point read does, and every item is authorized as `read_secret` on its own resolved type and category. A filter therefore returns a subset of what N point reads would return; it saves round-trips, never privileges. For an application whose grant *is* "values of category `email-sender`", "all my SMTP secrets" discloses nothing it could not already fetch by name.
 - **The selector vocabulary is deliberately small** and every field in it must be backed by an index: `references` in the body, or `$filter` over `category`, `type` and `reference` with `eq` / `in`. No `owner_tenant_id`, no ordering, no `$select`. Today `credstore_secrets` indexes none of `category`, `secret_type_uuid` or `sharing` individually, so shipping the filtered selector requires the migration that adds them; without it the filter is a sequential scan, and the platform checks the "indexed fields only" rule by review, not automatically.
 - **No pagination and no cursor.** Values must not be walkable; a paginated value read is a catalogue dump in slow motion.
 - **Hard cap with an explicit failure, never truncation.** Above the cap (proposed: 25) the request fails with `400 TOO_MANY_MATCHES` and the client is expected to narrow the selector. Truncation would both hide credentials from a legitimate caller and turn the endpoint into a drip.
@@ -276,7 +282,7 @@ Cache-Control: no-store
         "sharing": "shared",
         "inheritance": "inherited",
         "version": 3,
-        "type": "gts.cf.core.credstore.secret.v1~cf.core.credstore.basic_auth.v1~",
+        "type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~",
         "category": "email-sender",
         "expires_at": null
       }
@@ -312,9 +318,9 @@ Cache-Control: no-store
 ### Confirmation
 
 - Contract tests: no response schema under `/credentials` or `/credentials/{ref}` contains a `value` property; `value_fp` and `fp_key_id` appear in no schema at all.
-- E2E: a role with `read_meta` but not `read_value` reads the record, obtains the `ETag`, completes a guarded `PUT …/secret`, and still receives 404 on `GET …/secret` — byte-identical to the 404 for a name that does not exist.
+- E2E: a role with `read` but not `read_secret` reads the record, obtains the `ETag`, completes a guarded `PUT …/secret`, and still receives 404 on `GET …/secret` — byte-identical to the 404 for a name that does not exist.
 - E2E: the bulk endpoint rejects a selector matching more than the cap with `TOO_MANY_MATCHES`; an item the caller may not read is reported identically to an item that does not exist; a fence-poisoned item does not affect its siblings.
-- E2E: an application granted `read_value` on one category receives exactly its own credentials for a `$filter` on that category, and an empty result for another category.
+- E2E: an application granted `read_secret` on one category receives exactly its own credentials for a `$filter` on that category, and an empty result for another category.
 - E2E: the bulk endpoint accepts `$filter` but rejects `cursor`, `$orderby`, `$top` and `limit`; its response carries no `page_info`.
 - E2E: `PUT /credentials/{ref}` with `If-None-Match: *` returns 201 the first time and 412 the second; a `PUT` naming a different type is rejected; a `PUT` that omits expiry clears it.
 - E2E: a record created without a value returns 404 on its secret **and** an ancestor's inherited value keeps resolving for descendants while the record stays empty.
@@ -336,10 +342,11 @@ Compatibility is recorded here, not optimized for (D1).
 | Rotation | **no — moves** | `PUT /credstore/v1/secrets/{ref}` becomes `PUT /credstore/v1/credentials/{ref}/secret`; the `If-Match` contract itself is unchanged. |
 | Metadata edit | n/a — new | Previously impossible without rewriting the value; now `PUT /credentials/{ref}`. |
 | List, bulk read, suppression | n/a — new | Nothing to break. Listing is a documented non-goal today, so shipping it amends the PRD rather than breaking a contract. |
-| SDK trait `CredStoreClientV1` | **mostly** | `get` (value), `put` (rotate) and `delete` keep their names and meaning, re-pointed at the new addresses. `create` can no longer be one call: it either becomes a convenience wrapper that issues both writes and documents its non-atomicity, or it is replaced by `put_record` + `put_secret`. New methods (`metadata`, `list_metadata`, `read_secrets`) ship with default "unsupported" implementations, so existing implementors and test doubles keep compiling. |
-| **Authorization model (actions)** | **no — broken on purpose** | `read` splits into `read_value`, `read_meta` and `list_meta`; `write_meta` is added. Every policy granting `read` is re-issued. |
+| SDK trait `CredStoreClientV1` | **no — reshaped** | The trait follows the two resources. `get`, `put`, `list`, `delete` address the record: `get` returns a `Credential`, which has no `value` field, so every existing caller of `get` fails to compile rather than silently reading metadata. `get_secret`, `put_secret` and `read_secrets` address the value. `create` is removed: a single-request create of record plus value is exactly what the split takes away. In-repo consumers (OAGW, the keycloak-idp plugin) move to `get_secret`. |
+| **Secret type ids** | **no — renamed** | `gts.cf.core.credstore.secret.v1~` becomes `gts.cf.core.credstore.credential.v1~`, and every derived id, `SECRET_RESOURCE_TYPE` and `GENERIC_TYPE_UUID_STR` follow. Custom types re-register under the new base; stored `secret_type_uuid` values change (a constant change while there are no production rows, a migration afterwards). |
+| **Authorization model (resource type and actions)** | **no — replaced** | The resource type changes, so no shipped permission matches any new operation. The six actions are `list`, `read`, `write`, `delete` on the record and `read_secret`, `write_secret` on the value. Every policy is re-issued against `credential.v1~`. |
 
-**Why the authorization break is not softened.** Accepting `read` as a synonym on the new metadata surfaces would let deployments roll forward untouched, at the price of a grant whose meaning is permanently ambiguous: a reviewer could not tell whether `read` was meant to include value disclosure. Since the premise of this ADR is that value disclosure is a separate privilege, an ambiguous grant defeats it. The split is clean, and re-granting is a release task with an explicit checklist: enumerate every role holding `read`, decide per role whether it needs values, the catalogue, or both, issue the new grants.
+**Why the authorization break is structural, not softened.** The tempting shortcut would be to accept the shipped `read` on the new surfaces so deployments roll forward untouched. It would leave a grant whose meaning is permanently ambiguous — a reviewer could not tell whether `read` was meant to include value disclosure — and since the premise of this ADR is that value disclosure is a separate privilege, an ambiguous grant defeats it. The type rename closes the question without a rule: shipped permissions name `secret.v1~`, the new operations authorize against `credential.v1~`, and the two never match. Re-granting is a release task with an explicit checklist: enumerate every role holding the shipped `read` or `write`, decide per role whether it needs the record, the catalogue, the value, or several, and issue the new grants.
 
 **Rollout ordering that follows.** Grants first, endpoints second. If endpoints ship before grants are re-issued, reads fail closed — empty pages and 404s — which is safe but reads like an outage. The reverse order is safe and invisible. HTTP consumers of the value migrate on their own schedule only if the old path is kept alive as a temporary alias; whether to provide that alias is a rollout decision, and this ADR does not require one.
 
@@ -357,9 +364,9 @@ Compatibility is recorded here, not optimized for (D1).
 ### Authentication and authorization
 
 - **AuthN:** unchanged. No new principal kinds, no session or token-format change.
-- **AuthZ model:** `read` splits into `read_value`, `read_meta`, `list_meta`; `write_meta` is added; `write_value` covers create and rotate; `delete` is unchanged. The bulk endpoint introduces **no new action** — it evaluates `read_value` per item, so it can never grant more than N point reads.
-- **Compatibility of the model:** deliberately not preserved; see the table above. No synonym for `read` is accepted.
-- **Escalation path to watch.** Whoever may change a credential's `category` changes which application may read its value, and under the scoped selector that also changes which credentials appear in an application's bulk result. That right belongs to `write_meta`, its values come from a registry, and the PDP policy owner must treat it as privileged rather than cosmetic.
+- **AuthZ model:** six actions on the renamed resource type `gts.cf.core.credstore.credential.v1~…`: `list`, `read`, `write`, `delete` on the record; `read_secret`, `write_secret` on the value. Plain verbs for the entity follow the platform convention (`read`/`write`/`delete` in every other gear); the `_secret` suffix follows its compound-action pattern (`set_reaction`, `upload_attachment`) and names the sub-resource, never the entity. The bulk endpoint introduces **no new action** — it evaluates `read_secret` per item, so it can never grant more than N point reads.
+- **Compatibility of the model:** deliberately not preserved; see the table above. The break is structural: a shipped permission on `secret.v1~` matches no operation on `credential.v1~`.
+- **Escalation path to watch.** Whoever may change a credential's `category` changes which application may read its value, and under the scoped selector that also changes which credentials appear in an application's bulk result. That right belongs to `write`, its values come from a registry, and the PDP policy owner must treat it as privileged rather than cosmetic.
 
 ### Integration and contract
 
@@ -439,6 +446,7 @@ Compatibility is recorded here, not optimized for (D1).
 - Good: one schema for the list item and the point record (D8); `ETag` naturally available to metadata readers (D4).
 - Good: every disclosing route is its own path, so gateway policy, rate limits and audit selectors need no body inspection (D5). Not a single glob, though: `/credentials/*/secret` misses `POST /credentials:read-secrets`, so both addresses must be named — see Consequences.
 - Good: vocabulary matches the domain and converges with the existing `credentials-storage` service, which matters if the gear becomes its successor.
+- Good: with the base type renamed alongside, the type, the collection, the schemas, the actions and the SDK share one noun for the entity and one for the payload; no layer has to translate.
 - Bad: renames the collection and moves the value read; every HTTP consumer of a value changes.
 
 ### A3: `secrets` collection, value at `value`
@@ -446,6 +454,7 @@ Compatibility is recorded here, not optimized for (D1).
 - Good: the same structural benefit as A2 with a smaller rename — the collection name survives.
 - Bad: muddled vocabulary, in which "secret" names the record and "value" names the secret; every reader has to hold that inversion in mind.
 - Bad: keeps a name that will read oddly next to `credentials-storage` if the two converge.
+- Bad: the entity's noun is the payload's noun, so `GET /secrets/{ref}` promises a secret and returns none of it; no schema name fully removes that reading.
 
 ### B1: value only at its own address (CHOSEN)
 
@@ -481,7 +490,7 @@ Evaluated in its strongest form: the item returns metadata by default and the va
 
 - Good: one round-trip for "everything I may read", with the filtering the collection already has.
 - Bad: paginated, filterable and value-bearing at once is a walkable catalogue dump — the one shape D6 exists to forbid.
-- Bad: collapses `list_meta` and `read_value` into a single effective privilege (D2).
+- Bad: collapses `list` and `read_secret` into a single effective privilege (D2).
 - Bad: pagination interacts badly with per-item authorization and with the fence; a page would mix served values, fence-failed items and authorization holes, and a cursor would let a client resume the walk.
 - Rejected. The legitimate need behind it — "all my SMTP secrets" — is served by the bulk address, which keeps the scoped selector but refuses pagination and caps the result.
 
