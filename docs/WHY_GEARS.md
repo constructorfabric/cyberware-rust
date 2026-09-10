@@ -614,5 +614,5 @@ curl http://127.0.0.1:8087/cf/healthz   # liveness "ok"
 ---
 
 *Constructor Fabric Gears (Rust) · Apache-2.0 · by the
-[Cyber Fabric Foundation](https://www.constructorfabric.org).
+[Constructor Fabric Foundation](https://www.constructorfabric.org).
 Secure · Modular · Composable · GenAI-ready.*

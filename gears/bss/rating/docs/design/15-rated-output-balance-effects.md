@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Rated Output, Delta Dedup & Balance Effects (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: rating-core, 14-unit-synthesis-period-tick | Downstream: 16-billing-handoff-operations, Contracts | Owners: BSS Rating team -->
 

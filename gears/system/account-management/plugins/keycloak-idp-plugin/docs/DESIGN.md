@@ -7,6 +7,9 @@ refs:
   - ../../../docs/ADR/0006-cpt-cf-account-management-adr-idp-user-tenant-binding.md
 ---
 
+Created:  2026-08-17 by Virtuozzo International GmbH
+Updated:  2026-08-17 by Virtuozzo International GmbH
+
 # Technical Design — Keycloak IdP Plugin
 
 - [ ] `p3` - **ID**: `cpt-cf-keycloak-idp-plugin-design-keycloak-idp-plugin`

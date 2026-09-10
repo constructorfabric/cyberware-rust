@@ -78,6 +78,7 @@ fn service_with(db: &Arc<DBProvider<DbError>>, admit_inline: bool) -> RegistrySe
         } else {
             AdmissionMode::Outbox
         },
+        common::metrics(),
     )
 }
 

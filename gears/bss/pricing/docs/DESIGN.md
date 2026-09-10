@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Plan & Price Modeling — Technical Design (canonical index) -->
 <!-- Related: ./PRD.md, ./ADR/, ./design/ | Owners: BSS Product Catalog team -->
 

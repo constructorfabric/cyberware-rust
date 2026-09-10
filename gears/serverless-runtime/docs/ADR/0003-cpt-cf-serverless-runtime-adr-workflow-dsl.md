@@ -1,11 +1,12 @@
-<!--
-Created:  2026-03-30 by Constructor Tech
-Updated:  2026-04-22 by Constructor Tech
--->
 ---
 status: accepted
 date: 2026-03-30
 ---
+<!--
+Created:  2026-03-30 by Constructor Tech
+Updated:  2026-04-22 by Constructor Tech
+-->
+
 <!--
 =============================================================================
 ARCHITECTURE DECISION RECORD (ADR) — based on MADR format

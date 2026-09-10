@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Governance & ASC 606 (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Pricing (Product Catalog), Contracts, Finance | Downstream: Pricing (publish pipeline), Billing, Finance | Owners: BSS Rating team -->
 

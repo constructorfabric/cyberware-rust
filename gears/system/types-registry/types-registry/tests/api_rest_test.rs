@@ -151,6 +151,7 @@ async fn router_with(v1_ready: bool) -> Router {
         dispatch,
         // Admission inline, as `init()` wires it until T21.
         AdmissionMode::Inline,
+        common::metrics(),
     ));
     types_registry::api::rest::routes::register_routes(
         Router::new(),
@@ -1190,9 +1191,6 @@ fn submission_response_headers_are_declared() {
         (202, "Idempotency-Replayed", ResponseHeaderType::Boolean),
         (200, "Location", ResponseHeaderType::String),
         (200, "Idempotency-Replayed", ResponseHeaderType::Boolean),
-        // The family-lock timeout arm answers `503` with a bounded retry hint,
-        // so the header belongs in the contract and not only in the response.
-        (503, "Retry-After", ResponseHeaderType::Integer),
     ] {
         assert!(
             submit.iter().any(|actual| {

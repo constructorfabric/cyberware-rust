@@ -1,12 +1,11 @@
-//! Schema-level tests for the P0 initial migration (T2), run against a real
+//! Schema-level tests for the P0 migrations (T2), run against a real
 //! in-memory `SQLite` database (~1ms per DB). They verify the SQL itself —
 //! every `CHECK` constraint, every `UNIQUE`, the composite foreign key that
 //! ties an `operation_item` to its parent's `kind` / `dry_run`, and the
 //! up/down/up roundtrip — without needing a running server.
 //!
-//! `docs/database.sql` is the normative target. P0 creates 9 of its 11 tables;
-//! `source_claim` and `routing_config` (federation) are deliberately absent,
-//! which is asserted here rather than left to review.
+//! `docs/database.sql` is normative. P0 adds nine initial tables and then
+//! `coordination_state`; federation's `source_claim` remains absent.
 //!
 //! Postgres- and `MySQL`-dialect *behaviour* (identity columns, `bytea`,
 //! `ascii_bin` collation, FK `RESTRICT`) is not reachable from `SQLite`. The
@@ -35,8 +34,8 @@ const P0_TABLES: &[&str] = &[
     "types_registry__dependency",
 ];
 
-/// The two federation tables `database.sql` defines and P0 does not create.
-const FEDERATION_TABLES: &[&str] = &[
+/// Tables that P0 must not create.
+const NOT_CREATED_TABLES: &[&str] = &[
     "types_registry__routing_config",
     "types_registry__source_claim",
 ];
@@ -118,8 +117,117 @@ async fn insert_operation(db: &DatabaseConnection, id: &str, kind: u8, dry_run: 
 }
 
 // ---------------------------------------------------------------------------
-// Shape: the 9 tables, the 4 indexes, and the two tables P0 must NOT create.
+// Shape: the 9 tables, the 4 indexes, and the tables P0 must NOT create.
 // ---------------------------------------------------------------------------
+
+/// An installation with only the initial migration still gains coordination state.
+#[tokio::test]
+async fn an_existing_schema_gains_the_coordination_state_table_and_seed() {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+
+    Migrator::up(&db, Some(1))
+        .await
+        .expect("apply the initial migration alone");
+    assert!(
+        exec(
+            &db,
+            "SELECT COUNT(*) FROM types_registry__coordination_state"
+        )
+        .await
+        .is_err(),
+        "the initial migration must not create the table, which is the whole point",
+    );
+
+    Migrator::up(&db, None).await.expect("apply the rest");
+
+    let seeded = db
+        .query_one_raw(stmt(
+            &db,
+            "SELECT state_seq, updated_at FROM types_registry__coordination_state \
+             WHERE state_name = 'entity_write_order'",
+        ))
+        .await
+        .expect("query the seeded state")
+        .expect("the upgrade seeds exactly one state row");
+    assert_eq!(
+        seeded.try_get::<i64>("", "state_seq").expect("state_seq"),
+        0,
+        "and seeds it at zero",
+    );
+    assert!(
+        seeded.try_get::<String>("", "updated_at").is_ok(),
+        "and stamps the seed with a migration timestamp",
+    );
+
+    let count = db
+        .query_one_raw(stmt(
+            &db,
+            "SELECT COUNT(*) AS n FROM types_registry__coordination_state",
+        ))
+        .await
+        .expect("count the states")
+        .expect("one row");
+    assert_eq!(
+        count.try_get::<i64>("", "n").expect("count"),
+        1,
+        "P0 seeds entity_write_order and nothing else; routing belongs to federation",
+    );
+}
+
+/// The migration preserves a pre-existing table and advanced seed.
+#[tokio::test]
+async fn the_coordination_state_migration_absorbs_a_table_that_already_exists() {
+    /// Timestamp that the migration must preserve.
+    const PRESERVED_AT: &str = "2026-09-01T10:00:00.000Z";
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    exec(
+        &db,
+        "CREATE TABLE types_registry__coordination_state (
+             state_name TEXT NOT NULL PRIMARY KEY,
+             state_seq INTEGER NOT NULL,
+             updated_at TEXT NOT NULL)",
+    )
+    .await
+    .expect("pre-create the table");
+    exec(
+        &db,
+        format!(
+            "INSERT INTO types_registry__coordination_state (state_name, state_seq, updated_at) \
+             VALUES ('entity_write_order', 7, '{PRESERVED_AT}')"
+        ),
+    )
+    .await
+    .expect("pre-seed the row");
+
+    Migrator::up(&db, None)
+        .await
+        .expect("the migration must absorb the existing table and row");
+
+    let rows = db
+        .query_all_raw(stmt(
+            &db,
+            "SELECT state_seq, updated_at FROM types_registry__coordination_state",
+        ))
+        .await
+        .expect("read the seeded state");
+    assert_eq!(rows.len(), 1, "still exactly one row");
+    assert_eq!(
+        rows[0].try_get::<i64>("", "state_seq").expect("state_seq"),
+        7,
+        "and the seed must not reset a sequence already in use",
+    );
+    assert_eq!(
+        rows[0]
+            .try_get::<String>("", "updated_at")
+            .expect("updated_at"),
+        PRESERVED_AT,
+        "and the seed must not restamp a row that already moved",
+    );
+}
 
 #[tokio::test]
 async fn migration_creates_the_nine_p0_tables() {
@@ -131,15 +239,61 @@ async fn migration_creates_the_nine_p0_tables() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// coordination_state
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_second_migration_creates_the_coordination_table_and_seed() {
+    let db = migrated_db().await;
+    let seeded = db
+        .query_one_raw(stmt(
+            &db,
+            "SELECT state_seq FROM types_registry__coordination_state \
+             WHERE state_name = 'entity_write_order'",
+        ))
+        .await
+        .expect("query the seeded state")
+        .expect("the seed exists");
+    assert_eq!(
+        seeded.try_get::<i64>("", "state_seq").expect("state_seq"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn coordination_state_rejects_a_negative_sequence() {
+    let db = migrated_db().await;
+    exec(
+        &db,
+        "UPDATE types_registry__coordination_state SET state_seq = -1",
+    )
+    .await
+    .expect_err("ck_tr_coordination_state_seq must reject a negative sequence");
+}
+
+#[tokio::test]
+async fn coordination_state_rejects_a_second_row_for_one_state() {
+    let db = migrated_db().await;
+    exec(
+        &db,
+        "INSERT INTO types_registry__coordination_state \
+         (state_name, state_seq, updated_at) VALUES ('entity_write_order', 5, \
+         '2026-09-04T00:00:00.000Z')",
+    )
+    .await
+    .expect_err("the primary key on state_name must reject a duplicate state");
+}
+
 #[tokio::test]
 async fn migration_does_not_create_the_federation_tables() {
     let db = migrated_db().await;
-    for table in FEDERATION_TABLES {
+    for table in NOT_CREATED_TABLES {
         assert!(
             exec(&db, format!("SELECT COUNT(*) FROM {table}"))
                 .await
                 .is_err(),
-            "{table} is federation-only and must not exist in P0"
+            "{table} must not exist in P0"
         );
     }
 }
@@ -519,10 +673,10 @@ async fn dependency_kind_check_rejects_an_unknown_kind() {
     exec(
         &db,
         "INSERT INTO types_registry__dependency (from_entity_id, kind, to_entity_id) \
-         VALUES (1, 5, 1)",
+         VALUES (1, 4, 1)",
     )
     .await
-    .expect_err("ck_tr_dependency_kind admits only 1..=4");
+    .expect_err("ck_tr_dependency_kind admits only 1..=3");
 }
 
 // ---------------------------------------------------------------------------
@@ -925,11 +1079,10 @@ async fn every_table_accepts_a_complete_admission_graph() {
     .await
     .expect("insert current instance");
 
-    // kind 4 instance_of: the Instance conforms to the Type Schema.
     exec(
         &db,
         "INSERT INTO types_registry__dependency (from_entity_id, kind, to_entity_id) \
-         VALUES (2, 4, 1)",
+         VALUES (2, 3, 1)",
     )
     .await
     .expect("insert instance_of dependency edge");

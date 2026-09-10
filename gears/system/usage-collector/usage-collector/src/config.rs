@@ -35,7 +35,7 @@ pub struct UsageCollectorConfig {
 impl Default for UsageCollectorConfig {
     fn default() -> Self {
         Self {
-            vendor: "cyberfabric".to_owned(),
+            vendor: "constructorfabric".to_owned(),
             metrics: MetricsConfig::default(),
         }
     }

@@ -18,21 +18,16 @@ use crate::models::{MirrorStatus, Repo, SyncSummary};
 /// let mirror = hub.get::<dyn GithubMirrorClientV1>()?;
 /// ```
 ///
-/// The surface starts with what the gear can genuinely serve today and the
-/// first read-slice contract; sync triggers, issue/PR retrieval, and
-/// write-back operations are added as those capabilities are ported from
-/// the `github-repotap` prototype.
+/// The surface covers what the mirror serves today: identity, the mirrored
+/// repository listing, and a sync trigger. Write-back operations arrive with
+/// the increment that adds them.
 #[async_trait]
 pub trait GithubMirrorClientV1: Send + Sync {
     /// Report the mirror's identity: gear name, crate version, and the
     /// GitHub API base URL it is configured against.
     async fn status(&self, ctx: &SecurityContext) -> Result<MirrorStatus, CanonicalError>;
 
-    /// List repositories from the mirrored store.
-    ///
-    /// Until the storage port lands this returns the `Unimplemented`
-    /// canonical category (HTTP 501 semantics) — an honest signal that the
-    /// contract exists but the backing store does not yet.
+    /// List repositories from the mirrored store, one page at a time.
     async fn list_repos(
         &self,
         ctx: &SecurityContext,

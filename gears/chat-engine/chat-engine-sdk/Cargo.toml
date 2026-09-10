@@ -1,7 +1,7 @@
 [package]
 name = "cf-chat-engine-sdk"
 description = "SDK for chat-engine: plugin traits, models, and errors"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

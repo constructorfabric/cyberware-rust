@@ -1,0 +1,11 @@
+{
+  "$id": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~acme.sec._.introduced_by.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked producer example: a finding attributed to the commit that introduced it. Endpoint constraints narrow the inherited any-node default.",
+  "x-gts-traits": {
+    "src_types": ["gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.sec._.finding.v1~"],
+    "dst_types": ["gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~acme.scm._.commit.v1~"]
+  },
+  "type": "object",
+  "allOf": [{ "$ref": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~" }]
+}

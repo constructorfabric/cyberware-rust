@@ -76,6 +76,47 @@ pub fn enforcer_allow() -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(MockAuthZResolver))
 }
 
+/// PDP that constrains the TENANT only — a faithful model of the shipped
+/// policy plugins (`static-authz`, `tr-authz`), neither of which emits an
+/// `owner_id` predicate. Under this PDP the compiled scope admits every row in
+/// the caller's tenant, so it is the fixture that shows whether the gear's own
+/// ownership enforcement is doing the work.
+//
+// @cpt-cf-chat-engine-nfr-authentication
+struct TenantOnlyAuthZResolver;
+
+#[async_trait]
+impl AuthZResolverApi for TenantOnlyAuthZResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let constraints = match resolve_subject_tenant(&request) {
+            Some(tenant) => vec![Constraint {
+                predicates: vec![Predicate::In(InPredicate::new(
+                    pep_properties::OWNER_TENANT_ID,
+                    [tenant],
+                ))],
+            }],
+            None => vec![],
+        };
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Tenant-only enforcer — models the shipped policy plugins.
+#[must_use]
+pub fn enforcer_allow_tenant_only() -> PolicyEnforcer {
+    PolicyEnforcer::new(Arc::new(TenantOnlyAuthZResolver))
+}
+
 /// PDP that denies every request — models a real policy rejecting a subject
 /// (e.g. a cross-tenant caller). Every decision fails closed to `Forbidden`.
 struct DenyAllAuthZResolver;

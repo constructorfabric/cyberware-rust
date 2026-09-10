@@ -65,6 +65,50 @@ async fn get(router: Router, uri: &str) -> axum::http::Response<Body> {
 }
 
 #[tokio::test]
+async fn milestones_sharing_a_number_page_without_repeats_or_gaps() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    // `gm_milestones` has only a non-unique `(tenant_id, repo_id)` index, so
+    // two milestones in one repository may share a number. Ordering by
+    // number alone leaves their relative order to the database, and a row can
+    // then repeat or vanish between adjacent page windows.
+    for id in [401, 402] {
+        service
+            .upsert_milestone(&ctx, "acme", "widget", milestone_record(id, 7, "twin"))
+            .await
+            .expect("milestone seed must succeed");
+    }
+
+    let router = router_for(service, ctx);
+
+    let mut seen = Vec::new();
+    for page in 1..=2 {
+        let json = body_json(
+            get(
+                router.clone(),
+                &format!("/repos/acme/widget/milestones?per_page=1&page={page}"),
+            )
+            .await,
+        )
+        .await;
+        let items = json.as_array().expect("items");
+        assert_eq!(items.len(), 1, "one row per page: {json:?}");
+        seen.push(items[0]["id"].as_i64().expect("an id"));
+    }
+
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![401, 402],
+        "two windows over two equally numbered milestones must return each exactly once"
+    );
+}
+
+#[tokio::test]
 async fn milestones_are_listed_by_number() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;

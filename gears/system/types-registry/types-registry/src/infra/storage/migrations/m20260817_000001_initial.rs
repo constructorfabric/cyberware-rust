@@ -5,9 +5,8 @@
 //! Nine of the eleven tables are created, in FK-dependency order:
 //! `version_family`, `operation`, `operation_item`, `entity`,
 //! `type_schema_revision`, `instance_revision`, `type_schema`, `instance`,
-//! `dependency`. `source_claim` and `routing_config` belong to federation and
-//! are deliberately **not** created; when federation lands, its own migration
-//! adds them and seeds `routing_config (id = 1, generation = 1)`.
+//! `dependency`. A later migration adds `coordination_state`; federation will add
+//! `source_claim` and the `routing` state. No standalone `routing_config` exists.
 //!
 //! Outbox tables are not here either — they come from
 //! `outbox_migrations_with_prefix("types_registry_outbox")`.
@@ -367,7 +366,7 @@ const PG_UP_STATEMENTS: &[&str] = &[
             FOREIGN KEY (to_entity_id)
             REFERENCES types_registry__entity (id) ON DELETE CASCADE,
         CONSTRAINT ck_tr_dependency_kind
-            CHECK (kind IN (1, 2, 3, 4))
+            CHECK (kind IN (1, 2, 3))
     )",
     "CREATE INDEX IF NOT EXISTS idx_tr_dependency_to
         ON types_registry__dependency (to_entity_id, from_entity_id)",
@@ -680,7 +679,7 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             FOREIGN KEY (to_entity_id)
             REFERENCES types_registry__entity (id) ON DELETE CASCADE,
         CONSTRAINT ck_tr_dependency_kind
-            CHECK (kind IN (1, 2, 3, 4))
+            CHECK (kind IN (1, 2, 3))
     )",
     "CREATE INDEX IF NOT EXISTS idx_tr_dependency_to
         ON types_registry__dependency (to_entity_id, from_entity_id)",
@@ -981,7 +980,7 @@ const MYSQL_UP_STATEMENTS: &[&str] = &[
             FOREIGN KEY (to_entity_id)
             REFERENCES types_registry__entity (id) ON DELETE CASCADE,
         CONSTRAINT ck_tr_dependency_kind
-            CHECK (kind IN (1, 2, 3, 4))
+            CHECK (kind IN (1, 2, 3))
     )",
 ];
 

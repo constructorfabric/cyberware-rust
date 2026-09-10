@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-static-credstore-plugin"
-version = "0.2.9"
+version = "0.2.10"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -17,8 +17,8 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.11", path = "../../credstore-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.6", path = "../../../system/types-registry/types-registry-sdk" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.12", path = "../../credstore-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.7", path = "../../../system/types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 
 # ToolKit dependencies

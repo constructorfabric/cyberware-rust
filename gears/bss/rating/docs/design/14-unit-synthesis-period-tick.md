@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Unit Synthesis & Period Tick (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: 12/13 (pipeline), Pricing, Subscriptions, Finance, Promotions, Billing, Contracts | Downstream: rating-core, 15-rated-output-balance-effects | Owners: BSS Rating team -->
 

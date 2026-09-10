@@ -58,6 +58,50 @@ async fn get(router: Router, uri: &str) -> axum::http::Response<Body> {
 }
 
 #[tokio::test]
+async fn labels_sharing_a_name_page_without_repeats_or_gaps() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    // `gm_labels` has only a non-unique `(tenant_id, repo_id)` index, so two
+    // labels in one repository may share a name. Ordering by name alone
+    // leaves their relative order to the database, and a row can then repeat
+    // or vanish between adjacent page windows.
+    for id in [301, 302] {
+        service
+            .upsert_label(&ctx, "acme", "widget", label_record(id, "twin", "ff0000"))
+            .await
+            .expect("label seed must succeed");
+    }
+
+    let router = router_for(service, ctx);
+
+    let mut seen = Vec::new();
+    for page in 1..=2 {
+        let json = body_json(
+            get(
+                router.clone(),
+                &format!("/repos/acme/widget/labels?per_page=1&page={page}"),
+            )
+            .await,
+        )
+        .await;
+        let items = json.as_array().expect("items");
+        assert_eq!(items.len(), 1, "one row per page: {json:?}");
+        seen.push(items[0]["id"].as_i64().expect("an id"));
+    }
+
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![301, 302],
+        "two windows over two equally named labels must return each exactly once"
+    );
+}
+
+#[tokio::test]
 async fn labels_are_listed_by_name() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;

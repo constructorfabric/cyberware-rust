@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-cluster-conformance"
-version = "0.3.2"
+version = "0.3.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

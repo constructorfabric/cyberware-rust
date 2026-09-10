@@ -28,6 +28,7 @@ single-tenant = ["dep:single-tenant-tr-plugin"]
 static-tenants = ["dep:static-tr-plugin"]
 static-authn = ["dep:static-authn-plugin"]
 static-authz = ["dep:static-authz-plugin"]
+static-license = ["dep:static-license-plugin"]
 tr-authz = ["dep:tr-authz-plugin"]
 tenant-resolver-rg = ["dep:rg-tr-plugin"]
 static-credstore = ["credstore", "dep:static-credstore-plugin"]
@@ -68,6 +69,7 @@ types_registry = { package = "cf-gears-types-registry", path = "../../gears/syst
 tenant-resolver = { package = "cf-gears-tenant-resolver", path = "../../gears/system/tenant-resolver/tenant-resolver" }
 authn-resolver = { package = "cf-gears-authn-resolver", path = "../../gears/system/authn-resolver/authn-resolver" }
 authz-resolver = { package = "cf-gears-authz-resolver", path = "../../gears/system/authz-resolver/authz-resolver" }
+license-resolver = { package = "cf-gears-license-resolver", path = "../../gears/system/license-resolver/license-resolver" }
 
 # Optional tenant resolver plugins
 single-tenant-tr-plugin = { package = "cf-gears-single-tenant-tr-plugin", path = "../../gears/system/tenant-resolver/plugins/single-tenant-tr-plugin", optional = true }
@@ -78,6 +80,9 @@ rg-tr-plugin = { package = "cf-gears-rg-tr-plugin", path = "../../gears/system/t
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", path = "../../gears/system/authz-resolver/plugins/static-authz-plugin", optional = true }
 tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../gears/system/authz-resolver/plugins/tr-authz-plugin", optional = true }
+
+# Optional license resolver plugins
+static-license-plugin = { package = "cf-gears-static-license-plugin", path = "../../gears/system/license-resolver/plugins/static-license-plugin", optional = true }
 
 # Optional credstore plugins
 static-credstore-plugin = { package = "cf-gears-static-credstore-plugin", path = "../../gears/credstore/plugins/static-credstore-plugin", optional = true }

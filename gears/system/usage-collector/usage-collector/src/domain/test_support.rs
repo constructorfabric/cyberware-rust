@@ -537,7 +537,7 @@ pub fn hub_with_plugin(
 }
 
 /// Build a [`Service`] wired against a permit-by-default PDP and the
-/// supplied plugin stub, registered under the `cyberfabric` vendor.
+/// supplied plugin stub, registered under the `constructorfabric` vendor.
 ///
 /// The PDP fake ([`CountingTenantPermitResolver`]) scopes its permit to the
 /// request's own `OWNER_TENANT_ID`, so per-record paths under
@@ -546,9 +546,9 @@ pub fn hub_with_plugin(
 /// `require_constraints(false)`) still gets an `allow_all` permit.
 #[must_use]
 pub fn service_with_permit(plugin: Arc<dyn UsageCollectorPluginV1>, suffix: &str) -> Arc<Service> {
-    let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
+    let hub = hub_with_plugin(plugin, suffix, "constructorfabric");
     let enforcer = enforcer_for(CountingTenantPermitResolver::new());
-    Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer))
+    Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer))
 }
 
 /// Variant of [`service_with_permit`] that exposes the underlying
@@ -559,10 +559,10 @@ pub fn service_with_counting_permit(
     plugin: Arc<dyn UsageCollectorPluginV1>,
     suffix: &str,
 ) -> (Arc<Service>, Arc<CountingTenantPermitResolver>) {
-    let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
+    let hub = hub_with_plugin(plugin, suffix, "constructorfabric");
     let resolver = CountingTenantPermitResolver::new();
     let enforcer = enforcer_for(Arc::clone(&resolver) as Arc<dyn AuthZResolverApi>);
-    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+    let service = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
     (service, resolver)
 }
 
@@ -599,7 +599,7 @@ pub fn local_metrics() -> (
     (metrics, provider, exporter)
 }
 
-/// A [`Service`] wired against `resolver` + `plugin` (under `cyberfabric`) with
+/// A [`Service`] wired against `resolver` + `plugin` (under `constructorfabric`) with
 /// a real metrics adapter bound to the returned provider/exporter.
 #[must_use]
 pub fn service_with_metrics(
@@ -607,11 +607,11 @@ pub fn service_with_metrics(
     suffix: &str,
     resolver: Arc<dyn AuthZResolverApi>,
 ) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
-    let hub = hub_with_plugin(plugin, suffix, "cyberfabric");
+    let hub = hub_with_plugin(plugin, suffix, "constructorfabric");
     let (metrics, provider, exporter) = local_metrics();
     let service = Arc::new(Service::new_with_metrics(
         hub,
-        "cyberfabric".to_owned(),
+        "constructorfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
     ));
@@ -640,11 +640,11 @@ pub fn service_with_metrics_unready_plugin(
     suffix: &str,
     resolver: Arc<dyn AuthZResolverApi>,
 ) -> (Arc<Service>, SdkMeterProvider, InMemoryMetricExporter) {
-    let hub = hub_registry_only(suffix, "cyberfabric");
+    let hub = hub_registry_only(suffix, "constructorfabric");
     let (metrics, provider, exporter) = local_metrics();
     let service = Arc::new(Service::new_with_metrics(
         hub,
-        "cyberfabric".to_owned(),
+        "constructorfabric".to_owned(),
         enforcer_for(resolver),
         metrics,
     ));

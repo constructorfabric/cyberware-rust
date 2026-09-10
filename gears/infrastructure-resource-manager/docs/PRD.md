@@ -2,6 +2,9 @@
 refs: []
 ---
 
+Created:  2026-08-04 by Virtuozzo International GmbH
+Updated:  2026-09-01 by Virtuozzo International GmbH
+
 # PRD — Infrastructure Resource Manager (IRM)
 
 

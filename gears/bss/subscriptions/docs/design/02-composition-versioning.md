@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — Composition & Versioning (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Pricing (published Plan/Price/PriceWindow), Registry (skuId/PlanTier/CatalogVersion) | Downstream: Rating (composition read-model), Billing (snapshot refs) | Owners: BSS Subscriptions team -->
 

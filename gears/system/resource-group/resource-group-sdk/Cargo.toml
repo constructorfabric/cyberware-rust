@@ -1,7 +1,7 @@
 # Created: 2026-04-16 by Constructor Tech
 [package]
 name = "cf-gears-resource-group-sdk"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

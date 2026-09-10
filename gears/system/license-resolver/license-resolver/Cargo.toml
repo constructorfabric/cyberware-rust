@@ -1,0 +1,60 @@
+[package]
+name = "cf-gears-license-resolver"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "License resolver gear - validates licensing contracts and delegates checks to a backend plugin"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "licensing"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "license_resolver"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+license-resolver-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-macros = { workspace = true }
+
+# GTS types
+gts = { workspace = true }
+
+# Licensing contract schema validation
+jsonschema = { workspace = true }
+
+# Async runtime
+async-trait = { workspace = true }
+
+# Error handling and serialization
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+# Telemetry
+opentelemetry = { workspace = true }
+tracing = { workspace = true }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+schemars = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toolkit-gts = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+uuid = { workspace = true }

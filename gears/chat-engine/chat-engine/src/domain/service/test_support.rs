@@ -241,6 +241,13 @@ pub fn enforcer_deny() -> PolicyEnforcer {
     enforcer(Arc::new(DenyAllAuthZResolver))
 }
 
+/// Tenant-only enforcer — models the shipped policy plugins, which constrain
+/// `owner_tenant_id` and never `owner_id`.
+#[must_use]
+pub fn enforcer_allow_tenant_only() -> PolicyEnforcer {
+    enforcer(Arc::new(TenantOnlyAuthZResolver))
+}
+
 /// Allow enforcer with NO ABAC constraints — models a pure permission gate
 /// (e.g. `SESSION_TYPE`, DESIGN §3.5.6) where the PDP returns `decision=true`
 /// and no owner constraints, so nothing needs to compile against a scopable
@@ -313,6 +320,42 @@ impl AuthZResolverApi for MockAuthZResolver {
                     Predicate::In(InPredicate::new(pep_properties::OWNER_TENANT_ID, [tenant])),
                     Predicate::In(InPredicate::new(pep_properties::OWNER_ID, [subject_id])),
                 ],
+            }],
+            None => vec![],
+        };
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints,
+                ..Default::default()
+            },
+        })
+    }
+}
+
+/// Allow resolver that constrains the TENANT only — a faithful model of the
+/// shipped policy plugins (`static-authz`, `tr-authz`), neither of which emits
+/// an `owner_id` predicate. Under this PDP the compiled scope admits every row
+/// in the caller's tenant, so it is the fixture that proves the gear's own
+/// ownership guard (`owner_guard::ensure_session_owner`) is what keeps one
+/// user out of another user's session.
+//
+// @cpt-cf-chat-engine-nfr-authentication
+pub struct TenantOnlyAuthZResolver;
+
+#[async_trait]
+impl AuthZResolverApi for TenantOnlyAuthZResolver {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let constraints = match resolve_subject_tenant(&request) {
+            Some(tenant) => vec![Constraint {
+                predicates: vec![Predicate::In(InPredicate::new(
+                    pep_properties::OWNER_TENANT_ID,
+                    [tenant],
+                ))],
             }],
             None => vec![],
         };

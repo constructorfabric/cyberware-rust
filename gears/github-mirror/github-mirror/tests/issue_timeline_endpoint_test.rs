@@ -116,6 +116,41 @@ async fn timeline_entries_are_replayed_in_order_with_their_own_payloads() {
 }
 
 #[tokio::test]
+async fn an_arbitrary_timeline_payload_survives_the_round_trip() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+
+    let stored = serde_json::json!({
+        "event": "cross-referenced",
+        "source": { "type": "issue", "issue": { "number": 41, "title": "other" } },
+        "unmodeled_field": ["a", 1, null],
+        "nested": { "deep": { "flag": true } },
+    });
+    service
+        .upsert_issue_timeline_event(
+            &ctx,
+            "acme",
+            "widget",
+            timeline_record(9, 0, "cross-referenced", &stored.to_string()),
+        )
+        .await
+        .expect("timeline seed must succeed");
+
+    let router = router_for(service, ctx);
+    let json = body_json(get(router, "/repos/acme/widget/issues/9/timeline").await).await;
+    let items = json.as_array().expect("items");
+
+    assert_eq!(
+        items[0], stored,
+        "every key GitHub sent must come back untouched"
+    );
+}
+
+#[tokio::test]
 async fn timeline_of_unknown_repository_returns_404() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;
@@ -211,6 +246,14 @@ async fn an_unparsable_stored_payload_still_serves_its_event() {
     let router = router_for(service, ctx);
     let json = body_json(get(router, "/repos/acme/widget/issues/7/timeline").await).await;
     let items = json.as_array().expect("items");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["event"], "renamed");
+    assert_eq!(
+        items.len(),
+        1,
+        "one unreadable row must not fail the listing"
+    );
+    assert_eq!(
+        items[0],
+        serde_json::json!({ "event": "renamed" }),
+        "the documented fallback is the event name alone"
+    );
 }

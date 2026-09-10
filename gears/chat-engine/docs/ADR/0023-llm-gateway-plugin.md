@@ -1,10 +1,9 @@
-<!-- Created: 2026-03-06 by Constructor Tech -->
-<!-- Updated: 2026-04-07 by Constructor Tech -->
-
 ---
 status: accepted
 date: 2026-03-06
 ---
+<!-- Created: 2026-03-06 by Constructor Tech -->
+<!-- Updated: 2026-04-07 by Constructor Tech -->
 
 # ADR-0023: LLM Gateway Plugin
 

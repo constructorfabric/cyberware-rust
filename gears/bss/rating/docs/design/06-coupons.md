@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Coupons (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Promotions (frozen coupon snapshots), Finance (fxTableVersion for the billing-currency pass) | Downstream: Rating, Billing/Tax (discount lineage) | Owners: BSS Rating team -->
 

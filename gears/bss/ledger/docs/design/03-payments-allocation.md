@@ -1,3 +1,6 @@
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-07 by Virtuozzo International GmbH
+
 <!-- migration-note: converted from the legacy vhp-architecture design slice
      docs/bss/design/DESIGN-billing-ledger-balances-202606091200/03-DESIGN-billing-ledger-payments-allocation-202606091300.md
      to the gears-sdlc design-slice layout (cpt-* sub-IDs, CDSL flows). The original is preserved unchanged in the

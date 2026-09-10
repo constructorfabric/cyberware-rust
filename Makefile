@@ -506,7 +506,7 @@ cfs-validate-kit-local: cfs-repair
 
 # -------- API and docs --------
 
-.PHONY: openapi md-fabric slides web-docs-preview .example-server-build
+.PHONY: openapi md-fabric slides web-docs-preview .example-server-build arch_status_svg_update
 
 .example-server-build:
 	$(call print_target_banner)
@@ -570,6 +570,11 @@ slides:
 web-docs-preview:
 	$(call print_target_banner)
 	@bash tools/scripts/docs-preview.sh
+
+## Regenerate docs/img/architecture.drawio.svg with live gear status from the GitHub board
+arch_status_svg_update: py-env
+	$(call print_target_banner)
+	@$(PYTHON) tools/scripts/architecture_status_svg.py -v
 
 # -------- Development and auto fix --------
 
@@ -666,7 +671,7 @@ OPENAPI_BUILD_FEATURE_ARGS := $(if $(GEAR),$(GEAR_OPENAPI_FEATURE_ARGS),$(OPENAP
 
 # -------- Tests --------
 
-.PHONY: test test-no-macros test-macros test-sqlite test-pg test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
+.PHONY: test test-no-macros test-macros test-sqlite test-pg test-pgq test-mysql test-db test-users-info-pg test-usage-collector-pg test-types-registry-db test-cluster-pg test-cluster-redis test-rg-pg test-pricing-pg test-coord-pg test-fixtures-narrow test-fips
 
 # Run all tests, or a single gear when GEAR=<gear> is set.
 # When GEAR= is set, cargo gears ls packages finds matching crates + their
@@ -701,13 +706,26 @@ test-pg: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-toolkit-db --features pg,integration
 
+## Run the SQL/PGQ lane: toolkit-db's unit suites under the `pgq` feature (the
+## secure graph builder and its tests compile only there), the PostgreSQL 19
+## integration suite (tests/pg, Docker required; a testcontainers PG19) and the
+## trybuild guards. `pgq` implies `pg`, so without the filter this would re-run
+## every PG18 Docker suite `make test-pg` just ran; the filter keeps only what
+## this lane adds. The PG19 suite skips itself while the pre-GA image is
+## unavailable; CI sets GEARS_TEST_PG_GRAPH_REQUIRED=1 so there the skip is a
+## failure — do the same locally once the image is expected to be present.
+test-pgq: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-toolkit-db --features pgq,integration \
+		-E 'kind(lib) | binary(mod) | binary(ui)'
+
 ## Run MySQL integration tests
 test-mysql: install-tools
 	$(call print_target_banner)
 	cargo nextest run -p cf-gears-toolkit-db --features mysql,integration
 
 # Run all database integration tests
-test-db: test-sqlite test-pg test-mysql
+test-db: test-sqlite test-pg test-pgq test-mysql
 	$(call print_target_banner)
 
 ## Run users-info gear integration tests
@@ -724,8 +742,9 @@ test-usage-collector-pg: install-tools
 ## Run types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
 test-types-registry-db: install-tools
+	$(call print_target_banner)
 	cargo nextest run -p cf-gears-types-registry --features integration \
-	  --test migration_backends_test --test repo_backends_test
+	  -E 'binary(/_backends_test$$/)'
 
 ## Run the Postgres cluster plugin's conformance (Layer 2) and Layer 3
 ## integration suites (Docker required;
@@ -807,6 +826,28 @@ test-coord-pg: install-tools
 ## consumer is the example server's release build, which never runs a test.
 test-fixtures-narrow: install-tools
 	cargo nextest run -p cf-gears-bss-fixtures --no-default-features --test production_surface
+
+## Run the Redis cluster plugin's conformance (Layer 2) and Layer 3 integration
+## suites (Docker required; each spins up its own redis container via
+## testcontainers — see
+## gears/system/cluster/plugins/redis-cluster-plugin/docs/TESTING.md §7).
+##
+## Several container shapes run per PR, all single-node: a stock server (declares
+## EventuallyConsistent), an `--appendonly yes --appendfsync always` node (declares
+## Linearizable, which the leader-election conformance suite requires), and the
+## variants the declaration-and-environment scenarios need — no keyspace
+## notifications, an unsafe `maxmemory-policy`, a tiny `maxmemory` that forces real
+## eviction, `appendfsync everysec`, a `CONFIG`-denied ACL user, and one Redis 6.
+## The Sentinel and 3-node Cluster fixtures run here too — `RD-SPEC-002` on
+## Sentinel, `RD-SPEC-008/009/010` and `RD-LOCK-014` on the Cluster. A quorum or a
+## slot assignment costs tens of seconds, but nextest overlaps that startup with
+## the rest of the suite, so it is not wall clock the run as a whole pays.
+##
+## `--retries 1` for the same reason as test-cluster-pg: container setup is
+## load-sensitive on a busy host, and a genuine logic regression fails both
+## attempts, so this absorbs Docker churn without masking one.
+test-cluster-redis: install-tools
+	cargo nextest run -p cf-redis-cluster-plugin --features integration --retries 1
 
 ## Run FIPS-mode integration tests (requires Go for aws-lc-fips-sys).
 ## Covers:

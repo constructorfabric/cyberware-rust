@@ -13,7 +13,7 @@ Config maps to `TimescaleDbPluginConfig` (`src/config.rs`). Durations are whole 
 | `pool_size_max` | `16` | Connection-pool upper bound. |
 | `connection_timeout_secs` | `10` | Connection acquire timeout (seconds). |
 | `retention_period_secs` | `31536000` (365d) | `usage_records` retention window; chunks wholly older are dropped. |
-| `vendor` | `cyberfabric` | Vendor name for GTS instance registration. |
+| `vendor` | `constructorfabric` | Vendor name for GTS instance registration. |
 | `priority` | `10` | Plugin priority (lower = higher precedence). |
 
 ```toml
@@ -23,7 +23,7 @@ pool_size_min = 2
 pool_size_max = 16
 connection_timeout_secs = 10
 retention_period_secs = 31536000
-vendor = "cyberfabric"
+vendor = "constructorfabric"
 priority = 10
 ```
 

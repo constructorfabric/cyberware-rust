@@ -3,6 +3,9 @@ status: accepted
 date: 2026-05-24
 ---
 
+Created:  2026-05-22 by Virtuozzo International GmbH
+Updated:  2026-06-10 by Virtuozzo International GmbH
+
 # Monotonic deactivation as the cross-kind error retraction primitive
 
 <!-- toc -->

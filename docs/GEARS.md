@@ -21,7 +21,7 @@ The GTS naming conventions provide simple, human-readable, globally unique ident
 
 ## Detailed Overview
 
-![architecture.drawio.png](img/architecture.drawio.png)
+<img src="img/architecture.drawio.svg" alt="Gears architecture diagram">
 
 The diagram above illustrates the principal Gear architecture. The deployed component set depends on the target environment and build configuration; for example it can be a single executable for the desktop build or multiple containers for a cloud server.
 
@@ -659,18 +659,15 @@ Introduces an abstraction layer behind real token validation and claims extracti
 
 ### License Resolver
 #### Responsibility
-Introduces an abstraction layer over the upstream License Manager service. The goal is to provide a single entry point for license retrieval without coupling feature code to a specific subscription & billing system.
+Introduces an abstraction layer over the upstream License Manager service. The goal is to provide a single entry point for one yes/no question — is this Subject licensed for this Resource — without coupling feature code to a specific subscription & billing system. Check-only and read-only by design: exactly one `is_licensed` method, no license retrieval, no listing, and no grant store of its own.
 #### High Level Scenarios
-- [ ] p1 - features and quota provisioning on tenants/users/resources
-- [ ] p1 - adapter for single-user and single-tenant use-cases (desktop app)
-- [ ] p2 - cache and refresh license state
-- [ ] p2 - metrics collection for license acquisitions
-- [ ] p3 - audit with retention for license acquisitions
+- [x] p1 - license check for a subject/resource pair
+- [ ] p2 - helpers for registering the well-known `SecurityContext` subject contracts (user, tenant)
 #### More details
-- TODO: PRD link
-- TODO: Design link
-- TODO: API link
-- TODO: SDK link
+- [PRD](../gears/system/license-resolver/docs/PRD.md)
+- [Design](../gears/system/license-resolver/docs/DESIGN.md)
+- [API](../gears/system/license-resolver/license-resolver/README.md)
+- [SDK](../gears/system/license-resolver/license-resolver-sdk/README.md)
 
 ### Credentials Store
 #### Responsibility
@@ -704,7 +701,7 @@ Introduces an abstraction layer behind the real Outbound API Gateway. The main g
 
 ### Event Broker
 
-Multi-consumer, partitioned, append-only event streaming for Cyber Ware modules.
+Multi-consumer, partitioned, append-only event streaming for Gears modules.
 Typed events, at-least-once delivery, idempotent producers (chained/monotonic/stateless),
 pluggable storage backends, consumer-group cursor tracking.
 

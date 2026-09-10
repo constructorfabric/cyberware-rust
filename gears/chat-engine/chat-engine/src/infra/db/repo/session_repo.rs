@@ -47,18 +47,12 @@ use crate::infra::db::entity::message_reaction::{
 };
 use crate::infra::db::entity::session::{self as session_entity, Entity as SessionEntity};
 use crate::infra::db::odata_mapper::{SessionODataMapper, SessionQueryFilterField};
-use crate::infra::db::repo::ChatEngineDb;
+use crate::infra::db::repo::{ChatEngineDb, parse_owner_uuid};
 
 /// Parse a `sessions` owner identifier (tenant/user) into its `Uuid` column
 /// value. The strings always originate from a `SecurityContext` UUID, so a
 /// parse failure is an internal invariant break rather than a client error —
 /// surfaced as a fail-closed internal error instead of a panic.
-fn parse_owner_uuid(value: &str, field: &str) -> Result<Uuid, ChatEngineError> {
-    value.parse::<Uuid>().map_err(|err| {
-        ChatEngineError::internal(format!("session {field} is not a valid UUID: {err}"))
-    })
-}
-
 /// Maximum results returned per page.
 pub const MAX_PAGE_SIZE: u32 = 100;
 

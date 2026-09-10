@@ -60,6 +60,31 @@ async fn get(router: Router, uri: &str) -> axum::http::Response<Body> {
 }
 
 #[tokio::test]
+async fn an_over_long_filter_value_never_reaches_the_link_header() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+
+    // This listing ignores `state`, but it still carries the value into its
+    // pagination links, so the length has to be bounded before that.
+    let huge = "a".repeat(5_000);
+    let response = get(
+        router_for(service, ctx),
+        &format!("/repos/acme/widget/issues/7/comments?state={huge}"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response.headers().get(axum::http::header::LINK).is_none(),
+        "a refused request must carry no Link header at all"
+    );
+}
+
+#[tokio::test]
 async fn issue_comments_are_listed_oldest_first_for_their_issue() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-bss-rate-provider-http-json-plugin"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 description = "BSS FX rate-provider generic http-json source plugin: config-mapped GET-JSON feed registered as a RateProviderV1 plugin instance"

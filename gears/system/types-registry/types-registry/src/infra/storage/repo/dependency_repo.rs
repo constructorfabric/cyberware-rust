@@ -1,36 +1,31 @@
-//! The `dependency` repository: one entity's outgoing edges, and the transitive
-//! closure the transient `gts-rust` store is built from.
+//! Dependency edges, forward closure, and reverse impact.
 
 use std::collections::{HashMap, HashSet};
 
 use gts::GtsId;
-use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait};
+use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, FromQueryResult};
 use toolkit_db::secure::{
-    AccessScope, DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertManyExt,
+    AccessScope, DBRunner, RecursiveCte, ScopeError, SecureDeleteExt, SecureEntityExt,
+    SecureInsertManyExt,
 };
 
 use super::IN_CHUNK;
 use super::entity_repo::EntityRepo;
 use crate::domain::enums::DependencyKind;
-use crate::domain::ports::{DependencyClosure, EntityRow};
-use crate::infra::storage::entity::dependency;
+use crate::domain::ports::{DependencyClosure, EntityRow, ReverseImpact};
+use crate::infra::storage::entity::{dependency, entity};
 
 /// Maximum size of one dependency closure.
 ///
-/// **Its own bound, not `limits.activation_write_set`** — it took that key's value
-/// (512) as a starting point and nothing more. The two count different things: this
-/// bounds the entities one store build **reads**, SPEC §8.1 step 4.6's write set
-/// bounds the dependents an admission **refreshes**. The earlier wording here said
-/// this "mirrors" the key, which read as though an operator could move it; they
-/// cannot, and the key's own documentation now says so (`config::Limits`).
-///
-/// A private constant is the honest shape while the number has no operator meaning:
-/// the closure a single admission unit needs is bounded by its dependency graph
-/// rather than by the entity count, and the measured max fan-out in-repo is well
-/// under this. T14 is where a configured bound reaches this layer, and where the two
-/// bounds should be told apart by name. Upgrade path if it is hit: the
-/// generation/staging protocol in DESIGN §4.
+/// Independent of `limits.activation_write_set`: this limits reads, not refreshed rows.
 const CLOSURE_BOUND: usize = 512;
+
+/// Name of the forward-closure CTE.
+const FORWARD_CLOSURE_CTE: &str = "forward_closure";
+
+/// Name of the reverse-impact CTE.
+const REVERSE_IMPACT_CTE: &str = "reverse_impact";
 
 pub struct DependencyRepo;
 
@@ -84,56 +79,11 @@ impl DependencyRepo {
         Ok(())
     }
 
-    /// The entities directly consumed by any of `from_entity_ids`, chunked.
-    pub async fn direct_dependencies(
-        runner: &impl DBRunner,
-        scope: &AccessScope,
-        from_entity_ids: &[i64],
-    ) -> Result<Vec<i64>, ScopeError> {
-        let mut out = Vec::new();
-        for chunk in from_entity_ids.chunks(IN_CHUNK) {
-            let rows = dependency::Entity::find()
-                .filter(dependency::Column::FromEntityId.is_in(chunk.iter().copied()))
-                .secure()
-                .scope_with(scope)
-                .all(runner)
-                .await?;
-            out.extend(rows.into_iter().map(|r| r.to_entity_id));
-        }
-        Ok(out)
-    }
-
-    /// Candidate identifiers plus the transitive closure of what they consume,
-    /// `gts_id`-sorted. This is what the transient `gts-rust` store is built from.
+    /// Candidate identifiers and transitive dependencies, sorted by `gts_id`.
     ///
-    /// An iterative worklist over direct edges, not a recursive CTE — see the
-    /// module header. The `seen` set is not an optimization: cycles are valid
-    /// (ADR-0012), so without it the walk would not terminate.
-    ///
-    /// # The worklist is seeded from the identifier, not only from the edge table
-    ///
-    /// Each root contributes its whole `GtsId::chain_ids()` — every prefix of its
-    /// `~`-chain — before the edge walk starts (T10). That is a **different
-    /// relation**, not a shortcut for T13's edges: a derivation base is a pure
-    /// function of the identifier (`base~derived~` consumes `base~` by being named
-    /// so, and an Instance `base~thing.v1` conforms to `base~` likewise). Nothing
-    /// writes a `dependency` row for either, and nothing should — a stored edge
-    /// could disagree with the name. Without the seed, `validate_schema` on a
-    /// derived candidate and `validate_instance` on any Instance would fail with a
-    /// missing base. T13 adds what is *genuinely* edge-derived: `$ref` and
-    /// `x-gts-ref` targets, which no identifier implies — and it adds them **as
-    /// roots the caller passes in**, extracted from the candidate document, not
-    /// only as `dependency` rows. The rows are written at commit and so do not
-    /// exist during the read that validates the candidate that authored them; a
-    /// caller relying on the edge walk alone cannot see a first admission's own
-    /// references. See `domain::gts_store::load_unit_store`.
-    ///
-    /// Candidates with no entity row are reported in
-    /// [`DependencyClosure::missing_roots`] rather than failing the read, because a
-    /// first admission's own candidate is exactly that case. **`missing_roots` is
-    /// computed over the original roots only** — a chain member the seed added is
-    /// not something the caller asked for, so its absence is the store builder's
-    /// problem to name, not a missing root.
+    /// # Errors
+    /// Propagates the reads, and [`ScopeError::Invalid`] when the closure exceeds
+    /// [`CLOSURE_BOUND`].
     pub async fn closure(
         runner: &impl DBRunner,
         scope: &AccessScope,
@@ -163,30 +113,20 @@ impl DependencyRepo {
         missing_roots.sort();
         missing_roots.dedup();
 
-        let mut seen: HashSet<i64> = resolved.iter().map(|r| r.id).collect();
-        let mut frontier: Vec<i64> = seen.iter().copied().collect();
+        let seed_ids: Vec<i64> = resolved.iter().map(|r| r.id).collect();
         let mut by_id: HashMap<i64, EntityRow> = resolved.into_iter().map(|r| (r.id, r)).collect();
 
-        // The bound covers the seeded roots too, not only what the walk adds: a
-        // batch of chained identifiers can already exceed it before the first
-        // hop, and a first hop that discovers nothing new would break the loop
-        // before the guard below ever runs.
-        Self::ensure_within_bound(roots, by_id.len(), 0)?;
+        // Roots count toward the bound even if no edge is followed.
+        Self::ensure_within_bound(roots, by_id.len())?;
 
-        while !frontier.is_empty() {
-            let discovered = Self::direct_dependencies(runner, scope, &frontier).await?;
-            let fresh: Vec<i64> = discovered
-                .into_iter()
-                .filter(|id| seen.insert(*id))
-                .collect();
-            if fresh.is_empty() {
-                break;
-            }
-            Self::ensure_within_bound(roots, by_id.len(), fresh.len())?;
-            for row in EntityRepo::find_by_ids(runner, scope, &fresh).await? {
-                by_id.insert(row.id, row);
-            }
-            frontier = fresh;
+        // Filter seeds already returned by the walk.
+        let fresh: Vec<i64> = Self::forward_reachable(runner, scope, roots, &seed_ids)
+            .await?
+            .into_iter()
+            .filter(|id| !by_id.contains_key(id))
+            .collect();
+        for row in EntityRepo::find_by_ids(runner, scope, &fresh).await? {
+            by_id.insert(row.id, row);
         }
 
         let mut entities: Vec<EntityRow> = by_id.into_values().collect();
@@ -197,27 +137,80 @@ impl DependencyRepo {
         })
     }
 
-    /// Refuse a closure that has exceeded or would exceed [`CLOSURE_BOUND`].
-    ///
-    /// Called once over the seeded roots (`newly_discovered = 0`) and once per
-    /// hop over the entities that hop adds; the structured warning names the
-    /// roots and the reached size so the operator can tell a cyclic graph from
-    /// an oversized batch.
+    /// Follow outgoing edges, reading one row past [`CLOSURE_BOUND`] to detect overflow.
     ///
     /// # Errors
-    /// [`ScopeError::Invalid`] when `resolved_entities + newly_discovered`
-    /// exceeds the bound.
-    fn ensure_within_bound(
+    /// Propagates the read, and [`ScopeError::Invalid`] past [`CLOSURE_BOUND`].
+    async fn forward_reachable(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
         roots: &[String],
-        resolved_entities: usize,
-        newly_discovered: usize,
-    ) -> Result<(), ScopeError> {
-        if resolved_entities + newly_discovered > CLOSURE_BOUND {
+        seed_ids: &[i64],
+    ) -> Result<Vec<i64>, ScopeError> {
+        /// The projection: the dependency's entity id and nothing else.
+        #[derive(FromQueryResult)]
+        struct DependencyId {
+            id: i64,
+        }
+
+        if seed_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Saturation keeps the unreachable depth conversion infallible.
+        let max_depth = u32::try_from(CLOSURE_BOUND).unwrap_or(u32::MAX);
+        let read_limit = u64::try_from(CLOSURE_BOUND.saturating_add(1)).unwrap_or(u64::MAX);
+
+        // Seed the set so roots count once toward the closure bound.
+        let mut reachable: HashSet<i64> = seed_ids.iter().copied().collect();
+        // Chunk roots to stay within backend parameter limits.
+        for chunk in seed_ids.chunks(IN_CHUNK) {
+            let walk = RecursiveCte::<dependency::Entity>::new(
+                FORWARD_CLOSURE_CTE,
+                Condition::all().add(dependency::Column::FromEntityId.is_in(chunk.iter().copied())),
+                // Follow each dependency's own outgoing edges.
+                dependency::Column::FromEntityId,
+                dependency::Column::ToEntityId,
+                max_depth,
+            );
+            let rows = entity::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .with_ctes()
+                .recursive_cte(walk)
+                .join_cte(
+                    FORWARD_CLOSURE_CTE,
+                    Condition::all().add(
+                        Expr::col((Alias::new(FORWARD_CLOSURE_CTE), Alias::new("to_entity_id")))
+                            .equals((entity::Entity, entity::Column::Id)),
+                    ),
+                )
+                // Exclude seeds in memory to avoid another wide SQL parameter list.
+                .select_only()
+                .column(entity::Column::Id)
+                // Collapse entities reached through multiple paths.
+                .distinct()
+                // One row past the bound is all the refusal needs to see.
+                .limit(read_limit)
+                .all_as::<DependencyId>(runner)
+                .await?;
+
+            reachable.extend(rows.into_iter().map(|r| r.id));
+            Self::ensure_within_bound(roots, reachable.len())?;
+        }
+
+        let mut ids: Vec<i64> = reachable.into_iter().collect();
+        // Sorted so the follow-up read's `IN (…)` chunks are stable.
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    /// Refuse a closure that has exceeded [`CLOSURE_BOUND`].
+    fn ensure_within_bound(roots: &[String], reached: usize) -> Result<(), ScopeError> {
+        if reached > CLOSURE_BOUND {
             tracing::warn!(
                 roots = ?roots,
                 closure_bound = CLOSURE_BOUND,
-                resolved_entities,
-                newly_discovered,
+                reached,
                 "types_registry dependency closure exceeded its safety bound"
             );
             return Err(ScopeError::Invalid(
@@ -226,5 +219,84 @@ impl DependencyRepo {
             ));
         }
         Ok(())
+    }
+
+    /// Transitive dependents of `roots`, excluding roots and sorted by `gts_id`.
+    pub async fn reverse_impact(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        roots: &[i64],
+        bound: usize,
+    ) -> Result<ReverseImpact, ScopeError> {
+        /// The projection: the dependent's entity id and nothing else.
+        #[derive(FromQueryResult)]
+        struct DependentId {
+            id: i64,
+        }
+
+        if roots.is_empty() {
+            return Ok(ReverseImpact::Within(Vec::new()));
+        }
+        // Saturation keeps the unreachable depth conversion infallible.
+        let max_depth = u32::try_from(bound).unwrap_or(u32::MAX);
+        let read_limit = u64::try_from(bound.saturating_add(1)).unwrap_or(u64::MAX);
+
+        let mut dependents: HashSet<i64> = HashSet::new();
+        // Chunk roots to stay within backend parameter limits.
+        for chunk in roots.chunks(IN_CHUNK) {
+            let walk = RecursiveCte::<dependency::Entity>::new(
+                REVERSE_IMPACT_CTE,
+                Condition::all().add(dependency::Column::ToEntityId.is_in(chunk.iter().copied())),
+                // Follow dependents of each dependent.
+                dependency::Column::ToEntityId,
+                dependency::Column::FromEntityId,
+                max_depth,
+            );
+            let rows = entity::Entity::find()
+                .secure()
+                .scope_with(scope)
+                .with_ctes()
+                .recursive_cte(walk)
+                .join_cte(
+                    REVERSE_IMPACT_CTE,
+                    Condition::all().add(
+                        Expr::col((Alias::new(REVERSE_IMPACT_CTE), Alias::new("from_entity_id")))
+                            .equals((entity::Entity, entity::Column::Id)),
+                    ),
+                )
+                // The roots are the candidates the commit refreshes itself.
+                .filter(Condition::all().add(entity::Column::Id.is_not_in(roots.iter().copied())))
+                .select_only()
+                .column(entity::Column::Id)
+                // Collapse dependents reached through multiple paths.
+                .distinct()
+                // One row past the bound is all the refusal needs to see.
+                .limit(read_limit)
+                .all_as::<DependentId>(runner)
+                .await?;
+
+            dependents.extend(rows.into_iter().map(|r| r.id));
+            if dependents.len() > bound {
+                return Ok(Self::over_write_set(roots, dependents.len(), bound));
+            }
+        }
+
+        let mut ids: Vec<i64> = dependents.into_iter().collect();
+        // Stabilize follow-up `IN (…)` chunks; final order is by `gts_id`.
+        ids.sort_unstable();
+        let mut rows = EntityRepo::find_by_ids(runner, scope, &ids).await?;
+        rows.sort_by(|a, b| a.gts_id.cmp(&b.gts_id));
+        Ok(ReverseImpact::Within(rows))
+    }
+
+    /// Report a reverse-impact set larger than the write-set bound.
+    fn over_write_set(roots: &[i64], at_least: usize, bound: usize) -> ReverseImpact {
+        tracing::warn!(
+            roots = ?roots,
+            activation_write_set = bound,
+            at_least,
+            "types_registry reverse-impact set exceeded the activation write set bound"
+        );
+        ReverseImpact::OverBound { at_least, bound }
     }
 }

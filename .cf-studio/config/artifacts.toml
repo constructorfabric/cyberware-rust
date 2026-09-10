@@ -1,4 +1,11 @@
 [[ignore]]
+reason = "Ignore graph-storage research companions for ADR-0001 (graph-engine evaluation, PG19 SQL/PGQ spike report) — evidence documents, not Constructor Studio SDLC artifacts."
+patterns = [
+  "gears/graph-storage/docs/graph-engine-alternatives.md",
+  "gears/graph-storage/docs/SPIKE-pg19-sqlpgq.md",
+]
+
+[[ignore]]
 reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Constructor Studio SDLC artifact."
 patterns = ["gears/system/resource-group/docs/rust-traits.md"]
 

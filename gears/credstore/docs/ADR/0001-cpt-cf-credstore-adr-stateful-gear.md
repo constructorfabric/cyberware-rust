@@ -2,6 +2,10 @@
 status: accepted
 date: 2026-07-04
 ---
+
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-07 by Virtuozzo International GmbH
+
 # ADR-0001: Stateful Gear with Gear-Owned Secret Metadata
 
 

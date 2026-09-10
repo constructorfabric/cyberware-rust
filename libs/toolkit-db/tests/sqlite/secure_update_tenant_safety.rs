@@ -56,6 +56,9 @@ impl ScopableEntity for tenant_ent::Entity {
             _ => None,
         }
     }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![tenant_ent::Column::TenantId, tenant_ent::Column::Id]
+    }
 }
 
 struct CreateSecureUpdateTenantSafetyTables;

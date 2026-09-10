@@ -1,3 +1,6 @@
+Created:  2026-07-17 by Virtuozzo International GmbH
+Updated:  2026-07-17 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: FX Rate Provider (Adapter Gear) — Product Requirements -->
 <!-- Related: ./DESIGN.md, ../../ledger/docs/PRD.md, ../../ledger/docs/design/06-fx-multicurrency.md | Owners: @vstudzinskyi (BSS Billing Platform team) -->
 

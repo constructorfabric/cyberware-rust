@@ -2,7 +2,7 @@
 name = "cf-gears-oidc-authn-plugin"
 edition.workspace = true
 license.workspace = true
-version = "0.2.7"
+version = "0.2.8"
 description = "OIDC Authentication Resolver Plugin"
 keywords = ["constructorfabric", "cf-gears"]
 metadata.docs.rs.all-features = true

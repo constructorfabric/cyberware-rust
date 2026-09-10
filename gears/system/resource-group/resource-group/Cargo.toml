@@ -1,7 +1,7 @@
 # Created: 2026-04-16 by Constructor Tech
 [package]
 name = "cf-gears-resource-group"
-version = "0.3.3"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -31,7 +31,7 @@ integration = []
 
 [dependencies]
 # SDK - public API, models, and errors
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.0", path = "../resource-group-sdk", features = ["odata"] }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.1", path = "../resource-group-sdk", features = ["odata"] }
 
 # Core dependencies
 anyhow = { workspace = true }

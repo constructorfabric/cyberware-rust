@@ -9,6 +9,9 @@ refs:
   - bss/prd/PRD-subscriptions-entitlements-202601120119/PRD-subscriptions-entitlements-202601120119.md
 ---
 
+Created:  2026-06-11 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- migration-note: migrated from legacy Virtuozzo PRD format to virtuozzo-sdlc kit layout (cpt-* sub-IDs, 17-section outline). Original preserved unchanged at docs/bss/prd/PRD-billing-ledger-balances-202604041200/. Confluence metadata preserved below. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger & Balances — Double-Entry, AR, ASC 606-Compatible Posting -->
 <!-- Related: bss/prd/PRD-billing-ledger-balances-202604041200 | Upstream: Rating, Subscriptions, Catalog, Contracts | Downstream: ERP/GL, Payments -->

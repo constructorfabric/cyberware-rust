@@ -1,0 +1,43 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~acme.scm._.commit.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked producer example: a commit owned by an SCM, projected into the graph. payload stays open because additionalProperties would reject the inherited source member.",
+  "x-gts-traits": {
+    "index": [
+      "/payload/repository",
+      "/payload/authored_at"
+    ],
+    "full_text_search": [
+      "/payload/message"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.reference_node.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "authored_at": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "repository"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — Suspension, Renewal & Grace (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Contracts (renewal/grace SoR), Payments (pre-check/retry-exhaustion), OSS (pause) | Downstream: Billing (dunning, collection artifacts), Notifications (notice delivery) | Owners: BSS Subscriptions team -->
 

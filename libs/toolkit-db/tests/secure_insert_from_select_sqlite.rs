@@ -49,6 +49,9 @@ impl ScopableEntity for link::Entity {
     fn resolve_property(_property: &str) -> Option<<Self as EntityTrait>::Column> {
         None
     }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        Vec::new()
+    }
 }
 
 struct CreateLinkTable;

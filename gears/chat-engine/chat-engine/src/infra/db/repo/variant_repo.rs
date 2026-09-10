@@ -23,7 +23,7 @@ use crate::domain::authz::bypass;
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::Message;
 use crate::domain::service::variant_service::VariantRepo;
-use crate::infra::db::repo::ChatEngineDb;
+use crate::infra::db::repo::{ChatEngineDb, parse_owner_uuid};
 
 /// Sea-ORM-backed implementation of [`VariantRepo`].
 ///
@@ -360,8 +360,12 @@ impl VariantRepo for SeaVariantRepo {
     ) -> Result<crate::domain::session::Session> {
         use crate::infra::db::entity::session::{self as session_entity, Entity as SessionEntity};
 
-        let tenant_id = tenant_id.to_owned();
-        let user_id = user_id.to_owned();
+        // `sessions.tenant_id` / `user_id` are UUID columns — parse before
+        // building the predicate. A string comparison matches nothing (see
+        // `parse_owner_uuid`), which turned a legitimate owner's switch-type
+        // into a 404.
+        let tenant_uuid = parse_owner_uuid(tenant_id, "tenant_id")?;
+        let user_uuid = parse_owner_uuid(user_id, "user_id")?;
         self.db
             .transaction(move |tx| {
                 Box::pin(async move {
@@ -371,8 +375,8 @@ impl VariantRepo for SeaVariantRepo {
                     let scope = bypass::unrestricted_table_scope();
                     let owned_cond = Condition::all()
                         .add(session_entity::Column::SessionId.eq(session_id))
-                        .add(session_entity::Column::TenantId.eq(tenant_id.clone()))
-                        .add(session_entity::Column::UserId.eq(user_id.clone()));
+                        .add(session_entity::Column::TenantId.eq(tenant_uuid))
+                        .add(session_entity::Column::UserId.eq(user_uuid));
 
                     let _existing = SessionEntity::find()
                         .secure()

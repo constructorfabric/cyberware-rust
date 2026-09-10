@@ -1,5 +1,5 @@
 server:
-  home_dir: ~/.cyberfabric
+  home_dir: "~/.cf-gears"
 
 database:
   servers:

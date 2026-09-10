@@ -1,0 +1,495 @@
+<svg host="65bd71144e" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="1031px" height="781px" viewBox="-0.5 -0.5 1031 781" content="&lt;mxfile&gt;&lt;diagram id=&quot;he9-iO4WpUE7d0-Uhh2y&quot; name=&quot;Page-1&quot;&gt;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&lt;/diagram&gt;&lt;/mxfile&gt;">
+    <defs>
+        <linearGradient x1="0%" y1="0%" x2="0%" y2="100%" id="mx-gradient-f5f5f5-1-b3b3b3-1-s-0">
+            <stop offset="0%" style="stop-color: rgb(245, 245, 245); stop-opacity: 1;"/>
+            <stop offset="100%" style="stop-color: rgb(179, 179, 179); stop-opacity: 1;"/>
+        </linearGradient>
+        <linearGradient x1="0%" y1="0%" x2="0%" y2="100%" id="mx-gradient-dae8fc-1-7ea6e0-1-s-0">
+            <stop offset="0%" style="stop-color: rgb(218, 232, 252); stop-opacity: 1;"/>
+            <stop offset="100%" style="stop-color: rgb(126, 166, 224); stop-opacity: 1;"/>
+        </linearGradient>
+        <linearGradient x1="0%" y1="0%" x2="0%" y2="100%" id="mx-gradient-ffcd28-1-ffa500-1-s-0">
+            <stop offset="0%" style="stop-color: rgb(255, 205, 40); stop-opacity: 1;"/>
+            <stop offset="100%" style="stop-color: rgb(255, 165, 0); stop-opacity: 1;"/>
+        </linearGradient>
+        <linearGradient x1="0%" y1="100%" x2="0%" y2="0%" id="mx-gradient-f0f0f0-1-00cc00-1-s-0">
+            <stop offset="0%" style="stop-color: rgb(0, 204, 0); stop-opacity: 1;"/>
+            <stop offset="100%" style="stop-color: rgb(240, 240, 240); stop-opacity: 1;"/>
+        </linearGradient>
+    </defs>
+    <g>
+        <rect x="0" y="0" width="1030" height="780" fill="#ffffff" stroke="rgb(0, 0, 0)" pointer-events="all"/>
+        <rect x="89.57" y="394" width="910.43" height="196" rx="13.72" ry="13.72" fill="#f5f5f5" stroke="#666666" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe flex-start; justify-content: unsafe center; width: 908px; height: 1px; padding-top: 406px; margin-left: 91px;">
+                        <div data-drawio-colors="color: #333333; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 16px; font-family: Helvetica; color: rgb(51, 51, 51); line-height: 1.2; pointer-events: all; font-weight: bold; white-space: normal; overflow-wrap: normal;">
+                                Core
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="545" y="422" fill="#333333" font-family="Helvetica" font-size="16px" text-anchor="middle" font-weight="bold">
+                    Core
+                </text>
+            </switch>
+        </g>
+        
+        <rect x="89.57" y="617" width="910.43" height="120" rx="18" ry="18" fill="#f5f5f5" stroke="#666666" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe flex-start; justify-content: unsafe center; width: 908px; height: 1px; padding-top: 629px; margin-left: 91px;">
+                        <div data-drawio-colors="color: #333333; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 16px; font-family: Helvetica; color: rgb(51, 51, 51); line-height: 1.2; pointer-events: all; font-weight: bold; white-space: normal; overflow-wrap: normal;">
+                                Toolkit
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="545" y="645" fill="#333333" font-family="Helvetica" font-size="16px" text-anchor="middle" font-weight="bold">
+                    Toolkit
+                </text>
+            </switch>
+        </g>
+        <rect x="89.57" y="224" width="510" height="140" rx="11.2" ry="11.2" fill="#f5f5f5" stroke="#666666" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe flex-start; justify-content: unsafe center; width: 508px; height: 1px; padding-top: 236px; margin-left: 91px;">
+                        <div data-drawio-colors="color: #333333; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 16px; font-family: Helvetica; color: rgb(51, 51, 51); line-height: 1.2; pointer-events: all; font-weight: bold; white-space: normal; overflow-wrap: normal;">
+                                Gen AI
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="345" y="252" fill="#333333" font-family="Helvetica" font-size="16px" text-anchor="middle" font-weight="bold">
+                    Gen AI
+                </text>
+            </switch>
+        </g>
+        <rect x="629.57" y="224" width="370.43" height="140" rx="14" ry="14" fill="#f5f5f5" stroke="#666666" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe flex-start; justify-content: unsafe center; width: 368px; height: 1px; padding-top: 236px; margin-left: 631px;">
+                        <div data-drawio-colors="color: #333333; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 16px; font-family: Helvetica; color: rgb(51, 51, 51); line-height: 1.2; pointer-events: all; font-weight: bold; white-space: normal; overflow-wrap: normal;">
+                                Serverless
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="815" y="252" fill="#333333" font-family="Helvetica" font-size="16px" text-anchor="middle" font-weight="bold">
+                    Serverless
+                </text>
+            </switch>
+        </g>
+        <rect x="89.57" y="30" width="440" height="170" rx="11.9" ry="11.9" fill="#f5f5f5" stroke="#666666" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe flex-start; justify-content: unsafe center; width: 438px; height: 1px; padding-top: 42px; margin-left: 91px;">
+                        <div data-drawio-colors="color: #333333; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 16px; font-family: Helvetica; color: rgb(51, 51, 51); line-height: 1.2; pointer-events: all; font-weight: bold; white-space: normal; overflow-wrap: normal;">
+                                BSS
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="310" y="58" fill="#333333" font-family="Helvetica" font-size="16px" text-anchor="middle" font-weight="bold">
+                    BSS
+                </text>
+            </switch>
+        </g>
+        <rect x="559.57" y="30" width="439.07" height="170" rx="11.9" ry="11.9" fill="#f5f5f5" stroke="#666666" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe flex-start; justify-content: unsafe center; width: 437px; height: 1px; padding-top: 42px; margin-left: 561px;">
+                        <div data-drawio-colors="color: #333333; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 16px; font-family: Helvetica; color: rgb(51, 51, 51); line-height: 1.2; pointer-events: all; font-weight: bold; white-space: normal; overflow-wrap: normal;">
+                                OSS
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="779" y="58" fill="#333333" font-family="Helvetica" font-size="16px" text-anchor="middle" font-weight="bold">
+                    OSS
+                </text>
+            </switch>
+        </g>
+        <path d="M 51 30 L 52.31 587" fill="none" stroke="#1d1616" stroke-miterlimit="10" pointer-events="stroke"/>
+        
+        
+        
+        
+        
+        <path d="M 52.11 617 L 50.55 733.85" fill="none" stroke="#1d1616" stroke-miterlimit="10" pointer-events="stroke"/>
+        <path d="M 50.48 739.1 L 47.08 732.06 L 50.55 733.85 L 54.08 732.15 Z" fill="#1d1616" stroke="#1d1616" stroke-miterlimit="10" pointer-events="all"/>
+        <rect x="20" y="587" width="64.62" height="30" fill="none" stroke="none" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 63px; height: 1px; padding-top: 602px; margin-left: 21px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 12px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; white-space: normal; overflow-wrap: normal;">
+                                Dependencies
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="52" y="606" fill="#000000" font-family="Helvetica" font-size="12px" text-anchor="middle">
+                    Dependencies
+                </text>
+            </switch>
+        </g>
+        
+        
+        
+        <rect x="537.79" y="518" width="292.21" height="65" rx="9.75" ry="9.75" fill="none" stroke="#666666" stroke-dasharray="3 3" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe flex-start; width: 1px; height: 1px; padding-top: 529px; margin-left: 842px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: left;">
+                            <div style="display: inline-block; font-size: 10px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; white-space: nowrap;">
+                                <span style="font-size: 10px;">
+                                    Gears with Adapters to
+                                    <br style="font-size: 10px;"/>
+                                    existing external platforms
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="842" y="532" fill="#000000" font-family="Helvetica" font-size="10px">
+                    Gears with Adapters to...
+                </text>
+            </switch>
+        </g>
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        <ellipse cx="480.57" cy="440" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="480.57" cy="459" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="480.57" cy="479" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="310.57" cy="440" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="310.57" cy="459" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="310.57" cy="479" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="144.57" cy="440" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="144.57" cy="459" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="144.57" cy="479" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="649.57" cy="441" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="649.57" cy="460" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="649.57" cy="480" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="824.57" cy="440" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="824.57" cy="459" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="856.57" cy="82" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="856.57" cy="101" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="856.57" cy="121" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="856.57" cy="140" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="856.57" cy="159" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="856.57" cy="177" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="712.57" cy="82" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="712.57" cy="101" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="712.57" cy="121" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="712.57" cy="140" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="712.57" cy="159" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="712.57" cy="177" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="583.57" cy="82" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="583.57" cy="101" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="583.57" cy="121" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="583.57" cy="140" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="583.57" cy="159" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="583.57" cy="177" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="400.57" cy="83" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="400.57" cy="102" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="400.57" cy="122" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="400.57" cy="141" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="400.57" cy="160" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="400.57" cy="178" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="258.57" cy="82" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="258.57" cy="101" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="258.57" cy="121" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="258.57" cy="140" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="258.57" cy="159" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="258.57" cy="177" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="115.57" cy="82" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="115.57" cy="101" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="115.57" cy="121" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="115.57" cy="140" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="115.57" cy="159" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="115.57" cy="177" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="140.57" cy="279" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="140.57" cy="298" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="140.57" cy="317" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="140.57" cy="335" rx="5" ry="5" fill="#eae7ee" stroke="#000000" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="278.57" cy="280" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="278.57" cy="299" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="278.57" cy="318" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="278.57" cy="336" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="421.57" cy="280" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="421.57" cy="299" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="421.57" cy="318" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="421.57" cy="336" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="681.57" cy="279" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="681.57" cy="298" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="681.57" cy="317" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="822.57" cy="279" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="822.57" cy="298" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="822.57" cy="317" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        
+        
+        
+        
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe flex-start; width: 1px; height: 1px; padding-top: 506px; margin-left: 442px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: left;">
+                            <div style="display: inline-block; font-size: 11px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; font-weight: bold; white-space: nowrap;">
+                                Foundational, highly-reusable Core Gears
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="442" y="509" fill="#000000" font-family="Helvetica" font-size="11px" font-weight="bold">
+                    Foundational, highly-reusable Core Gears
+                </text>
+            </switch>
+        </g>
+        <ellipse cx="276.57" cy="660" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="276.57" cy="679" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="276.57" cy="698" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="276.57" cy="716" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="412.57" cy="660" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="412.57" cy="679" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="412.57" cy="698" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="412.57" cy="716" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="554.57" cy="660" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="554.57" cy="679" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="554.57" cy="698" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="554.57" cy="716" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="697.07" cy="661" rx="5.5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="697.07" cy="680" rx="5.5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="697.07" cy="699" rx="5.5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="697.07" cy="717" rx="5.5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="412.57" cy="533" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <ellipse cx="412.57" cy="552" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="412.57" cy="570" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <ellipse cx="276.57" cy="532" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="276.57" cy="551" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="276.57" cy="569" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="556.57" cy="532" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="556.57" cy="551" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+        <ellipse cx="556.57" cy="569" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="697.57" cy="530" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="697.57" cy="549" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <ellipse cx="472.57" cy="760" rx="5" ry="5" fill="#eae7ee" stroke="#9e9e9e" stroke-dasharray="3 3" pointer-events="all"/>
+        <rect x="477.57" y="745" width="80.43" height="30" fill="none" stroke="none" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 86px; height: 1px; padding-top: 760px; margin-left: 475px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 12px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; white-space: normal; overflow-wrap: normal;">
+                                Not started
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="518" y="764" fill="#000000" font-family="Helvetica" font-size="12px" text-anchor="middle">
+                    Not started
+                </text>
+            </switch>
+        </g>
+        <ellipse cx="571.57" cy="760" rx="5" ry="5" fill="url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)" stroke="#bababa" pointer-events="all"/>
+        <rect x="582.57" y="745" width="54.43" height="30" fill="none" stroke="none" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe flex-start; width: 58px; height: 1px; padding-top: 760px; margin-left: 582px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: left;">
+                            <div style="display: inline-block; font-size: 12px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; white-space: normal; overflow-wrap: normal;">
+                                In design
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="582" y="764" fill="#000000" font-family="Helvetica" font-size="12px">
+                    In design
+                </text>
+            </switch>
+        </g>
+        <ellipse cx="650" cy="760" rx="5" ry="5" fill="url(#mx-gradient-dae8fc-1-7ea6e0-1-s-0)" stroke="#98b9e7" pointer-events="all"/>
+        <rect x="657" y="745" width="80.43" height="30" fill="none" stroke="none" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 84px; height: 1px; padding-top: 760px; margin-left: 655px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 12px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; white-space: normal; overflow-wrap: normal;">
+                                Design ready
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="697" y="764" fill="#000000" font-family="Helvetica" font-size="12px" text-anchor="middle">
+                    Design ready
+                </text>
+            </switch>
+        </g>
+        <ellipse cx="752.43" cy="760" rx="5" ry="5" fill="url(#mx-gradient-ffcd28-1-ffa500-1-s-0)" stroke="#d79b00" pointer-events="all"/>
+        <rect x="754" y="745" width="98.86" height="30" fill="none" stroke="none" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 101px; height: 1px; padding-top: 760px; margin-left: 753px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: center;">
+                            <div style="display: inline-block; font-size: 12px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; white-space: normal; overflow-wrap: normal;">
+                                In development
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="803" y="764" fill="#000000" font-family="Helvetica" font-size="12px" text-anchor="middle">
+                    In development
+                </text>
+            </switch>
+        </g>
+        <rect x="876.86" y="746" width="128.14" height="30" fill="none" stroke="none" pointer-events="all"/>
+        <g transform="translate(-0.5 -0.5)">
+            <switch>
+                <foreignObject pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility" style="overflow: visible; text-align: left;">
+                    <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe flex-start; width: 130px; height: 1px; padding-top: 761px; margin-left: 877px;">
+                        <div data-drawio-colors="color: #000000; " style="box-sizing: border-box; font-size: 0px; text-align: left;">
+                            <div style="display: inline-block; font-size: 12px; font-family: Helvetica; color: rgb(0, 0, 0); line-height: 1.2; pointer-events: all; white-space: normal; overflow-wrap: normal;">
+                                Mature (in production)
+                            </div>
+                        </div>
+                    </div>
+                </foreignObject>
+                <text x="877" y="765" fill="#000000" font-family="Helvetica" font-size="12px">
+                    Mature (in production)
+                </text>
+            </switch>
+        </g>
+        <ellipse cx="868.57" cy="761" rx="5" ry="5" fill="url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)" stroke="#2e842e" pointer-events="all"/>
+    </g>
+    <switch>
+        <g requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"/>
+        <a transform="translate(0,-5)" xlink:href="https://www.diagrams.net/doc/faq/svg-export-text-problems" target="_blank">
+            <text text-anchor="middle" font-size="10px" x="50%" y="100%">
+                Text is not SVG - cannot display
+            </text>
+        </a>
+    </switch>
+
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2896" target="_blank"><text x="833.57" y="443.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Web-search gw</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2599" target="_blank"><text x="833.57" y="462.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">URL crawler</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2887" target="_blank"><text x="149.57" y="282.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Chat engine</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2892" target="_blank"><text x="149.57" y="301.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">LLM gateway</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2894" target="_blank"><text x="149.57" y="320.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Models registry</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Models%20rounter" target="_blank"><text x="149.57" y="338.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Models rounter</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4330" target="_blank"><text x="430.57" y="283.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Local Model runtimes</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3099" target="_blank"><text x="430.57" y="302.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Local Model controller</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3100" target="_blank"><text x="430.57" y="321.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Local Model scheduler</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4327" target="_blank"><text x="430.57" y="339.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">RAG / Search index</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2888" target="_blank"><text x="287.57" y="283.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">AI agents</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4328" target="_blank"><text x="287.57" y="302.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Prompts registry</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4329" target="_blank"><text x="287.57" y="321.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">MCP registry</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3347" target="_blank"><text x="287.57" y="339.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Agents memory</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2885" target="_blank"><text x="690.57" y="282.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Serverless Gateway</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4727" target="_blank"><text x="690.57" y="301.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Trigger manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3107" target="_blank"><text x="690.57" y="320.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Supabase storage</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2886" target="_blank"><text x="831.57" y="282.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Starlark FaaS</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2904" target="_blank"><text x="831.57" y="301.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Declarartive workflows</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2897" target="_blank"><text x="831.57" y="320.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Python FaaS</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+DB%20%28secure%20ORM%29" target="_blank"><text x="421.57" y="663.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">DB (secure ORM)</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3426" target="_blank"><text x="421.57" y="682.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Type System</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2868" target="_blank"><text x="421.57" y="701.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Outbox</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2900" target="_blank"><text x="421.57" y="719.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Async jobs</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+API%20gateway" target="_blank"><text x="563.57" y="663.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">API gateway</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+API%20%28OData%29" target="_blank"><text x="563.57" y="682.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">API (OData)</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+HTTP%20middleware" target="_blank"><text x="563.57" y="701.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">HTTP middleware</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+gRPC" target="_blank"><text x="563.57" y="719.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">gRPC</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Architecture%20lints" target="_blank"><text x="706.07" y="664.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Architecture lints</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Unit%20tests%20/%20e2e%20tests" target="_blank"><text x="706.07" y="683.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Unit tests / e2e tests</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Code%20coverage" target="_blank"><text x="706.07" y="702.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Code coverage</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Code%20%26%20spec%20validators" target="_blank"><text x="706.07" y="720.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Code &amp; spec validators</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2902" target="_blank"><text x="153.57" y="443.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Resource groups</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4316" target="_blank"><text x="153.57" y="462.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Application manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4207" target="_blank"><text x="153.57" y="482.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Generic installer</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4499" target="_blank"><text x="319.57" y="443.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Alert manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4317" target="_blank"><text x="319.57" y="462.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">CEP collector</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2873" target="_blank"><text x="319.57" y="482.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Emails storage</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2893" target="_blank"><text x="489.57" y="443.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">File storage</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2895" target="_blank"><text x="489.57" y="462.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">File parser</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3343" target="_blank"><text x="489.57" y="482.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">File downloader</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4453" target="_blank"><text x="658.57" y="444.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Graph storage</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2899" target="_blank"><text x="658.57" y="463.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Analytics</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2874" target="_blank"><text x="658.57" y="483.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Notification service</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4315" target="_blank"><text x="124.57" y="85.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Markeplace</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4311" target="_blank"><text x="124.57" y="104.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Contracts mgmnt</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4314" target="_blank"><text x="124.57" y="124.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Product &amp; SKU</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4304" target="_blank"><text x="124.57" y="143.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Plan management</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2872" target="_blank"><text x="124.57" y="162.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Subscriptions</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4318" target="_blank"><text x="124.57" y="180.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Ticketing</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4312" target="_blank"><text x="267.57" y="85.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Orders mgmt</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4313" target="_blank"><text x="267.57" y="104.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Orders workfflow</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3306" target="_blank"><text x="267.57" y="124.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Quota Manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3341" target="_blank"><text x="267.57" y="143.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">License Manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4303" target="_blank"><text x="267.57" y="162.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Tarifs</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4302" target="_blank"><text x="267.57" y="180.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Rating</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2871" target="_blank"><text x="409.57" y="86.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Billing</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4116" target="_blank"><text x="409.57" y="105.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Billing ledger</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4305" target="_blank"><text x="409.57" y="125.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">FX Rate provider</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4308" target="_blank"><text x="409.57" y="144.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Invoicing</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4307" target="_blank"><text x="409.57" y="163.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Tax Engine</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4309" target="_blank"><text x="409.57" y="181.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Payments</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3048" target="_blank"><text x="592.57" y="85.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Account Manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4385" target="_blank"><text x="592.57" y="104.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Construct</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4298" target="_blank"><text x="592.57" y="124.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Service catalog</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4296" target="_blank"><text x="592.57" y="143.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">User tasks</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4341" target="_blank"><text x="592.57" y="162.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Translation engine</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4342" target="_blank"><text x="592.57" y="180.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Calendar</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4323" target="_blank"><text x="865.57" y="85.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Infrastructure inventory</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4319" target="_blank"><text x="865.57" y="104.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Infrastructure manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4326" target="_blank"><text x="865.57" y="124.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Infrastructure monitoring</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4324" target="_blank"><text x="865.57" y="143.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Location manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4299" target="_blank"><text x="865.57" y="162.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">DNS Manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4301" target="_blank"><text x="865.57" y="180.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">SSL cert manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2889" target="_blank"><text x="721.57" y="85.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Usage collector</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3305" target="_blank"><text x="721.57" y="104.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Quota Enforcer</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4287" target="_blank"><text x="721.57" y="124.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Admission Policy Engine</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4320" target="_blank"><text x="721.57" y="143.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Access Policy manager</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4286" target="_blank"><text x="721.57" y="162.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Admission control</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4288" target="_blank"><text x="721.57" y="180.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">License enforcement</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Authorization" target="_blank"><text x="285.57" y="663.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Authorization</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2882" target="_blank"><text x="285.57" y="682.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Canonical errors</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Contracts" target="_blank"><text x="285.57" y="701.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Contracts</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues?q=is%3Aissue+Macros" target="_blank"><text x="285.57" y="719.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Macros</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2891" target="_blank"><text x="285.57" y="535.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Types Registry</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2890" target="_blank"><text x="285.57" y="554.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Events broker</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2902" target="_blank"><text x="285.57" y="572.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Resource groups</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2898" target="_blank"><text x="421.57" y="536.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Settings service</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/4501" target="_blank"><text x="421.57" y="555.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Task engine</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2903" target="_blank"><text x="421.57" y="573.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Audit</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3102" target="_blank"><text x="565.57" y="535.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Tenant Resolver</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3103" target="_blank"><text x="565.57" y="554.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Auth resolver</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2907" target="_blank"><text x="565.57" y="572.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Lincense resolver</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/2542" target="_blank"><text x="706.57" y="533.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Credential store</text></a>
+        <a xlink:href="https://github.com/constructorfabric/gears-rust/issues/3104" target="_blank"><text x="706.57" y="552.60" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="11px" pointer-events="all">Outbound API gateway</text></a>
+    </svg>

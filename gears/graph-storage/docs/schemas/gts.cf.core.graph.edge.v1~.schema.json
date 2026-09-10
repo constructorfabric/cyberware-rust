@@ -1,0 +1,88 @@
+{
+  "$id": "gts://gts.cf.core.graph.edge.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Base graph edge: the producer-authored part of an edge -- its type, its two endpoints and an optional discriminator for parallel edges. The edge key is derived by the gear from those, and the envelope (tenant, timestamps, acting subjects, tombstone) is gear-assigned; neither is in this type, both are in the API schema.",
+  "x-gts-abstract": true,
+  "x-gts-traits-schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "family": {
+        "type": "string",
+        "enum": [
+          "static",
+          "analysis"
+        ],
+        "description": "static edges are replaced by scope re-sync; analysis edges survive it."
+      },
+      "src_types": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "x-gts-ref": "gts.cf.core.graph.node.v1~"
+        },
+        "default": [
+          "gts.cf.core.graph.node.v1~"
+        ],
+        "minItems": 1,
+        "description": "Admissible source node types, as GTS patterns."
+      },
+      "dst_types": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "x-gts-ref": "gts.cf.core.graph.node.v1~"
+        },
+        "default": [
+          "gts.cf.core.graph.node.v1~"
+        ],
+        "minItems": 1,
+        "description": "Admissible target node types, as GTS patterns."
+      },
+      "emit_events": {
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "required": [
+      "family",
+      "src_types",
+      "dst_types"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "format": "gts-type-id",
+      "x-gts-ref": "gts.cf.core.graph.edge.v1~"
+    },
+    "src_node_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "id of the source node."
+    },
+    "dst_node_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "id of the target node."
+    },
+    "discriminator": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "Distinguishes parallel edges of one type between one pair of nodes."
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "type",
+    "src_node_key",
+    "dst_node_key"
+  ]
+}

@@ -98,6 +98,9 @@ impl toolkit_db::secure::ScopableEntity for ent::Entity {
             _ => None,
         }
     }
+    fn scope_columns() -> Vec<<Self as sea_orm::EntityTrait>::Column> {
+        vec![ent::Column::TenantId, ent::Column::Id]
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -371,6 +374,9 @@ impl toolkit_db::secure::ScopableEntity for cte_ent::Entity {
             p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
             _ => None,
         }
+    }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![cte_ent::Column::TenantId, cte_ent::Column::Id]
     }
 }
 

@@ -95,6 +95,44 @@ pub enum FilterOp {
     Or,
 }
 
+impl FieldKind {
+    /// Whether a field of this kind accepts `op`.
+    ///
+    /// This is the table `OperationBuilder::with_odata_filter` publishes as
+    /// each endpoint's `x-odata-filter.allowedFields`, so what a caller reads
+    /// in the contract is what the parser enforces: ordering operators are
+    /// meaningless on a `Bool` or a `Uuid`, and the string functions only
+    /// apply to `String`.
+    #[must_use]
+    pub const fn allows(self, op: FilterOp) -> bool {
+        match self {
+            Self::String => matches!(
+                op,
+                FilterOp::Eq
+                    | FilterOp::Ne
+                    | FilterOp::In
+                    | FilterOp::Contains
+                    | FilterOp::StartsWith
+                    | FilterOp::EndsWith
+            ),
+            Self::Uuid => matches!(op, FilterOp::Eq | FilterOp::Ne | FilterOp::In),
+            Self::Bool => matches!(op, FilterOp::Eq | FilterOp::Ne),
+            Self::I64 | Self::F64 | Self::Decimal | Self::DateTimeUtc | Self::Date | Self::Time => {
+                matches!(
+                    op,
+                    FilterOp::Eq
+                        | FilterOp::Ne
+                        | FilterOp::Gt
+                        | FilterOp::Ge
+                        | FilterOp::Lt
+                        | FilterOp::Le
+                        | FilterOp::In
+                )
+            }
+        }
+    }
+}
+
 impl fmt::Display for FilterOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -256,6 +294,7 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
                 odata_ast::CompareOperator::Lt => FilterOp::Lt,
                 odata_ast::CompareOperator::Le => FilterOp::Le,
             };
+            reject_unsupported_op(field, field_name, filter_op)?;
 
             Ok(FilterNode::binary(field, filter_op, value))
         }
@@ -375,11 +414,26 @@ pub fn convert_expr_to_filter_node<F: FilterField>(
                 ));
             }
 
+            reject_unsupported_op(field, field_name, FilterOp::In)?;
+
             Ok(FilterNode::InList { field, values })
         }
 
         E::Identifier(name) => Err(FilterError::BareIdentifier(name.clone())),
         E::Value(_) => Err(FilterError::BareLiteral),
+    }
+}
+
+/// Refuse an operator the field's kind does not accept, so the parser holds
+/// to the same table the contract publishes.
+fn reject_unsupported_op<F: FilterField>(field: F, name: &str, op: FilterOp) -> FilterResult<()> {
+    if field.kind().allows(op) {
+        Ok(())
+    } else {
+        Err(FilterError::UnsupportedOperation(format!(
+            "`{op}` on field `{name}` of type {}",
+            field.kind()
+        )))
     }
 }
 

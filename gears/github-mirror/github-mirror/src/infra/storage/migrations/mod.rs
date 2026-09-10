@@ -26,6 +26,7 @@ pub mod review_comments_006;
 pub mod review_comments_diff_anchors_029;
 pub mod review_threads_017;
 pub mod reviews_007;
+pub mod support;
 pub mod tags_015;
 pub mod workflow_jobs_023;
 pub mod workflow_runs_013;

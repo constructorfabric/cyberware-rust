@@ -530,9 +530,10 @@ async fn list_children_rejects_unknown_status_value() {
 /// (`lt`/`le`/`gt`/`ge`) on the wire string would silently fall
 /// back to the hidden storage ordinal (`status < 3` meaning "any
 /// SMALLINT less than `Deleted`"), which is a confusing semantic
-/// mismatch with the public string contract. The AM mapper rejects
-/// these operators via `FieldToColumn::map_value`; the framework
-/// surfaces the rejection as a validation error.
+/// mismatch with the public string contract. `toolkit-odata` refuses
+/// an ordered operator on a string field before the query reaches the
+/// AM mapper, which rejects it as well via `FieldToColumn::map_value`;
+/// either way the caller gets a validation error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_children_rejects_ordered_comparison_on_status() {
     let h = setup_sqlite().await.expect("harness");
@@ -552,8 +553,10 @@ async fn list_children_rejects_ordered_comparison_on_status() {
         .expect_err("ordered comparison on status MUST be rejected");
     let detail = format!("{err:?}");
     assert!(
-        detail.contains("not supported on `status`") || detail.contains("ordered"),
-        "expected mapper rejection for ordered operator; got {detail}"
+        detail.contains("not supported on `status`")
+            || detail.contains("ordered")
+            || detail.contains("Unsupported operation: `lt` on field `status`"),
+        "expected the ordered operator to be rejected; got {detail}"
     );
 }
 

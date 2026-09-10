@@ -4,6 +4,9 @@ date: 2026-07-15
 decision-makers: "BSS Subscriptions team"
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # ADR-0002: Subscriptions Owns the Change Boundary; Rating Owns the Math
 
 <!-- toc -->

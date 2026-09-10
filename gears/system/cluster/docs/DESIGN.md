@@ -799,6 +799,8 @@ The cluster gear ships three default backend implementations built on `Arc<dyn C
 - `CasBasedLeaderElectionBackend` — `put_if_absent(election_key, node_id, ttl)` for candidacy, `watch(election_key)` for status changes, background renewal task at `ttl / (max_missed_renewals + 1)`, TTL expiry → `Status(Lost)` followed by auto-reenroll. `features()` returns `LeaderElectionFeatures { linearizable: cache.consistency() == Linearizable }` — derives from the underlying cache's consistency.
 - `CasBasedDistributedLockBackend` — `put_if_absent(lock_key, holder_id, ttl)` for `try_lock`, `watch(lock_key)` to notify blocked waiters on release, background TTL reaper. Release via delete-if-still-holder using CAS (a foreign holder cannot release another's lock). No fencing tokens (the no-remote-in-critical-section rule eliminates the stale-writer scenario). `features()` returns `LockFeatures { linearizable: cache.consistency() == Linearizable }`.
 
+  **`discover` reconciles from backend truth on every call, whatever the cache's watch capability.** The membership view the watch maintains is not a sound source for `discover`, and the reason is the difference between a stream and a point query: being one event behind is what a stream *is*, while `discover` is a point query callers expect to reflect writes that have already returned. The view can be stale two ways, and only one of them is obvious. Without a native prefix watch it is as fresh as the last `PollingPrefixWatch` tick, so up to a poll interval behind — that case was always reconciled. **With a native prefix watch on a *remote* backend it is as fresh as the last delivered event, and delivery is a network round trip**: a `set_state` that has already returned has published its event and not yet had it applied. `discover` used to skip the sweep in that second case, on the reasoning that an event-maintained view is already current, which held only while every prefix-watch-capable cache was in-process and an event was a task yield away. The Redis plugin is the first remote backend in the platform to declare `prefix_watch: true`, and it fails `SC-DISC-002` under the old condition — the disabled instance is still reported enabled. Nothing in the SDK can ask a cache whether its watch is local, and a correctness property should not rest on the answer anyway. Note the asymmetry that hid this: `register` pre-inserts into the local view, so read-your-writes held for registration and failed only for `set_state`/`set_metadata`/`deregister`, which run inside the heartbeat task and hold no reference to that view. The cost is one cursor-based `scan_prefix` plus a `get` per instance per `discover`, over a single service's prefix; the sweep already snapshots the view's revision and discards its rebuilt map if a concurrent mutation raced it, so this path needs no new concurrency reasoning. (Found while building the Redis plugin, which is what made the second staleness case reachable.)
+
 **Constructor pair per default backend**:
 - `new(cache: Arc<dyn ClusterCacheBackend>) -> Result<Self, ClusterError>` — returns `Err(ClusterError::InvalidConfig)` if `cache.consistency() == EventuallyConsistent`. Default-safe.
 - `new_allow_weak_consistency(cache: Arc<dyn ClusterCacheBackend>) -> Self` — always succeeds. Caller acknowledges the safety implications. Construction emits a warning log at instantiation. Required by spec for use cases where the underlying cache is intentionally `EventuallyConsistent` (Redis Sentinel, NATS R=1, Postgres `synchronous_commit=off`) and the consumer accepts the split-brain risk.
@@ -900,6 +902,28 @@ Enumeration is provided by `ClusterCacheBackend::scan_prefix(prefix) -> Vec<Stri
 
   Consumer gears now resolve via *V1::resolver(...).profile(P).resolve()
 ```
+
+**A startup that fails partway stops the backends it already started.** The diagram
+above is the success path; the failure path matters as much, because by the time any
+one primitive fails to resolve, the plugins for the earlier ones are *running* — a
+connection pool, background tasks, and for a Redis binding a second subscriber
+connection. `ClusterWiring::from_config` therefore owns the unwind: profile wiring
+hands the accumulated stop hooks back alongside the error rather than dropping them
+with the builder, and they are run newest-first — the same order `ClusterHandle::stop()`
+uses, so a primitive is stopped before the cache it rides.
+
+Reaching that path needs only a weak cache with `leader_election` omitted: the
+cache's `build_cache` has returned by the time the CAS default's consistency guard
+rejects it (§3.11). The leak was latent for as long as the failure path existed,
+because it is quiet for the backends that predate the Redis plugin — an idle
+Postgres pool costs nothing visible. The Redis plugin's ADR-006 `Drop` guard turns
+the same leak into a **debug-build panic**, which is how a scenario whose entire
+subject is a profile that *must fail startup* found it.
+
+The public builder's `build_and_start` keeps its existing contract and does **not**
+unwind: a direct builder caller registered those hooks itself and still owns
+whatever they close over. Only the config-driven path, which owns the hooks it
+accumulated, can safely run them.
 
 #### Shutdown Sequence
 

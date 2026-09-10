@@ -145,6 +145,30 @@ impl MetricsHarness {
 
         total
     }
+
+    /// Bucket boundaries of the named histogram, if exported.
+    #[must_use]
+    pub fn histogram_bounds(&self, name: &str) -> Option<Vec<f64>> {
+        let metrics = self
+            .exporter
+            .get_finished_metrics()
+            .expect("in-memory exporter should be readable");
+
+        for resource_metrics in &metrics {
+            for scope_metrics in resource_metrics.scope_metrics() {
+                for metric in scope_metrics.metrics() {
+                    if metric.name() == name
+                        && let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data()
+                        && let Some(dp) = hist.data_points().next()
+                    {
+                        return Some(dp.bounds().collect());
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl Default for MetricsHarness {
@@ -263,4 +287,32 @@ fn production_otel_path_records_metrics() {
     assert!(harness.histogram_count(AUTHN_JWT_VALIDATION_DURATION_SECONDS, &[]) >= 1);
     assert!(harness.histogram_count(AUTHN_JWKS_FETCH_DURATION_SECONDS, &[]) >= 1);
     assert!(harness.histogram_count(AUTHN_S2S_EXCHANGE_DURATION_SECONDS, &[]) >= 1);
+}
+
+#[test]
+fn duration_histograms_use_second_scale_bucket_boundaries() {
+    let harness = MetricsHarness::new();
+    let metrics = harness.metrics();
+
+    // Record a sample so each histogram exports a data point.
+    metrics.record_request_success_duration(Duration::from_millis(3));
+    metrics.record_jwks_fetch_duration(Duration::from_millis(40));
+
+    harness.force_flush();
+
+    for name in [
+        AUTHN_REQUEST_SUCCESS_DURATION_SECONDS,
+        AUTHN_JWKS_FETCH_DURATION_SECONDS,
+    ] {
+        let bounds = harness
+            .histogram_bounds(name)
+            .expect("duration histogram should export a data point");
+        assert_eq!(
+            bounds,
+            vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0
+            ],
+            "{name} records seconds and must use second-scale bucket boundaries"
+        );
+    }
 }

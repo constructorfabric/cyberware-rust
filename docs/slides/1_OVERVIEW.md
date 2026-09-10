@@ -12,7 +12,7 @@ paginate: true
 
 ### A secure, modular XaaS development framework & middleware
 
-By the **Cyber Fabric Foundation** · Apache-2.0
+By the **Constructor Fabric Foundation** · Apache-2.0
 
 *Composable building blocks · Defense-in-depth · Multi-tenancy · GenAI-ready*
 
@@ -626,7 +626,7 @@ A **dual-layer** strategy with an explicit **zero-overlap** rule:
 
 - **Unit & integration** — in-process, SQLite `:memory:`, **mocked AuthZ**
   - domain invariants, validation, error chains, DTO conversions, seeding — *no HTTP, no real DB*
-- **End-to-end** — pytest vs. a running `cyberware-server` with a **real DB**
+- **End-to-end** — pytest vs. a running `cf-gears-example-server` with a **real DB**
   - JSON wire format, real AuthZ wiring, DB-specific SQL, cross-gear SDK boundaries
 
 Unit-test gate: (1) deterministic domain logic? (2) atomic & fast? (3) removing it lowers confidence?
@@ -675,7 +675,7 @@ Run modes: SQLite (`config/quickstart.yaml`), no-DB (`config/no-db.yaml`), or `-
 ## Configuration
 
 ```yaml
-server:   { home_dir: "~/.cfgears" }
+server:   { home_dir: "~/.cf-gears" }
 database: { url: "sqlite://database/database.db", max_conns: 10 }
 gears:
   api_gateway:
@@ -760,4 +760,4 @@ On **Windows** (no `make`): `python tools/scripts/ci.py check`
 
 Start: `make example` → http://127.0.0.1:8087/cf/docs
 
-Apache-2.0 · Cyber Fabric Foundation
+Apache-2.0 · Constructor Fabric Foundation

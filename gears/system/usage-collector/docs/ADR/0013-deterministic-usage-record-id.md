@@ -3,6 +3,9 @@ status: accepted
 date: 2026-07-07
 ---
 
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-20 by Virtuozzo International GmbH
+
 # Deterministic gateway-derived usage-record id (UUIDv5 of the dedup key)
 
 <!-- toc -->

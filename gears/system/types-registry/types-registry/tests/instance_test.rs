@@ -17,8 +17,9 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use types_registry::config::TypesRegistryConfig;
+use types_registry::domain::admission::AdmissionFailureReason;
 use types_registry::domain::admission::acceptance::{AcceptanceContext, AcceptanceError, accept};
-use types_registry::domain::admission::worker::WorkerError;
+use types_registry::domain::admission::worker::{Tuning, WorkerError, run_operation};
 use types_registry::domain::admission::{Candidate, OperationDispatch, SubmitRequest};
 use types_registry::domain::enums as domain_enums;
 use types_registry::domain::policy::RegistrationPolicy;
@@ -27,15 +28,15 @@ use types_registry::infra::storage::entity::{instance, instance_revision, versio
 use types_registry::infra::storage::repo::EntityRepo;
 
 mod common;
-use common::{allow_all, run_operation, stores, test_db};
+use common::{allow_all, stores, test_db};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const LATER: OffsetDateTime = datetime!(2026-08-18 10:20:40 UTC);
 
-/// The conforming type. `name` is required, so a value omitting it really fails.
-const TYPE_ID: &str = gts_id!("cf.core.example.thing.v1~");
+/// Conforming type with a dedicated family key to avoid cross-process lock contention.
+const TYPE_ID: &str = gts_id!("cf.core.inst.thing.v1~");
 /// An Instance of it: a full five-token last segment with no `~`.
-const INSTANCE_ID: &str = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1");
+const INSTANCE_ID: &str = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
 
 struct NoDispatch;
 
@@ -68,6 +69,7 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
         &AcceptanceContext {
             policy: &policy,
             config: &config,
+            metrics: &common::metrics(),
         },
         &dispatch,
         &SubmitRequest {
@@ -100,12 +102,35 @@ async fn admit_type_then(
     content: Value,
 ) -> Result<types_registry::domain::admission::worker::OperationOutcome, WorkerError> {
     let type_op = submit(db, "type-key", TYPE_ID, conforming_schema()).await;
-    run_operation(&stores(), &worker(db), &allow_all(), type_op, LATER)
-        .await
-        .expect("the conforming type admits");
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        type_op,
+        LATER,
+    )
+    .await
+    .expect("the conforming type admits");
 
     let op = submit(db, key, gts_id, content).await;
-    run_operation(&stores(), &worker(db), &allow_all(), op, LATER).await
+    run_operation(
+        &stores(),
+        &worker(db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        op,
+        LATER,
+    )
+    .await
 }
 
 /// An Instance records the exact schema revision that validated it; its current row
@@ -194,8 +219,8 @@ async fn a_value_violating_its_schema_is_refused_on_its_merits() {
         "a value that does not satisfy its type must not commit",
     );
     assert_eq!(
-        item.failure.as_ref().map(|f| f.reason.as_ref()),
-        Some("invalid_value"),
+        item.failure.as_ref().map(|f| f.reason.clone()),
+        Some(AdmissionFailureReason::InvalidValue),
         "distinct from `invalid_schema`: the schema is fine, the value is not",
     );
 
@@ -217,9 +242,20 @@ async fn an_instance_without_its_type_fails_retryably() {
     let db = test_db().await;
     let op = submit(&db, "k1", INSTANCE_ID, json!({ "name": "orphan" })).await;
 
-    let err = run_operation(&stores(), &worker(&db), &allow_all(), op, LATER)
-        .await
-        .expect_err("an absent conforming type is retryable, so it surfaces as an error");
+    let err = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        op,
+        LATER,
+    )
+    .await
+    .expect_err("an absent conforming type is retryable, so it surfaces as an error");
 
     match err {
         WorkerError::ConformingTypeAbsent { gts_id, type_id } => {
@@ -242,13 +278,24 @@ async fn an_instance_may_not_join_a_type_schema_family() {
 
     // A Type Schema and an Instance that share a `family_key`: the schema is
     // `…thing.v1~` and the instance is the same identifier without the terminator.
-    let schema_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1~");
-    let instance_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1");
+    let schema_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1~");
+    let instance_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
 
     let type_op = submit(&db, "type-key", TYPE_ID, conforming_schema()).await;
-    run_operation(&stores(), &worker(&db), &allow_all(), type_op, LATER)
-        .await
-        .expect("the base type admits");
+    run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        type_op,
+        LATER,
+    )
+    .await
+    .expect("the base type admits");
 
     let derived = json!({
         "$id": format!("gts://{schema_id}"),
@@ -256,9 +303,20 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         "allOf": [{ "$ref": format!("gts://{TYPE_ID}") }],
     });
     let schema_op = submit(&db, "k-schema", schema_id, derived).await;
-    let schema_outcome = run_operation(&stores(), &worker(&db), &allow_all(), schema_op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let schema_outcome = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        schema_op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
     assert_eq!(
         schema_outcome.items[0].status,
         domain_enums::OperationItemStatus::Succeeded,
@@ -268,15 +326,26 @@ async fn an_instance_may_not_join_a_type_schema_family() {
 
     // Same family key, other kind.
     let instance_op = submit(&db, "k-instance", instance_id, json!({ "name": "clash" })).await;
-    let outcome = run_operation(&stores(), &worker(&db), &allow_all(), instance_op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let outcome = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        instance_op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
 
     let item = &outcome.items[0];
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
-        item.failure.as_ref().map(|f| f.reason.as_ref()),
-        Some("family_kind_conflict"),
+        item.failure.as_ref().map(|f| f.reason.clone()),
+        Some(AdmissionFailureReason::FamilyKindConflict),
         "not `already_exists`: the identifier is free, the family is the conflict",
     );
 
@@ -291,7 +360,7 @@ async fn an_instance_may_not_join_a_type_schema_family() {
         .expect("families");
     let shared = families
         .iter()
-        .filter(|f| f.family_key.ends_with("example.first"))
+        .filter(|f| f.family_key.ends_with("inst.first"))
         .count();
     assert_eq!(shared, 1, "one family key, not two: {families:?}");
 }
@@ -301,8 +370,8 @@ async fn an_instance_may_not_join_a_type_schema_family() {
 #[tokio::test]
 async fn a_type_schema_may_not_join_an_instance_family() {
     let db = test_db().await;
-    let instance_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1");
-    let schema_id = gts_id!("cf.core.example.thing.v1~cf.core.example.first.v1~");
+    let instance_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1");
+    let schema_id = gts_id!("cf.core.inst.thing.v1~cf.core.inst.first.v1~");
 
     let outcome = admit_type_then(&db, "k-instance", instance_id, json!({ "name": "first" }))
         .await
@@ -320,20 +389,29 @@ async fn a_type_schema_may_not_join_an_instance_family() {
         "allOf": [{ "$ref": format!("gts://{TYPE_ID}") }],
     });
     let schema_op = submit(&db, "k-schema", schema_id, derived).await;
-    let schema_outcome = run_operation(&stores(), &worker(&db), &allow_all(), schema_op, LATER)
-        .await
-        .expect("the worker itself must not fail");
+    let schema_outcome = run_operation(
+        &stores(),
+        &worker(&db),
+        &allow_all(),
+        Tuning {
+            limits: &common::limits(),
+            worker: &common::worker_settings(),
+            metrics: &common::metrics(),
+        },
+        schema_op,
+        LATER,
+    )
+    .await
+    .expect("the worker itself must not fail");
 
     let item = &schema_outcome.items[0];
     assert_eq!(item.status, domain_enums::OperationItemStatus::Failed);
     assert_eq!(
-        item.failure.as_ref().map(|f| f.reason.as_ref()),
-        Some("family_kind_conflict"),
+        item.failure.as_ref().map(|f| f.reason.clone()),
+        Some(AdmissionFailureReason::FamilyKindConflict),
     );
 }
 
-/// An Instance admits against a type committed by an **earlier operation**: with an
-/// empty `dependency` table, only the Instance's own identifier reaches it.
 #[tokio::test]
 async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
     let db = test_db().await;
@@ -347,7 +425,6 @@ async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
         outcome.items[0].failure,
     );
 
-    // The dependency table is empty: nothing wrote an edge, and nothing needed to.
     let provider = worker(&db);
     let conn = provider.conn().expect("conn");
     let edges = types_registry::infra::storage::entity::dependency::Entity::find()
@@ -356,9 +433,20 @@ async fn an_instance_admits_against_a_type_from_an_earlier_operation() {
         .all(&conn)
         .await
         .expect("edges");
-    assert!(
-        edges.is_empty(),
-        "a conforming type is identifier-derived, not edge-derived: {edges:?}",
+    let instance_row = EntityRepo::find_by_gts_id(&conn, &allow_all(), INSTANCE_ID)
+        .await
+        .expect("read")
+        .expect("committed");
+    let type_row = EntityRepo::find_by_gts_id(&conn, &allow_all(), TYPE_ID)
+        .await
+        .expect("read")
+        .expect("committed");
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    assert_eq!(edges[0].from_entity_id, instance_row.id);
+    assert_eq!(edges[0].to_entity_id, type_row.id);
+    assert_eq!(
+        edges[0].kind,
+        types_registry::infra::storage::entity::enums::DependencyKind::InstanceOf,
     );
 
     // And the storage vocabulary agrees with the domain's on the kind.

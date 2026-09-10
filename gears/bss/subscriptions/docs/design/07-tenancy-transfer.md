@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — Multi-Tenant Ownership & Transfer (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: AMS (tenant identity, delegation proofs), Policy Engine (transfer gate) | Downstream: Rating/Billing (tenant axes), Analytics (roll-ups) | Owners: BSS Subscriptions team -->
 

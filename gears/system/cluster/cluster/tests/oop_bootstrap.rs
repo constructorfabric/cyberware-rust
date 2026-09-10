@@ -31,8 +31,6 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cf_system_sdks::directory::{
@@ -50,23 +48,16 @@ use tonic::{Request, Response, Status};
 /// Accepts presence, resolves nothing.
 ///
 /// Resolution failing is the honest shape for this test: cluster consumes no
-/// contract, so nothing should ask - and the framework's rule that directory
-/// registration is **not** a readiness signal (§4.4) means a directory this
-/// unhelpful must still yield a `Ready` pod.
-#[derive(Default)]
-struct StubDirectory {
-    registered: AtomicUsize,
-    heartbeats: AtomicUsize,
-    deregistered: AtomicUsize,
-}
-
-/// The serving half. A local newtype because the orphan rule forbids
-/// `impl DirectoryService for Arc<StubDirectory>`, and the counters have to stay
-/// readable from the test after the server task takes ownership.
-struct StubService(Arc<StubDirectory>);
+/// contract, so nothing should ask. Presence calls (register / heartbeat /
+/// deregister) succeed but are not observed: whether the framework's presence loop
+/// actually registers and deregisters is the framework's own contract, covered by
+/// `toolkit::runtime::oop_registration_tests`, not something a gear re-proves
+/// (ADR-0005). This test needs a directory only so the eager
+/// `DirectoryGrpcClient::connect` in `run_oop_with_options` succeeds.
+struct StubDirectory;
 
 #[tonic::async_trait]
-impl DirectoryService for StubService {
+impl DirectoryService for StubDirectory {
     async fn resolve_grpc_service(
         &self,
         _request: Request<ResolveGrpcServiceRequest>,
@@ -108,7 +99,6 @@ impl DirectoryService for StubService {
         &self,
         _request: Request<RegisterInstanceRequest>,
     ) -> Result<Response<()>, Status> {
-        self.0.registered.fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(()))
     }
 
@@ -116,23 +106,20 @@ impl DirectoryService for StubService {
         &self,
         _request: Request<DeregisterInstanceRequest>,
     ) -> Result<Response<()>, Status> {
-        self.0.deregistered.fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(()))
     }
 
     async fn heartbeat(&self, _request: Request<HeartbeatRequest>) -> Result<Response<()>, Status> {
-        self.0.heartbeats.fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(()))
     }
 }
 
-/// Serve the stub on an ephemeral port, returning its endpoint and its counters.
-async fn serve_stub_directory() -> (String, Arc<StubDirectory>) {
+/// Serve the stub on an ephemeral port, returning its endpoint.
+async fn serve_stub_directory() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let stub = Arc::new(StubDirectory::default());
 
-    let service = DirectoryServiceServer::new(StubService(Arc::clone(&stub)));
+    let service = DirectoryServiceServer::new(StubDirectory);
     tokio::spawn(async move {
         // The task is dropped with the test, which closes the listener; a serve
         // error at that point is teardown, not a failure.
@@ -144,7 +131,7 @@ async fn serve_stub_directory() -> (String, Arc<StubDirectory>) {
         );
     });
 
-    (format!("http://{addr}"), stub)
+    format!("http://{addr}")
 }
 
 // The child process
@@ -255,12 +242,31 @@ fn sigterm(pid: u32) {
 
 // The test
 
+/// Reaps the child on *every* exit from the test, an unwinding assertion included.
+///
+/// `std::process::Child` has no `Drop` that kills or waits, so a panic in the probe
+/// block below would otherwise unwind straight past the manual reap and orphan a
+/// `cluster-oop` still bound to both ports - which nextest reports as `FAIL + LEAK`
+/// (the leaked child keeps the test's stdout/stderr pipe open). Owning the child
+/// through this guard makes the reap a `Drop`, so it happens-before every exit,
+/// panic or not.
+struct ChildReaper(std::process::Child);
+
+impl Drop for ChildReaper {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+}
+
 /// `cargo build -p cf-gears-cluster --bin cluster-oop` and
 /// `cluster-oop --config <file>` serving the four probes - `D1`'s first and third
 /// exit criteria, through the binary rather than around it.
 #[tokio::test(flavor = "multi_thread")]
 async fn cluster_oop_binary_serves_the_framework_probes_and_drains_on_sigterm() {
-    let (directory_endpoint, directory) = serve_stub_directory().await;
+    let directory_endpoint = serve_stub_directory().await;
 
     let home = tempfile::tempdir().expect("tempdir");
     let http_port = free_port();
@@ -271,23 +277,27 @@ async fn cluster_oop_binary_serves_the_framework_probes_and_drains_on_sigterm() 
 
     let probe_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_cluster-oop"))
-        .arg("--config")
-        .arg(&config_path)
-        // The bootstrap reads the endpoint from this variable when the option is
-        // defaulted, which is how a master host hands it down (`OopRunOptions`).
-        // Setting it here, on the child only, keeps the test off the well-known
-        // 50051 and out of the parent's environment.
-        .env(
-            toolkit::runtime::TOOLKIT_DIRECTORY_ENDPOINT_ENV,
-            &directory_endpoint,
-        )
-        .env("HOME", home.path())
-        .spawn()
-        .expect("cluster-oop should spawn - cargo builds it for this target");
+    let mut child = ChildReaper(
+        std::process::Command::new(env!("CARGO_BIN_EXE_cluster-oop"))
+            .arg("--config")
+            .arg(&config_path)
+            // The bootstrap reads the endpoint from this variable when the option is
+            // defaulted, which is how a master host hands it down (`OopRunOptions`).
+            // Setting it here, on the child only, keeps the test off the well-known
+            // 50051 and out of the parent's environment.
+            .env(
+                toolkit::runtime::TOOLKIT_DIRECTORY_ENDPOINT_ENV,
+                &directory_endpoint,
+            )
+            .env("HOME", home.path())
+            .spawn()
+            .expect("cluster-oop should spawn - cargo builds it for this target"),
+    );
 
-    // A closure so every early exit still reaps the child; a leaked `cluster-oop`
-    // would hold both ports for the rest of the run.
+    // The probe block below asserts, and an assertion panics rather than returns;
+    // `child` is a `ChildReaper` so that unwind still reaps the process on the way
+    // out. A bare `std::process::Child` would be dropped without a kill, orphaning
+    // a `cluster-oop` on both ports - the `FAIL + LEAK` nextest reports.
     let outcome = tokio::time::timeout(Duration::from_secs(90), async {
         // 1. Liveness: the listener binds and answers before anything else is true.
         let body = await_body(
@@ -350,23 +360,23 @@ async fn cluster_oop_binary_serves_the_framework_probes_and_drains_on_sigterm() 
             "both OpenAPI paths are the same handler and must not diverge"
         );
 
-        // 4. The process registered itself, unprompted and with no code of its own
-        //    (ADR-0005): the presence loop is the framework's.
-        assert!(
-            directory.registered.load(Ordering::SeqCst) >= 1,
-            "the bootstrap's presence loop should have registered the instance"
-        );
+        // Presence is deliberately NOT asserted here. Whether the bootstrap's
+        // registration loop runs is the framework's contract (ADR-0005), covered in
+        // `toolkit::runtime::oop_registration_tests`; re-proving it from a gear
+        // couples this test to an asynchronous, readiness-decoupled path (§4.4) it
+        // has no business observing. This test proves the gear-specific half only -
+        // that `cluster-oop` boots, links its gears, and serves the probes.
     })
     .await;
 
-    // 5. Drain on SIGTERM: `/readyz` must go 503 `draining` and the process must
+    // 4. Drain on SIGTERM: `/readyz` must go 503 `draining` and the process must
     //    exit 0. This is the half a `preStop` delay exists to make useful (§4.8,
     //    `D2`), so it is asserted here rather than assumed.
     let drain = if outcome.is_ok() {
-        sigterm(child.id());
+        sigterm(child.0.id());
         let exit = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if let Some(status) = child.try_wait().expect("try_wait") {
+                if let Some(status) = child.0.try_wait().expect("try_wait") {
                     return status;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -378,12 +388,8 @@ async fn cluster_oop_binary_serves_the_framework_probes_and_drains_on_sigterm() 
         None
     };
 
-    // Reap unconditionally before asserting, so a failed assertion above does not
-    // leave a `cluster-oop` holding the ports.
-    if child.try_wait().expect("try_wait").is_none() {
-        drop(child.kill());
-        drop(child.wait());
-    }
+    // No manual reap here: `child` is a `ChildReaper`, so it is reaped when it drops
+    // at end of scope - and, crucially, when an assertion below unwinds past it.
 
     outcome.expect("cluster-oop should come up and serve its probes within 90s");
     let exit = drain
@@ -392,10 +398,6 @@ async fn cluster_oop_binary_serves_the_framework_probes_and_drains_on_sigterm() 
     assert!(
         exit.success(),
         "cluster-oop should exit cleanly after SIGTERM, got {exit:?}"
-    );
-    assert!(
-        directory.deregistered.load(Ordering::SeqCst) >= 1,
-        "the drain should deregister from the directory"
     );
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-single-tenant-tr-plugin"
-version = "0.1.34"
+version = "0.1.35"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,8 +19,8 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.23", path = "../../tenant-resolver-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.6", path = "../../../types-registry/types-registry-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.0", path = "../../tenant-resolver-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.7", path = "../../../types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 
 # ToolKit dependencies

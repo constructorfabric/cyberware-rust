@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-bss-rate-provider-sdk"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 description = "BSS FX rate-provider SDK: the source-plugin GTS spec + shared source utilities (conversion, error mapping, fetch metrics)"

@@ -3,6 +3,9 @@ status: accepted
 date: 2026-05-24
 ---
 
+Created:  2026-05-22 by Virtuozzo International GmbH
+Updated:  2026-07-20 by Virtuozzo International GmbH
+
 # Mandatory idempotency key on every ingestion record
 
 <!-- toc -->

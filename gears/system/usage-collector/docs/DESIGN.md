@@ -1,3 +1,6 @@
+Created:  2026-02-25 by Virtuozzo International GmbH
+Updated:  2026-08-11 by Virtuozzo International GmbH
+
 # Usage Collector — DESIGN
 
 <!-- toc -->
@@ -1221,4 +1224,3 @@ major-version bump on REST v1 or SDK v1.
 - **SDK trait reference**: [sdk-trait.md](./sdk-trait.md)
 - **Plugin SPI reference**: [plugin-spi.md](./plugin-spi.md)
 - **ADRs**: [ADR/](./ADR/)
-

@@ -53,7 +53,7 @@ use toolkit_macros::domain_model;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::domain::authz::{actions, bypass, resource_types};
+use crate::domain::authz::{actions, bypass, owner_guard, resource_types};
 use crate::domain::context::{
     is_context_overflow_error, read_memory_strategy, validate_memory_strategy,
     write_memory_strategy,
@@ -311,6 +311,11 @@ impl MessageService {
                 Some(message_id),
             )
             .await?;
+        // The PDP scope alone clamps the tenant only; pin the caller's owner
+        // pair into the SQL predicate so a same-tenant stranger's message
+        // resolves to 0 rows (404) rather than being read.
+        // @cpt-cf-chat-engine-nfr-authentication
+        let scope = owner_guard::caller_scope(ctx, &scope);
         self.messages
             .find_message_by_id_scoped(&scope, message_id)
             .await?
@@ -339,6 +344,8 @@ impl MessageService {
                 Some(message_id),
             )
             .await?;
+        // @cpt-cf-chat-engine-nfr-authentication
+        let scope = owner_guard::caller_scope(ctx, &scope);
         self.messages
             .find_message_by_id_scoped(&scope, message_id)
             .await?
@@ -360,6 +367,10 @@ impl MessageService {
             .enforcer
             .access_scope(ctx, &resource_types::MESSAGE, actions::LIST, None)
             .await?;
+        // Ownership travels with the scope into the `WHERE` clause: post-
+        // filtering a page would leave the paging counts wrong.
+        // @cpt-cf-chat-engine-nfr-authentication
+        let scope = owner_guard::caller_scope(ctx, &scope);
         let messages = self
             .messages
             .fetch_active_history_scoped(&scope, session_id, None)
@@ -1072,6 +1083,8 @@ impl MessageService {
                 Some(message_id),
             )
             .await?;
+        // @cpt-cf-chat-engine-nfr-authentication
+        let scope = owner_guard::caller_scope(ctx, &scope);
 
         // 2. Resolve the target message scoped to `session_id` under the PDP
         //    scope. A miss folds to 404 — this also covers the idempotent
@@ -1175,6 +1188,13 @@ impl MessageService {
             .find_by_id_scoped(&bypass::system_read_scope(), session_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+
+        // Ownership is a gear invariant, not a PDP outcome: no shipped policy
+        // plugin constrains `owner_id`, so a tenant-only scope would admit a
+        // same-tenant stranger. Check the owner pair on the trusted prefetch
+        // before the decision; the PDP may only narrow from here.
+        // @cpt-cf-chat-engine-nfr-authentication
+        owner_guard::ensure_session_owner(ctx, &prefetch)?;
 
         // @cpt-cf-chat-engine-interface-pep
         let scope = self

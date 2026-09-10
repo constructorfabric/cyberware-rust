@@ -1,4 +1,5 @@
-Created: 2026-07-21
+Created:  2026-07-21 by Virtuozzo International GmbH
+Updated:  2026-07-21 by Virtuozzo International GmbH
 
 # PRD — TimescaleDB Usage Collector Storage Plugin
 

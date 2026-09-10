@@ -18,7 +18,7 @@ use crate::defaults::{
 };
 use toolkit::client_hub::ClientHub;
 
-use crate::config::{BackendBinding, ClusterConfig, ProfileConfig};
+use crate::config::{BackendBinding, ClusterConfig, DEFAULT_PROVIDER, ProfileConfig};
 use crate::domain::local_client::LocalClusterClient;
 use crate::domain::provider::ProviderRegistry;
 use crate::domain::registry::{BoundProfile, InstanceId, ProfileInstanceRefs, ProfileRegistry};
@@ -53,6 +53,15 @@ pub struct ProfileBackends {
     /// programmatic builder path, where the resolved backends' own
     /// `provider_name()` is the only identity there is.
     providers: Option<ProviderIdentities>,
+    /// Whether an auto-filled [`CasBasedLeaderElectionBackend`] may be built over
+    /// an eventually-consistent cache, via
+    /// [`ProfileBackends::allow_weak_leader_election`]. Ignored when
+    /// `leader_election` is explicitly bound to a native backend.
+    allow_weak_leader_election: bool,
+    /// Whether an auto-filled [`CasBasedDistributedLockBackend`] may be built over
+    /// an eventually-consistent cache, via [`ProfileBackends::allow_weak_lock`].
+    /// Ignored when `lock` is explicitly bound to a native backend.
+    allow_weak_lock: bool,
 }
 
 /// The provider name behind each primitive of one profile, as the operator wrote
@@ -101,7 +110,52 @@ impl ProfileBackends {
             leader_election: None,
             lock: None,
             providers: None,
+            allow_weak_leader_election: false,
+            allow_weak_lock: false,
         }
+    }
+
+    /// Permits the auto-filled leader-election default to be built over an
+    /// eventually-consistent cache, routing it through
+    /// [`CasBasedLeaderElectionBackend::new_allow_weak_consistency`] instead of the
+    /// default-safe `new`.
+    ///
+    /// Takes no argument on purpose: calling it *is* the acknowledgement, mirroring
+    /// the SDK constructor it selects, so there is no `false` to pass and no way to
+    /// reach the weak path without naming it. Without this, a profile whose cache
+    /// declares `EventuallyConsistent` fails
+    /// [`build_and_start`](ClusterWiringBuilder::build_and_start) with
+    /// `InvalidConfig` — which is the correct default (ADR-009), not a bug to work
+    /// around.
+    ///
+    /// The config-driven equivalent is
+    /// `leader_election: { provider: default, allow_weak_consistency: true }`.
+    /// No-op when `leader_election` is bound to a native backend, which brings its
+    /// own guarantees.
+    #[must_use]
+    pub fn allow_weak_leader_election(mut self) -> Self {
+        self.allow_weak_leader_election = true;
+        self
+    }
+
+    /// Permits the auto-filled lock default to be built over an
+    /// eventually-consistent cache, routing it through
+    /// [`CasBasedDistributedLockBackend::new_allow_weak_consistency`].
+    ///
+    /// The lock counterpart of
+    /// [`allow_weak_leader_election`](Self::allow_weak_leader_election), and needed
+    /// just as often: both CAS-based defaults share the same constructor guard, so a
+    /// weak-cache profile that only permits the weak leader election still fails on
+    /// the lock. The config-driven equivalent is
+    /// `lock: { provider: default, allow_weak_consistency: true }`.
+    ///
+    /// A profile that can bind a *native* lock should prefer that — the Redis
+    /// plugin's `SET NX PX` lease is a purpose-built primitive, whereas this flag
+    /// only silences a guard over CAS on a cache that cannot support it.
+    #[must_use]
+    pub fn allow_weak_lock(mut self) -> Self {
+        self.allow_weak_lock = true;
+        self
     }
 
     /// Binds a native leader-election backend, overriding the SDK default.
@@ -167,12 +221,69 @@ impl ClusterWiring {
         config: &ClusterConfig,
         providers: &ProviderRegistry,
     ) -> Result<WiredCluster, ClusterError> {
-        // Read before any backend is built: a zero window is an operator error
-        // that must fail before a pool is opened, not after (§5.8.1).
-        let mut builder = Self::builder(hub).with_fence_retention(config.fence_retention()?)?;
+        // Wiring is all-or-nothing, and on the failure path that means *shutting
+        // down what already started* rather than merely not returning a handle.
+        // Every `?` in `wire_profiles`/`build_and_start_bound_returning_hooks` can
+        // fire after one or more profiles have had real backends built — a
+        // `build_cache_for_profile` opens a connection pool, background tasks, and
+        // (for Redis) a second subscriber connection — and those live behind stop
+        // hooks accumulated on `builder`. Dropping the builder discards the hooks
+        // without running them, so a misconfigured profile leaked every backend it
+        // managed to build before failing.
+        //
+        // Invisible for a long time, because the Postgres plugin's leak is a quiet
+        // idle pool. The Redis plugin has an ADR-006 `Drop` guard, so the same
+        // leak **panics in a debug build** — which is how this was found, by
+        // `RD-SPEC-004`, whose whole subject is a profile that must fail startup
+        // (redis-cluster-plugin/docs/TESTING.md §4.6).
+        //
+        // `fence_retention` is read before any backend is built: a zero window is
+        // an operator error that must fail before a pool is opened, and with no
+        // hooks yet accumulated a plain `?` here has nothing to unwind (§5.8.1).
+        let builder = Self::builder(hub).with_fence_retention(config.fence_retention()?)?;
+        let builder = match Self::wire_profiles(builder, config, providers).await {
+            Ok(builder) => builder,
+            Err((err, hooks)) => {
+                run_stop_hooks_on_failed_wiring(hooks).await;
+                return Err(err);
+            }
+        };
+        match builder.build_and_start_bound_returning_hooks() {
+            Ok(wired) => Ok(wired),
+            Err((err, hooks)) => {
+                run_stop_hooks_on_failed_wiring(hooks).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Wires every profile in `config` onto `builder`.
+    ///
+    /// Hands the accumulated [`StopHook`]s back alongside the error rather than
+    /// letting them drop, so [`from_config`](Self::from_config) can shut down the
+    /// backends earlier profiles already started. That is the only reason this is a
+    /// separate function: the loop body is otherwise unchanged, and `?` inside it
+    /// would discard exactly what the caller needs.
+    async fn wire_profiles(
+        mut builder: ClusterWiringBuilder,
+        config: &ClusterConfig,
+        providers: &ProviderRegistry,
+    ) -> Result<ClusterWiringBuilder, (ClusterError, Vec<StopHook>)> {
+        macro_rules! unwind_on_err {
+            ($result:expr, $builder:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(err) => return Err((err, $builder.take_stop_hooks())),
+                }
+            };
+        }
+
         for (name, profile) in &config.profiles {
             tracing::debug!(profile = %name, "wiring cluster profile from config");
-            let (cache, cache_stop) = build_cache_for_profile(name, profile, providers).await?;
+            let (cache, cache_stop) = unwind_on_err!(
+                build_cache_for_profile(name, profile, providers).await,
+                builder
+            );
             // Pushed immediately, so it matches the cache's actual start-order
             // position (first). `build_and_start` runs `stop_hooks` in reverse push
             // order, so pushing here — before the leader/lock hooks below — means
@@ -183,7 +294,9 @@ impl ClusterWiring {
             let mut backends = ProfileBackends::new(Arc::clone(&cache));
             // Recorded before the bindings are resolved, because it is the
             // *config* that says which provider serves each primitive, and an
-            // omitted primitive inherits the cache's provider (§5.5).
+            // omitted primitive — or a `default` sentinel binding, which the SDK
+            // default still layers over this cache — inherits the cache's provider
+            // (§5.5). `binding_provider` folds the sentinel into that omitted case.
             backends.providers = Some(ProviderIdentities {
                 cache: profile.cache.provider.clone(),
                 leader_election: binding_provider(
@@ -193,47 +306,180 @@ impl ClusterWiring {
                 lock: binding_provider(profile.lock.as_ref(), &profile.cache.provider),
             });
 
-            if let Some(binding) = &profile.leader_election {
-                let provider = providers
-                    .leader_election_provider(&binding.provider)
-                    .ok_or_else(|| ClusterError::InvalidConfig {
-                        reason: format!(
-                            "profile `{name}`: unknown leader_election provider `{}`",
-                            binding.provider
-                        ),
-                    })?;
-                let (backend, stop) = provider.build_leader_election(&binding.options).await?;
-                backends = backends.with_leader_election(backend);
+            // The two optional primitives, each either natively bound through its
+            // own provider registry or riding the omit-default auto-wrap, and each
+            // honouring the reserved [`DEFAULT_PROVIDER`] sentinel. One helper
+            // apiece rather than two near-identical blocks inline: they differ only
+            // in which registry they consult and which `with_*` setter they call.
+            //
+            // Each appends its plugin stop hook to `hooks` rather than pushing
+            // straight onto the builder, so a failure in a later binding can unwind
+            // the earlier ones too — `bind_lock` failing after `bind_leader_election`
+            // started a native leader backend has to stop it. The local hooks are
+            // handed to the builder before any error is returned, which is what
+            // `take_stop_hooks` then collects.
+            let mut hooks: Vec<StopHook> = Vec::new();
+            let bound = async {
+                let backends =
+                    bind_leader_election(name, profile, providers, backends, &mut hooks).await?;
+                bind_lock(name, profile, providers, backends, &mut hooks).await
+            }
+            .await;
+            for stop in hooks {
                 builder = builder.on_stop(move || async move { stop().await });
             }
-
-            if let Some(binding) = &profile.lock {
-                let provider = providers.lock_provider(&binding.provider).ok_or_else(|| {
-                    ClusterError::InvalidConfig {
-                        reason: format!(
-                            "profile `{name}`: unknown lock provider `{}`",
-                            binding.provider
-                        ),
-                    }
-                })?;
-                let (backend, stop) = provider.build_lock(&binding.options).await?;
-                backends = backends.with_lock(backend);
-                builder = builder.on_stop(move || async move { stop().await });
-            }
+            backends = unwind_on_err!(bound, builder);
 
             builder = builder.profile_named(name.clone(), backends);
         }
-        builder.build_and_start_bound()
+        Ok(builder)
     }
 }
 
-/// The provider serving a primitive: its own binding's when it has one, else the
-/// `cache_provider` the omit-default SDK backend is layered over (§5.5).
+/// Runs the stop hooks of a wiring that failed partway, newest first.
+///
+/// Reverse push order, the same order [`ClusterHandle::stop`] uses, so a
+/// primitive layered on a cache is stopped before the cache it rides. Failures
+/// are not propagated: the caller already has an error to report, and it is the
+/// *configuration* error an operator needs to see rather than whatever a
+/// best-effort teardown then said.
+async fn run_stop_hooks_on_failed_wiring(hooks: Vec<StopHook>) {
+    if hooks.is_empty() {
+        return;
+    }
+    tracing::debug!(
+        hooks = hooks.len(),
+        "cluster wiring failed after starting backends; stopping them before reporting"
+    );
+    for hook in hooks.into_iter().rev() {
+        hook().await;
+    }
+}
+
+/// Binds a profile's `leader_election`, honouring the reserved
+/// [`DEFAULT_PROVIDER`] sentinel.
+///
+/// The sentinel is checked *before* the registry lookup, so the reserved name can
+/// never be shadowed by a plugin that registers a provider called `default`. It
+/// contributes no backend and no stop hook — [`resolve_profile_backends`] still
+/// supplies the SDK default and owns its shutdown-revoke seam; all the binding does
+/// is carry the operator's `allow_weak_consistency` acknowledgement to it.
+async fn bind_leader_election(
+    name: &str,
+    profile: &ProfileConfig,
+    providers: &ProviderRegistry,
+    mut backends: ProfileBackends,
+    hooks: &mut Vec<StopHook>,
+) -> Result<ProfileBackends, ClusterError> {
+    let Some(binding) = &profile.leader_election else {
+        return Ok(backends);
+    };
+    if binding.provider == DEFAULT_PROVIDER {
+        if guarded_default_options(name, "leader_election", binding)?.allow_weak_consistency {
+            backends = backends.allow_weak_leader_election();
+        }
+        return Ok(backends);
+    }
+    let provider = providers
+        .leader_election_provider(&binding.provider)
+        .ok_or_else(|| ClusterError::InvalidConfig {
+            reason: format!(
+                "profile `{name}`: unknown leader_election provider `{}`",
+                binding.provider
+            ),
+        })?;
+    let (backend, stop) = provider.build_leader_election(&binding.options).await?;
+    hooks.push(stop);
+    Ok(backends.with_leader_election(backend))
+}
+
+/// Binds a profile's `lock`, honouring the reserved [`DEFAULT_PROVIDER`] sentinel.
+/// See [`bind_leader_election`] for how the sentinel is handled.
+async fn bind_lock(
+    name: &str,
+    profile: &ProfileConfig,
+    providers: &ProviderRegistry,
+    mut backends: ProfileBackends,
+    hooks: &mut Vec<StopHook>,
+) -> Result<ProfileBackends, ClusterError> {
+    let Some(binding) = &profile.lock else {
+        return Ok(backends);
+    };
+    if binding.provider == DEFAULT_PROVIDER {
+        if guarded_default_options(name, "lock", binding)?.allow_weak_consistency {
+            backends = backends.allow_weak_lock();
+        }
+        return Ok(backends);
+    }
+    let provider =
+        providers
+            .lock_provider(&binding.provider)
+            .ok_or_else(|| ClusterError::InvalidConfig {
+                reason: format!(
+                    "profile `{name}`: unknown lock provider `{}`",
+                    binding.provider
+                ),
+            })?;
+    let (backend, stop) = provider.build_lock(&binding.options).await?;
+    hooks.push(stop);
+    Ok(backends.with_lock(backend))
+}
+
+/// The options a `provider: `[`DEFAULT_PROVIDER`] binding may carry, for a primitive
+/// whose SDK default backend has a consistency guard (`leader_election` and `lock`).
+///
+/// Lives here rather than in [`crate::config`] because it is a wiring-internal
+/// parsing detail: unlike every other binding option, these keys never reach a
+/// provider, so nothing outside this module ever sees the parsed form. The
+/// operator-facing half — what the flag means and where it is accepted — is
+/// documented on [`DEFAULT_PROVIDER`].
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DefaultBindingOptions {
+    /// Route this primitive's SDK default through `new_allow_weak_consistency`
+    /// instead of the default-safe `new`, accepting that an eventually-consistent
+    /// cache may produce split-brain (dual leaders / dual lock holders) under
+    /// partition (ADR-009). Default `false`.
+    #[serde(default)]
+    allow_weak_consistency: bool,
+}
+
+/// Parses a `provider: `[`DEFAULT_PROVIDER`] binding's options for one of the two
+/// primitives whose SDK default carries a consistency guard.
+///
+/// `deny_unknown_fields` on [`DefaultBindingOptions`] does the work: these options
+/// reach no provider, so this is the only layer that can catch an operator's typo,
+/// and a silently-ignored `allow_weak_consistancy` would leave the profile failing
+/// startup with an error that says nothing about the misspelling.
+fn guarded_default_options(
+    profile: &str,
+    primitive: &str,
+    binding: &BackendBinding,
+) -> Result<DefaultBindingOptions, ClusterError> {
+    serde_json::from_value(serde_json::Value::Object(binding.options.clone())).map_err(|err| {
+        ClusterError::InvalidConfig {
+            reason: format!(
+                "profile `{profile}`: invalid options on `{primitive}: {{ provider: \
+                 {DEFAULT_PROVIDER} }}`: {err}. The only option this binding accepts is \
+                 `allow_weak_consistency: <bool>`"
+            ),
+        }
+    })
+}
+
+/// The provider serving a primitive: its own binding's when it names a real one,
+/// else the `cache_provider` the omit-default SDK backend is layered over (§5.5).
+///
+/// A `provider: `[`DEFAULT_PROVIDER`] binding reports the cache provider too, not
+/// the literal `default`: the sentinel selects the same SDK default an omitted
+/// primitive gets, layered over this profile's cache, so the identity a consumer
+/// sees in `CapabilityNotMet { provider }` is that cache's — the backend that
+/// actually stores the coordination records.
 fn binding_provider(binding: Option<&BackendBinding>, cache_provider: &str) -> String {
-    binding.map_or_else(
-        || cache_provider.to_owned(),
-        |binding| binding.provider.clone(),
-    )
+    match binding {
+        Some(binding) if binding.provider != DEFAULT_PROVIDER => binding.provider.clone(),
+        _ => cache_provider.to_owned(),
+    }
 }
 
 async fn build_cache_for_profile(
@@ -241,6 +487,21 @@ async fn build_cache_for_profile(
     profile: &ProfileConfig,
     providers: &ProviderRegistry,
 ) -> Result<(Arc<dyn ClusterCacheBackend>, StopHook), ClusterError> {
+    // The cache is the anchor every SDK default wraps, so there is no "default
+    // cache" for the reserved name to resolve to. Caught here rather than left to
+    // the registry lookup, which would answer the misleading "unknown cache
+    // provider `default`" — misleading because `default` *is* a name the wiring
+    // knows, just not one this binding can use.
+    if profile.cache.provider == DEFAULT_PROVIDER {
+        return Err(ClusterError::InvalidConfig {
+            reason: format!(
+                "profile `{name}`: `cache: {{ provider: {DEFAULT_PROVIDER} }}` is not valid — \
+                 `{DEFAULT_PROVIDER}` selects the SDK default backend *over* a profile's cache, \
+                 so the cache itself must name a real provider (e.g. `standalone`, `postgres`, \
+                 `redis`)"
+            ),
+        });
+    }
     let provider = providers
         .cache_provider(&profile.cache.provider)
         .ok_or_else(|| ClusterError::InvalidConfig {
@@ -348,28 +609,71 @@ impl ClusterWiringBuilder {
         Ok(handle)
     }
 
+    /// Removes and returns every stop hook registered so far.
+    ///
+    /// Exists for one caller: [`ClusterWiring::from_config`]'s failure path, which
+    /// has to shut down the backends already-wired profiles started rather than
+    /// drop their hooks unrun (see the note there). Deliberately **not** public —
+    /// a builder that has had its hooks taken will not stop what it started, which
+    /// is only safe when the caller is about to run them itself.
+    fn take_stop_hooks(&mut self) -> Vec<StopHook> {
+        std::mem::take(&mut self.stop_hooks)
+    }
+
     /// [`build_and_start`](Self::build_and_start), also returning the
     /// bound-profile set (DESIGN §5.2).
     ///
     /// The config-driven [`ClusterWiring::from_config`] surfaces this set to its
     /// caller; the programmatic builder path does not need it yet, so
     /// `build_and_start` keeps its shape and drops it.
+    ///
+    /// A direct builder caller registered its stop hooks itself and still owns
+    /// whatever they close over, so a resolution failure drops them — the
+    /// pre-existing contract. Only [`ClusterWiring::from_config`], which built
+    /// those backends on the caller's behalf, uses the hook-returning form so it
+    /// can shut them down.
     fn build_and_start_bound(self) -> Result<WiredCluster, ClusterError> {
+        self.build_and_start_bound_returning_hooks()
+            .map_err(|(err, hooks)| {
+                drop(hooks);
+                err
+            })
+    }
+
+    /// [`build_and_start_bound`](Self::build_and_start_bound), handing the
+    /// accumulated stop hooks back on failure instead of dropping them.
+    ///
+    /// The distinction matters only for [`ClusterWiring::from_config`], which
+    /// starts every backend itself: a resolution failure there leaves real pools,
+    /// tasks, and connections running behind these hooks, and the Redis plugin's
+    /// ADR-006 `Drop` guard turns leaking them into a debug-build panic
+    /// (redis-cluster-plugin/docs/DESIGN.md §11).
+    fn build_and_start_bound_returning_hooks(
+        mut self,
+    ) -> Result<WiredCluster, (ClusterError, Vec<StopHook>)> {
+        macro_rules! unwind_on_err {
+            ($result:expr, $self:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(err) => return Err((err, $self.take_stop_hooks())),
+                }
+            };
+        }
+
         // Phase 1 — resolve all backends (fallible) before touching the hub.
         // Default leader-election and lock backends the wiring itself creates
         // expose a shutdown-revoke seam; collect them so
         // `ClusterHandle::stop` can revoke in-flight coordination before shutdown
         // completes (DESIGN §3.13). Native (explicitly-bound) backends are not
         // revoked here — they manage shutdown through their own plugin stop hook.
-        let mut bound = Vec::with_capacity(self.profiles.len());
+        let profiles = std::mem::take(&mut self.profiles);
+        let mut bound = Vec::with_capacity(profiles.len());
         let mut revokers: Vec<Arc<dyn ShutdownRevoke>> = Vec::new();
-        for (name, backends) in self.profiles {
-            bound.push(resolve_profile_backends(
-                name,
-                backends,
-                self.fence_retention,
-                &mut revokers,
-            )?);
+        for (name, backends) in profiles {
+            bound.push(unwind_on_err!(
+                resolve_profile_backends(name, backends, self.fence_retention, &mut revokers),
+                self
+            ));
         }
 
         // Phase 2 — register every primitive under the profile scope. A failure
@@ -378,15 +682,19 @@ impl ClusterWiringBuilder {
         // so far before propagating the error — the hub stays all-or-nothing.
         let mut registered: Vec<String> = Vec::with_capacity(bound.len());
         for profile in &bound {
-            register_profile_or_rollback(&self.hub, profile, &registered)?;
+            unwind_on_err!(
+                register_profile_or_rollback(&self.hub, profile, &registered),
+                self
+            );
             registered.push(profile.name.clone());
         }
 
+        let stop_hooks = self.take_stop_hooks();
         Ok((
             ClusterHandle {
                 hub: self.hub,
                 registered,
-                stop_hooks: self.stop_hooks,
+                stop_hooks,
                 revokers,
                 profiles: None,
                 stopped: false,
@@ -437,20 +745,33 @@ fn resolve_profile_backends(
         if let Some(backend) = backends.leader_election {
             backend
         } else {
-            let default = Arc::new(
+            // Both arms build the same backend over the reserved lease cache; they
+            // differ only in whether the consistency guard is enforced or explicitly
+            // waived (`ProfileBackends::allow_weak_leader_election`, reached from YAML
+            // as `leader_election: { provider: default, allow_weak_consistency: true }`).
+            // The weak constructor is infallible and logs its own split-brain
+            // warning, so the `?` lives on the guarded arm alone.
+            let backend = if backends.allow_weak_leader_election {
+                CasBasedLeaderElectionBackend::new_allow_weak_consistency(Arc::clone(&lease_cache))
+            } else {
                 CasBasedLeaderElectionBackend::new(Arc::clone(&lease_cache))?
-                    .with_fence_retention(fence_retention),
-            );
+            };
+            let default = Arc::new(backend.with_fence_retention(fence_retention));
             revokers.push(Arc::clone(&default) as Arc<dyn ShutdownRevoke + Send + Sync>);
             default as Arc<dyn LeaderElectionBackend>
         };
     let lock: Arc<dyn DistributedLockBackend> = if let Some(backend) = backends.lock {
         backend
     } else {
-        let default = Arc::new(
+        // The lock default shares the leader default's constructor guard, so a
+        // weak-cache profile has to waive both or neither — waiving only the leader
+        // one moves the startup failure four lines down rather than resolving it.
+        let backend = if backends.allow_weak_lock {
+            CasBasedDistributedLockBackend::new_allow_weak_consistency(Arc::clone(&lease_cache))
+        } else {
             CasBasedDistributedLockBackend::new(Arc::clone(&lease_cache))?
-                .with_fence_retention(fence_retention),
-        );
+        };
+        let default = Arc::new(backend.with_fence_retention(fence_retention));
         revokers.push(Arc::clone(&default) as Arc<dyn ShutdownRevoke>);
         default as Arc<dyn DistributedLockBackend>
     };
@@ -618,11 +939,11 @@ impl ClusterHandle {
     ///    started is stopped first). The standalone plugin's stop hook closes
     ///    active **cache** watches via the plugin's `StandaloneCache::shutdown`,
     ///    so a cache-watch consumer observes `Closed(Shutdown)` one phase after the
-    ///    leader/lock/SD revocation — still within `stop()` (the chosen simplest
+    ///    leader/lock revocation — still within `stop()` (the chosen simplest
     ///    path; the slight ordering is intentional).
     ///
     /// No best-effort remote cleanup is attempted; TTL bounds any remaining
-    /// cluster resources — held leader claims, locks, and service registrations
+    /// cluster resources — held leader claims and locks
     /// all lapse via their backend TTL (`cpt-cf-clst-fr-shutdown-ttl-cleanup`).
     pub async fn stop(mut self) {
         tracing::info!(

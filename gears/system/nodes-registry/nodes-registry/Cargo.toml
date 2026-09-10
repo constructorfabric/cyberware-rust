@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-nodes-registry"
-version = "0.1.37"
+version = "0.1.38"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -33,7 +33,7 @@ toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-node-info = { workspace = true }
 toolkit-macros = { workspace = true }
-nodes_registry-sdk = { package = "cf-gears-nodes-registry-sdk", version = "0.1.27", path = "../nodes-registry-sdk" }
+nodes_registry-sdk = { package = "cf-gears-nodes-registry-sdk", version = "0.1.28", path = "../nodes-registry-sdk" }
 
 [dev-dependencies]
 toolkit-gts = { workspace = true }

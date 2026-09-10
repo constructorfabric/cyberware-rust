@@ -203,13 +203,6 @@ fn collect_schema_refs(schema: &Value) -> Vec<String> {
                 }
             }
         }
-
-        // x-gts-ref (GTS-specific reference)
-        if let Some(ref_val) = obj.get("x-gts-ref").and_then(|v| v.as_str())
-            && let Some(gts_ref) = normalize_gts_ref(ref_val)
-        {
-            refs.push(gts_ref);
-        }
     }
 
     refs
@@ -266,21 +259,18 @@ mod tests {
     fn test_collect_schema_refs() {
         const BASE_ID: &str = gts_id!("vendor.pkg.ns.base.v1~");
         const MIXIN_ID: &str = gts_id!("vendor.pkg.ns.mixin.v1~");
-        const OTHER_ID: &str = gts_id!("vendor.pkg.ns.other.v1~");
-
         let schema = json!({
             "$ref": gts_uri!("vendor.pkg.ns.base.v1~"),
             "allOf": [
                 { "$ref": MIXIN_ID }
             ],
-            "x-gts-ref": OTHER_ID
+            "x-gts-ref": gts_id!("vendor.pkg.ns.other.v1~")
         });
 
         let refs = collect_schema_refs(&schema);
-        assert_eq!(refs.len(), 3);
+        assert_eq!(refs.len(), 2);
         assert!(refs.contains(&BASE_ID.to_owned()));
         assert!(refs.contains(&MIXIN_ID.to_owned()));
-        assert!(refs.contains(&OTHER_ID.to_owned()));
     }
 
     #[test]

@@ -70,6 +70,13 @@
 )]
 
 // Re-export key types for public API
+// The `Scopable` derive emits `::toolkit_db::…` paths, which do not resolve
+// inside this crate. Aliasing it into the extern prelude for test builds lets
+// the derive's own output be tested next to the code that relies on it, rather
+// than only in downstream crates that happen to use it.
+#[cfg(test)]
+extern crate self as toolkit_db;
+
 pub use advisory_locks::{DbLockError, DbLockGuard, LockConfig};
 
 // Re-export sea_orm_migration for gears that implement DatabaseCapability

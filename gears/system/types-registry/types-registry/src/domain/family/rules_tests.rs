@@ -136,6 +136,7 @@ fn a_versionless_tail_has_no_probe() {
 // what a caller is told while every rule still fires, which no rule test can catch.
 
 use super::FamilyRefusal;
+use crate::domain::admission::AdmissionFailureReason;
 use crate::domain::enums::EntityKind;
 use crate::domain::family::family_key;
 
@@ -154,7 +155,7 @@ fn a_kind_conflict_names_the_candidate_before_the_family() {
         candidate: EntityKind::TypeSchema,
         existing: EntityKind::Instance,
     };
-    assert_eq!(refusal.reason(), "family_kind_conflict");
+    assert_eq!(refusal.reason(), AdmissionFailureReason::FamilyKindConflict);
     assert_eq!(
         refusal.to_string(),
         "'gts.cf.core.example.thing.v2~' is a Type Schema, but version family \
@@ -169,7 +170,10 @@ fn a_shape_conflict_names_the_member_that_already_decided_the_major() {
         gts_id: gts_id!("cf.core.example.thing.v1.0~").to_owned(),
         conflicting: gts_id!("cf.core.example.thing.v1~").to_owned(),
     };
-    assert_eq!(refusal.reason(), "family_shape_conflict");
+    assert_eq!(
+        refusal.reason(),
+        AdmissionFailureReason::FamilyShapeConflict
+    );
     assert_eq!(
         refusal.to_string(),
         "'gts.cf.core.example.thing.v1.0~' cannot join the major that \
@@ -184,7 +188,7 @@ fn a_missing_predecessor_names_the_predecessor_and_not_the_candidate() {
         gts_id: gts_id!("cf.core.example.thing.v1.2~").to_owned(),
         predecessor: gts_id!("cf.core.example.thing.v1.1~").to_owned(),
     };
-    assert_eq!(refusal.reason(), "missing_predecessor");
+    assert_eq!(refusal.reason(), AdmissionFailureReason::MissingPredecessor);
     assert_eq!(
         refusal.to_string(),
         "'gts.cf.core.example.thing.v1.2~' requires its predecessor \
@@ -200,7 +204,7 @@ fn an_unreadable_version_refuses_without_naming_a_sibling() {
     let refusal = FamilyRefusal::UnreadableVersion {
         gts_id: "cf.core.example.thing.v1~550e8400-e29b-41d4-a716-446655440000".to_owned(),
     };
-    assert_eq!(refusal.reason(), "unreadable_version");
+    assert_eq!(refusal.reason(), AdmissionFailureReason::UnreadableVersion);
     assert_eq!(
         refusal.to_string(),
         "'cf.core.example.thing.v1~550e8400-e29b-41d4-a716-446655440000' names no readable \

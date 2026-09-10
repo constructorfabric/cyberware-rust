@@ -1,14 +1,14 @@
 [package]
 name = "cf-chat-engine"
 description = "Chat Engine module: multi-tenant conversational infrastructure with plugin-driven backends"
-version = "0.3.2"
+version = "0.3.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
-keywords = ["cyberfabric", "cyberfabric-modules"]
+keywords = ["constructorfabric", "cf-gears"]
 categories = ["artificial-intelligence"]
 
 [package.metadata.docs.rs]
@@ -28,7 +28,7 @@ default = []
 k8s = ["dep:kube", "dep:k8s-openapi"]
 
 [dependencies]
-chat-engine-sdk = { package = "cf-chat-engine-sdk", version = "0.1.0", path = "../chat-engine-sdk" }
+chat-engine-sdk = { package = "cf-chat-engine-sdk", version = "0.1.1", path = "../chat-engine-sdk" }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -82,3 +82,8 @@ k8s-openapi = { workspace = true, features = ["latest"], optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
+# The ownership-denial WARN assertion in `domain/authz/owner_guard_tests.rs`.
+# `no-env-filter` so the capture does not depend on the runner's `RUST_LOG`.
+# The event is emitted synchronously on the test thread, so this crate's
+# thread-local capture is sound here (it is not across `tokio::spawn`).
+tracing-test = { workspace = true, features = ["no-env-filter"] }

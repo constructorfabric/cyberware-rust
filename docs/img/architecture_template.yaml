@@ -1,0 +1,220 @@
+# Configuration for tools/scripts/architecture_status_svg.py
+#
+# This file defines the mapping used to render the live architecture diagram
+# (docs/arch/img/architecture.drawio.svg) from the template
+# (docs/img/architecture_template.drawio.svg) using gear status pulled from the
+# GitHub Projects v2 board.
+#
+# Three things are configured here:
+#   1. github            - which project/board to read the "Status" field from
+#   2. status_map        - GitHub "Status" single-select value -> SVG legend status
+#   3. svg_status_styles - SVG legend status -> status-icon (circle) style
+#   4. gear_name_overrides - explicit SVG-gear-name -> GitHub-issue-title mapping
+#                            for names that do not auto-normalize (typos, renames)
+
+github:
+  org: constructorfabric
+  repo: gears-rust
+  project_number: 48
+  # Name of the single-select project field that holds the gear status.
+  status_field: Status
+
+
+# ---------------------------------------------------------------------------
+# GitHub unit tag (the "PREFIX - " in an issue title) -> SVG section box name
+# (the bold 16px box titles on the diagram). Used to (a) decide which GitHub
+# gears are expected on the diagram, and (b) flag section mismatches (a gear
+# drawn in the wrong box). Prefixes not listed here (DEVX, INSIGHT, STUDIO,
+# GEARS, TEST, ...) are treated as "not drawn on the diagram".
+# ---------------------------------------------------------------------------
+section_map:
+  CORE: "Core"
+  GENAI: "Gen AI"
+  SERVERLESS: "Serverless"
+  BSS: "BSS"
+  OSS: "OSS"
+  TOOLKIT: "Toolkit"
+
+# ---------------------------------------------------------------------------
+# Explicit exclusions to silence mapping warnings for known/intentional cases.
+#   svg_gears        - SVG labels that are toolkit/framework primitives with no
+#                      GitHub gear (won't warn as "only in SVG").
+#   github_titles    - exact GitHub issue titles to ignore ("only in GitHub").
+#   github_prefixes  - whole GitHub unit tags to ignore ("only in GitHub").
+#   github_patterns  - regexes matched against the full GitHub title to ignore
+#                      (e.g. plugins, umbrellas, script-test scaffolding).
+# ---------------------------------------------------------------------------
+exclusions:
+  # Toolkit/framework primitives are handled via status_overrides below, so
+  # they no longer need silencing here. Add any SVG label that should not warn
+  # as "only in SVG".
+  svg_gears: []
+  github_titles: []
+  github_prefixes: []
+  github_patterns:
+    - " [Pp]lugin"          # plugin sub-issues, not standalone gears
+    - "Umbrella issue"      # umbrella/tracking issues
+    - "\\(script test\\)"   # scaffolding / test issues
+
+# ---------------------------------------------------------------------------
+# GitHub Status (10 pipeline stages) -> SVG legend status (5 buckets).
+# Keys are the exact GitHub single-select option names.
+# Values must match a key in `svg_status_styles`.
+# ---------------------------------------------------------------------------
+status_map:
+  "Todo": "Not started"
+  "In Req": "In design"
+  "Req Done": "In design"
+  "In Design": "In design"
+  "Design Done": "Design ready"
+  "In Dev": "In development"
+  "Dev Done": "In development"
+  "In QA": "In development"
+  "QA Done": "In development"
+  "In Prod": "Mature"
+
+# ---------------------------------------------------------------------------
+# SVG legend status -> style applied to the gear's status circle (ellipse).
+# These values are lifted verbatim from the template legend swatches, so the
+# gradient `fill` references resolve against the template's <defs>.
+# `dasharray` is optional (only "Not started" uses a dashed outline).
+# ---------------------------------------------------------------------------
+svg_status_styles:
+  "Not started":
+    fill: "#eae7ee"
+    stroke: "#9e9e9e"
+    dasharray: "3 3"
+  "In design":
+    fill: "url(#mx-gradient-f5f5f5-1-b3b3b3-1-s-0)"
+    stroke: "#bababa"
+  "Design ready":
+    fill: "url(#mx-gradient-dae8fc-1-7ea6e0-1-s-0)"
+    stroke: "#98b9e7"
+  "In development":
+    fill: "url(#mx-gradient-ffcd28-1-ffa500-1-s-0)"
+    stroke: "#d79b00"
+  "Mature":
+    fill: "url(#mx-gradient-f0f0f0-1-00cc00-1-s-0)"
+    stroke: "#2e842e"
+
+# ---------------------------------------------------------------------------
+# Same statuses, expressed as the full drawio (mxCell) ellipse style string. A
+# `.drawio.svg` embeds its editable source in the <svg content="<mxfile>...">
+# attribute, and the drawio editor renders the circles from THAT, not from the
+# <ellipse> layer above. So the script recolours the embedded mxfile too, by
+# replacing each status circle's style with the matching string below. These
+# are copied verbatim from the template legend swatches.
+# ---------------------------------------------------------------------------
+mx_status_styles:
+  "Not started":   "ellipse;whiteSpace=wrap;html=1;aspect=fixed;dashed=1;fontSize=16;fontColor=#000000;fillColor=#eae7ee;strokeColor=#9e9e9e;"
+  "In design":     "ellipse;whiteSpace=wrap;html=1;aspect=fixed;fontSize=16;fillColor=#f5f5f5;strokeColor=#bababa;gradientColor=#b3b3b3;"
+  "Design ready":  "ellipse;whiteSpace=wrap;html=1;aspect=fixed;fontSize=16;fillColor=#dae8fc;strokeColor=#98b9e7;gradientColor=#7ea6e0;"
+  "In development": "ellipse;whiteSpace=wrap;html=1;aspect=fixed;fontSize=16;fillColor=#ffcd28;strokeColor=#d79b00;gradientColor=#ffa500;"
+  "Mature":        "ellipse;whiteSpace=wrap;html=1;aspect=fixed;fontSize=16;fillColor=#00CC00;strokeColor=#2e842e;fontColor=#ffffff;gradientColor=#F0F0F0;gradientDirection=north;"
+
+# ---------------------------------------------------------------------------
+# Gear name matching.
+#
+# By default the script normalizes each GitHub issue title (strips the
+# "PREFIX - " unit tag, drops parenthetical notes, lowercases and removes
+# non-alphanumerics) and matches it against the same normalization of each SVG
+# gear label. The overrides below cover SVG labels whose text differs from the
+# GitHub title beyond what normalization handles (typos, abbreviations,
+# renames). Keys are the exact SVG label text; values are the exact GitHub
+# issue titles.
+# ---------------------------------------------------------------------------
+gear_mappings:
+  "Access Policy manager": { issue_id: 4320 }
+  "Account Manager": { issue_id: 3048 }
+  "Admission control": { issue_id: 4286 }
+  "Admission Policy Engine": { issue_id: 4287 }
+  "Agents memory": { issue_id: 3347 }
+  "AI agents": { issue_id: 2888 }
+  "Alert manager": { issue_id: 4499 }
+  "Analytics": { issue_id: 2899 }
+  "API (OData)": { issue_id: null, status_override: "Mature" }
+  "API gateway": { issue_id: null, status_override: "Mature" }
+  "Application manager": { issue_id: 4316 }
+  "Architecture lints": { issue_id: null, status_override: "In development" }
+  "Async jobs": { issue_id: 2900 }
+  "Audit": { issue_id: 2903 }
+  "Auth resolver": { issue_id: 3103 }
+  "Authorization": { issue_id: null, status_override: "Mature" }
+  "Billing": { issue_id: 2871 }
+  "Billing ledger": { issue_id: 4116 }
+  "Calendar": { issue_id: 4342 }
+  "Canonical errors": { issue_id: 2882 }
+  "CEP collector": { issue_id: 4317 }
+  "Chat engine": { issue_id: 2887 }
+  "Code & spec validators": { issue_id: null, status_override: "In development" }
+  "Code coverage": { issue_id: null, status_override: "In development" }
+  "Construct": { issue_id: 4385 }
+  "Contracts": { issue_id: null, status_override: "Mature" }
+  "Contracts mgmnt": { issue_id: 4311 }
+  "Credential store": { issue_id: 2542 }
+  "DB (secure ORM)": { issue_id: null, status_override: "Mature" }
+  "Declarartive workflows": { issue_id: 2904 }
+  "DNS Manager": { issue_id: 4299 }
+  "Emails storage": { issue_id: 2873 }
+  "Events broker": { issue_id: 2890 }
+  "File downloader": { issue_id: 3343 }
+  "File parser": { issue_id: 2895 }
+  "File storage": { issue_id: 2893 }
+  "FX Rate provider": { issue_id: 4305 }
+  "Generic installer": { issue_id: 4207 }
+  "Graph storage": { issue_id: 4453 }
+  "gRPC": { issue_id: null, status_override: "In development" }
+  "HTTP middleware": { issue_id: null, status_override: "In development" }
+  "Infrastructure inventory": { issue_id: 4323 }
+  "Infrastructure manager": { issue_id: 4319 }
+  "Infrastructure monitoring": { issue_id: 4326 }
+  "Invoicing": { issue_id: 4308 }
+  "License enforcement": { issue_id: 4288 }
+  "License Manager": { issue_id: 3341 }
+  "Lincense resolver": { issue_id: 2907 }
+  "LLM gateway": { issue_id: 2892 }
+  "Local Model controller": { issue_id: 3099 }
+  "Local Model runtimes": { issue_id: 4330 }
+  "Local Model scheduler": { issue_id: 3100 }
+  "Location manager": { issue_id: 4324 }
+  "Macros": { issue_id: null, status_override: "Mature" }
+  "Markeplace": { issue_id: 4315 }
+  "MCP registry": { issue_id: 4329 }
+  "Models registry": { issue_id: 2894 }
+  "Models rounter": { issue_id: null }
+  "Notification service": { issue_id: 2874 }
+  "Orders mgmt": { issue_id: 4312 }
+  "Orders workfflow": { issue_id: 4313 }
+  "Outbound API gateway": { issue_id: 3104 }
+  "Outbox": { issue_id: 2868, status_override: "Mature" }
+  "Payments": { issue_id: 4309 }
+  "Plan management": { issue_id: 4304 }
+  "Product & SKU": { issue_id: 4314 }
+  "Prompts registry": { issue_id: 4328 }
+  "Python FaaS": { issue_id: 2897 }
+  "Quota Enforcer": { issue_id: 3305 }
+  "Quota Manager": { issue_id: 3306 }
+  "RAG / Search index": { issue_id: 4327 }
+  "Rating": { issue_id: 4302 }
+  "Resource groups": { issue_id: 2902 }
+  "Serverless Gateway": { issue_id: 2885 }
+  "Service catalog": { issue_id: 4298 }
+  "Settings service": { issue_id: 2898 }
+  "SSL cert manager": { issue_id: 4301 }
+  "Starlark FaaS": { issue_id: 2886 }
+  "Subscriptions": { issue_id: 2872 }
+  "Supabase storage": { issue_id: 3107 }
+  "Tarifs": { issue_id: 4303 }
+  "Task engine": { issue_id: 4501 }
+  "Tax Engine": { issue_id: 4307 }
+  "Tenant Resolver": { issue_id: 3102, status_override: "Mature" }
+  "Ticketing": { issue_id: 4318 }
+  "Translation engine": { issue_id: 4341 }
+  "Trigger manager": { issue_id: 4727 }
+  "Type System": { issue_id: 3426, status_override: "Mature" }
+  "Types Registry": { issue_id: 2891 }
+  "Unit tests / e2e tests": { issue_id: null, status_override: "Mature" }
+  "URL crawler": { issue_id: 2599 }
+  "Usage collector": { issue_id: 2889 }
+  "User tasks": { issue_id: 4296 }
+  "Web-search gw": { issue_id: 2896 }

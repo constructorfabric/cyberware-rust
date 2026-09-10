@@ -84,6 +84,10 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
                     ::core::option::Option::None
                 }
 
+                fn scope_columns() -> ::std::vec::Vec<Self::Column> {
+                    ::std::vec::Vec::new()
+                }
+
                 fn resolve_property(_property: &str) -> ::core::option::Option<Self::Column> {
                     ::core::option::Option::None
                 }
@@ -111,6 +115,7 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
 
     // Generate resolve_property implementation
     let resolve_property_impl = generate_resolve_property(&config, input.ident.span());
+    let scope_columns_impl = generate_scope_columns(&config, input.ident.span());
 
     // Generate the implementation
     Ok(quote! {
@@ -126,6 +131,7 @@ pub fn expand_derive_scopable(input: DeriveInput) -> syn::Result<TokenStream> {
             #type_col_impl
 
             #resolve_property_impl
+            #scope_columns_impl
         }
     })
 }
@@ -151,6 +157,47 @@ fn generate_col_impl(
             fn #method_ident() -> ::core::option::Option<Self::Column> {
                 ::core::option::Option::None
             }
+        }
+    }
+}
+
+/// Enumerate every column a scope predicate can address.
+///
+/// Built from the same configuration as `resolve_property`, so the two cannot
+/// disagree about what counts as a scope column — which matters because a
+/// property-graph declaration derives its `PROPERTIES` list from this, and a
+/// scope column left out of that list is silently unfilterable.
+///
+/// `type_col` is deliberately absent: `resolve_property` emits no arm for it
+/// (there is no well-known property name), so no scope constraint can address
+/// it — listing it here would let an entity whose only dimension is `type_col`
+/// pass the Policy 2 gates while resolving nothing, which is the silent
+/// deny-all those gates exist to refuse.
+fn generate_scope_columns(config: &SecureConfig, span: Span) -> TokenStream {
+    let mut columns = Vec::new();
+
+    for col_name in [
+        config.tenant_col.as_ref().map(|(name, _)| name),
+        config.resource_col.as_ref().map(|(name, _)| name),
+        config.owner_col.as_ref().map(|(name, _)| name),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let col_ident = syn::Ident::new(&snake_to_upper_camel(col_name), span);
+        columns.push(quote! { Self::Column::#col_ident });
+    }
+
+    // `pep_prop` columns are scope columns too: `resolve_property` maps them,
+    // so a scope can address them, so a pattern must be able to filter on them.
+    for (_, column, _) in &config.pep_props {
+        let col_ident = syn::Ident::new(&snake_to_upper_camel(column), span);
+        columns.push(quote! { Self::Column::#col_ident });
+    }
+
+    quote! {
+        fn scope_columns() -> ::std::vec::Vec<Self::Column> {
+            ::std::vec![#(#columns),*]
         }
     }
 }

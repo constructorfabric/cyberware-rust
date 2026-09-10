@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-tr-authz-plugin"
-version = "0.1.15"
+version = "0.1.16"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,9 +19,9 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.3.23", path = "../../authz-resolver-sdk" }
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.23", path = "../../../tenant-resolver/tenant-resolver-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.6", path = "../../../types-registry/types-registry-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.4.0", path = "../../authz-resolver-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.0", path = "../../../tenant-resolver/tenant-resolver-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.7", path = "../../../types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 tenant-resolver = { workspace = true }
 

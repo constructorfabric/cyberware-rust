@@ -9,6 +9,9 @@ refs:
   - bss/prd/PRD-subscriptions-lifecycle-202604021200/PRD-subscriptions-lifecycle-202604021200.md
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # PRD — Rating — Usage Rating & Commercial Pricing Logic
 
 <!-- toc -->
@@ -1282,7 +1285,7 @@ Explicit dispositions for domains not owned by this PRD (no silent omissions):
 | **Plan-scoped coupon evaluation base** — which component holds a plan's line set for an `AnchorPeriod`, what triggers it (it cannot precede the last member line's rating, yet an open period keeps re-resolving usage), and how a member line's re-rate cascades into the plan-scoped discount and its split-back | Promotions + Rating Design | Before `line_total` coupons go live | **Open (T-D-22, 2026-07-28)**: step 7 is per-line and every evaluation unit is sub-plan, so no such point exists today. Launch posture: `applyScope = line_total` **fails closed**, T-D-20's cross-scope exclusivity is inert, and per-line `exclusive_best` over `usage`/`recurring` is unaffected. | — |
 | Formal confirmation of rating-core deployment model | Architecture / Program leadership | Before Design lock | **Superseded by ADR-0002 / T-D-16 (§14)**: rating-core is a pure crate inside the one `rating` gear deployable — the earlier "submodule of Rating vs standalone service" framing predates the consolidation (post-rename it read "submodule of itself"). Executive ack of ADR-0002 is the remaining formality. | — |
 | Minimal cloud subset for a real S3 / VM / Disks catalog | PM Team | 2026-06-11 | Resolved: Dimensional and CAPACITY/reservation (consumption + capacity flavor) in Scope; **Composite meter is in launch** — the pricing gear delivers the derived-meter primitive (Slice 10, formula-as-data over ≥2 published units) and hands Rating the eval math (SEAMS.md M5, 2026-07-10); VM MAY also be priced via the instance-type dimension. (The prior Follow-on status assumed no upstream primitive; superseded.) | 2026-06-11 |
-| Usage dimension-population contract (emission of `dimensionKey` values, field shapes, normalization) | OSS / CyberFabric Core (emission); Rating (declare/freeze) | TBD | BSS side closeable now (declare + freeze; Rating passes through). External dependency / critical path: the OSS metering emission shape. Until OSS emits values, `dimensionKey` stays empty. | — |
+| Usage dimension-population contract (emission of `dimensionKey` values, field shapes, normalization) | OSS / Constructor Fabric Core (emission); Rating (declare/freeze) | TBD | BSS side closeable now (declare + freeze; Rating passes through). External dependency / critical path: the OSS metering emission shape. Until OSS emits values, `dimensionKey` stays empty. | — |
 | (Finance) Launch without a hard spend cap / real-time spend stop — accepted? Owner of credit risk + prepaid gating | Finance | TBD | Rating owns no enforcement. Finance MUST accept launch without a ceiling, or name the gating owner (Billing post-aggregation cap / OSS-Policy real-time stop). | — |
 | (Product + OSS/Policy) Free-tier level: per-meter $0 band vs per-account-per-service allowance; boundary behavior and enforcing domain | Product + OSS/Policy | TBD | Current Scope = per-`(meter, dimensionKey)` $0 band; cross-account allowance is a new aggregate (Follow-on). | — |
 | (Product + Finance) Per-resource minimum charge and stance on rapid create/delete churn | Product + Finance | TBD | `minimumCharge` MAY be configured per resource; churn policy undecided. | — |

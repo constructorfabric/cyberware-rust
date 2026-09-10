@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-rg-tr-plugin"
-version = "0.1.15"
+version = "0.1.16"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,9 +19,9 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.3.23", path = "../../tenant-resolver-sdk" }
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.0", path = "../../../resource-group/resource-group-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.6", path = "../../../types-registry/types-registry-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.0", path = "../../tenant-resolver-sdk" }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.1", path = "../../../resource-group/resource-group-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.3.7", path = "../../../types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 resource-group = { workspace = true }
 

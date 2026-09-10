@@ -1,9 +1,9 @@
-<!-- Created: 2026-04-15 by Constructor Tech -->
 ---
 status: accepted
 date: 2026-04-15
 decision-makers: Constructor Fabric Steering Committee
 ---
+<!-- Created: 2026-04-15 by Constructor Tech -->
 
 # Enforce test code in separate files vian architecture lint DE1101
 

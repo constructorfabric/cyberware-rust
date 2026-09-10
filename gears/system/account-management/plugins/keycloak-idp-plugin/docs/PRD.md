@@ -1,3 +1,6 @@
+Created:  2026-08-17 by Virtuozzo International GmbH
+Updated:  2026-08-17 by Virtuozzo International GmbH
+
 # PRD — Keycloak IdP Plugin
 
 <!-- toc -->

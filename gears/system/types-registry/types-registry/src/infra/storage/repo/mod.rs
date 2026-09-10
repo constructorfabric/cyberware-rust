@@ -25,13 +25,9 @@
 //! the pattern (`prefilter_prefix` in [`entity_repo`]): too tight would silently
 //! *drop* real matches.
 //!
-//! # The dependency walk is iterative, not a recursive CTE
-//!
-//! `11_database_patterns.md` forbids raw SQL outside migration definitions, and a
-//! recursive CTE cannot be expressed through `SeaORM`'s typed builder. The
-//! worklist in [`DependencyRepo::closure`] is the only shape available here, not
-//! merely the cheaper one (SPEC D5).
+//! Dependency walks use `ToolKit`'s scoped recursive CTE builder, without raw SQL.
 
+pub mod coordination_state_repo;
 pub mod dependency_repo;
 pub mod entity_repo;
 pub mod instance_repo;
@@ -39,6 +35,7 @@ pub mod operation_repo;
 pub mod type_schema_repo;
 pub mod version_family_repo;
 
+pub use coordination_state_repo::CoordinationStateRepo;
 pub use dependency_repo::DependencyRepo;
 pub use entity_repo::{EntityPage, EntityRepo, PageRequest};
 pub use instance_repo::InstanceRepo;

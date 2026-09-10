@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use toolkit_utils::SecretString;
 use toolkit_utils::var_expand::ExpandVarsError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12,8 +13,11 @@ pub struct GithubMirrorConfig {
     /// Supports `${VAR}` and `${VAR:-default}` so the token can live in the
     /// environment instead of a checked-in config file; call
     /// [`GithubMirrorConfig::resolved_token`] rather than reading the field.
+    /// `SecretString` keeps the value out of every `Debug`/`Display` of the
+    /// config - it prints as `[REDACTED]` - so a startup config dump cannot
+    /// leak a literally-configured PAT.
     #[serde(default)]
-    pub github_token: Option<String>,
+    pub github_token: Option<SecretString>,
 }
 
 impl GithubMirrorConfig {
@@ -25,8 +29,8 @@ impl GithubMirrorConfig {
     /// instead of silently syncing unauthenticated.
     pub fn resolved_token(&self) -> Result<Option<String>, ExpandVarsError> {
         self.github_token
-            .as_deref()
-            .map(toolkit_utils::var_expand::expand_env_vars)
+            .as_ref()
+            .map(|token| toolkit_utils::var_expand::expand_env_vars(token.expose()))
             .transpose()
             .map(|token| token.filter(|t| !t.is_empty()))
     }
@@ -57,7 +61,32 @@ impl GithubMirrorConfig {
                 ),
             });
         }
+        // A token would travel in cleartext over plain `http`. Loopback is
+        // allowed so a local mock server still works without TLS.
+        if parsed.scheme() == "http" && self.github_token.is_some() && !is_loopback(&parsed) {
+            return Err(crate::domain::error::DomainError::Validation {
+                field: "api_base_url".to_owned(),
+                message: format!(
+                    concat!(
+                        "`{}` uses http, which would send the GitHub token in cleartext; ",
+                        "use https (or a loopback host for local testing)"
+                    ),
+                    self.api_base_url
+                ),
+            });
+        }
         Ok(self.api_base_url.clone())
+    }
+}
+
+/// Whether the URL points at this machine, where plain `http` carries no
+/// token over a network.
+fn is_loopback(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 

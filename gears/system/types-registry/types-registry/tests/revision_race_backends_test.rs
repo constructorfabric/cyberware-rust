@@ -1,30 +1,10 @@
-//! The two concurrency branches of `unit::commit_revision`, on `PostgreSQL` and
-//! `MySQL`.
+//! Commit exclusion and rollback on `PostgreSQL` and `MySQL`.
 //!
-//! `revision_test.rs` runs one admission at a time, which reaches neither branch:
-//! both need a *second* admission to commit while this one's transaction is open,
-//! and `SQLite` cannot produce that — a second concurrent writer fails the whole
-//! transaction with `database is locked` rather than committing underneath one.
-//!
-//! The two branches, both opened by the same `READ COMMITTED` window between the
-//! entity read and the content read:
-//!
-//! * **The `unchanged` re-read.** A pass that answered `unchanged` on what it read
-//!   would report "your content is current" about content that no longer is. The
-//!   re-read is the only thing stopping it, and deleting it leaves every
-//!   single-threaded test green.
-//! * **The lost compare-and-swap.** A pass whose content genuinely differs reaches
-//!   the CAS, and by then `expected` no longer matches. It must answer
-//!   `precondition_failed` rather than allocate a revision against a moved version.
-//!
-//! # The interleaving is deterministic, not raced
-//!
-//! Both cases pause the pass under test at the current-content read using
-//! `common::PausingStores`, a decorator that delegates every call to the real
-//! adapter and blocks on a channel inside that one. Nothing is faked: the second
-//! admission is a real `commit_revision` on a real second connection, committing
-//! before the first resumes. Racing the two instead would exercise the branches only
-//! by luck, and could not tell a missing re-read from a lucky ordering.
+//! The first commit is paused after claiming `entity_write_order`; a second real
+//! connection must wait and then observe the first commit. `SQLite` cannot distinguish
+//! this lock from its own writer serialization, so only `PostgreSQL` and `MySQL` run it.
+//! A separate `MySQL` case exhausts the database recursion limit during the commit
+//! guard and proves that the claim rolls back without becoming a candidate refusal.
 //!
 //! Gated behind `--features integration` because it needs a Docker daemon:
 //!
@@ -41,31 +21,36 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sea_orm::{EntityTrait, QueryOrder};
 use time::OffsetDateTime;
 use time::macros::datetime;
+use toolkit_canonical_errors::{CanonicalError, Problem};
+use toolkit_db::secure::{ScopeError, SecureEntityExt};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 
 use common::{
-    PausePoint, PausingStores, allow_all, provider_for, seed_current_type_schema,
-    seed_operation_item, seed_pending_revision_item, stores,
+    ClaimSignallingStores, PausePoint, PausingStores, allow_all, provider_for,
+    seed_current_type_schema, seed_operation_item, seed_pending_revision_item,
 };
-use types_registry::domain::admission::unit::{
-    EvaluatedOutcome, EvaluatedUnit, RevisionCommit, commit_revision,
-};
+use types_registry::domain::admission::revision::RevisionCommit;
+use types_registry::domain::admission::unit::{EvaluatedOutcome, EvaluatedUnit, commit_revision};
+use types_registry::domain::admission::vector::RevisionVector;
 use types_registry::domain::admission::worker::{ItemFailure, WorkerError};
 use types_registry::domain::artifacts::{MaterializedArtifacts, content_hash};
-use types_registry::domain::enums::{EntityKind, OwnershipScope};
+use types_registry::domain::enums::{DependencyKind, EntityKind, OwnershipScope};
 use types_registry::domain::family::family_key;
-use types_registry::domain::ports::{NewEntity, NewRevision, commit_write};
-use types_registry::infra::storage::repo::{EntityRepo, TypeSchemaRepo, VersionFamilyRepo};
+use types_registry::domain::ports::{NewEntity, NewRevision, ReverseImpact, commit_write};
+use types_registry::infra::storage::entity::{operation_item, type_schema, type_schema_revision};
+use types_registry::infra::storage::repo::{
+    CoordinationStateRepo, DependencyRepo, EntityRepo, TypeSchemaRepo, VersionFamilyRepo,
+};
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 
 /// The candidate every case revises. One identifier per case, so the two cases
 /// cannot see each other's rows.
-const UNCHANGED_CASE_ID: &str = gts_id!("acme.crm.reread.type.v1~");
-const CAS_CASE_ID: &str = gts_id!("acme.crm.swapped.type.v1~");
+const EXCLUSION_CASE_ID: &str = gts_id!("acme.crm.queued.type.v1~");
 
 const BODY_A: &str = r#"{"$schema":"http://json-schema.org/draft-07/schema#","title":"a"}"#;
 const BODY_B: &str = r#"{"$schema":"http://json-schema.org/draft-07/schema#","title":"b"}"#;
@@ -113,6 +98,11 @@ fn unit(gts_id: &str, body: &str, operation_item_id: i64) -> EvaluatedUnit {
             },
         },
         operation_item_id,
+        edges: Vec::new(),
+        // The vector a real evaluation of this fixture would record, spelled out: the closure over
+        // the candidate's own identifier resolves to the candidate and nothing else, and nothing
+        // references it, so both halves are empty.
+        vector: RevisionVector::new(vec![parsed.id().to_owned()], Vec::new()),
     }
 }
 
@@ -174,21 +164,20 @@ async fn seed_entity_at_revision_one(db: &Provider, gts_id: &str) -> i64 {
     entity.id
 }
 
-/// Run one `commit_revision` to completion in its own transaction on its own
-/// connection, with the plain adapter.
-async fn commit_alone(
+/// Commit on a separate connection through caller-supplied ports.
+async fn try_commit_through(
     db: &Provider,
+    stores: Arc<dyn types_registry::domain::ports::Stores>,
     gts_id: &str,
     body: &str,
     expected: i64,
-) -> Result<RevisionCommit, ItemFailure> {
+) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
     let item = {
         let conn = db.conn().expect("conn");
         seed_pending_revision_item(&conn, gts_id, expected, NOW).await
     };
     let provider: DBProvider<WorkerError> = DBProvider::new(db.db());
     let unit = Arc::new(unit(gts_id, body, item));
-    let stores = stores();
     provider
         .transaction_with_config(commit_write(&db.db()), move |tx| {
             let unit = Arc::clone(&unit);
@@ -200,13 +189,14 @@ async fn commit_alone(
                     &allow_all(),
                     unit.as_ref(),
                     expected,
+                    &common::limits(),
                     NOW,
+                    &common::metrics(),
                 )
                 .await
             })
         })
         .await
-        .expect("a concurrency outcome is an ItemFailure, never a WorkerError")
 }
 
 /// The current `resource_version` of one entity.
@@ -223,23 +213,17 @@ async fn resource_version(db: &Provider, gts_id: &str) -> i64 {
 // The two branches
 // ---------------------------------------------------------------------------
 
-/// A pass whose content equals the current revision is held at the content read
-/// while a real revision commits underneath it. It must **not** report
-/// `unchanged`: its answer was true when it read and false by the time it would
-/// write, and the caller would be told a version that had already moved.
-///
-/// Mutation-checked: deleting the re-read block in `commit_revision` turns this
-/// into `Unchanged { resource_version: 1 }` while the entity sits at 2.
-async fn a_paused_unchanged_pass_reports_the_precondition_it_lost(db: &Provider, backend: &str) {
-    seed_entity_at_revision_one(db, UNCHANGED_CASE_ID).await;
+/// The second commit waits at the claim, then reads the first commit's result.
+async fn a_second_commit_waits_for_the_first(db: &Provider, backend: &str) {
+    seed_entity_at_revision_one(db, EXCLUSION_CASE_ID).await;
 
     let item = {
         let conn = db.conn().expect("conn");
-        seed_pending_revision_item(&conn, UNCHANGED_CASE_ID, 1, NOW).await
+        seed_pending_revision_item(&conn, EXCLUSION_CASE_ID, 1, NOW).await
     };
     let (decorated, reached, resume) = PausingStores::new(PausePoint::CurrentDocuments);
     let provider: DBProvider<WorkerError> = DBProvider::new(db.db());
-    let unit = Arc::new(unit(UNCHANGED_CASE_ID, BODY_A, item));
+    let unit = Arc::new(unit(EXCLUSION_CASE_ID, BODY_B, item));
 
     let paused = tokio::spawn(async move {
         provider
@@ -247,7 +231,17 @@ async fn a_paused_unchanged_pass_reports_the_precondition_it_lost(db: &Provider,
                 let unit = Arc::clone(&unit);
                 let stores = Arc::clone(&decorated);
                 Box::pin(async move {
-                    commit_revision(stores.as_ref(), tx, &allow_all(), unit.as_ref(), 1, NOW).await
+                    commit_revision(
+                        stores.as_ref(),
+                        tx,
+                        &allow_all(),
+                        unit.as_ref(),
+                        1,
+                        &common::limits(),
+                        NOW,
+                        &common::metrics(),
+                    )
+                    .await
                 })
             })
             .await
@@ -255,93 +249,53 @@ async fn a_paused_unchanged_pass_reports_the_precondition_it_lost(db: &Provider,
 
     reached.await.expect("the pass reaches the content read");
 
-    // A real second admission on a second connection, committed while the first
-    // transaction is still open. This is the commit the re-read exists to notice.
-    let winner = commit_alone(db, UNCHANGED_CASE_ID, BODY_B, 1).await;
-    assert!(
-        matches!(winner, Ok(RevisionCommit::Admitted(c)) if c.resource_version == 2),
-        "the competing revision must commit first on {backend}: {winner:?}",
-    );
-
-    resume.send(()).expect("the paused pass is still waiting");
-    let outcome = paused
-        .await
-        .expect("task")
-        .expect("a lost precondition is an ItemFailure, never a WorkerError");
-
-    match outcome {
-        Err(failure) => assert_eq!(
-            failure.reason, "precondition_failed",
-            "the pass must report the version it lost on {backend}",
-        ),
-        Ok(other) => panic!("expected a refusal on {backend}, got {other:?}"),
-    }
-    assert_eq!(
-        resource_version(db, UNCHANGED_CASE_ID).await,
-        2,
-        "and it must have written nothing on {backend}",
-    );
-}
-
-/// The same window, a candidate whose content genuinely differs: it passes the
-/// `unchanged` test, reaches the compare-and-swap, and finds `expected` gone. The
-/// precondition is in the statement's `WHERE`, so the lost race is `false` rather
-/// than a second revision at a version that had moved.
-async fn a_paused_revision_loses_the_compare_and_swap(db: &Provider, backend: &str) {
-    seed_entity_at_revision_one(db, CAS_CASE_ID).await;
-
-    let item = {
-        let conn = db.conn().expect("conn");
-        seed_pending_revision_item(&conn, CAS_CASE_ID, 1, NOW).await
+    // `expected = 2` succeeds only if this reads after the held commit.
+    let (signalling, entered) = ClaimSignallingStores::new();
+    let mut second = {
+        let db = Arc::clone(db);
+        tokio::spawn(async move {
+            try_commit_through(&db, signalling, EXCLUSION_CASE_ID, BODY_C, 2).await
+        })
     };
-    let (decorated, reached, resume) = PausingStores::new(PausePoint::CurrentDocuments);
-    let provider: DBProvider<WorkerError> = DBProvider::new(db.db());
-    let unit = Arc::new(unit(CAS_CASE_ID, BODY_B, item));
-
-    let paused = tokio::spawn(async move {
-        provider
-            .transaction_with_config(commit_write(&provider.db()), move |tx| {
-                let unit = Arc::clone(&unit);
-                let stores = Arc::clone(&decorated);
-                Box::pin(async move {
-                    commit_revision(stores.as_ref(), tx, &allow_all(), unit.as_ref(), 1, NOW).await
-                })
-            })
-            .await
-    });
-
-    reached.await.expect("the pass reaches the content read");
-
-    let winner = commit_alone(db, CAS_CASE_ID, BODY_C, 1).await;
+    entered
+        .await
+        .expect("the second commit must reach the claim");
     assert!(
-        matches!(winner, Ok(RevisionCommit::Admitted(c)) if c.resource_version == 2),
-        "the competing revision must commit first on {backend}: {winner:?}",
+        tokio::time::timeout(Duration::from_millis(500), &mut second)
+            .await
+            .is_err(),
+        "and having reached it, must still be queued behind the held one on {backend}",
+    );
+    assert_eq!(
+        resource_version(db, EXCLUSION_CASE_ID).await,
+        1,
+        "and nothing can have committed while the row was held, on {backend}",
     );
 
     resume.send(()).expect("the paused pass is still waiting");
-    let outcome = paused
+    let first = paused
         .await
         .expect("task")
-        .expect("a lost compare-and-swap is an ItemFailure, never a WorkerError");
+        .expect("the held pass must not fail on infrastructure");
+    assert!(
+        matches!(first, Ok(RevisionCommit::Admitted(c)) if c.resource_version == 2),
+        "the first pass commits once released on {backend}: {first:?}",
+    );
 
-    match outcome {
-        Err(failure) => assert_eq!(
-            failure.reason, "precondition_failed",
-            "a lost compare-and-swap is terminal, not a rebase, on {backend}",
-        ),
-        Ok(other) => panic!("expected a refusal on {backend}, got {other:?}"),
-    }
-    assert_eq!(
-        resource_version(db, CAS_CASE_ID).await,
-        2,
-        "the loser must not have advanced the version a second time on {backend}",
+    let second = second
+        .await
+        .expect("task")
+        .expect("the queued commit must not fail on infrastructure");
+    assert!(
+        matches!(second, Ok(RevisionCommit::Admitted(c)) if c.resource_version == 3),
+        "and the queued commit lands against what the first left behind on {backend}: \
+         {second:?}",
     );
 }
 
 /// Both cases in one body, so neither backend can drift into covering less.
 async fn assert_revision_races_behave(db: &Provider, backend: &str) {
-    a_paused_unchanged_pass_reports_the_precondition_it_lost(db, backend).await;
-    a_paused_revision_loses_the_compare_and_swap(db, backend).await;
+    a_second_commit_waits_for_the_first(db, backend).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -390,4 +344,152 @@ async fn revision_races_behave_on_mysql() {
 
     let db = provider_for(&format!("mysql://root@{host}:{port}/test"), 8).await;
     assert_revision_races_behave(&db, "mysql").await;
+}
+
+/// A database capacity failure must unwind a real admission transaction. Setting
+/// the server default before the pool opens makes the low session limit apply to
+/// the connection that executes the guard, without a `SET SESSION` on a different
+/// pooled connection. The error assertion proves that the actual traversal hit it.
+#[tokio::test]
+async fn mysql_recursion_limit_aborts_the_commit_without_a_write_set_refusal() {
+    use testcontainers::ImageExt;
+    use testcontainers::runners::AsyncRunner;
+
+    let container = test_containers::mysql()
+        .with_cmd(["--cte-max-recursion-depth=2"])
+        .start()
+        .await
+        .expect("start mysql with a low recursion limit");
+    let port = container.get_host_port_ipv4(3306).await.expect("port");
+    let host = container.get_host().await.expect("host").to_string();
+    let db = provider_for(&format!("mysql://root@{host}:{port}/test"), 4).await;
+    let chain = [
+        gts_id!("acme.crm.depth0.type.v1~"),
+        gts_id!("acme.crm.depth1.type.v1~"),
+        gts_id!("acme.crm.depth2.type.v1~"),
+        gts_id!("acme.crm.depth3.type.v1~"),
+        gts_id!("acme.crm.depth4.type.v1~"),
+    ];
+    let mut ids = Vec::new();
+    for id in chain {
+        ids.push(seed_entity_at_revision_one(&db, id).await);
+    }
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    for pair in ids.windows(2) {
+        DependencyRepo::replace_outgoing(
+            &conn,
+            &scope,
+            pair[1],
+            &[(DependencyKind::SchemaRef, pair[0])],
+        )
+        .await
+        .expect("seed dependent -> predecessor");
+    }
+
+    // The same graph can produce an application refusal when the query completes.
+    // A depth cap of one reaches two dependents without exhausting MySQL's limit.
+    assert!(matches!(
+        DependencyRepo::reverse_impact(&conn, &scope, &[ids[0]], 1)
+            .await
+            .expect("the bounded query completes"),
+        ReverseImpact::OverBound { bound: 1, .. }
+    ));
+    let before_schemas = type_schema::Entity::find()
+        .order_by_asc(type_schema::Column::EntityId)
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
+        .await
+        .expect("current schemas before commit");
+    let before_sequence = CoordinationStateRepo::entity_write_sequence(&conn, &scope)
+        .await
+        .expect("sequence before commit");
+    let item_id = seed_pending_revision_item(&conn, chain[0], 1, NOW).await;
+    let candidate = Arc::new(unit(chain[0], BODY_B, item_id));
+    let provider: DBProvider<WorkerError> = DBProvider::new(db.db());
+
+    // Call the real commit boundary directly: the worker's evaluation would hit
+    // this limit before opening a write transaction. Here the guard fails AFTER
+    // the entity_write_order UPDATE, so unchanged state actually proves rollback.
+    let result = provider
+        .transaction_with_config(commit_write(&db.db()), move |tx| {
+            let candidate = Arc::clone(&candidate);
+            Box::pin(async move {
+                commit_revision(
+                    common::stores().as_ref(),
+                    tx,
+                    &allow_all(),
+                    &candidate,
+                    1,
+                    &common::limits(),
+                    NOW,
+                    &common::metrics(),
+                )
+                .await
+            })
+        })
+        .await;
+    let error = result.expect_err("the database abort must remain an infrastructure error");
+    assert!(
+        matches!(&error, WorkerError::Storage(ScopeError::Db(_))),
+        "expected a driver error, not an application refusal: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("cte_max_recursion_depth"),
+        "the failure must be the MySQL recursion guard, not another SQL error: {error}"
+    );
+    let problem = Problem::from(CanonicalError::from(error));
+    assert_eq!(problem.status, Some(500));
+    assert_eq!(
+        problem.detail,
+        "An internal error occurred. Please retry later."
+    );
+
+    assert_eq!(
+        CoordinationStateRepo::entity_write_sequence(&conn, &scope)
+            .await
+            .expect("sequence after abort"),
+        before_sequence,
+        "the claim UPDATE must roll back with the failed guard"
+    );
+    assert_eq!(resource_version(&db, chain[0]).await, 1);
+    assert_eq!(
+        type_schema::Entity::find()
+            .order_by_asc(type_schema::Column::EntityId)
+            .secure()
+            .scope_with(&scope)
+            .all(&conn)
+            .await
+            .expect("current schemas after abort"),
+        before_schemas,
+        "neither the candidate nor a dependent may have new current artifacts"
+    );
+    assert!(
+        type_schema_revision::Entity::find_by_id((ids[0], 2))
+            .secure()
+            .scope_with(&scope)
+            .one(&conn)
+            .await
+            .expect("revision lookup")
+            .is_none(),
+        "an aborted commit must not retain revision 2"
+    );
+    let item = operation_item::Entity::find_by_id(item_id)
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .expect("item lookup")
+        .expect("accepted item remains");
+    assert_eq!(
+        item.status,
+        types_registry::infra::storage::entity::enums::OperationItemStatus::Pending
+    );
+    assert!(
+        item.error_payload.is_none(),
+        "no activation_write_set_exceeded outcome"
+    );
+    assert!(item.result_revision_no.is_none());
+    assert!(item.result_resource_version.is_none());
 }

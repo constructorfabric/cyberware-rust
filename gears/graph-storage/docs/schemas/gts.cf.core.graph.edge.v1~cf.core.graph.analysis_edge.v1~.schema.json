@@ -1,0 +1,24 @@
+{
+  "$id": "gts://gts.cf.core.graph.edge.v1~cf.core.graph.analysis_edge.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Derived edge asserted by an analyzer. Survives scope replacement, and therefore must carry provenance saying what produced it.",
+  "x-gts-abstract": true,
+  "x-gts-traits": { "family": "analysis" },
+  "type": "object",
+  "allOf": [
+    { "$ref": "gts://gts.cf.core.graph.edge.v1~" },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "properties": {
+            "provenance": { "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~" }
+          },
+          "required": ["provenance"]
+        }
+      },
+      "required": ["payload"]
+    }
+  ]
+}

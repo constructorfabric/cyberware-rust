@@ -12,6 +12,7 @@ use cluster_sdk::{
 };
 use standalone_cluster_plugin::StandaloneClusterPlugin;
 
+use crate::defaults::test_cache::MemoryCache;
 use crate::defaults::{CasBasedDistributedLockBackend, CasBasedLeaderElectionBackend};
 use toolkit::client_hub::ClientHub;
 use tracing_test::traced_test;
@@ -441,6 +442,97 @@ async fn two_profiles_on_one_cache_report_one_cache_instance() {
     handle.stop().await;
 }
 
+// ---------------------------------------------------------------------------
+// The programmatic weak-consistency opt-in
+// (`ProfileBackends::allow_weak_leader_election` / `allow_weak_lock`).
+//
+// The config-driven half of this — the reserved `provider: default` binding that
+// reaches these builders from operator YAML — is tested in `config_tests.rs`
+// alongside the rest of the `from_config` path. These cover the builder API a
+// host using `ClusterWiring::builder()` calls directly, which is a separate
+// public entry point rather than a wrapper over the YAML one.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_weak_cache_profile_fails_without_the_builder_opt_ins() {
+    let hub = Arc::new(ClientHub::new());
+
+    let result = ClusterWiring::builder(hub)
+        .profile(
+            EventBroker,
+            ProfileBackends::new(MemoryCache::eventually_consistent()),
+        )
+        .build_and_start();
+
+    assert!(
+        matches!(result, Err(ClusterError::InvalidConfig { .. })),
+        "the CAS defaults' consistency guard must reject a weak cache by default"
+    );
+}
+
+#[tokio::test]
+async fn the_leader_opt_in_alone_still_fails_on_the_lock() {
+    // Both CAS defaults share one guard, and the leader is resolved first, so a
+    // single-flag implementation looks correct until the lock is reached. The
+    // config-level counterpart is
+    // `opting_in_on_leader_election_alone_still_fails_on_the_lock`.
+    let hub = Arc::new(ClientHub::new());
+
+    let result = ClusterWiring::builder(hub)
+        .profile(
+            EventBroker,
+            ProfileBackends::new(MemoryCache::eventually_consistent()).allow_weak_leader_election(),
+        )
+        .build_and_start();
+
+    let Err(ClusterError::InvalidConfig { reason }) = result else {
+        panic!("the lock default's guard must still bite");
+    };
+    assert!(
+        reason.contains("CasBasedDistributedLockBackend"),
+        "the surviving failure must be the lock guard, got: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn both_builder_opt_ins_start_a_weak_cache_profile() {
+    let hub = Arc::new(ClientHub::new());
+
+    let handle = ClusterWiring::builder(Arc::clone(&hub))
+        .profile(
+            EventBroker,
+            ProfileBackends::new(MemoryCache::eventually_consistent())
+                .allow_weak_leader_election()
+                .allow_weak_lock(),
+        )
+        .build_and_start()
+        .expect("both opt-ins present, so the profile must start");
+
+    // The auto-filled defaults track the cache's declaration rather than claiming
+    // a guarantee the opt-in cannot confer: waiving the *constructor guard* does
+    // not make the backend linearizable.
+    let leader = LeaderElectionV1::resolver(&hub)
+        .profile(EventBroker)
+        .resolve()
+        .await
+        .expect("the weak leader default resolves");
+    assert!(
+        !leader.features().linearizable,
+        "the leader default must keep reporting linearizable: false over a weak cache"
+    );
+    let lock = DistributedLockV1::resolver(&hub)
+        .profile(EventBroker)
+        .resolve()
+        .await
+        .expect("the weak lock default resolves");
+    assert!(
+        !lock.features().linearizable,
+        "the lock default must keep reporting linearizable: false over a weak cache"
+    );
+
+    handle.stop().await;
+}
+
 /// The hub stays all-or-nothing: a later profile failing registration rolls back
 /// every profile registered before it (DESIGN §3.7). Returning the bound-profile
 /// set does not change that — the set is built first, but nothing is published
@@ -483,4 +575,58 @@ async fn a_failed_registration_rolls_back_the_profiles_before_it() {
     );
 
     plugin.stop().await;
+}
+
+#[tokio::test]
+async fn a_natively_bound_lock_needs_no_opt_in_over_a_weak_cache() {
+    // The shape the Redis plugin actually ships: a weak cache with a *native*
+    // lock bound over it. The lock guard never runs, because no CAS default is
+    // auto-filled for that primitive — so only leader election needs the flag.
+    // This is why the plugin's own operator YAML binds `lock: { provider: redis }`
+    // rather than reaching for a second opt-in.
+    let hub = Arc::new(ClientHub::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let handle = ClusterWiring::builder(Arc::clone(&hub))
+        .profile(
+            EventBroker,
+            ProfileBackends::new(MemoryCache::eventually_consistent())
+                .allow_weak_leader_election()
+                .with_lock(Arc::new(MarkerLockBackend {
+                    // Stands in for a purpose-built lock (the Redis plugin's
+                    // `SET NX PX` lease). Its own inner backend rides a
+                    // linearizable cache, which is exactly the point: a native
+                    // binding brings its own guarantees rather than inheriting the
+                    // profile cache's.
+                    inner: Arc::new(
+                        CasBasedDistributedLockBackend::new(MemoryCache::linearizable())
+                            .expect("lock backend over linearizable cache"),
+                    ),
+                    calls: Arc::clone(&calls),
+                })),
+        )
+        .build_and_start()
+        .expect("a native lock over a weak cache needs no lock opt-in");
+
+    let lock = DistributedLockV1::resolver(&hub)
+        .profile(EventBroker)
+        .resolve()
+        .await
+        .expect("the native lock resolves");
+    let acquired = lock
+        .try_lock("shard-assignment", Duration::from_secs(5))
+        .await;
+    assert!(
+        acquired.is_ok(),
+        "the native lock's own backend rides a linearizable cache, so this uncontended \
+         acquisition must succeed: {acquired:?}"
+    );
+    drop(acquired);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the natively-bound lock must serve the call, not a CAS default"
+    );
+
+    handle.stop().await;
 }

@@ -55,14 +55,8 @@ impl VersionFamilyRepo {
     /// inside the admission commit transaction and a raised unique violation aborts
     /// that transaction on `PostgreSQL`. See [`conflict_do_nothing`].
     ///
-    /// **This is not a row lock.** `database.sql` describes the family row as the
-    /// lock that serializes concurrent first admission — `SELECT … FOR UPDATE` on
-    /// Postgres and `MySQL` — but `DBRunner` hides the raw executor and the secure
-    /// builder exposes no lock clause, so a repository cannot take one. Serializing
-    /// the *validation* window (family shape and contiguity) needs the toolkit
-    /// advisory lock, which lives on the `Db` handle and must be held **across**
-    /// this transaction, so it belongs to the caller. `admission::worker` takes it,
-    /// in `domain::family::lock_order`'s order.
+    /// Family validation is serialized by the transaction's `entity_write_order`
+    /// claim, not by a family-row lock (SPEC §8.1).
     ///
     /// # Errors
     /// Propagates scope validation and database failures. Returns

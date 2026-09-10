@@ -1,6 +1,6 @@
 # cf-gears-event-broker-sdk
 
-High-level Rust SDK for the Cyberfabric Event Broker.
+High-level Rust SDK for the `event-broker` gear.
 
 Wire concerns (JSON serialisation, partition selection, producer-chain bookkeeping,
 subscription lifecycle recovery, canonical error handling) are handled inside the
