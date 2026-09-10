@@ -4,53 +4,46 @@ SDK crate for the `CredStore` gear, providing public API contracts for credentia
 
 ## Overview
 
-This crate defines the transport-agnostic interface for the `CredStore` gear:
+This crate defines the transport-agnostic interface for the `CredStore` gear
+(ADR-0004: the credential record and its secret value are separate
+resources):
 
-- **`CredStoreClientV1`** — consumer-facing trait (`get`/`put`/`create`/`delete`);
-  `get` returns the value plus metadata (`owner_tenant_id`, `sharing`,
-  `is_inherited`, `id`, `version`, `secret_type`, `expires_at`)
-- **`CredStorePluginClientV1`** — backend trait: a pure per-tenant value store
-  (`get`/`put`/`delete` keyed by `tenant_id` + `key` + optional `owner_id`); it
-  holds no sharing/hierarchy/policy — that lives in the gear. Planned,
-  ADR-0006, not yet implemented: the key becomes `tenant_id`/`value_id` — no
-  `key`, no `owner_id` — since backend entries become immutable, addressed
-  only by version, and unique store-wide; the plugin learns nothing about
-  references, owners, or sharing
-- **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`GetSecretResponse`** — Domain models
-- **`CredStoreError`** — Error types for all operations
-- **`CredStorePluginSpecV1`** — GTS schema for plugin registration
-- Planned (ADR-0004), not yet implemented — `CredStoreClientV1` reshaped
-  around the credential record and its secret value: `get`, `get_secret`,
-  `put`, `patch`, `list`, `delete`.
-  - `get` — point read of one credential record, without its value; also the
-    source of the `ETag` a value-blind writer needs
-  - `get_secret` — hierarchical read of the value, at its own address
-  - `put` — precondition-guarded create-or-replace of the record together
-    with its value, in one call; the create-only precondition is how a
-    credential is created
+- **`CredStoreClientV1`** — consumer-facing trait, six methods:
+  - `get` — point read of one credential record (`Credential`), without its
+    value; also the source of the `ETag` a value-blind writer needs
+  - `get_secret` — hierarchical read of the value (`Secret`), at its own
+    address; a winning record with no value (`declared`/`suppressed`) is the
+    canonical miss
+  - `put` — precondition-guarded create-or-replace of the whole credential —
+    record and value together, in one call; `PutPrecondition::CreateOnly` is
+    how a credential is created (there is no separate `create` method)
   - `patch` — precondition-guarded partial update following RFC 7396
     merge-patch semantics: present fields replace, absent fields are
     untouched; metadata edit, value rotate, or value remove (a `null` value)
     all go through it; never creates
-  - `list` — takes an `ODataQuery` (`filter`, `select`, `orderby`, `limit`,
-    `cursor`) over credential records; an item's `secret` field is present
-    only when `select` names it. Selecting `secret` switches the call into
-    **value mode**, matching the REST contract one-for-one: `limit` and
-    `cursor` are rejected, results are capped and non-paginated, and only
-    `reference in (...)` or `type eq`/`in` may filter — no prefix or ordered
-    operator over `reference` — see ADR-0004 for why that one is withheld
-    rather than pending. Without `secret` selected, `list` behaves exactly as
-    the plain listing: paginated, never carrying values regardless of the
-    caller's grants
   - `delete` — precondition-guarded delete of the record and its value
-
-  **`get` changes meaning**: it returns a `Credential`, which has no `value`
-  field, so every existing caller fails to compile rather than silently
-  reading metadata; value readers move to `get_secret`. **`create` is
-  removed**: `put` under the create-only precondition is create, and it
-  always carries a value — creating with `put` (record and value together,
-  guarded by the create-only precondition), then editing or rotating with
-  `patch`; a `patch` `value` of `null` removes the value.
+  - the collection read (`list`, `$select=secret` for bulk value reads) is
+    ADR-0005, Phase 3 — not yet implemented
+- **`CredStorePluginClientV1`** — backend trait: a pure per-tenant, per-version
+  value store (`get`/`put`/`delete` keyed by `tenant_id`/`value_id`); it holds
+  no sharing/hierarchy/policy — that lives in the gear
+- **`Credential`** / **`Secret`** — the two representations `get`/`get_secret`
+  return: `Credential` never carries the value (`reference`, `secret_type`,
+  `sharing`, `fallback`, `status`, `inheritance`, `version`, `updated_at`,
+  `expires_at`, `validator`); `Secret` carries only what is needed to use the
+  value (`reference`, `secret_type`, `expires_at`, `value`, `validator`)
+- **`CredentialWrite`** / **`CredentialPatch`** — `put`/`patch` request
+  shapes; `CredentialPatch`'s `expires_at`/`value` are `PatchField<T>`
+  (`Absent`/`Null`/`Set`), the RFC 7396 tri-state
+- **`PutPrecondition`** / **`WritePrecondition`** — `put` distinguishes
+  create-only (`If-None-Match: *`) from a guarded/unconditional replace;
+  `patch`/`delete` keep the simpler `Exists`/`Matches` shape
+- **`Fallback`** / **`CredentialStatus`** / **`InheritanceStatus`** —
+  suppression policy and the two independent status fields of a `Credential`
+- **`SecretRef`** / **`SecretValue`** / **`SharingMode`** / **`Validator`** —
+  further domain models
+- **`CredStoreError`** — Error types for all operations
+- **`CredStorePluginSpecV1`** — GTS schema for plugin registration
 
 ## Usage
 
@@ -66,14 +59,14 @@ async fn secret_length(
     security: &SecurityContext,
 ) -> Result<Option<usize>, CredStoreError> {
     let key = SecretRef::new("my-api-key")?;
-    let response = credstore.get(security, &key).await?;
+    let secret = credstore.get_secret(security, &key).await?;
 
-    Ok(response.map(|secret| secret.value.as_bytes().len()))
+    Ok(secret.map(|s| s.value.as_bytes().len()))
 }
 ```
 
-A missing or out-of-scope secret is expressed as `Ok(None)`, preventing existence
-leaks. An explicit denial of the read action is returned as `CredStoreError::AccessDenied`.
+A missing or out-of-scope credential is expressed as `Ok(None)`, preventing existence
+leaks. An explicit denial of the `read_secret` action is returned as `CredStoreError::AccessDenied`.
 
 ## License
 

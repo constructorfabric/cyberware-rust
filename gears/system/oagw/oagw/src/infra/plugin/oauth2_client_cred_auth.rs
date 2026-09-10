@@ -161,7 +161,7 @@ impl OAuth2ClientCredAuthPlugin {
             .map_err(|e| PluginError::Internal(format!("invalid secret ref '{raw}': {e}")))?;
         let response = self
             .credstore
-            .get(security_context, &secret_ref)
+            .get_secret(security_context, &secret_ref)
             .await
             .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
             .ok_or_else(|| PluginError::SecretNotFound(cred_ref.to_owned()))?;

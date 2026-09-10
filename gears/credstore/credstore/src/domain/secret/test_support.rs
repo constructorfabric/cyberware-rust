@@ -156,6 +156,90 @@ pub fn type_deny_enforcer(
     (PolicyEnforcer::new(resolver.clone()), resolver)
 }
 
+/// Permissive PDP fake recording every `(action)` evaluated — for asserting
+/// ADR-0004's body-derived action selection (`write`/`write_secret`).
+pub struct RecordingAuthZResolver {
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl AuthZResolverApi for RecordingAuthZResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.seen
+            .lock()
+            .expect("lock")
+            .push(request.action.name.clone());
+        MockAuthZResolver.evaluate(ctx, request).await
+    }
+}
+
+impl RecordingAuthZResolver {
+    /// Every action name evaluated so far, in call order.
+    ///
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn seen_actions(&self) -> Vec<String> {
+        self.seen.lock().expect("lock").clone()
+    }
+}
+
+/// Permissive enforcer recording every evaluated action name; returns the
+/// resolver so tests can assert which of `write`/`write_secret` a body
+/// actually required.
+#[must_use]
+pub fn type_recording_enforcer() -> (PolicyEnforcer, Arc<RecordingAuthZResolver>) {
+    let resolver = Arc::new(RecordingAuthZResolver {
+        seen: Mutex::new(Vec::new()),
+    });
+    (PolicyEnforcer::new(resolver.clone()), resolver)
+}
+
+/// PDP fake denying exactly one `(resource_type, action)` pair; permissive
+/// otherwise. Models a policy that grants everything except one action on
+/// one type — e.g. `write` without `write_secret`.
+pub struct ActionDenyAuthZResolver {
+    resource_type: String,
+    action: String,
+}
+
+#[async_trait]
+impl AuthZResolverApi for ActionDenyAuthZResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        if request.resource.resource_type == self.resource_type
+            && request.action.name == self.action
+        {
+            return Ok(EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext::default(),
+            });
+        }
+        MockAuthZResolver.evaluate(ctx, request).await
+    }
+}
+
+/// Enforcer denying exactly `action` on `resource_type`, permissive for
+/// every other `(type, action)` pair.
+#[must_use]
+pub fn action_deny_enforcer(
+    resource_type: String,
+    action: &str,
+) -> (PolicyEnforcer, Arc<ActionDenyAuthZResolver>) {
+    let resolver = Arc::new(ActionDenyAuthZResolver {
+        resource_type,
+        action: action.to_owned(),
+    });
+    (PolicyEnforcer::new(resolver.clone()), resolver)
+}
+
 /// PDP fake that always returns a transport failure.
 struct FailAuthZResolver;
 
@@ -357,6 +441,19 @@ impl FakePlugin {
     /// Panics if the internal mutex is poisoned.
     pub fn fail_next_deletes(&self, n: usize) {
         *self.delete_failures.lock().expect("lock") += n;
+    }
+
+    /// Arrange for the next `n` `put` calls on this (already-populated)
+    /// instance to fail — for tests that need the *value* write (not the
+    /// fence-key bootstrap put, which typically runs first on a fresh
+    /// instance) to fail. Bootstrap the fence key with an unrelated write
+    /// first, then call this before the write under test.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn fail_next_puts(&self, n: usize) {
+        *self.put_failures.lock().expect("lock") += n;
     }
 
     /// Number of backend reads of the reserved fence-key entry so far.
@@ -686,6 +783,17 @@ impl FakeSecretRepo {
     pub fn gc_entries(&self) -> Vec<GcEntry> {
         self.gc.lock().expect("lock").clone()
     }
+
+    /// Resolution-eligible (ADR-0004, Suppression): `active` and not expired,
+    /// or `declared` with `fallback: none` (a suppressing row that competes
+    /// and blocks). Mirrors the production predicate in
+    /// `infra::storage::repo_impl::reads::resolution_eligible_condition`.
+    fn resolution_eligible(r: &SecretRow) -> bool {
+        match r.status {
+            SecretStatus::Active => r.expires_at.is_none_or(|at| at > OffsetDateTime::now_utc()),
+            SecretStatus::Declared => r.fallback == crate::domain::secret::model::Fallback::None,
+        }
+    }
 }
 
 impl Default for FakeSecretRepo {
@@ -710,8 +818,7 @@ impl SecretRepo for FakeSecretRepo {
         let best = rows
             .iter()
             .filter(|r| {
-                r.status == SecretStatus::Active
-                    && r.expires_at.is_none_or(|at| at > OffsetDateTime::now_utc())
+                Self::resolution_eligible(r)
                     && r.reference == key_str
                     && chain.contains(&r.tenant_id.0)
                     && match r.sharing {
@@ -747,6 +854,34 @@ impl SecretRepo for FakeSecretRepo {
         Ok(result)
     }
 
+    async fn resolve_candidates(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        key: &SecretRef,
+        chain: &[Uuid],
+    ) -> Result<Vec<SecretRow>, DomainError> {
+        let rows = self.rows.lock().expect("lock");
+        let key_str = key.as_ref();
+        let candidates = rows
+            .iter()
+            .filter(|r| {
+                r.reference == key_str
+                    && chain.contains(&r.tenant_id.0)
+                    && if r.tenant_id == req_tenant {
+                        match r.sharing {
+                            SharingMode::Private => r.owner_id.0 == subject.0,
+                            SharingMode::Tenant | SharingMode::Shared => true,
+                        }
+                    } else {
+                        r.sharing == SharingMode::Shared && Self::resolution_eligible(r)
+                    }
+            })
+            .cloned()
+            .collect();
+        Ok(candidates)
+    }
+
     async fn find_own(
         &self,
         _scope: &AccessScope,
@@ -761,7 +896,7 @@ impl SecretRepo for FakeSecretRepo {
             .filter(|r| {
                 r.tenant_id == tenant
                     && r.reference == key_str
-                    && r.status == SecretStatus::Active
+                    && matches!(r.status, SecretStatus::Active | SecretStatus::Declared)
                     && match r.sharing {
                         SharingMode::Private => r.owner_id.0 == subject.0,
                         _ => true,
@@ -784,7 +919,7 @@ impl SecretRepo for FakeSecretRepo {
         let row = rows.iter().find(|r| {
             r.tenant_id == tenant
                 && r.reference == key_str
-                && r.status == SecretStatus::Active
+                && matches!(r.status, SecretStatus::Active | SecretStatus::Declared)
                 && match sharing {
                     SharingMode::Private => {
                         r.sharing == SharingMode::Private && r.owner_id == subject
@@ -885,12 +1020,13 @@ impl SecretRepo for FakeSecretRepo {
             owner_id: new.owner_id,
             status: SecretStatus::Active,
             version: 1,
+            updated_at: OffsetDateTime::now_utc(),
             secret_type_uuid: new.secret_type_uuid,
             expires_at: new.expires_at,
             value_id: Some(new.value_id),
             value_fp: Some(new.value_fp.clone()),
             fp_key_id: Some(new.fp_key_id),
-            fallback: crate::domain::secret::model::Fallback::Inherit,
+            fallback: new.fallback,
         });
         drop(rows);
         self.gc
@@ -910,6 +1046,7 @@ impl SecretRepo for FakeSecretRepo {
         id: Uuid,
         expected_version: Option<i64>,
         sharing: SharingMode,
+        fallback: crate::domain::secret::model::Fallback,
         expires_at: Option<OffsetDateTime>,
         new_value_id: ValueId,
         value_fp: Vec<u8>,
@@ -932,7 +1069,7 @@ impl SecretRepo for FakeSecretRepo {
         let mut rows = self.rows.lock().expect("lock");
         let row = rows.iter_mut().find(|r| {
             r.id == id
-                && r.status == SecretStatus::Active
+                && matches!(r.status, SecretStatus::Active | SecretStatus::Declared)
                 && expected_version.is_none_or(|v| r.version == v)
         });
         let Some(row) = row else {
@@ -943,8 +1080,11 @@ impl SecretRepo for FakeSecretRepo {
         row.value_fp = Some(value_fp);
         row.fp_key_id = Some(fp_key_id);
         row.sharing = sharing;
+        row.fallback = fallback;
         row.expires_at = expires_at;
+        row.status = SecretStatus::Active;
         row.version += 1;
+        row.updated_at = OffsetDateTime::now_utc();
         let updated = row.clone();
         drop(rows);
 
@@ -957,6 +1097,69 @@ impl SecretRepo for FakeSecretRepo {
                 value_id: old_id,
                 tenant_id: updated.tenant_id,
                 reason: GcReason::Superseded,
+                enqueued_at: OffsetDateTime::now_utc(),
+            });
+        }
+        Ok(Some((updated, old_value_id)))
+    }
+
+    async fn update_metadata(
+        &self,
+        _scope: &AccessScope,
+        id: Uuid,
+        expected_version: Option<i64>,
+        sharing: SharingMode,
+        fallback: crate::domain::secret::model::Fallback,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Result<Option<SecretRow>, DomainError> {
+        let mut rows = self.rows.lock().expect("lock");
+        let row = rows
+            .iter_mut()
+            .find(|r| r.id == id && expected_version.is_none_or(|v| r.version == v));
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        row.sharing = sharing;
+        row.fallback = fallback;
+        row.expires_at = expires_at;
+        row.version += 1;
+        row.updated_at = OffsetDateTime::now_utc();
+        Ok(Some(row.clone()))
+    }
+
+    async fn remove_value(
+        &self,
+        _scope: &AccessScope,
+        id: Uuid,
+        expected_version: Option<i64>,
+        sharing: SharingMode,
+        fallback: crate::domain::secret::model::Fallback,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+        let mut rows = self.rows.lock().expect("lock");
+        let row = rows
+            .iter_mut()
+            .find(|r| r.id == id && expected_version.is_none_or(|v| r.version == v));
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let old_value_id = row.value_id.take();
+        row.value_fp = None;
+        row.fp_key_id = None;
+        row.status = SecretStatus::Declared;
+        row.sharing = sharing;
+        row.fallback = fallback;
+        row.expires_at = expires_at;
+        row.version += 1;
+        row.updated_at = OffsetDateTime::now_utc();
+        let updated = row.clone();
+        drop(rows);
+
+        if let Some(old_id) = old_value_id {
+            self.gc.lock().expect("lock").push(GcEntry {
+                value_id: old_id,
+                tenant_id: updated.tenant_id,
+                reason: GcReason::Removed,
                 enqueued_at: OffsetDateTime::now_utc(),
             });
         }

@@ -1,155 +1,129 @@
-//! Consumer contract for tenant-scoped credential operations.
+//! Consumer contract for tenant-scoped credential operations (ADR-0004: the
+//! credential surface).
 //!
-//! Defines anti-enumerating reads and explicit optimistic-concurrency semantics
-//! for create, update, and delete operations.
+//! Defines anti-enumerating reads and explicit optimistic-concurrency
+//! semantics for the record and its value as two separate representations —
+//! see [`crate::models::Credential`] and [`crate::models::Secret`].
 
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
 
 use crate::error::CredStoreError;
 use crate::models::{
-    GetSecretResponse, SecretRef, SecretValue, SharingMode, WriteOptions, WritePrecondition,
+    Credential, CredentialPatch, CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef,
+    Validator, WritePrecondition,
 };
 
-/// Consumer-facing API trait for credential storage operations.
+/// Consumer-facing API trait for credential storage operations. Six methods,
+/// none named `create` or `read_secrets`: `put` under
+/// [`PutPrecondition::CreateOnly`] **is** create, and the collection read
+/// (`list`, with `$select=secret` for bulk value reads) is Phase 3.
 #[async_trait]
 pub trait CredStoreClientV1: Send + Sync {
-    /// Retrieves a secret by reference, applying hierarchical resolution.
+    /// Retrieves the credential **record** by reference, applying
+    /// hierarchical resolution. Never carries the value — see
+    /// [`Self::get_secret`].
     ///
-    /// Returns `Ok(Some(_))` with the value and metadata when an accessible
-    /// secret is found, `Ok(None)` when none exists or is inaccessible (a
-    /// single 404 surface that prevents enumeration), and
-    /// `Err(AccessDenied)` only when the caller lacks read permission.
+    /// Returns `Ok(Some(_))` for an accessible record — including one whose
+    /// caller-tenant row is `declared` (no value) — `Ok(None)` when the
+    /// reference resolves to nothing the caller may see (a single 404
+    /// surface that prevents enumeration), and `Err(AccessDenied)` only when
+    /// the PDP evaluation itself cannot be completed.
+    ///
+    /// Requires the `read` action.
     async fn get(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError>;
+    ) -> Result<Option<Credential>, CredStoreError>;
 
-    /// Updates an existing secret with default [`WriteOptions`]: the type is
-    /// preserved and so is the expiry
-    /// ([`ExpiryWrite::Preserve`](crate::ExpiryWrite::Preserve)), so a value
-    /// rotation never strips an existing expiry. Use [`Self::put_opts`] to set
-    /// or clear it explicitly.
+    /// Retrieves the resolved **value**, applying hierarchical resolution. A
+    /// winning record with no value (`declared`, or `suppressed`) is the
+    /// canonical miss — `Ok(None)`, identical to "does not exist".
     ///
-    /// # Concurrency
+    /// Requires the `read_secret` action.
+    async fn get_secret(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+    ) -> Result<Option<Secret>, CredStoreError>;
+
+    /// Creates or replaces the whole credential — record and value together,
+    /// in one call. `precondition` carries the intent:
+    /// [`PutPrecondition::CreateOnly`] fails with [`CredStoreError::Conflict`]
+    /// if the caller's own tenant already holds a record under the
+    /// reference; [`PutPrecondition::Exists`] / [`PutPrecondition::Matches`]
+    /// fail the same way if it does not (a `put` under either never
+    /// creates).
     ///
-    /// Every write names its concurrency stance — `precondition` is required,
-    /// there is no unconditional overwrite:
+    /// Requires **both** `write` and `write_secret`, evaluated before any
+    /// side effect — a caller missing either fails the whole request.
     ///
-    /// * Read-modify-write callers (must not overwrite a concurrent update)
-    ///   pass [`WritePrecondition::Matches`] with the `(id, version)` from the
-    ///   [`GetSecretResponse`] they derived the new value from — the
-    ///   in-process `If-Match` — and handle [`CredStoreError::Conflict`] by
-    ///   re-reading. The generation-bound validator also closes the ABA hole
-    ///   (a validator from a deleted-and-recreated secret never matches).
-    /// * Blind create-or-replace flows (rotation / provisioning controllers
-    ///   that own their references, where the new value is not derived from
-    ///   the stored one) pass [`WritePrecondition::Exists`] — an explicit
-    ///   last-writer-wins overwrite, `create` + retry when the secret may not
-    ///   exist yet. Under immutable value versions (ADR-0006) `Exists` means
-    ///   exactly ordinary last-writer-wins with no other role: recovering a
-    ///   fence-poisoned reference (ADR-0003) is an ordinary new write too
-    ///   (any precondition), since there is no "same key" left to re-`PUT`
-    ///   into — a fenced `GET` still fails closed with `Ok(None)`, but no
-    ///   special healing path exists to obtain a version validator from.
+    /// # Errors
     ///
-    /// A `put` never creates: the target must exist, and a missing target
-    /// fails the precondition with [`CredStoreError::Conflict`] regardless of
-    /// the variant. Use [`Self::create`] for the create path (the only
-    /// preconditionless write).
+    /// Returns [`CredStoreError::Conflict`] on a failed precondition (create
+    /// found an existing row, or replace found none) or a lost CAS.
+    /// Returns [`CredStoreError::TypeViolation`] on a trait violation, an
+    /// unresolvable type, or an attempted type change (`TYPE_IMMUTABLE`) —
+    /// including creating over a reference that currently resolves to an
+    /// ancestor's `shared` record of a different type
+    /// (`TYPE_MISMATCH_WITH_INHERITED`).
     async fn put(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
-        self.put_opts(
-            ctx,
-            key,
-            value,
-            sharing,
-            precondition,
-            WriteOptions::default(),
-        )
-        .await
-    }
+        write: CredentialWrite,
+        precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError>;
 
-    /// Updates an existing secret with explicit [`WriteOptions`] (secret type,
-    /// expiry). The type is immutable: an `opts.secret_type` differing from
-    /// the existing secret's type is rejected. A failed `precondition` yields
-    /// [`CredStoreError::Conflict`] — see [`Self::put`] for the concurrency
-    /// contract.
+    /// Applies a partial change to the record, the value, or both — RFC 7396
+    /// JSON Merge Patch semantics: a field present is applied exactly as
+    /// [`Self::put`] would apply it, a field absent is left untouched.
+    /// `patch.value` present as [`crate::models::PatchField::Null`] removes
+    /// the value (the record becomes `declared`); as
+    /// [`crate::models::PatchField::Set`] it rotates/creates it.
     ///
-    /// The default implementation reports the operation as unsupported so
-    /// value-store test doubles that only override [`Self::get`] stay valid;
-    /// real gear clients override it.
-    async fn put_opts(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        precondition: WritePrecondition,
-        opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
-        let _ = (ctx, key, value, sharing, precondition, opts);
-        Err(CredStoreError::internal(
-            "put_opts is not supported by this CredStoreClientV1 implementation",
-        ))
-    }
-
-    /// Creates a secret, failing with [`CredStoreError::Conflict`] if one of the
-    /// same sharing class already exists (create-only — the 409 path behind the
-    /// REST `POST`, and the only write without a precondition). Use
-    /// [`Self::put`] to update an existing secret.
-    async fn create(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-    ) -> Result<(), CredStoreError> {
-        self.create_opts(ctx, key, value, sharing, WriteOptions::default())
-            .await
-    }
-
-    /// Create-only variant of [`Self::put_opts`]. See it for the default
-    /// implementation contract.
-    async fn create_opts(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
-        let _ = (ctx, key, value, sharing, opts);
-        Err(CredStoreError::internal(
-            "create_opts is not supported by this CredStoreClientV1 implementation",
-        ))
-    }
-
-    /// Deletes a secret, guarded by a required optimistic-concurrency
-    /// [`WritePrecondition`] (the in-process equivalent of a REST `If-Match`
-    /// delete; [`WritePrecondition::Exists`] is the explicit
-    /// delete-whatever-is-there form). A failed precondition yields
-    /// [`CredStoreError::Conflict`].
+    /// The action set is derived from the body: any metadata field present
+    /// (`sharing`/`fallback`/`secret_type`/`expires_at`) requires `write`;
+    /// `value` present (`Set` or `Null`) requires `write_secret`; both
+    /// present require both — all required actions are evaluated before any
+    /// side effect. Never creates: no own record under the reference is
+    /// [`CredStoreError::NotFound`].
     ///
-    /// The default implementation reports the operation as unsupported so
-    /// value-store test doubles that only override [`Self::get`] stay valid;
-    /// real gear clients override it.
+    /// A patch whose metadata equals the current record and carries no
+    /// `value` key is a no-op: it returns the current validator unchanged,
+    /// without bumping the version.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredStoreError::NotFound`] if the caller holds no own
+    /// record under the reference.
+    /// Returns [`CredStoreError::Conflict`] on a failed precondition.
+    /// Returns [`CredStoreError::TypeViolation`] on an empty patch
+    /// (`EMPTY_PATCH`), a trait violation, or a `secret_type` differing from
+    /// the stored one (`TYPE_IMMUTABLE`).
+    async fn patch(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        patch: CredentialPatch,
+        precondition: WritePrecondition,
+    ) -> Result<Validator, CredStoreError>;
+
+    /// Deletes the caller's own-tenant credential (record and value
+    /// together), guarded by the mandatory `precondition`. Releases the
+    /// reference at once.
+    ///
+    /// Requires the `delete` action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredStoreError::NotFound`] if no own-tenant record exists.
+    /// Returns [`CredStoreError::Conflict`] on a failed precondition.
     async fn delete(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
         precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
-        let _ = (ctx, key, precondition);
-        Err(CredStoreError::internal(
-            "delete is not supported by this CredStoreClientV1 implementation",
-        ))
-    }
+    ) -> Result<(), CredStoreError>;
 }

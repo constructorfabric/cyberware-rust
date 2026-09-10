@@ -16,7 +16,7 @@ use uuid::Uuid;
 pub use helpers::{CredstoreDbProvider, SecretRepoImpl};
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{GcEntry, GcReason, NewSecret, SecretRow};
+use crate::domain::secret::model::{Fallback, GcEntry, GcReason, NewSecret, SecretRow};
 use crate::domain::secret::repo::SecretRepo;
 
 #[async_trait]
@@ -29,6 +29,16 @@ impl SecretRepo for SecretRepoImpl {
         chain: &[Uuid],
     ) -> Result<Option<SecretRow>, DomainError> {
         reads::resolve_for_get(self, req_tenant, subject, key, chain).await
+    }
+
+    async fn resolve_candidates(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        key: &SecretRef,
+        chain: &[Uuid],
+    ) -> Result<Vec<SecretRow>, DomainError> {
+        reads::resolve_candidates(self, req_tenant, subject, key, chain).await
     }
 
     async fn find_own(
@@ -94,6 +104,7 @@ impl SecretRepo for SecretRepoImpl {
         id: Uuid,
         expected_version: Option<i64>,
         sharing: SharingMode,
+        fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
         new_value_id: ValueId,
         value_fp: Vec<u8>,
@@ -105,10 +116,53 @@ impl SecretRepo for SecretRepoImpl {
             id,
             expected_version,
             sharing,
+            fallback,
             expires_at,
             new_value_id,
             value_fp,
             fp_key_id,
+        )
+        .await
+    }
+
+    async fn update_metadata(
+        &self,
+        scope: &AccessScope,
+        id: Uuid,
+        expected_version: Option<i64>,
+        sharing: SharingMode,
+        fallback: Fallback,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Result<Option<SecretRow>, DomainError> {
+        writes::update_metadata(
+            self,
+            scope,
+            id,
+            expected_version,
+            sharing,
+            fallback,
+            expires_at,
+        )
+        .await
+    }
+
+    async fn remove_value(
+        &self,
+        scope: &AccessScope,
+        id: Uuid,
+        expected_version: Option<i64>,
+        sharing: SharingMode,
+        fallback: Fallback,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+        writes::remove_value(
+            self,
+            scope,
+            id,
+            expected_version,
+            sharing,
+            fallback,
+            expires_at,
         )
         .await
     }

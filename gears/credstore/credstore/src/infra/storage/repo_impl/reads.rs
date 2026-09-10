@@ -9,7 +9,7 @@ use toolkit_security::{AccessScope, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{SecretRow, SecretStatus};
+use crate::domain::secret::model::{Fallback, SecretRow, SecretStatus};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
 use crate::infra::storage::entity;
 use crate::infra::storage::repo_impl::helpers::{
@@ -23,6 +23,53 @@ fn scope_err_to_domain(e: ScopeError) -> DomainError {
     }
 }
 
+/// Resolution-eligible statuses (ADR-0004, Suppression): `active` and not
+/// expired, or `declared` with `fallback = none` (a suppressing row that
+/// competes and blocks regardless of any stale `expires_at` it carries — a
+/// suppression policy does not expire). A `declared`/`inherit` row is
+/// excluded by construction — it is simply not one of these two `(status,
+/// fallback)` shapes.
+fn resolution_eligible_condition() -> Condition {
+    Condition::any()
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
+                .add(
+                    Condition::any()
+                        .add(entity::secrets::Column::ExpiresAt.is_null())
+                        .add(
+                            entity::secrets::Column::ExpiresAt.gt(time::OffsetDateTime::now_utc()),
+                        ),
+                ),
+        )
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Status.eq(SecretStatus::Declared.as_smallint()))
+                .add(entity::secrets::Column::Fallback.eq(Fallback::None.as_smallint())),
+        )
+}
+
+/// Sharing-visibility predicate for `tenant`'s own rows: private rows only
+/// for `subject`, tenant/shared rows visible to the whole tenant. Shared by
+/// [`resolve_for_get`], [`resolve_candidates`] and (indirectly) `find_own`.
+fn own_tenant_visibility_condition(tenant: Uuid, subject: Uuid) -> Condition {
+    Condition::any()
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Private)))
+                .add(entity::secrets::Column::TenantId.eq(tenant))
+                .add(entity::secrets::Column::OwnerId.eq(subject)),
+        )
+        .add(
+            Condition::all()
+                .add(entity::secrets::Column::Sharing.is_in([
+                    sharing_to_i16(SharingMode::Tenant),
+                    sharing_to_i16(SharingMode::Shared),
+                ]))
+                .add(entity::secrets::Column::TenantId.eq(tenant)),
+        )
+}
+
 pub(super) async fn resolve_for_get(
     repo: &SecretRepoImpl,
     req_tenant: TenantId,
@@ -34,24 +81,18 @@ pub(super) async fn resolve_for_get(
     let req = req_tenant.0;
     // resolve_for_get applies its own chain + sharing predicates;
     // PDP authorization runs upstream. allow_all skips the scope WHERE clamp.
-    // The predicate stays `status = active` in Phase 1 (ADR-0006): a
-    // `declared` row is never a resolution candidate yet.
+    // The predicate is `status = active OR (status = declared AND fallback =
+    // none)` (ADR-0004, Suppression): a suppressing row competes and, when
+    // nearest, wins — the walk stops there rather than falling through.
     let rows = entity::secrets::Entity::find()
         .secure()
         .scope_with(&AccessScope::allow_all())
         .filter(Condition::all().add(entity::secrets::Column::Reference.eq(key.as_ref())))
-        .filter(
-            Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
-        )
-        // Expired secrets resolve as not-found (write paths still see the
-        // row: overwrite refreshes it, delete revokes it, the maintenance
-        // job sweeps it).
-        .filter(
-            Condition::any()
-                .add(entity::secrets::Column::ExpiresAt.is_null())
-                .add(entity::secrets::Column::ExpiresAt.gt(time::OffsetDateTime::now_utc())),
-        )
+        // Expired `active` secrets resolve as not-found (write paths still
+        // see the row: overwrite refreshes it, delete revokes it, the
+        // maintenance job sweeps it); embedded in the eligibility condition
+        // so it never weakens `declared`/`none` suppression.
+        .filter(resolution_eligible_condition())
         .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
         // Visibility by sharing class, within the ancestor `chain`:
         //   * Private — own tenant + owner only (`tenant_id == req AND
@@ -100,6 +141,50 @@ pub(super) async fn resolve_for_get(
     best.map(entity_to_model).transpose()
 }
 
+pub(super) async fn resolve_candidates(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    subject: OwnerId,
+    key: &SecretRef,
+    chain: &[Uuid],
+) -> Result<Vec<SecretRow>, DomainError> {
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
+
+    // Own tenant: every sharing-visible row, any status (so the record view
+    // can report a `declared` own row's `status`/`fallback`/validator even
+    // though it never resolves). Ancestors: `shared` rows only, and only
+    // those that pass the resolution predicate — an ancestor's
+    // `declared`/`inherit` row is invisible here exactly as it is to a value
+    // read (ADR-0004, ADR-0005 "Reducing a reference to one item").
+    let mut visibility = Condition::any().add(
+        Condition::all()
+            .add(entity::secrets::Column::TenantId.eq(req))
+            .add(own_tenant_visibility_condition(req, subject.0)),
+    );
+    if !ancestors.is_empty() {
+        visibility = visibility.add(
+            Condition::all()
+                .add(entity::secrets::Column::TenantId.is_in(ancestors))
+                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
+                .add(resolution_eligible_condition()),
+        );
+    }
+
+    let rows = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(Condition::all().add(entity::secrets::Column::Reference.eq(key.as_ref())))
+        .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
+        .filter(visibility)
+        .all(&conn)
+        .await
+        .map_err(scope_err_to_domain)?;
+
+    rows.into_iter().map(entity_to_model).collect()
+}
+
 pub(super) async fn find_own(
     repo: &SecretRepoImpl,
     scope: &AccessScope,
@@ -108,8 +193,10 @@ pub(super) async fn find_own(
     key: &SecretRef,
 ) -> Result<Option<SecretRow>, DomainError> {
     let conn = repo.db.conn()?;
-    // Active rows only — there is no delete saga to resume any more
-    // (ADR-0006): `delete_by_id` is one transaction.
+    // Active or declared — there is no delete saga to resume any more
+    // (ADR-0006: `delete_by_id` is one transaction), but a `declared` row is
+    // a legitimate "own record" `patch`/`delete` must be able to find
+    // (ADR-0004).
     let rows = entity::secrets::Entity::find()
         .secure()
         .scope_with(scope)
@@ -117,7 +204,10 @@ pub(super) async fn find_own(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
+                .add(entity::secrets::Column::Status.is_in([
+                    SecretStatus::Active.as_smallint(),
+                    SecretStatus::Declared.as_smallint(),
+                ]))
                 .add(
                     Condition::any()
                         .add(
@@ -174,7 +264,10 @@ pub(super) async fn find_for_write(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
+                .add(entity::secrets::Column::Status.is_in([
+                    SecretStatus::Active.as_smallint(),
+                    SecretStatus::Declared.as_smallint(),
+                ]))
                 .add(class),
         )
         .one(&conn)

@@ -1,6 +1,6 @@
-//! Authorization policy-enforcement helpers for typed secrets.
+//! Authorization policy-enforcement helpers for typed credentials.
 //!
-//! Builds the concrete GTS resource type for each secret and converts PDP
+//! Builds the concrete GTS resource type for each credential and converts PDP
 //! decisions into tenant-scoped [`AccessScope`]
 //! values or fail-closed domain errors.
 
@@ -9,25 +9,41 @@ use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 
 use crate::domain::error::DomainError;
 
-/// PDP resource type for a concrete secret type: the full derived GTS id
+/// PDP resource type for a concrete credential type: the full derived GTS id
 /// (design §5.4), e.g.
-/// `gts.cf.core.credstore.secret.v1~cf.core.credstore.api_key.v1~`.
+/// `gts.cf.core.credstore.credential.v1~cf.core.credstore.api_key.v1~`.
 ///
 /// This is the **only** resource type credstore evaluates: every operation
-/// authorizes against the secret's full concrete type (including `generic`),
-/// so policies can target any type without a separate base-type gate. The id
-/// comes from the per-operation types-registry resolution
+/// authorizes against the credential's full concrete type (including
+/// `generic`), so policies can target any type without a separate base-type
+/// gate. The id comes from the per-operation types-registry resolution
 /// ([`crate::domain::secret::type_resolver::ResolvedSecretType::gts_id`]),
 /// so dynamically registered types are addressable without a release.
 #[must_use]
-pub fn secret_type_resource(gts_id: &str) -> ResourceType {
+pub fn credential_type_resource(gts_id: &str) -> ResourceType {
     ResourceType::new(gts_id.to_owned(), &[pep_properties::OWNER_TENANT_ID])
 }
 
+/// The six PDP actions ADR-0004 replaces the shipped `read`/`write`/`delete`
+/// with: plain verbs for the record, `_secret`-suffixed verbs for the value.
+/// `LIST` is evaluated by the collection read (Phase 3, ADR-0005) — defined
+/// here now so the vocabulary is complete and stable.
 pub mod actions {
+    /// Collection read (Phase 3). Also implied by `read` (a record reader
+    /// can list what it can read), per ADR-0004's "Implications between the
+    /// actions".
+    pub const LIST: &str = "list";
+    /// Point read of the credential record (`GET /credentials/{ref}`).
     pub const READ: &str = "read";
+    /// `PUT`/`PATCH` of any metadata field (`sharing`, `fallback`,
+    /// `expires_at`, `secret_type` on replace).
     pub const WRITE: &str = "write";
+    /// `DELETE /credentials/{ref}`.
     pub const DELETE: &str = "delete";
+    /// Point read of the value (`GET /credentials/{ref}/secret`).
+    pub const READ_SECRET: &str = "read_secret";
+    /// `PUT`/`PATCH` of the `value` field.
+    pub const WRITE_SECRET: &str = "write_secret";
 }
 
 /// Map a PEP enforcement failure to a domain error (fail-closed).

@@ -19,9 +19,9 @@ fn catalog_names_and_ids_are_unique_and_well_formed() {
     for d in SECRET_TYPE_CATALOG {
         assert!(
             d.gts_id.starts_with(&format!(
-                "{GTS_ID_PREFIX}cf.core.credstore.secret.v1~cf.core.credstore."
+                "{GTS_ID_PREFIX}cf.core.credstore.credential.v1~cf.core.credstore."
             )),
-            "{} not derived from the secret base type",
+            "{} not derived from the credential base type",
             d.name
         );
         assert!(d.gts_id.ends_with(".v1~"));

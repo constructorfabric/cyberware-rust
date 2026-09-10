@@ -1,12 +1,13 @@
 //! GTS-based secret types and their enforceable traits.
 //!
-//! A *secret type* classifies a secret and binds the handling rules the
+//! A *secret type* classifies a credential and binds the handling rules the
 //! gear enforces uniformly — most importantly which [`SharingMode`]s the
-//! type permits. Every type is a GTS type derived from the credstore secret
-//! base type ([`crate::SECRET_RESOURCE_TYPE`]):
+//! type permits. Every type is a GTS type derived from the credstore
+//! credential base type ([`crate::CREDENTIAL_RESOURCE_TYPE`]), renamed from
+//! `secret.v1~` to `credential.v1~` by ADR-0004 (§5.4):
 //!
 //! ```text
-//! gts.cf.core.credstore.secret.v1~cf.core.credstore.<name>.v1~
+//! gts.cf.core.credstore.credential.v1~cf.core.credstore.<name>.v1~
 //! ```
 //!
 //! The catalog below is the single source of truth for the traits; each
@@ -183,7 +184,7 @@ const BASIC_AUTH_SCHEMA: &str = r#"{
 pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     SecretTypeDescriptor {
         name: "generic",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.generic.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"),
         allow_sharing: ALL,
         value_schema: None,
         max_size_bytes: None,
@@ -193,7 +194,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "api-key",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.api_key.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.api_key.v1~"),
         allow_sharing: ALL,
         value_schema: None,
         max_size_bytes: Some(8 * 1024),
@@ -203,7 +204,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "personal-token",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.personal_token.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.personal_token.v1~"),
         allow_sharing: PRIVATE_ONLY,
         value_schema: None,
         max_size_bytes: Some(8 * 1024),
@@ -213,7 +214,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "oauth2-client",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.oauth2_client.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.oauth2_client.v1~"),
         allow_sharing: TENANT_SHARED,
         value_schema: Some(OAUTH2_CLIENT_SCHEMA),
         max_size_bytes: Some(16 * 1024),
@@ -223,7 +224,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "basic-auth",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.basic_auth.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.basic_auth.v1~"),
         allow_sharing: ALL,
         value_schema: Some(BASIC_AUTH_SCHEMA),
         max_size_bytes: Some(16 * 1024),
@@ -233,7 +234,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "bearer-token",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.bearer_token.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.bearer_token.v1~"),
         allow_sharing: PRIVATE_TENANT,
         value_schema: None,
         max_size_bytes: Some(64 * 1024),
@@ -243,7 +244,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "certificate",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.certificate.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.certificate.v1~"),
         allow_sharing: TENANT_SHARED,
         value_schema: None,
         max_size_bytes: Some(256 * 1024),
@@ -253,7 +254,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "ssh-key",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.ssh_key.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.ssh_key.v1~"),
         allow_sharing: PRIVATE_TENANT,
         value_schema: None,
         max_size_bytes: Some(64 * 1024),
@@ -263,7 +264,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "webhook-hmac",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.webhook_hmac.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.webhook_hmac.v1~"),
         allow_sharing: TENANT_SHARED,
         value_schema: None,
         max_size_bytes: Some(8 * 1024),
@@ -273,7 +274,7 @@ pub const SECRET_TYPE_CATALOG: &[SecretTypeDescriptor] = &[
     },
     SecretTypeDescriptor {
         name: "connection-string",
-        gts_id: gts_id!("cf.core.credstore.secret.v1~cf.core.credstore.connection_string.v1~"),
+        gts_id: gts_id!("cf.core.credstore.credential.v1~cf.core.credstore.connection_string.v1~"),
         allow_sharing: TENANT_ONLY,
         value_schema: None,
         max_size_bytes: Some(4 * 1024),
@@ -373,7 +374,15 @@ pub fn type_uuid(gts_id: &str) -> Option<Uuid> {
 /// the value the `credstore_secrets.secret_type_uuid` column DEFAULT uses.
 /// Pinned by `type_uuid_is_deterministic_and_matches_registry_v5` so the
 /// migration default and the computed id can never drift.
-pub const GENERIC_TYPE_UUID_STR: &str = "2a8aac98-cf09-58ed-acd6-f599f35cb5bf";
+///
+/// **Changed by ADR-0004** (§5.4): the base type rename
+/// (`secret.v1~` → `credential.v1~`) changes the v5 UUID of every derived
+/// type, including `generic`, so this constant is re-pinned alongside it —
+/// a constant change while the gear has no production rows (`m0001`'s
+/// migration-time DEFAULT uses this constant directly, so it picks up the
+/// new value automatically); afterwards, renaming the base type is a data
+/// migration.
+pub const GENERIC_TYPE_UUID_STR: &str = "c57822de-3aae-58b7-b712-71d907c999e2";
 
 /// UUID v5 namespace the SDK's deterministic identifiers are derived under.
 ///

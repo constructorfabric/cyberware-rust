@@ -26,7 +26,7 @@ use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{GcReason, NewSecret, SecretStatus};
+use crate::domain::secret::model::{Fallback, GcReason, NewSecret, SecretStatus};
 use crate::domain::secret::repo::SecretRepo;
 use crate::infra::storage::entity;
 use crate::infra::storage::migrations::Migrator;
@@ -76,6 +76,7 @@ fn new_secret(
         value_id,
         value_fp: vec![7u8; 32],
         fp_key_id: 1,
+        fallback: Fallback::Inherit,
     }
 }
 
@@ -91,6 +92,13 @@ async fn seed_active(
     let value_id = ValueId::new_v4();
     let new = new_secret(tenant, owner, key, sharing, value_id);
     let id = new.id;
+    // Mirror the real write protocol's step 2 (record intent) before step 4
+    // (`insert_active`): `insert_active_tx` now requires its own gc-pending
+    // delete to affect exactly one row (it rolls back otherwise), matching
+    // `switch_value_tx`'s intent-claim check.
+    repo.gc_insert_pending(value_id, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     repo.insert_active(&AccessScope::for_tenant(tenant), &new)
         .await
         .expect("insert_active");
@@ -268,12 +276,16 @@ async fn switch_value_bumps_version_and_enqueues_old_as_superseded() {
     let (id, old_value) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
 
     let new_value = ValueId::new_v4();
+    repo.gc_insert_pending(new_value, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     let (row, old) = repo
         .switch_value(
             &scope,
             id,
             None,
             SharingMode::Tenant,
+            Fallback::Inherit,
             None,
             new_value,
             vec![9u8; 32],
@@ -314,6 +326,7 @@ async fn switch_value_version_mismatch_returns_none_without_touching_gc() {
             id,
             Some(99), // stale
             SharingMode::Tenant,
+            Fallback::Inherit,
             None,
             new_value,
             vec![9u8; 32],
@@ -350,6 +363,7 @@ async fn switch_value_missing_row_returns_none() {
             Uuid::new_v4(),
             None,
             SharingMode::Tenant,
+            Fallback::Inherit,
             None,
             ValueId::new_v4(),
             vec![9u8; 32],
@@ -368,14 +382,19 @@ async fn switch_value_with_matching_expected_version_bumps() {
     let scope = AccessScope::for_tenant(tenant);
     let (id, _old) = seed_active(&repo, tenant, owner, "ver", SharingMode::Tenant).await;
 
+    let new_value = ValueId::new_v4();
+    repo.gc_insert_pending(new_value, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     let (row, _) = repo
         .switch_value(
             &scope,
             id,
             Some(1),
             SharingMode::Tenant,
+            Fallback::Inherit,
             None,
-            ValueId::new_v4(),
+            new_value,
             vec![9u8; 32],
             1,
         )
@@ -445,6 +464,9 @@ async fn delete_then_create_only_put_under_the_same_reference_succeeds() {
 
     let new_value = ValueId::new_v4();
     let new = new_secret(tenant, owner, "reused", SharingMode::Tenant, new_value);
+    repo.gc_insert_pending(new_value, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     repo.insert_active(&scope, &new)
         .await
         .expect("recreate under the same reference immediately succeeds");
@@ -472,17 +494,18 @@ async fn list_expired_matches_only_active_rows_past_expiry() {
     let mut new = new_secret(tenant, owner, "expired", SharingMode::Tenant, value_id);
     new.id = expired_id;
     new.expires_at = Some(time::OffsetDateTime::now_utc() - TimeDuration::seconds(5));
+    repo.gc_insert_pending(value_id, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     repo.insert_active(&scope, &new).await.expect("insert");
 
     // A live (unexpired) row is untouched by the listing.
-    let mut live = new_secret(
-        tenant,
-        owner,
-        "living",
-        SharingMode::Tenant,
-        ValueId::new_v4(),
-    );
+    let live_value_id = ValueId::new_v4();
+    let mut live = new_secret(tenant, owner, "living", SharingMode::Tenant, live_value_id);
     live.expires_at = Some(time::OffsetDateTime::now_utc() + TimeDuration::hours(1));
+    repo.gc_insert_pending(live_value_id, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     repo.insert_active(&scope, &live)
         .await
         .expect("insert live");
@@ -504,6 +527,9 @@ async fn delete_expired_row_enqueues_its_version_and_is_idempotent() {
     let mut new = new_secret(tenant, owner, "expired", SharingMode::Tenant, value_id);
     new.expires_at = Some(time::OffsetDateTime::now_utc() - TimeDuration::seconds(5));
     let id = new.id;
+    repo.gc_insert_pending(value_id, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     repo.insert_active(&scope, &new).await.expect("insert");
 
     let removed = repo
@@ -820,16 +846,14 @@ async fn secret_type_round_trips_through_storage() {
     let tenant = Uuid::new_v4();
     let owner = Uuid::new_v4();
     let scope = AccessScope::for_tenant(tenant);
-    let mut new = new_secret(
-        tenant,
-        owner,
-        "typed",
-        SharingMode::Private,
-        ValueId::new_v4(),
-    );
+    let value_id = ValueId::new_v4();
+    let mut new = new_secret(tenant, owner, "typed", SharingMode::Private, value_id);
     new.secret_type_uuid = SecretType::from_name("personal-token")
         .expect("known")
         .uuid();
+    repo.gc_insert_pending(value_id, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
     repo.insert_active(&scope, &new).await.expect("insert");
 
     let row = repo
@@ -950,5 +974,520 @@ async fn scope_includes_tenant_or_of_constraints_admits_on_broad_alternative() {
             .await
             .expect("broad OR alternative admits"),
         "a whole-tenant alternative must still grant despite a narrower sibling"
+    );
+}
+
+// ── ADR-0004: update_metadata, remove_value, widened find_own/find_for_write,
+//    widened resolve_for_get (suppression), resolve_candidates ──────────────
+
+#[tokio::test]
+async fn update_metadata_bumps_version_and_leaves_value_untouched() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, value_id) = seed_active(&repo, tenant, owner, "meta", SharingMode::Tenant).await;
+
+    let row = repo
+        .update_metadata(
+            &scope,
+            id,
+            Some(1),
+            SharingMode::Shared,
+            Fallback::None,
+            None,
+        )
+        .await
+        .expect("update_metadata")
+        .expect("row updated");
+    assert_eq!(row.version, 2);
+    assert_eq!(row.sharing, SharingMode::Shared);
+    assert_eq!(row.fallback, Fallback::None);
+    assert_eq!(row.value_id, Some(value_id), "value untouched");
+    assert_eq!(row.status, SecretStatus::Active, "status untouched");
+}
+
+#[tokio::test]
+async fn update_metadata_version_mismatch_returns_none() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _) = seed_active(&repo, tenant, owner, "meta-stale", SharingMode::Tenant).await;
+
+    let result = repo
+        .update_metadata(
+            &scope,
+            id,
+            Some(99),
+            SharingMode::Shared,
+            Fallback::None,
+            None,
+        )
+        .await
+        .expect("update_metadata");
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn remove_value_declares_row_and_enqueues_old_value_as_removed() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, value_id) = seed_active(&repo, tenant, owner, "rm", SharingMode::Tenant).await;
+
+    let (row, old) = repo
+        .remove_value(
+            &scope,
+            id,
+            Some(1),
+            SharingMode::Tenant,
+            Fallback::None,
+            None,
+        )
+        .await
+        .expect("remove_value")
+        .expect("row updated");
+    assert_eq!(row.status, SecretStatus::Declared);
+    assert_eq!(row.value_id, None);
+    assert_eq!(row.value_fp, None);
+    assert_eq!(row.fp_key_id, None);
+    assert_eq!(row.fallback, Fallback::None);
+    assert_eq!(row.version, 2);
+    assert_eq!(old, Some(value_id));
+
+    let gc = repo.gc_list(100).await.expect("gc_list");
+    let entry = gc
+        .iter()
+        .find(|e| e.value_id == value_id)
+        .expect("old value enqueued for gc");
+    assert_eq!(entry.reason, GcReason::Removed);
+}
+
+#[tokio::test]
+async fn remove_value_on_already_declared_row_returns_no_old_value() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _) = seed_active(&repo, tenant, owner, "rm-twice", SharingMode::Tenant).await;
+
+    let (declared, _) = repo
+        .remove_value(
+            &scope,
+            id,
+            Some(1),
+            SharingMode::Tenant,
+            Fallback::None,
+            None,
+        )
+        .await
+        .expect("remove_value")
+        .expect("row updated");
+    assert_eq!(declared.status, SecretStatus::Declared);
+
+    // Idempotent re-send: metadata equal, no value to enqueue this time.
+    let (row, old) = repo
+        .remove_value(
+            &scope,
+            id,
+            Some(2),
+            SharingMode::Tenant,
+            Fallback::None,
+            None,
+        )
+        .await
+        .expect("remove_value")
+        .expect("row still updated (version bumps)");
+    assert_eq!(row.status, SecretStatus::Declared);
+    assert_eq!(old, None);
+}
+
+#[tokio::test]
+async fn remove_value_version_mismatch_returns_none() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _) = seed_active(&repo, tenant, owner, "rm-stale", SharingMode::Tenant).await;
+
+    let result = repo
+        .remove_value(
+            &scope,
+            id,
+            Some(99),
+            SharingMode::Tenant,
+            Fallback::None,
+            None,
+        )
+        .await
+        .expect("remove_value");
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn switch_value_accepts_a_declared_row_and_reactivates_it() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _old) = seed_active(&repo, tenant, owner, "reactivate", SharingMode::Tenant).await;
+    repo.remove_value(
+        &scope,
+        id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::None,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("declared");
+
+    let new_value = ValueId::new_v4();
+    repo.gc_insert_pending(new_value, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
+    let (row, old) = repo
+        .switch_value(
+            &scope,
+            id,
+            Some(2),
+            SharingMode::Tenant,
+            Fallback::Inherit,
+            None,
+            new_value,
+            vec![3u8; 32],
+            1,
+        )
+        .await
+        .expect("switch_value")
+        .expect("declared row reactivated");
+    assert_eq!(row.status, SecretStatus::Active);
+    assert_eq!(row.value_id, Some(new_value));
+    assert_eq!(row.fallback, Fallback::Inherit);
+    assert_eq!(old, None, "the declared row had no value to supersede");
+}
+
+#[tokio::test]
+async fn find_own_and_find_for_write_see_a_declared_row() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _) = seed_active(&repo, tenant, owner, "own-declared", SharingMode::Tenant).await;
+    repo.remove_value(
+        &scope,
+        id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::Inherit,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("declared");
+
+    let own = repo
+        .find_own(
+            &scope,
+            TenantId(tenant),
+            OwnerId(owner),
+            &sref("own-declared"),
+        )
+        .await
+        .expect("find_own")
+        .expect("declared row is still an own record");
+    assert_eq!(own.status, SecretStatus::Declared);
+
+    let for_write = repo
+        .find_for_write(
+            &scope,
+            TenantId(tenant),
+            OwnerId(owner),
+            &sref("own-declared"),
+            SharingMode::Tenant,
+        )
+        .await
+        .expect("find_for_write")
+        .expect("declared row addressed for a create-only conflict check");
+    assert_eq!(for_write.id, id);
+}
+
+#[tokio::test]
+async fn resolve_for_get_suppressed_row_blocks_the_walk() {
+    let repo = setup().await;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+
+    seed_active(&repo, parent, owner, "suppressed", SharingMode::Shared).await;
+    let (child_id, _) = seed_active(&repo, child, owner, "suppressed", SharingMode::Tenant).await;
+    let scope = AccessScope::for_tenant(child);
+    repo.remove_value(
+        &scope,
+        child_id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::None,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("declared/none");
+
+    let resolved = repo
+        .resolve_for_get(
+            TenantId(child),
+            OwnerId(owner),
+            &sref("suppressed"),
+            &[child, parent],
+        )
+        .await
+        .expect("resolve");
+    let winner = resolved.expect("the declared/none row itself is the winner (it blocks)");
+    assert_eq!(winner.tenant_id, TenantId(child));
+    assert_eq!(winner.status, SecretStatus::Declared);
+    assert_eq!(winner.fallback, Fallback::None);
+}
+
+#[tokio::test]
+async fn resolve_for_get_declared_inherit_row_never_competes() {
+    let repo = setup().await;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+
+    seed_active(&repo, parent, owner, "inherit-through", SharingMode::Shared).await;
+    let (child_id, _) =
+        seed_active(&repo, child, owner, "inherit-through", SharingMode::Tenant).await;
+    let scope = AccessScope::for_tenant(child);
+    repo.remove_value(
+        &scope,
+        child_id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::Inherit,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("declared/inherit");
+
+    let resolved = repo
+        .resolve_for_get(
+            TenantId(child),
+            OwnerId(owner),
+            &sref("inherit-through"),
+            &[child, parent],
+        )
+        .await
+        .expect("resolve")
+        .expect("the ancestor's shared row must still resolve");
+    assert_eq!(resolved.tenant_id, TenantId(parent));
+    assert_eq!(resolved.status, SecretStatus::Active);
+}
+
+#[tokio::test]
+async fn resolve_candidates_includes_own_declared_row_and_ancestor_shared_row() {
+    let repo = setup().await;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+
+    seed_active(&repo, parent, owner, "cand", SharingMode::Shared).await;
+    let (child_id, _) = seed_active(&repo, child, owner, "cand", SharingMode::Tenant).await;
+    let scope = AccessScope::for_tenant(child);
+    repo.remove_value(
+        &scope,
+        child_id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::Inherit,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("declared/inherit");
+
+    let candidates = repo
+        .resolve_candidates(
+            TenantId(child),
+            OwnerId(owner),
+            &sref("cand"),
+            &[child, parent],
+        )
+        .await
+        .expect("resolve_candidates");
+
+    assert_eq!(
+        candidates.len(),
+        2,
+        "own declared row + ancestor shared row"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|r| r.tenant_id == TenantId(child) && r.status == SecretStatus::Declared),
+        "own declared/inherit row must be visible for record-view reporting"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|r| r.tenant_id == TenantId(parent) && r.status == SecretStatus::Active),
+        "ancestor's resolving shared row must be visible"
+    );
+}
+
+// ── hardening: intent-claim check rolls back a reclaimed write ──────────────
+
+#[tokio::test]
+async fn insert_active_rolls_back_when_intent_already_reclaimed() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let value_id = ValueId::new_v4();
+    // No `gc_insert_pending`: simulates the maintenance job's pending-reclaim
+    // pass having already deleted the intent (and the backend bytes) before
+    // this transaction runs — `insert_active_tx`'s own gc-delete must then
+    // affect 0 rows and roll the whole transaction back.
+    let new = new_secret(tenant, owner, "orphaned", SharingMode::Tenant, value_id);
+    let err = repo
+        .insert_active(&AccessScope::for_tenant(tenant), &new)
+        .await
+        .expect_err("must roll back when the intent was already reclaimed");
+    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
+
+    let resolved = repo
+        .resolve_for_get(
+            TenantId(tenant),
+            OwnerId(owner),
+            &sref("orphaned"),
+            &[tenant],
+        )
+        .await
+        .expect("resolve");
+    assert!(
+        resolved.is_none(),
+        "the row insert must have rolled back entirely"
+    );
+}
+
+#[tokio::test]
+async fn switch_value_rolls_back_when_intent_already_reclaimed() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, old_value) = seed_active(&repo, tenant, owner, "k", SharingMode::Tenant).await;
+
+    let new_value = ValueId::new_v4();
+    // No `gc_insert_pending` for `new_value`: same reclaimed-intent scenario.
+    let err = repo
+        .switch_value(
+            &scope,
+            id,
+            Some(1),
+            SharingMode::Tenant,
+            Fallback::Inherit,
+            None,
+            new_value,
+            vec![1u8; 32],
+            1,
+        )
+        .await
+        .expect_err("must roll back when the intent was already reclaimed");
+    assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
+
+    let row = repo
+        .resolve_for_get(TenantId(tenant), OwnerId(owner), &sref("k"), &[tenant])
+        .await
+        .expect("resolve")
+        .expect("row");
+    assert_eq!(
+        row.value_id,
+        Some(old_value),
+        "the row must still point at the original value"
+    );
+    assert_eq!(row.version, 1, "the version must be unchanged");
+}
+
+// ── hardening: delete_expired_row re-checks expiry under the lock ───────────
+
+#[tokio::test]
+async fn delete_expired_row_skips_a_row_no_longer_expired() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let (id, _value_id) = seed_active(&repo, tenant, owner, "extended", SharingMode::Tenant).await;
+    let scope = AccessScope::for_tenant(tenant);
+    // Simulate a client PUT/PATCH extending the expiry between the job's
+    // `list_expired` snapshot and its delete transaction.
+    repo.update_metadata(
+        &scope,
+        id,
+        Some(1),
+        SharingMode::Tenant,
+        Fallback::Inherit,
+        Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1)),
+    )
+    .await
+    .expect("update_metadata")
+    .expect("row updated");
+
+    let removed = repo
+        .delete_expired_row(id)
+        .await
+        .expect("delete_expired_row");
+    assert_eq!(
+        removed, None,
+        "a row no longer expired must be skipped, not deleted"
+    );
+    let row = repo
+        .resolve_for_get(
+            TenantId(tenant),
+            OwnerId(owner),
+            &sref("extended"),
+            &[tenant],
+        )
+        .await
+        .expect("resolve");
+    assert!(row.is_some(), "the row must survive");
+}
+
+#[tokio::test]
+async fn resolve_candidates_excludes_ancestor_declared_inherit_row() {
+    let repo = setup().await;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+
+    let (parent_id, _) = seed_active(&repo, parent, owner, "hidden", SharingMode::Shared).await;
+    let parent_scope = AccessScope::for_tenant(parent);
+    repo.remove_value(
+        &parent_scope,
+        parent_id,
+        Some(1),
+        SharingMode::Shared,
+        Fallback::Inherit,
+        None,
+    )
+    .await
+    .expect("remove_value")
+    .expect("ancestor declared/inherit");
+
+    let candidates = repo
+        .resolve_candidates(
+            TenantId(child),
+            OwnerId(owner),
+            &sref("hidden"),
+            &[child, parent],
+        )
+        .await
+        .expect("resolve_candidates");
+    assert!(
+        candidates.is_empty(),
+        "an ancestor's declared/inherit row must not be a candidate at all"
     );
 }

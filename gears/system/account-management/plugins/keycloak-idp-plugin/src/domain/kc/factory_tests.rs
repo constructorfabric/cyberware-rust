@@ -10,8 +10,8 @@ use crate::domain::test_support::{NoopMetrics, StubCredStore, keycloak_cfg};
 use crate::infra::kc_http::ReqwestKcTransport;
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
-    TenantId, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialPatch, CredentialWrite, PutOutcome,
+    PutPrecondition, Secret, SecretRef, SecretValue, Validator, WritePrecondition,
 };
 use parking_lot::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,32 +20,29 @@ use uuid::Uuid;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Stub that hands back one canned response per `get` call. `GetSecretResponse`
+/// Stub that hands back one canned response per `get_secret` call. `Secret`
 /// is not `Clone`, so we `take()` from a `Mutex<Option<_>>`.
 #[domain_model]
 #[derive(Default)]
 struct StubOnce {
-    response: StdMutex<Option<GetSecretResponse>>,
+    response: StdMutex<Option<Secret>>,
 }
 
 #[async_trait]
 impl CredStoreClientV1 for StubOnce {
-    async fn create(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-    ) -> Result<(), CredStoreError> {
-        self.put(ctx, key, value, sharing, WritePrecondition::Exists)
-            .await
-    }
-
     async fn get(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+    ) -> Result<Option<Credential>, CredStoreError> {
+        Ok(None)
+    }
+
+    async fn get_secret(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<Option<Secret>, CredStoreError> {
         Ok(self.response.lock().take())
     }
 
@@ -53,11 +50,29 @@ impl CredStoreClientV1 for StubOnce {
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-        _value: SecretValue,
-        _sharing: SharingMode,
+        _write: CredentialWrite,
+        _precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
+        Ok(PutOutcome {
+            created: true,
+            validator: Validator {
+                id: Uuid::nil(),
+                version: 1,
+            },
+        })
+    }
+
+    async fn patch(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
-        Ok(())
+    ) -> Result<Validator, CredStoreError> {
+        Ok(Validator {
+            id: Uuid::nil(),
+            version: 1,
+        })
     }
 
     async fn delete(
@@ -132,15 +147,15 @@ async fn factory_with_tls_ca_bundle_ref_loads_bundle() {
     // CredStore stub returns a fresh self-signed PEM under any ref id.
     let pem = make_test_ca_pem();
     let stub = Arc::new(StubOnce {
-        response: StdMutex::new(Some(GetSecretResponse {
-            value: SecretValue::from(pem.as_str()),
-            id: uuid::Uuid::nil(),
+        response: StdMutex::new(Some(Secret {
+            reference: SecretRef::new("platform-ca-bundle").expect("valid SecretRef"),
             secret_type: String::new(),
             expires_at: None,
-            owner_tenant_id: TenantId::nil(),
-            sharing: SharingMode::Tenant,
-            is_inherited: false,
-            version: 1,
+            value: SecretValue::from(pem.as_str()),
+            validator: Validator {
+                id: Uuid::nil(),
+                version: 1,
+            },
         })),
     });
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));
@@ -185,15 +200,15 @@ async fn factory_with_invalid_tls_ca_bundle_fails_init() {
     let bad_pem =
         "-----BEGIN CERTIFICATE-----\nnot-valid-base64-content!!!\n-----END CERTIFICATE-----\n";
     let stub = Arc::new(StubOnce {
-        response: StdMutex::new(Some(GetSecretResponse {
-            value: SecretValue::from(bad_pem),
-            id: uuid::Uuid::nil(),
+        response: StdMutex::new(Some(Secret {
+            reference: SecretRef::new("platform-ca-bundle").expect("valid SecretRef"),
             secret_type: String::new(),
             expires_at: None,
-            owner_tenant_id: TenantId::nil(),
-            sharing: SharingMode::Tenant,
-            is_inherited: false,
-            version: 1,
+            value: SecretValue::from(bad_pem),
+            validator: Validator {
+                id: Uuid::nil(),
+                version: 1,
+            },
         })),
     });
     let reader = CredStoreReader::new(stub, build_system_ctx(Uuid::nil()));

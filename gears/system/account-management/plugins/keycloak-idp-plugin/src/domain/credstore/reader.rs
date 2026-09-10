@@ -43,7 +43,7 @@ impl CredStoreReader {
     ///   (the plugin only stores UTF-8 client secrets — non-UTF-8 indicates
     ///   storage corruption or a key collision with another consumer).
     pub async fn get(&self, key: &SecretRef) -> Result<Option<SecretString>, CredStoreError> {
-        let response = self.inner.get(&self.system_ctx, key).await?;
+        let response = self.inner.get_secret(&self.system_ctx, key).await?;
         let Some(response) = response else {
             return Ok(None);
         };

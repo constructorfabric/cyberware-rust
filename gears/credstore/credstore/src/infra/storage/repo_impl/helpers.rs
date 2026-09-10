@@ -56,6 +56,7 @@ pub(crate) fn entity_to_model(m: entity::secrets::Model) -> Result<SecretRow, Do
         owner_id: OwnerId(m.owner_id),
         status,
         version: m.version,
+        updated_at: m.updated_at,
         // Opaque here: the domain layer resolves the UUID to the type id +
         // traits via the types-registry, so non-catalog types round-trip.
         secret_type_uuid: m.secret_type_uuid,

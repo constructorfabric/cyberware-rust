@@ -6,7 +6,7 @@
 //! garbage-collection intent/work-queue entries, all persisted separately
 //! from secret values.
 
-use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, ValueId, WriteOptions};
+use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, ValueId};
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -26,8 +26,11 @@ pub enum SecretStatus {
     /// The row resolves and points at a value (`value_id IS NOT NULL`).
     Active,
     /// The row holds its reference but carries no value (`value_id IS
-    /// NULL`), reached only via a value-removal write. Never a resolution
-    /// candidate in Phase 1 (`resolve_for_get` still filters `status = 2`).
+    /// NULL`), reached only via a value-removal write (`PATCH {"value":
+    /// null}`, or a `PATCH` that suppresses an active row in the same
+    /// transaction). A resolution candidate only when its `fallback` is
+    /// `None` (ADR-0004, Suppression): `status = 2 OR (status = 4 AND
+    /// fallback = 2)`.
     Declared,
 }
 impl SecretStatus {
@@ -53,11 +56,10 @@ impl SecretStatus {
     }
 }
 
-/// Suppression policy for a `declared` row (ADR-0004, modelled here because
-/// `m0002` stores it alongside the two-status/pointer schema). Phase 1 never
-/// writes `None` — no write path produces a `declared` row yet — but the
-/// column and its decode/encode live in the domain now so the storage layer
-/// and future write paths share one representation.
+/// Suppression policy for a `declared` row (ADR-0004): a record's policy for
+/// the time it holds no value. `write` sets it (`PUT`, or `PATCH
+/// {"fallback": …}`); it is stored on every row (both `Active` and
+/// `Declared`) and consulted only while the row is `Declared`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
@@ -87,6 +89,24 @@ impl Fallback {
     }
 }
 
+impl From<credstore_sdk::Fallback> for Fallback {
+    fn from(f: credstore_sdk::Fallback) -> Self {
+        match f {
+            credstore_sdk::Fallback::Inherit => Self::Inherit,
+            credstore_sdk::Fallback::None => Self::None,
+        }
+    }
+}
+
+impl From<Fallback> for credstore_sdk::Fallback {
+    fn from(f: Fallback) -> Self {
+        match f {
+            Fallback::Inherit => Self::Inherit,
+            Fallback::None => Self::None,
+        }
+    }
+}
+
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct SecretRow {
@@ -99,6 +119,10 @@ pub struct SecretRow {
     /// Monotonic version (optimistic-locking); 1 on create, bumped by every
     /// successful value switch or metadata update.
     pub version: i64,
+    /// Last-write instant; bumped alongside `version` by every successful
+    /// value switch or metadata update. Surfaced on `Credential` for the
+    /// caller's own row only (ADR-0004).
+    pub updated_at: OffsetDateTime,
     /// Deterministic v5 UUID of the secret's GTS type id (the stored
     /// representation); immutable for the row's lifetime. Resolved to the
     /// type id + traits via the types-registry per operation.
@@ -117,81 +141,25 @@ pub struct SecretRow {
     pub value_fp: Option<Vec<u8>>,
     /// Fence-key id `value_fp` was computed under; `Some` iff `value_fp` is.
     pub fp_key_id: Option<i16>,
-    /// Suppression policy; only consulted for a `Declared` row's fallback
-    /// competition (ADR-0004). Always `Inherit` in Phase 1.
+    /// Suppression policy of this row (ADR-0004): consulted only while the
+    /// row is `Declared` — an `Active` row's own value always wins,
+    /// `fallback` stays stored but not consulted.
     pub fallback: Fallback,
 }
 
-/// Everything a write needs beyond identity and value: sharing mode,
-/// create-only vs update, optimistic-concurrency precondition, and typed
-/// options (secret type + expiry).
-#[domain_model]
-#[derive(Debug, Clone, Default)]
-pub struct WriteSpec {
-    pub sharing: SharingMode,
-    pub create_only: bool,
-    /// Mandatory for updates (`Some` from [`Self::update`]), absent only on
-    /// the create path (`None` from [`Self::create`]) — creates are the one
-    /// preconditionless write.
-    pub precondition: Option<WritePrecondition>,
-    pub opts: WriteOptions,
-    /// When overwriting an existing secret, keep the stored sharing mode
-    /// instead of applying `sharing`. Set for a PUT that omitted `sharing`, so
-    /// a value rotation (`{"value": "..."}`) never silently narrows a `shared`
-    /// secret back to `tenant`. `sharing` is still the class selector.
-    pub preserve_sharing: bool,
-}
-
-impl WriteSpec {
-    /// Update of an existing secret with default options. The
-    /// optimistic-concurrency precondition is mandatory: a version validator
-    /// for read-modify-write, [`WritePrecondition::Exists`] for an explicit
-    /// last-writer-wins overwrite. An update never creates.
-    #[must_use]
-    pub fn update(sharing: SharingMode, precondition: WritePrecondition) -> Self {
-        Self {
-            sharing,
-            precondition: Some(precondition),
-            ..Self::default()
-        }
-    }
-
-    /// Create-only (409 on same-class duplicate) with default options.
-    #[must_use]
-    pub fn create(sharing: SharingMode) -> Self {
-        Self {
-            sharing,
-            create_only: true,
-            ..Self::default()
-        }
-    }
-
-    /// Attach typed write options (secret type, expiry).
-    #[must_use]
-    pub fn with_opts(mut self, opts: WriteOptions) -> Self {
-        self.opts = opts;
-        self
-    }
-
-    /// Preserve the existing secret's sharing on overwrite (see field docs).
-    #[must_use]
-    pub fn preserve_sharing(mut self, preserve: bool) -> Self {
-        self.preserve_sharing = preserve;
-        self
-    }
-}
-
-/// Optimistic-concurrency precondition for a write, parsed from `If-Match`.
+/// Optimistic-concurrency precondition for `patch`/`delete`, parsed from
+/// `If-Match`. `put` uses the distinct [`PutPrecondition`], which additionally
+/// carries the create-only intent (`If-None-Match: *`).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WritePrecondition {
-    /// `If-Match: *` — the target secret must already exist.
+    /// `If-Match: *` — the target credential must already exist.
     Exists,
     /// `If-Match: "<id>.<version>"` — the generation-bound strong validator.
-    /// `id` is the row UUID (a fresh one per recreated secret), so a
-    /// validator from a deleted-and-recreated secret's earlier generation can
-    /// never match the current row even when the version counters coincide
-    /// (no ABA); `version` is the per-row monotonic counter.
+    /// `id` is the row UUID (a fresh one per recreated credential), so a
+    /// validator from a deleted-and-recreated credential's earlier generation
+    /// can never match the current row even when the version counters
+    /// coincide (no ABA); `version` is the per-row monotonic counter.
     Version {
         /// Row (generation) UUID the caller's validator was minted for.
         id: Uuid,
@@ -201,6 +169,32 @@ pub enum WritePrecondition {
     /// `If-Match: "<id>.<v>", "<id2>.<v2>", …` — a multi-valued list (RFC 7232
     /// §3.1). The precondition is satisfied if the current row matches **any**
     /// listed `(id, version)` validator.
+    AnyVersion(Vec<(Uuid, i64)>),
+}
+
+/// Precondition for `put` (ADR-0004, "Two write verbs on one resource"):
+/// distinguishes create-only from a guarded or unconditional replace, parsed
+/// from `If-None-Match`/`If-Match`.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutPrecondition {
+    /// `If-None-Match: *` — create-only; `Conflict` if the caller's own
+    /// tenant already holds a row under the reference (of any status —
+    /// `declared` counts as "holds a row" too).
+    CreateOnly,
+    /// `If-Match: *` — replace, last-writer-wins; `Conflict` (mapped to
+    /// [`crate::domain::error::DomainError::VersionConflict`] by the caller,
+    /// mirroring `WritePrecondition::Exists`) if no own row exists.
+    Exists,
+    /// `If-Match: "<id>.<version>"` — guarded replace.
+    Version {
+        /// Row (generation) UUID the caller's validator was minted for.
+        id: Uuid,
+        /// Version counter the caller last observed.
+        version: i64,
+    },
+    /// `If-Match: "<id>.<v>", "<id2>.<v2>", …` — a multi-valued list (RFC 7232
+    /// §3.1); satisfied if the current row matches **any** listed validator.
     AnyVersion(Vec<(Uuid, i64)>),
 }
 
@@ -223,6 +217,9 @@ pub struct NewSecret {
     pub value_fp: Vec<u8>,
     /// Fence-key id `value_fp` was computed under.
     pub fp_key_id: i16,
+    /// Suppression policy carried into the row at create time (ADR-0004);
+    /// `PUT`'s default is [`Fallback::Inherit`] when the body omits it.
+    pub fallback: Fallback,
 }
 
 /// Why a `credstore_value_gc` entry was enqueued (`reason` column,

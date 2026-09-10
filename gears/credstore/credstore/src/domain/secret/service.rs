@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 
 use authz_resolver_sdk::PolicyEnforcer;
 use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV1, GetSecretResponse, OwnerId, SecretRef, SecretValue,
-    SharingMode, TenantId, ValueId,
+    CredStoreError, CredStorePluginClientV1, Credential, CredentialPatch, CredentialStatus,
+    CredentialWrite, Fallback as SdkFallback, InheritanceStatus, OwnerId, PatchField, PutOutcome,
+    Secret, SecretRef, SecretValue, SharingMode, TenantId, Validator, ValueId,
 };
 use tokio::time::sleep;
 use toolkit_macros::domain_model;
@@ -26,12 +27,12 @@ use crate::domain::ports::metrics::{
 };
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
-use credstore_sdk::SecretType;
 use time::OffsetDateTime;
 
 use crate::domain::secret::fence;
 use crate::domain::secret::model::{
-    GcEntry, GcReason, NewSecret, SecretRow, WritePrecondition, WriteSpec,
+    Fallback, GcEntry, GcReason, NewSecret, PutPrecondition, SecretRow, SecretStatus,
+    WritePrecondition,
 };
 use crate::domain::secret::repo::SecretRepo;
 use crate::domain::secret::type_resolver::{ResolvedSecretType, SecretTypeResolver};
@@ -98,6 +99,13 @@ pub fn map_plugin_err(e: CredStoreError) -> DomainError {
         CredStoreError::TypeViolation { reason, detail } => DomainError::Internal {
             diagnostic: format!(
                 "plugin returned TypeViolation (detail redacted, {} bytes)",
+                reason.len() + detail.len()
+            ),
+            cause: None,
+        },
+        CredStoreError::InvalidRequest { reason, detail } => DomainError::Internal {
+            diagnostic: format!(
+                "plugin returned InvalidRequest (detail redacted, {} bytes)",
                 reason.len() + detail.len()
             ),
             cause: None,
@@ -492,30 +500,217 @@ impl Service {
         Ok(fence::compute_fp(key.as_slice(), value.as_bytes()))
     }
 
-    /// Retrieve a secret, walking up the tenant hierarchy.
+    /// Retrieve the credential **record** (ADR-0004). See
+    /// [`Self::resolve_credential`] for the resolution/reduction this
+    /// delegates to; the SDK contract never needs the winning row's identity
+    /// this method's sibling carries for the REST layer's weak `ETag`.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
-    /// Returns [`DomainError::NotFound`] if the plugin has no value for a
-    /// resolved row's current `value_id` even after one retry against the
-    /// row's re-read, current pointer.
     pub async fn get(
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, DomainError> {
+    ) -> Result<Option<Credential>, DomainError> {
+        Ok(self
+            .resolve_credential(ctx, key)
+            .await?
+            .map(|(credential, _weak_validator_source)| credential))
+    }
+
+    /// Retrieve the credential **record** (ADR-0004), walking up the tenant
+    /// hierarchy to determine the effective row and reducing it with the
+    /// caller's own row (ADR-0005 "Reducing a reference to one item").
+    /// Never carries the value — see [`Self::get_secret`].
+    ///
+    /// Returns the assembled [`Credential`] together with the winning row's
+    /// `(id, version)` whenever the caller holds no own row — the REST
+    /// layer's weak-`ETag` source (ADR-0004, D4): `Credential::validator`
+    /// stays `None` in that case (the caller has no row of its own to hold a
+    /// real validator for), so the weak hash has to come from here instead.
+    /// Not part of the SDK contract, hence not [`Self::get`] itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    pub async fn resolve_credential(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+    ) -> Result<Option<(Credential, Option<(Uuid, i64)>)>, DomainError> {
         let req = TenantId(ctx.subject_tenant_id());
         let subject = OwnerId(ctx.subject_id());
         let chain = self.dir.ancestor_chain(ctx, req).await?;
 
-        // Resolve first (prefetch — AUTHZ_USAGE_SCENARIOS S09): a secret that does
-        // not resolve is a 404 without consulting the PDP; there is nothing to
-        // authorize.
+        let candidates = self
+            .repo
+            .resolve_candidates(req, subject, key, &chain)
+            .await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        // The caller's own row: two-phase priority, private beats non-private
+        // at the same (own) tenant — mirrors `find_own`/`resolve_for_get`.
+        let own = candidates
+            .iter()
+            .filter(|r| r.tenant_id == req)
+            .min_by_key(|r| i32::from(r.sharing != SharingMode::Private));
+
+        // The winner: nearest row that actually resolves — `active` and not
+        // expired, or `declared` with `fallback: none` (a suppressing row
+        // that competes and blocks). A `declared`/`inherit` row never
+        // competes (ADR-0004, Suppression; ADR-0005, "Reducing a reference
+        // to one item").
+        let now = OffsetDateTime::now_utc();
+        let resolvable = |r: &&SecretRow| match r.status {
+            SecretStatus::Active => r.expires_at.is_none_or(|at| at > now),
+            SecretStatus::Declared => r.fallback == Fallback::None,
+        };
+        let pos = |t: TenantId| chain.iter().position(|c| *c == t.0).unwrap_or(usize::MAX);
+        let winner = candidates.iter().filter(resolvable).min_by(|a, b| {
+            pos(a.tenant_id)
+                .cmp(&pos(b.tenant_id))
+                .then((a.sharing != SharingMode::Private).cmp(&(b.sharing != SharingMode::Private)))
+        });
+
+        let Some(effective) = own.or(winner) else {
+            // Nothing resolves and the caller holds no row at all.
+            return Ok(None);
+        };
+
+        let inheritance = if let Some(w) = winner {
+            if w.status == SecretStatus::Declared {
+                // A declared/none winner blocks the walk — the caller's own
+                // row or an ancestor's, either way the outcome is the same
+                // name (ADR-0004, Suppression).
+                InheritanceStatus::Suppressed
+            } else if own.is_some_and(|o| o.id == w.id) {
+                let ancestor_candidate_exists = candidates.iter().any(|r| r.tenant_id != req);
+                if ancestor_candidate_exists {
+                    InheritanceStatus::Overridden
+                } else {
+                    InheritanceStatus::Own
+                }
+            } else {
+                InheritanceStatus::Inherited
+            }
+        } else {
+            // Nothing resolves; the caller has an own row (declared/inherit,
+            // or an expired-active row with nothing behind it) — reported as
+            // `Own` (ADR-0004: "choose Own and document").
+            InheritanceStatus::Own
+        };
+
+        let resolved = self.resolve_stored(effective.secret_type_uuid).await?;
+
+        // Single PDP evaluation, on the effective record's full concrete
+        // type, gated on the *caller's* tenant. A PDP denial or an
+        // out-of-scope tenant is indistinguishable from a missing record
+        // (anti-enumeration 404); a PDP or registry *outage* propagates.
+        let scope = match self
+            .scope_for_timed(
+                ctx,
+                &authz::credential_type_resource(&resolved.gts_id),
+                actions::READ,
+            )
+            .await
+        {
+            Ok(scope) => scope,
+            Err(DomainError::AccessDenied { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !self.repo.scope_includes_tenant(&scope, req.0).await? {
+            self.metrics.cross_tenant_denied();
+            return Ok(None);
+        }
+
+        let (status, fallback, version, updated_at, owner_id, validator) = match own {
+            Some(o) => (
+                if o.status == SecretStatus::Active {
+                    CredentialStatus::Active
+                } else {
+                    CredentialStatus::Declared
+                },
+                Some(SdkFallback::from(o.fallback)),
+                Some(o.version),
+                Some(o.updated_at),
+                Some(o.owner_id),
+                Some(Validator {
+                    id: o.id,
+                    version: o.version,
+                }),
+            ),
+            None => (CredentialStatus::None, None, None, None, None, None),
+        };
+
+        // `own` is `None` here only when `winner` is `Some` (we already
+        // returned `Ok(None)` above when both were absent), so this is the
+        // weak-`ETag` source whenever the caller holds no own row.
+        let weak_validator_source = if own.is_none() {
+            winner.map(|w| (w.id, w.version))
+        } else {
+            None
+        };
+
+        Ok(Some((
+            Credential {
+                reference: key.clone(),
+                secret_type: resolved.gts_id,
+                sharing: effective.sharing,
+                fallback,
+                status,
+                inheritance,
+                version,
+                updated_at,
+                owner_id,
+                expires_at: effective.expires_at,
+                validator,
+            },
+            weak_validator_source,
+        )))
+    }
+
+    /// Retrieve the resolved **value** (ADR-0004), walking up the tenant
+    /// hierarchy. A winning record with no value (`declared`, including the
+    /// suppression case) is the canonical miss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::AccessDenied`] if the caller is out of scope.
+    /// Returns [`DomainError::NotFound`] if the reference resolves to nothing
+    /// (including a re-read that finds a different generation) after one
+    /// retry.
+    /// Returns [`DomainError::ServiceUnavailable`] if the plugin still has no
+    /// value for a row's current `value_id` on the retry — by protocol a
+    /// live pointer always names bytes that were durably written first, so
+    /// this is a backend inconsistency, not absence.
+    pub async fn get_secret(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+    ) -> Result<Option<Secret>, DomainError> {
+        let req = TenantId(ctx.subject_tenant_id());
+        let subject = OwnerId(ctx.subject_id());
+        let chain = self.dir.ancestor_chain(ctx, req).await?;
+
+        // Resolve first (prefetch — AUTHZ_USAGE_SCENARIOS S09): a reference
+        // that does not resolve is a 404 without consulting the PDP; there
+        // is nothing to authorize. The predicate already admits a
+        // `declared`/`none` suppressing row (ADR-0004) — such a winner
+        // carries no value, so the resolved row's `value_id` decides the
+        // canonical miss below.
         let Some(row) = self.repo.resolve_for_get(req, subject, key, &chain).await? else {
             self.metrics.read_outcome(ReadOutcome::Miss);
             return Ok(None);
         };
+        if row.value_id.is_none() {
+            // The winning row is `declared`/`none` (suppression): the walk
+            // stopped here and there is nothing to serve for this reference.
+            self.metrics.read_outcome(ReadOutcome::Miss);
+            return Ok(None);
+        }
 
         // Single PDP evaluation, on the secret's full concrete type (including
         // `generic`) as resolved from the types-registry, gated on the
@@ -529,8 +724,8 @@ impl Service {
         let scope = match self
             .scope_for_timed(
                 ctx,
-                &authz::secret_type_resource(&resolved.gts_id),
-                actions::READ,
+                &authz::credential_type_resource(&resolved.gts_id),
+                actions::READ_SECRET,
             )
             .await
         {
@@ -555,9 +750,6 @@ impl Service {
 
         let plugin = self.plugins.resolve().await?;
 
-        // A resolved row with no value_id ("declared") is never returned by
-        // resolve_for_get in Phase 1 (its predicate stays status = active),
-        // but guard the invariant explicitly rather than unwrap a None.
         let Some(value_id) = row.value_id else {
             return Err(DomainError::NotFound);
         };
@@ -603,7 +795,7 @@ impl Service {
             tracing::warn!(
                 tenant = %served_row.tenant_id.0,
                 key = %key.as_ref(),
-                "credstore get: value fingerprint mismatch; failing closed \
+                "credstore get_secret: value fingerprint mismatch; failing closed \
                  (the backend entry the row points to was altered or corrupted out of band; \
                  a fresh write recovers it)"
             );
@@ -617,24 +809,29 @@ impl Service {
             ReadOutcome::HitOwn
         });
 
-        Ok(Some(GetSecretResponse {
-            value,
-            id: served_row.id,
-            owner_tenant_id: served_row.tenant_id,
-            sharing: served_row.sharing,
-            is_inherited,
-            version: served_row.version,
+        Ok(Some(Secret {
+            reference: key.clone(),
             secret_type: resolved.gts_id,
             expires_at: served_row.expires_at,
+            value,
+            validator: Validator {
+                id: served_row.id,
+                version: served_row.version,
+            },
         }))
     }
 
     /// Read the backend value for `row`'s `value_id`, retrying once against a
     /// freshly re-resolved row if the plugin reports `NotFound` — the read
     /// landed a moment before a concurrent write switched the pointer and
-    /// cleaned up the old version. A second consecutive `NotFound` is a real
-    /// error (the version the row currently names is itself missing), mapped
-    /// onto [`DomainError::NotFound`].
+    /// cleaned up the old version. A second consecutive `NotFound` for a
+    /// `value_id` the fresh row still references is a backend inconsistency,
+    /// not absence — by protocol the backend `put` always precedes the row
+    /// CAS that names it (ADR-0006 §6.2), so a live pointer to missing bytes
+    /// can only mean the backend entry was corrupted or lost out of band —
+    /// mapped onto [`DomainError::ServiceUnavailable`] (retryable), not a
+    /// 404. A row found `declared` on the retry (suppressed/removed
+    /// concurrently) is a legitimate miss instead — `Ok(None)`.
     ///
     /// The retry re-runs the *same* `resolve_for_get` call (same requesting
     /// tenant/subject/key/chain) rather than looking up the row by id, per
@@ -675,6 +872,8 @@ impl Service {
             Ok(None) => {
                 let fresh = self.repo.resolve_for_get(req, subject, key, chain).await?;
                 let Some(fresh) = fresh else {
+                    // The reference itself is gone (deleted, not merely
+                    // rotated) — a genuine miss.
                     return Err(DomainError::NotFound);
                 };
                 if fresh.id != row.id {
@@ -683,14 +882,27 @@ impl Service {
                     return Err(DomainError::NotFound);
                 }
                 let Some(fresh_value_id) = fresh.value_id else {
-                    return Err(DomainError::NotFound);
+                    // The row was suppressed/declared concurrently — a
+                    // legitimate miss (ADR-0004), not a backend
+                    // inconsistency.
+                    return Ok(None);
                 };
                 match self
                     .plugin_get_timed(plugin, ctx, &fresh.tenant_id, fresh_value_id)
                     .await
                 {
                     Ok(Some(v)) => Ok(Some((v, fresh))),
-                    Ok(None) => Err(DomainError::NotFound),
+                    // By protocol the backend `put` always precedes the row
+                    // CAS that names it (ADR-0006 §6.2 steps 3-4), so a row
+                    // that still references this `value_id` after a
+                    // committed CAS names bytes that must exist; a second
+                    // consecutive miss here is a backend inconsistency, not
+                    // absence — fail as a retryable outage, not a 404.
+                    Ok(None) => Err(DomainError::ServiceUnavailable {
+                        detail: "value version missing in backend; retry".to_owned(),
+                        retry_after: None,
+                        cause: None,
+                    }),
                     Err(DomainError::AccessDenied { .. }) => Ok(None),
                     Err(e) => Err(e),
                 }
@@ -722,7 +934,8 @@ impl Service {
         result
     }
 
-    /// Create or update a secret.
+    /// Create or replace the whole credential — record and value together
+    /// (ADR-0004, "Two write verbs on one resource").
     ///
     /// A write targets the row of its own sharing class — `private` →
     /// `(tenant, ref, owner)`, `tenant`/`shared` → `(tenant, ref)` — so a private
@@ -736,9 +949,16 @@ impl Service {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::Conflict`] if `spec.create_only` and a secret of
-    /// the same sharing class already exists.
-    /// Returns [`DomainError::TypeViolation`] on a trait violation.
+    /// Returns [`DomainError::Conflict`] if [`PutPrecondition::CreateOnly`] and
+    /// the caller's own tenant already holds a row (of any status) under the
+    /// reference.
+    /// Returns [`DomainError::VersionConflict`] if a replace precondition
+    /// names no own row, or a version/generation mismatch.
+    /// Returns [`DomainError::TypeViolation`] on a trait violation, an
+    /// unresolvable type, a differing type on replace (`TYPE_IMMUTABLE`), a
+    /// missing type on create (`TYPE_REQUIRED`), or a create over a reference
+    /// that currently resolves to an ancestor's `shared` record of a
+    /// different type (`TYPE_MISMATCH_WITH_INHERITED`).
     #[allow(
         clippy::cognitive_complexity,
         clippy::too_many_lines,
@@ -749,58 +969,28 @@ impl Service {
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
-        value: SecretValue,
-        spec: WriteSpec,
-    ) -> Result<(), DomainError> {
-        let WriteSpec {
+        write: CredentialWrite,
+        precondition: PutPrecondition,
+    ) -> Result<PutOutcome, DomainError> {
+        let CredentialWrite {
+            secret_type,
             sharing,
-            create_only,
-            precondition,
-            opts,
-            preserve_sharing,
-        } = spec;
+            fallback,
+            expires_at,
+            value,
+        } = write;
+        let fallback = Fallback::from(fallback);
         let tenant = TenantId(ctx.subject_tenant_id());
         let owner = OwnerId(ctx.subject_id());
-
-        // Updates must state their concurrency stance — a version validator
-        // (read-modify-write CAS) or an explicit `Exists` (last-writer-wins).
-        // Create is the only preconditionless write.
-        if !create_only && precondition.is_none() {
-            return Err(DomainError::PreconditionRequired {
-                detail: "update requires an If-Match precondition (a version validator or `*`)"
-                    .to_owned(),
-            });
-        }
 
         // Fail fast if no plugin is available before touching metadata.
         let plugin = self.plugins.resolve().await?;
 
-        // When `sharing` was omitted (`preserve_sharing`), a value rotation
-        // targets the secret the owner would GET: a `private` secret is
-        // owner-scoped and wins over a coexisting non-private one, so rotate the
-        // private row if the caller has one under this reference; otherwise fall
-        // through to the non-private (tenant/shared) class.
-        let sharing = if preserve_sharing
-            && self
-                .repo
-                .find_for_write(
-                    &AccessScope::allow_all(),
-                    tenant,
-                    owner,
-                    key,
-                    SharingMode::Private,
-                )
-                .await?
-                .is_some()
-        {
-            SharingMode::Private
-        } else {
-            sharing
-        };
-
         // Prefetch the target row of this sharing class (own-tenant, keyed by
-        // tenant+owner+key+sharing) with `allow_all`; the single PDP evaluation
-        // runs once the secret's concrete type is known.
+        // tenant+owner+key+sharing, of either resting status — a `declared`
+        // row still "holds" the reference, ADR-0004) with `allow_all`; the
+        // single PDP evaluation runs once the credential's concrete type is
+        // known.
         if let Some(existing) = self
             .repo
             .find_for_write(&AccessScope::allow_all(), tenant, owner, key, sharing)
@@ -810,40 +1000,20 @@ impl Service {
             // Authorize on the concrete type BEFORE any 4xx that would reveal
             // the row exists.
             let scope = self
-                .scope_for_timed(
-                    ctx,
-                    &authz::secret_type_resource(&resolved.gts_id),
-                    actions::WRITE,
-                )
+                .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, true)
                 .await?;
-            if !self.repo.scope_includes_tenant(&scope, tenant.0).await? {
-                self.metrics.cross_tenant_denied();
-                return Err(DomainError::AccessDenied { cause: None });
-            }
 
-            if create_only {
+            if matches!(precondition, PutPrecondition::CreateOnly) {
                 return Err(DomainError::Conflict);
             }
-            let effective_sharing = if preserve_sharing {
-                existing.sharing
-            } else {
-                sharing
-            };
-            if (existing.sharing == SharingMode::Private)
-                != (effective_sharing == SharingMode::Private)
-            {
-                return Err(DomainError::UnsupportedTransition {
-                    detail: "cannot move between private and tenant/shared".into(),
-                });
-            }
-            if let Some(requested) = opts.secret_type.as_ref()
+            if let Some(requested) = secret_type.as_ref()
                 && requested.to_uuid() != existing.secret_type_uuid
             {
                 return Err(DomainError::TypeViolation {
                     field: "type",
                     reason: typing::reasons::TYPE_IMMUTABLE,
                     detail: format!(
-                        "secret is of type '{}'; changing it to '{}' is not supported",
+                        "credential is of type '{}'; changing it to '{}' is not supported",
                         resolved.gts_id, requested
                     ),
                 });
@@ -851,69 +1021,325 @@ impl Service {
             typing::validate_write(
                 &resolved.gts_id,
                 &resolved.traits,
-                effective_sharing,
+                sharing,
                 &value,
-                opts.expires_at.requested(),
+                expires_at,
             )?;
-            let expected_version = Self::precheck_version(precondition.as_ref(), &existing)?;
-            return self
+            let expected_version = Self::precheck_put_version(&precondition, &existing)?;
+            let validator = self
                 .overwrite_existing(
                     ctx,
                     &plugin,
                     tenant,
                     &scope,
                     existing.id,
-                    effective_sharing,
+                    sharing,
+                    fallback,
                     expected_version,
-                    opts.expires_at.resolve(existing.expires_at),
+                    expires_at,
                     value,
                 )
-                .await;
+                .await?;
+            return Ok(PutOutcome {
+                created: false,
+                validator,
+            });
         }
 
-        // The target does not exist. An update never creates.
-        if !create_only {
+        // The target does not exist. A replace precondition never creates.
+        if !matches!(precondition, PutPrecondition::CreateOnly) {
             return Err(DomainError::VersionConflict);
         }
 
-        // Create path: the type defaults to generic; traits + per-type access
-        // validated before any side effect.
-        let type_uuid = opts
-            .secret_type
-            .map_or_else(|| SecretType::generic().uuid(), |id| id.to_uuid());
+        // Create path: `secret_type` is required (ADR-0004 — no
+        // default-to-generic as there was pre-ADR-0004); traits + per-type
+        // access validated before any side effect.
+        let Some(requested_type) = secret_type.as_ref() else {
+            return Err(DomainError::InvalidRequest {
+                field: "type",
+                reason: typing::reasons::TYPE_REQUIRED,
+                detail: "type is required to create a credential".to_owned(),
+            });
+        };
+        let type_uuid = requested_type.to_uuid();
         let resolved = self.types.resolve(type_uuid).await?;
         typing::validate_write(
             &resolved.gts_id,
             &resolved.traits,
             sharing,
             &value,
-            opts.expires_at.requested(),
+            expires_at,
         )?;
+
+        // Authorize on the requested concrete type BEFORE the inherited-type
+        // check below: its 409 detail names the inherited type, which a
+        // caller without `write`/`write_secret` on this type must not learn.
         let scope = self
-            .scope_for_timed(
-                ctx,
-                &authz::secret_type_resource(&resolved.gts_id),
-                actions::WRITE,
-            )
+            .authorize_write_actions(ctx, &resolved.gts_id, tenant, true, true)
             .await?;
-        if !self.repo.scope_includes_tenant(&scope, tenant.0).await? {
-            self.metrics.cross_tenant_denied();
-            return Err(DomainError::AccessDenied { cause: None });
+
+        // If the reference currently resolves to an ancestor's `shared`
+        // record of a different type, creating here would silently diverge
+        // from what a value read already serves (`fr-override-type-consistency`).
+        let chain = self.dir.ancestor_chain(ctx, tenant).await?;
+        if let Some(inherited) = self
+            .repo
+            .resolve_for_get(tenant, owner, key, &chain)
+            .await?
+            && inherited.secret_type_uuid != type_uuid
+        {
+            let inherited_resolved = self.resolve_stored(inherited.secret_type_uuid).await?;
+            return Err(DomainError::TypeViolation {
+                field: "type",
+                reason: typing::reasons::TYPE_MISMATCH_WITH_INHERITED,
+                detail: format!(
+                    "reference currently resolves to an inherited credential of type '{}'; \
+                     '{}' would diverge from it",
+                    inherited_resolved.gts_id, resolved.gts_id
+                ),
+            });
         }
 
-        self.create_new(
-            ctx,
-            &plugin,
-            tenant,
-            owner,
-            key,
-            sharing,
-            type_uuid,
-            opts.expires_at.resolve(None),
-            value,
-            &scope,
-        )
-        .await
+        let validator = self
+            .create_new(
+                ctx, &plugin, tenant, owner, key, sharing, fallback, type_uuid, expires_at, value,
+                &scope,
+            )
+            .await?;
+        Ok(PutOutcome {
+            created: true,
+            validator,
+        })
+    }
+
+    /// Apply a partial change to the record, the value, or both (ADR-0004,
+    /// RFC 7396 JSON Merge Patch semantics). Never creates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotFound`] if the caller holds no own record
+    /// under the reference.
+    /// Returns [`DomainError::InvalidRequest`] (`EMPTY_PATCH`) if the patch
+    /// touches nothing at all.
+    /// Returns [`DomainError::TypeViolation`] (`TYPE_IMMUTABLE`) if
+    /// `secret_type` is present and differs from the stored type, or another
+    /// trait violation.
+    /// Returns [`DomainError::UnsupportedTransition`] if `sharing` would move
+    /// the record between the private and tenant/shared key classes.
+    /// Returns [`DomainError::VersionConflict`] on a failed precondition.
+    #[allow(
+        clippy::cognitive_complexity,
+        clippy::too_many_lines,
+        reason = "body-derived authorization and RFC 7396 merge semantics are inherently \
+                  branchy; kept as one function for readability of the flow"
+    )]
+    pub async fn patch(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        patch: CredentialPatch,
+        precondition: WritePrecondition,
+    ) -> Result<Validator, DomainError> {
+        let tenant = TenantId(ctx.subject_tenant_id());
+        let owner = OwnerId(ctx.subject_id());
+
+        // Own row required — reveals own-tenant existence, the same accepted
+        // part of the threat model as `delete` (cross-tenant existence stays
+        // hidden by the read path's anti-enumeration 404).
+        let existing = self
+            .repo
+            .find_own(&AccessScope::allow_all(), tenant, owner, key)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        if patch.is_empty() {
+            return Err(DomainError::InvalidRequest {
+                field: "patch",
+                reason: typing::reasons::EMPTY_PATCH,
+                detail: "a merge patch must touch at least one field".to_owned(),
+            });
+        }
+
+        let metadata_present = patch.sharing.is_some()
+            || patch.fallback.is_some()
+            || !patch.expires_at.is_absent()
+            || patch.secret_type.is_some();
+        let value_present = !patch.value.is_absent();
+
+        // Both required actions are evaluated — and must both allow — before
+        // any side effect AND before any response that would reveal a detail
+        // of the caller's row (its type, its version, its sharing class)
+        // (ADR-0004, "Why the value has its own read address, and why writes
+        // do not").
+        let resolved = self.resolve_stored(existing.secret_type_uuid).await?;
+        let scope = self
+            .authorize_write_actions(
+                ctx,
+                &resolved.gts_id,
+                tenant,
+                metadata_present,
+                value_present,
+            )
+            .await?;
+
+        if let Some(requested) = patch.secret_type.as_ref()
+            && requested.to_uuid() != existing.secret_type_uuid
+        {
+            return Err(DomainError::TypeViolation {
+                field: "type",
+                reason: typing::reasons::TYPE_IMMUTABLE,
+                detail: format!("credential type is immutable; cannot change it to '{requested}'"),
+            });
+        }
+        if let Some(new_sharing) = patch.sharing
+            && (existing.sharing == SharingMode::Private) != (new_sharing == SharingMode::Private)
+        {
+            return Err(DomainError::UnsupportedTransition {
+                detail: "cannot move between private and tenant/shared".into(),
+            });
+        }
+        let expected_version = Self::precheck_version(Some(&precondition), &existing)?;
+
+        let merged_sharing = patch.sharing.unwrap_or(existing.sharing);
+        let merged_fallback = patch.fallback.map_or(existing.fallback, Fallback::from);
+        let merged_expires_at = match patch.expires_at {
+            PatchField::Absent => existing.expires_at,
+            PatchField::Null => None,
+            PatchField::Set(at) => Some(at),
+        };
+
+        if metadata_present {
+            typing::validate_metadata(
+                &resolved.gts_id,
+                &resolved.traits,
+                merged_sharing,
+                merged_expires_at,
+            )?;
+        }
+
+        match patch.value {
+            PatchField::Absent => {
+                if merged_sharing == existing.sharing
+                    && merged_fallback == existing.fallback
+                    && merged_expires_at == existing.expires_at
+                {
+                    // No-op: metadata unchanged, no `value` key — return the
+                    // current validator without bumping anything.
+                    return Ok(Validator {
+                        id: existing.id,
+                        version: existing.version,
+                    });
+                }
+                let row = self
+                    .repo
+                    .update_metadata(
+                        &scope,
+                        existing.id,
+                        expected_version,
+                        merged_sharing,
+                        merged_fallback,
+                        merged_expires_at,
+                    )
+                    .await?
+                    .ok_or(DomainError::VersionConflict)?;
+                Ok(Validator {
+                    id: row.id,
+                    version: row.version,
+                })
+            }
+            PatchField::Set(new_value) => {
+                typing::validate_value(&resolved.gts_id, &resolved.traits, &new_value)?;
+                self.overwrite_existing(
+                    ctx,
+                    &self.plugins.resolve().await?,
+                    tenant,
+                    &scope,
+                    existing.id,
+                    merged_sharing,
+                    merged_fallback,
+                    expected_version,
+                    merged_expires_at,
+                    new_value,
+                )
+                .await
+            }
+            PatchField::Null => {
+                let plugin = self.plugins.resolve().await?;
+                let removed = self
+                    .repo
+                    .remove_value(
+                        &scope,
+                        existing.id,
+                        expected_version,
+                        merged_sharing,
+                        merged_fallback,
+                        merged_expires_at,
+                    )
+                    .await?
+                    .ok_or(DomainError::VersionConflict)?;
+                let (row, old_value_id) = removed;
+                if let Some(old_id) = old_value_id {
+                    self.cleanup_replaced_value(ctx, &plugin, &tenant, old_id)
+                        .await;
+                }
+                Ok(Validator {
+                    id: row.id,
+                    version: row.version,
+                })
+            }
+        }
+    }
+
+    /// Evaluate whichever of `write`/`write_secret` the caller's operation
+    /// needs, gated on the caller's own tenant, before any side effect.
+    /// Returns the scope to clamp the subsequent repo write with (the
+    /// `write` scope when evaluated, else `write_secret`'s — both target the
+    /// same tenant, so either is a sound SQL clamp).
+    async fn authorize_write_actions(
+        &self,
+        ctx: &SecurityContext,
+        resolved_gts_id: &str,
+        tenant: TenantId,
+        need_write: bool,
+        need_write_secret: bool,
+    ) -> Result<AccessScope, DomainError> {
+        let scope = if need_write {
+            let s = self
+                .scope_for_timed(
+                    ctx,
+                    &authz::credential_type_resource(resolved_gts_id),
+                    actions::WRITE,
+                )
+                .await?;
+            if !self.repo.scope_includes_tenant(&s, tenant.0).await? {
+                self.metrics.cross_tenant_denied();
+                return Err(DomainError::AccessDenied { cause: None });
+            }
+            Some(s)
+        } else {
+            None
+        };
+        let scope = if need_write_secret {
+            let s = self
+                .scope_for_timed(
+                    ctx,
+                    &authz::credential_type_resource(resolved_gts_id),
+                    actions::WRITE_SECRET,
+                )
+                .await?;
+            if !self.repo.scope_includes_tenant(&s, tenant.0).await? {
+                self.metrics.cross_tenant_denied();
+                return Err(DomainError::AccessDenied { cause: None });
+            }
+            scope.or(Some(s))
+        } else {
+            scope
+        };
+        // At least one of need_write/need_write_secret is always true at
+        // every call site (`put` always needs both; `patch` is reached only
+        // when `metadata_present || value_present`, guaranteed by
+        // `CredentialPatch::is_empty` having already been rejected).
+        Ok(scope.unwrap_or_else(AccessScope::deny_all))
     }
 
     /// Optimistic-concurrency pre-check before any backend write: returns the
@@ -944,6 +1370,38 @@ impl Service {
         }
     }
 
+    /// Optimistic-concurrency pre-check for `put`'s replace preconditions
+    /// (mirrors [`Self::precheck_version`] for [`PutPrecondition`]). Never
+    /// called for [`PutPrecondition::CreateOnly`] (handled by the caller
+    /// before an `existing` row is even looked at).
+    fn precheck_put_version(
+        precondition: &PutPrecondition,
+        existing: &SecretRow,
+    ) -> Result<Option<i64>, DomainError> {
+        match precondition {
+            // `CreateOnly` can never actually reach here (the caller already
+            // returned `Conflict` on an existing row before calling this),
+            // but the match stays exhaustive over the full precondition type.
+            PutPrecondition::CreateOnly | PutPrecondition::Exists => Ok(None),
+            PutPrecondition::Version { id, version } => {
+                if *id != existing.id || *version != existing.version {
+                    return Err(DomainError::VersionConflict);
+                }
+                Ok(Some(*version))
+            }
+            PutPrecondition::AnyVersion(validators) => {
+                if validators
+                    .iter()
+                    .any(|(id, version)| *id == existing.id && *version == existing.version)
+                {
+                    Ok(Some(existing.version))
+                } else {
+                    Err(DomainError::VersionConflict)
+                }
+            }
+        }
+    }
+
     /// Create-path write protocol (ADR-0006 §6.2 steps 2-4, `insert_active`
     /// variant): mint a fresh `value_id`, record its intent, write the
     /// backend, then insert the row `active` pointing at it. A create-only
@@ -951,7 +1409,8 @@ impl Service {
     /// (best-effort) and returns `Conflict`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "carries every field a create needs: identity, sharing, type, expiry, value, scope"
+        reason = "carries every field a create needs: identity, sharing, fallback, type, expiry, \
+                  value, scope"
     )]
     async fn create_new(
         &self,
@@ -961,11 +1420,12 @@ impl Service {
         owner: OwnerId,
         key: &SecretRef,
         sharing: SharingMode,
+        fallback: Fallback,
         secret_type_uuid: Uuid,
         expires_at: Option<OffsetDateTime>,
         value: SecretValue,
         scope: &AccessScope,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Validator, DomainError> {
         let value_fp = self.stamp_fp(plugin, &value).await?;
         let new_id = ValueId::new_v4();
         self.repo.gc_insert_pending(new_id, tenant).await?;
@@ -978,8 +1438,9 @@ impl Service {
             return Err(e);
         }
 
+        let id = Uuid::new_v4();
         let new = NewSecret {
-            id: Uuid::new_v4(),
+            id,
             tenant_id: tenant,
             reference: key.clone(),
             sharing,
@@ -989,9 +1450,10 @@ impl Service {
             value_id: new_id,
             value_fp,
             fp_key_id: fence::CURRENT_FENCE_KEY_ID,
+            fallback,
         };
         match self.repo.insert_active(scope, &new).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(Validator { id, version: 1 }),
             Err(DomainError::Conflict) => {
                 self.abort_new_value(ctx, plugin, &tenant, new_id).await;
                 Err(DomainError::Conflict)
@@ -1008,11 +1470,14 @@ impl Service {
     /// backend, then one transaction switches the row's pointer. A lost CAS
     /// (version mismatch, or the row vanished) aborts the just-written
     /// version (best-effort) and returns `VersionConflict`; a won CAS
-    /// best-effort cleans up the version it just superseded.
+    /// best-effort cleans up the version it just superseded. Shared by
+    /// `put`'s replace leg and `patch {"value": …}` (ADR-0004: the
+    /// value-write half of `PATCH` is the same protocol as `PUT`'s) —
+    /// accepts a `declared` row too, switching it back to `active`.
     #[allow(
         clippy::too_many_arguments,
         reason = "carries every field an overwrite's CAS needs: identity, precondition, sharing, \
-                  expiry, value"
+                  fallback, expiry, value"
     )]
     async fn overwrite_existing(
         &self,
@@ -1022,10 +1487,11 @@ impl Service {
         scope: &AccessScope,
         existing_id: Uuid,
         sharing: SharingMode,
+        fallback: Fallback,
         expected_version: Option<i64>,
         expires_at: Option<OffsetDateTime>,
         value: SecretValue,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Validator, DomainError> {
         let value_fp = self.stamp_fp(plugin, &value).await?;
         let new_id = ValueId::new_v4();
         self.repo.gc_insert_pending(new_id, tenant).await?;
@@ -1045,6 +1511,7 @@ impl Service {
                 existing_id,
                 expected_version,
                 sharing,
+                fallback,
                 expires_at,
                 new_id,
                 value_fp,
@@ -1052,7 +1519,7 @@ impl Service {
             )
             .await?;
 
-        let Some((_row, old_value_id)) = switched else {
+        let Some((row, old_value_id)) = switched else {
             // Lost the CAS: version mismatch, or the row vanished
             // concurrently (delete won). The just-written backend bytes are
             // unreferenced; abort them best-effort.
@@ -1064,7 +1531,10 @@ impl Service {
             self.cleanup_replaced_value(ctx, plugin, &tenant, old_id)
                 .await;
         }
-        Ok(())
+        Ok(Validator {
+            id: row.id,
+            version: row.version,
+        })
     }
 
     /// Timed `plugin.put`, mapping the error and recording the dependency
@@ -1125,11 +1595,14 @@ impl Service {
         result
     }
 
-    /// Step-3-failure cleanup: `plugin.put` never landed, so only the
-    /// intent row needs dropping. Best-effort; a failure here is simply
-    /// reclaimed later by the maintenance job's pending-reclaim pass.
+    /// Step-3-failure cleanup: `plugin.put` reported an error, but its ack
+    /// may have been lost after the bytes were actually persisted — so the
+    /// intent row is marked `Aborted` (best-effort) rather than deleted: the
+    /// job's drain then issues a `plugin.delete` for it (`NotFound` =
+    /// success) and only then drops the row, so a persisted-but-unacked
+    /// write is never left as an untracked orphan.
     async fn abandon_pending(&self, new_id: ValueId) {
-        if let Err(e) = self.repo.gc_delete(new_id).await {
+        if let Err(e) = self.repo.gc_mark(new_id, GcReason::Aborted).await {
             Self::warn_gc_step_failed(new_id, "abandon_pending", &e);
         }
     }
@@ -1238,7 +1711,7 @@ impl Service {
         let scope = self
             .scope_for_timed(
                 ctx,
-                &authz::secret_type_resource(&resolved.gts_id),
+                &authz::credential_type_resource(&resolved.gts_id),
                 actions::DELETE,
             )
             .await?;
@@ -1395,8 +1868,16 @@ impl Service {
 
     /// One `pending` gc entry: skip if too young, drop-without-touching-the-
     /// backend if a live row still references it (the defensive branch), else
-    /// drain it like any other terminal entry. Returns whether this call
-    /// advanced the batch.
+    /// reclaim it — **claim first, then best-effort delete** (the opposite
+    /// order from [`Self::drain_terminal_entry`]): `gc_delete` runs before
+    /// `plugin.delete` so that if two runners race this same entry, the
+    /// loser's `gc_delete` reports `false` and it backs off rather than
+    /// double-counting or racing the backend call. A crash between the claim
+    /// and the backend delete leaves an untracked orphan — accepted, since
+    /// garbage is not the correctness property this ordering protects; a
+    /// live row can never be affected either way, because
+    /// `is_value_referenced` already gated this branch. Returns whether this
+    /// call advanced the batch.
     async fn drain_pending_entry(
         &self,
         ctx: &SecurityContext,
@@ -1416,8 +1897,20 @@ impl Service {
             // drop the stale intent row.
             return self.repo.gc_delete(entry.value_id).await;
         }
-        self.drain_terminal_entry(ctx, &entry.tenant_id, entry.value_id, counter)
-            .await
+        if !self.repo.gc_delete(entry.value_id).await? {
+            // Already claimed by another runner (or resolved by the
+            // writer's own step-5 cleanup) between our read and this call.
+            return Ok(false);
+        }
+        if let Some(plugin) = self.gc_plugin(ctx).await
+            && let Err(e) = self
+                .plugin_delete_timed(&plugin, ctx, &entry.tenant_id, entry.value_id)
+                .await
+        {
+            Self::warn_gc_step_failed(entry.value_id, "gc_pending_reclaim_delete", &e);
+        }
+        *counter += 1;
+        Ok(true)
     }
 
     /// One already-decided gc entry (`superseded`/`removed`/`aborted`, or a

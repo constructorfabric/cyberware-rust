@@ -6,7 +6,7 @@
 //! against the GTS types-registry to recover the full type id (the PDP
 //! resource the single authz evaluation targets) and the effective traits
 //! the write path enforces. New secret types are added by registering a
-//! GTS schema derived from `gts.cf.core.credstore.secret.v1~` — no
+//! GTS schema derived from `gts.cf.core.credstore.credential.v1~` — no
 //! credstore release involved; the compiled-in catalog only seeds the
 //! built-in schemas.
 //!
@@ -31,7 +31,7 @@ use crate::domain::error::DomainError;
 pub struct ResolvedSecretType {
     /// Full chained GTS type id — the PDP resource type and the
     /// wire-visible type name (e.g.
-    /// `gts.cf.core.credstore.secret.v1~cf.core.credstore.api_key.v1~`).
+    /// `gts.cf.core.credstore.credential.v1~cf.core.credstore.api_key.v1~`).
     pub gts_id: String,
     /// Effective enforcement traits (chain-merged; leaf-declared values
     /// win, the secret base type fills the rest).

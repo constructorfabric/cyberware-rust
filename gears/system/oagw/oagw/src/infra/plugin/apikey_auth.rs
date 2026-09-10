@@ -48,7 +48,7 @@ impl AuthPlugin for ApiKeyAuthPlugin {
 
         let response = self
             .credstore
-            .get(&ctx.security_context, &key)
+            .get_secret(&ctx.security_context, &key)
             .await
             .map_err(|e| PluginError::Internal(format!("credstore error: {e}")))?
             .ok_or_else(|| PluginError::SecretNotFound(config.secret_ref.clone()))?;

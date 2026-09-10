@@ -5,8 +5,12 @@
 //! once written, is immutable: the gear always mints a fresh
 //! [`ValueId`](crate::models::ValueId) before it writes, so a `put` to a
 //! `value_id` the gear has already written is a contract violation the gear
-//! itself never issues; a plugin MAY defend against it anyway by rejecting
-//! such a call with [`CredStoreError::Conflict`]. `delete` of a `value_id` the
+//! itself never issues; a plugin **MUST** reject such a call with
+//! [`CredStoreError::Conflict`] rather than silently overwrite — this is not
+//! merely a defensive backstop: the fence-key bootstrap (`Service::
+//! load_fence_key`) relies on a losing replica's `put` to the fixed fence-key
+//! `value_id` being rejected this way to detect "another replica already won"
+//! and safely re-read instead of clobbering the winner's key. `delete` of a `value_id` the
 //! plugin does not (or no longer) hold is success (idempotent) — the gear's
 //! garbage-collection drain and its best-effort post-write cleanup both rely
 //! on a duplicate delete being harmless. The plugin learns nothing about
@@ -34,9 +38,12 @@ pub trait CredStorePluginClientV1: Send + Sync {
     ) -> Result<Option<SecretValue>, CredStoreError>;
 
     /// Writes a brand-new, immutable entry at `(tenant_id, value_id)`. The
-    /// gear never reuses a `value_id` for a second `put`; a plugin MAY reject
-    /// a `put` to an id it already holds with [`CredStoreError::Conflict`] as
-    /// a defensive backstop against a contract violation.
+    /// gear never reuses a `value_id` for a second `put`, but a conforming
+    /// plugin **MUST** still reject a `put` to an id it already holds with
+    /// [`CredStoreError::Conflict`] — immutability is a contract requirement,
+    /// not an optional defensive backstop, since the fence-key bootstrap
+    /// relies on this rejection across replicas to tell "another replica
+    /// already won" apart from an actual failure.
     async fn put(
         &self,
         ctx: &SecurityContext,

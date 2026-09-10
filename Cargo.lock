@@ -2225,6 +2225,8 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "gts",
+ "inventory",
  "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",

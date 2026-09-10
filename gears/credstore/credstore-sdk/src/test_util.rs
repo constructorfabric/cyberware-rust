@@ -3,35 +3,42 @@
 //! A single configurable [`MockCredStoreClient`] covering the shapes consumers
 //! exercise in tests, so each gear no longer hand-rolls its own:
 //!
-//! * [`MockCredStoreClient::empty`] — every `get` resolves to `Ok(None)`;
+//! * [`MockCredStoreClient::empty`] — every `get`/`get_secret` resolves to
+//!   `Ok(None)`;
 //! * [`MockCredStoreClient::with_secrets`] — a keyed `(reference, value)` store;
 //! * [`MockCredStoreClient::returning_raw_value`] — a fixed raw value for any
 //!   reference (e.g. non-UTF-8 bytes to drive malformed-value paths);
 //! * [`MockCredStoreClient::always_failing`] — every operation fails with
 //!   [`CredStoreError::Internal`].
 //!
-//! Only `get` carries behaviour; the write half is a no-op that succeeds (or
-//! fails, in the always-failing mode) to match.
+//! Only `get`/`get_secret` carry behaviour; the write half (`put`/`patch`/
+//! `delete`) is a no-op that succeeds (or fails, in the always-failing mode)
+//! to match, returning a placeholder validator — this double is read-oriented,
+//! for consumers that only resolve credentials.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
+use uuid::Uuid;
 
 use crate::{
-    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretType, SecretValue,
-    SharingMode, TenantId, WriteOptions, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialPatch, CredentialStatus,
+    CredentialWrite, Fallback, InheritanceStatus, OwnerId, PutOutcome, PutPrecondition, Secret,
+    SecretRef, SecretType, SecretValue, SharingMode, Validator, WritePrecondition,
 };
 
 enum Behavior {
-    /// `get` returns the mapped value for a known reference, else `Ok(None)`.
+    /// `get`/`get_secret` return the mapped value for a known reference, else
+    /// `Ok(None)`.
     Store(HashMap<String, Vec<u8>>),
-    /// `get` returns this raw value for *any* reference.
+    /// `get`/`get_secret` return this raw value for *any* reference.
     AnyValue(Vec<u8>),
     /// Every operation fails with [`CredStoreError::Internal`].
     Failing,
-    /// `get` fails with [`CredStoreError::NotFound`] — a client implementation
-    /// that reports the not-found surface as an error instead of `Ok(None)`.
+    /// `get`/`get_secret` fail with [`CredStoreError::NotFound`] — a client
+    /// implementation that reports the not-found surface as an error instead
+    /// of `Ok(None)`.
     NotFound,
 }
 
@@ -42,7 +49,7 @@ pub struct MockCredStoreClient {
 }
 
 impl MockCredStoreClient {
-    /// Empty store — every `get` resolves to `Ok(None)`.
+    /// Empty store — every `get`/`get_secret` resolves to `Ok(None)`.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -86,9 +93,9 @@ impl MockCredStoreClient {
         }
     }
 
-    /// `get` fails with [`CredStoreError::NotFound`] for any reference — for
-    /// consumers hardening against clients that report the not-found surface
-    /// as an error instead of `Ok(None)`.
+    /// `get`/`get_secret` fail with [`CredStoreError::NotFound`] for any
+    /// reference — for consumers hardening against clients that report the
+    /// not-found surface as an error instead of `Ok(None)`.
     #[must_use]
     pub fn erroring_not_found() -> Self {
         Self {
@@ -96,18 +103,39 @@ impl MockCredStoreClient {
         }
     }
 
-    /// Build a canned response wrapping `value` with placeholder metadata
-    /// (nil id/tenant, `generic` type, version 1, not inherited, no expiry).
-    fn response(value: Vec<u8>) -> GetSecretResponse {
-        GetSecretResponse {
-            value: SecretValue::new(value),
-            id: uuid::Uuid::nil(),
-            owner_tenant_id: TenantId::nil(),
+    /// Build a canned [`Credential`] record with placeholder metadata (nil
+    /// generation id, `generic` type, version 1, own/active, no expiry).
+    fn credential(reference: &SecretRef) -> Credential {
+        Credential {
+            reference: reference.clone(),
+            secret_type: SecretType::generic().gts_id().to_owned(),
             sharing: SharingMode::default(),
-            is_inherited: false,
-            version: 1,
+            fallback: Some(Fallback::default()),
+            status: CredentialStatus::Active,
+            inheritance: InheritanceStatus::Own,
+            version: Some(1),
+            updated_at: None,
+            owner_id: Some(OwnerId::nil()),
+            expires_at: None,
+            validator: Some(Self::validator()),
+        }
+    }
+
+    /// Build a canned [`Secret`] wrapping `value` with placeholder metadata.
+    fn secret(reference: &SecretRef, value: Vec<u8>) -> Secret {
+        Secret {
+            reference: reference.clone(),
             secret_type: SecretType::generic().gts_id().to_owned(),
             expires_at: None,
+            value: SecretValue::new(value),
+            validator: Self::validator(),
+        }
+    }
+
+    fn validator() -> Validator {
+        Validator {
+            id: Uuid::nil(),
+            version: 1,
         }
     }
 
@@ -125,36 +153,54 @@ impl CredStoreClientV1 for MockCredStoreClient {
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+    ) -> Result<Option<Credential>, CredStoreError> {
         match &self.behavior {
-            Behavior::Store(store) => Ok(store.get(key.as_ref()).cloned().map(Self::response)),
-            Behavior::AnyValue(value) => Ok(Some(Self::response(value.clone()))),
+            Behavior::Store(store) => Ok(store
+                .contains_key(key.as_ref())
+                .then(|| Self::credential(key))),
+            Behavior::AnyValue(_) => Ok(Some(Self::credential(key))),
             Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
             Behavior::NotFound => Err(CredStoreError::NotFound),
         }
     }
 
-    async fn put_opts(
+    async fn get_secret(
         &self,
         _ctx: &SecurityContext,
-        _key: &SecretRef,
-        _value: SecretValue,
-        _sharing: SharingMode,
-        _precondition: WritePrecondition,
-        _opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
-        self.write_result()
+        key: &SecretRef,
+    ) -> Result<Option<Secret>, CredStoreError> {
+        match &self.behavior {
+            Behavior::Store(store) => Ok(store
+                .get(key.as_ref())
+                .cloned()
+                .map(|v| Self::secret(key, v))),
+            Behavior::AnyValue(value) => Ok(Some(Self::secret(key, value.clone()))),
+            Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
+            Behavior::NotFound => Err(CredStoreError::NotFound),
+        }
     }
 
-    async fn create_opts(
+    async fn put(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-        _value: SecretValue,
-        _sharing: SharingMode,
-        _opts: WriteOptions,
-    ) -> Result<(), CredStoreError> {
-        self.write_result()
+        _write: CredentialWrite,
+        precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
+        self.write_result().map(|()| PutOutcome {
+            created: matches!(precondition, PutPrecondition::CreateOnly),
+            validator: Self::validator(),
+        })
+    }
+
+    async fn patch(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _patch: CredentialPatch,
+        _precondition: WritePrecondition,
+    ) -> Result<Validator, CredStoreError> {
+        self.write_result().map(|()| Self::validator())
     }
 
     async fn delete(

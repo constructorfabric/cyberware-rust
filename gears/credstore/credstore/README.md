@@ -71,7 +71,8 @@ missed.
 ## Usage
 
 After the gear initializes, consumers obtain its client from `ClientHub`. This
-example retrieves a secret without formatting or logging its value:
+example reads a secret value (`get_secret`, the `read_secret` action) without
+formatting or logging it; the record itself is read with `get` (`read`):
 
 ```no_run
 use std::error::Error;
@@ -86,9 +87,9 @@ async fn secret_length(
 ) -> Result<Option<usize>, Box<dyn Error>> {
     let credstore = hub.get::<dyn CredStoreClientV1>()?;
     let key = SecretRef::new("my-api-key")?;
-    let response = credstore.get(security, &key).await?;
+    let secret = credstore.get_secret(security, &key).await?;
 
-    Ok(response.map(|secret| secret.value.as_bytes().len()))
+    Ok(secret.map(|s| s.value.as_bytes().len()))
 }
 ```
 
@@ -105,12 +106,9 @@ credstore:
     vendor: "constructorfabric" # GTS vendor used to discover the value-store plugin
     hierarchy:
       ancestor_cache_ttl_secs: 300
-    reaper:
-      tick_secs: 60
-      provisioning_timeout_secs: 300
-      # planned, ADR-0006: removed — replaced by the `gc` job
-      # (`gc.pending_max_age_secs: 3600`, `gc.batch_size: 256`), run as
-      # `credstore gc` on an operator-chosen schedule, not inside the gear
+    gc:                          # settings of the maintenance job (ADR-0006); no resident reaper
+      pending_max_age_secs: 3600 # a pending write intent older than this is reclaimed by the job
+      batch_size: 256            # rows per batch in the job's expiry and gc passes
 ```
 
 ## License

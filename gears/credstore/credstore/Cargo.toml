@@ -58,9 +58,18 @@ anyhow = { workspace = true }
 time = { workspace = true }
 utoipa = { workspace = true }
 opentelemetry = { workspace = true, features = ["metrics"] }
+# Link-time GTS permission catalog (`src/gts/permissions.rs`): declares
+# AuthzPermissionV1 instances into the toolkit-gts inventory that
+# types-registry aggregates at boot.
+toolkit-gts = { workspace = true }
+# Direct dep needed because `gts_instance!` expansions reference `::gts::*`
+# paths (the compile-time `<S as GtsSchema>::SCHEMA_ID` prefix asserts).
+# Without this the proc-macro emits `::gts::…` identifiers that cannot be
+# resolved.
+gts = { workspace = true }
+inventory = { workspace = true }
 
 [dev-dependencies]
-toolkit-gts = { workspace = true }
 tower = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["rt", "macros", "test-util"] }

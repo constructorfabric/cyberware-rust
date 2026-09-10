@@ -1,37 +1,45 @@
-//! REST handlers for the credstore module.
+//! REST handlers for the credstore module (ADR-0004: the credential surface).
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use credstore_sdk::{ExpiryWrite, GtsId, SecretRef, SecretValue, SharingMode, WriteOptions};
+use credstore_sdk::{
+    CredentialPatch, CredentialWrite, Fallback, GtsId, PatchField, SecretRef, SecretValue,
+    SharingMode,
+};
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::SecurityContext;
 
-use super::dto::{CreateSecretRequestDto, GetSecretResponseDto, UpdateSecretRequestDto};
+use super::dto::{
+    CredentialDto, CredentialPatchDto, PutCredentialRequestDto, SecretDto, weak_etag,
+};
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{WritePrecondition, WriteSpec};
+use crate::domain::secret::model::{
+    PutPrecondition as DomainPutPrecondition, WritePrecondition as DomainWritePrecondition,
+};
 use crate::domain::secret::service::Service;
+use crate::domain::secret::typing::reasons;
 
 /// Concrete service alias for the handlers.
 pub(crate) type ConcreteService = Service;
 
-/// Parse the **mandatory** `If-Match` precondition (RFC 7232 §3.1). The GET
-/// handler emits a strong, generation-bound `"<id>.<version>"` validator
-/// (`id` = the row UUID, fresh per recreated secret — no ABA reuse across
-/// generations). A missing header is a typed 400 (`IF_MATCH_REQUIRED`): every
-/// update/delete states its concurrency stance — a version validator for
-/// read-modify-write, `*` for an explicit last-writer-wins overwrite.
+/// `Content-Type` a `PATCH` body must carry (RFC 7396 JSON Merge Patch).
+const MERGE_PATCH_CONTENT_TYPE: &str = "application/merge-patch+json";
+
+/// Parse the mandatory `If-Match` precondition (RFC 7232 §3.1), used by
+/// `PATCH` and `DELETE`. A missing header is a typed 400
+/// (`IF_MATCH_REQUIRED`).
 ///
 /// `If-Match` is `"*" / 1#entity-tag`: it may span multiple header lines and
 /// each line may carry a comma-separated list, and the list matches if **any**
 /// validator matches. We accept `*` (target must exist) or one-or-more strong
-/// `"<id>.<version>"` validators; a single one yields [`WritePrecondition::Version`],
-/// several yield [`WritePrecondition::AnyVersion`]. Weak validators (`W/"…"`)
-/// and any other shape are a typed 400.
-fn parse_if_match(headers: &axum::http::HeaderMap) -> Result<WritePrecondition, DomainError> {
+/// `"<id>.<version>"` validators; a single one yields
+/// [`DomainWritePrecondition::Version`], several yield
+/// [`DomainWritePrecondition::AnyVersion`]. Weak validators (`W/"…"`) and any
+/// other shape are a typed 400.
+fn parse_if_match(headers: &axum::http::HeaderMap) -> Result<DomainWritePrecondition, DomainError> {
     let mut lines = headers
         .get_all(axum::http::header::IF_MATCH)
         .iter()
@@ -55,7 +63,7 @@ fn parse_if_match(headers: &axum::http::HeaderMap) -> Result<WritePrecondition, 
             // `*` matches any current representation → an existence check; it
             // subsumes any other member, so return immediately.
             if tag == "*" {
-                return Ok(WritePrecondition::Exists);
+                return Ok(DomainWritePrecondition::Exists);
             }
             // Strong validator only: `"<id>.<version>"` (a UUID contains no
             // `.`, so the split is unambiguous).
@@ -75,143 +83,92 @@ fn parse_if_match(headers: &axum::http::HeaderMap) -> Result<WritePrecondition, 
     }
     match validators.as_slice() {
         [] => Err(malformed()),
-        [(id, version)] => Ok(WritePrecondition::Version {
+        [(id, version)] => Ok(DomainWritePrecondition::Version {
             id: *id,
             version: *version,
         }),
-        _ => Ok(WritePrecondition::AnyVersion(validators)),
+        _ => Ok(DomainWritePrecondition::AnyVersion(validators)),
     }
 }
 
-/// Parse the optional typed-write fields shared by the create/update DTOs
-/// into [`WriteOptions`]: a full GTS type id (`GtsId`) and an RFC 3339
-/// expiry. A `type` that is not a well-formed GTS type id and malformed
-/// timestamps are typed 400s; whether a well-formed custom type actually
-/// exists is decided by the service against the types-registry.
-///
-/// Expiry follows REST whole-value-replace semantics: a present `expires_at`
-/// sets it ([`ExpiryWrite::Set`]) and an omitted one clears any stored expiry
-/// ([`ExpiryWrite::Clear`]). (This differs from the SDK convenience
-/// [`put`](credstore_sdk::CredStoreClientV1::put), which defaults to
-/// [`ExpiryWrite::Preserve`](credstore_sdk::ExpiryWrite::Preserve).)
-fn parse_write_options(
-    secret_type: Option<&str>,
-    expires_at: Option<&str>,
-) -> Result<WriteOptions, DomainError> {
-    let secret_type = secret_type
-        .map(|input| {
-            GtsId::try_new(input).map_err(|_| DomainError::TypeViolation {
-                field: "type",
-                reason: crate::domain::secret::typing::reasons::UNKNOWN_SECRET_TYPE,
-                detail: format!("secret type must be a full GTS type id: {input}"),
-            })
-        })
-        .transpose()?;
-    let expires_at = expires_at
-        .map(|raw| {
-            time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
-                .map(ExpiryWrite::Set)
-                .map_err(|_| DomainError::TypeViolation {
-                    field: "expires_at",
-                    reason: "INVALID_EXPIRES_AT",
-                    detail: "expires_at must be an RFC 3339 timestamp".to_owned(),
+/// Parse `PUT`'s precondition (ADR-0004, "Two write verbs on one resource"):
+/// exactly one of `If-None-Match: *` (create-only) or `If-Match` (guarded or
+/// unconditional replace, parsed like [`parse_if_match`]). Neither, or both,
+/// is a typed 400 (`PRECONDITION_REQUIRED`); an `If-None-Match` naming
+/// anything other than `*` is a typed 400 (`INVALID_IF_MATCH`).
+fn parse_put_precondition(
+    headers: &axum::http::HeaderMap,
+) -> Result<DomainPutPrecondition, DomainError> {
+    let has_if_none_match = headers.contains_key(axum::http::header::IF_NONE_MATCH);
+    let has_if_match = headers.contains_key(axum::http::header::IF_MATCH);
+    match (has_if_none_match, has_if_match) {
+        (true, true) => Err(DomainError::InvalidRequest {
+            field: "If-Match",
+            reason: reasons::PRECONDITION_REQUIRED,
+            detail: "send exactly one of If-None-Match or If-Match, not both".to_owned(),
+        }),
+        (false, false) => Err(DomainError::InvalidRequest {
+            field: "If-Match",
+            reason: reasons::PRECONDITION_REQUIRED,
+            detail: "PUT requires `If-None-Match: *` (create) or `If-Match` (replace)".to_owned(),
+        }),
+        (true, false) => {
+            let value = headers
+                .get(axum::http::header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| DomainError::InvalidPrecondition {
+                    detail: "If-None-Match must be `*`".to_owned(),
+                })?;
+            if value.trim() == "*" {
+                Ok(DomainPutPrecondition::CreateOnly)
+            } else {
+                Err(DomainError::InvalidPrecondition {
+                    detail: "If-None-Match must be `*` (create-only); a specific ETag is not \
+                             meaningful here"
+                        .to_owned(),
                 })
-        })
-        .transpose()?
-        .unwrap_or(ExpiryWrite::Clear);
-    Ok(WriteOptions {
-        secret_type,
-        expires_at,
+            }
+        }
+        (false, true) => Ok(match parse_if_match(headers)? {
+            DomainWritePrecondition::Exists => DomainPutPrecondition::Exists,
+            DomainWritePrecondition::Version { id, version } => {
+                DomainPutPrecondition::Version { id, version }
+            }
+            DomainWritePrecondition::AnyVersion(v) => DomainPutPrecondition::AnyVersion(v),
+        }),
+    }
+}
+
+/// Parse an RFC 3339 timestamp from a REST field, mapping a malformed value
+/// to a typed 400.
+fn parse_rfc3339(field: &'static str, raw: &str) -> Result<time::OffsetDateTime, DomainError> {
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).map_err(|_| {
+        DomainError::InvalidRequest {
+            field,
+            reason: "INVALID_EXPIRES_AT",
+            detail: format!("{field} must be an RFC 3339 timestamp"),
+        }
     })
 }
 
-/// `POST /credstore/v1/secrets`
+/// Parse a full GTS type id from a REST field, mapping a malformed value to
+/// a typed 400. Whether a *well-formed* custom type actually exists is
+/// decided by the service against the types-registry.
+fn parse_gts_type(field: &'static str, raw: &str) -> Result<GtsId, DomainError> {
+    GtsId::try_new(raw).map_err(|_| DomainError::TypeViolation {
+        field,
+        reason: reasons::UNKNOWN_SECRET_TYPE,
+        detail: format!("{field} must be a full GTS type id: {raw}"),
+    })
+}
+
+/// `GET /credstore/v1/credentials/{ref}` (ADR-0004).
 ///
 /// # Errors
 ///
 /// Returns a canonical `Problem` envelope on invalid reference (400), access denied (403),
-/// conflict (409), or service unavailable (503).
-pub async fn create_secret(
-    uri: axum::http::Uri,
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<ConcreteService>>,
-    Json(body): Json<CreateSecretRequestDto>,
-) -> ApiResult<impl IntoResponse> {
-    let key = SecretRef::new(body.reference).map_err(|e| {
-        CanonicalError::from(DomainError::InvalidSecretRef {
-            detail: e.to_string(),
-        })
-    })?;
-    let opts = parse_write_options(body.secret_type.as_deref(), body.expires_at.as_deref())
-        .map_err(CanonicalError::from)?;
-    svc.put(
-        &ctx,
-        &key,
-        SecretValue::from(body.value),
-        WriteSpec::create(body.sharing.into()).with_opts(opts),
-    )
-    .await?;
-    let location = format!("{}/{}", uri.path().trim_end_matches('/'), key.as_ref());
-    Ok((
-        StatusCode::CREATED,
-        [(axum::http::header::LOCATION, location)],
-    )
-        .into_response())
-}
-
-/// `PUT /credstore/v1/secrets/{ref}` — update of an existing secret.
-///
-/// `If-Match` is **mandatory** (a version validator for read-modify-write, or
-/// `*` for an explicit last-writer-wins overwrite); a stale version yields a
-/// canonical `Aborted` (409, `OPTIMISTIC_LOCK_FAILURE`). A PUT never creates:
-/// a missing target fails the precondition (409); create via `POST`.
-///
-/// # Errors
-///
-/// Returns a canonical `Problem` envelope on invalid reference / malformed or
-/// missing `If-Match` (400), access denied (403), unsupported transition
-/// (400), version precondition failure or missing target (409), or service
-/// unavailable (503).
-pub async fn put_secret(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<ConcreteService>>,
-    Path(reference): Path<String>,
-    headers: axum::http::HeaderMap,
-    Json(body): Json<UpdateSecretRequestDto>,
-) -> ApiResult<impl IntoResponse> {
-    let precondition = parse_if_match(&headers)?;
-    let key = SecretRef::new(reference).map_err(|e| {
-        CanonicalError::from(DomainError::InvalidSecretRef {
-            detail: e.to_string(),
-        })
-    })?;
-    let opts = parse_write_options(body.secret_type.as_deref(), body.expires_at.as_deref())
-        .map_err(CanonicalError::from)?;
-    // An omitted `sharing` preserves the existing secret's mode on overwrite
-    // (finding #8); `tenant` is only the create-via-upsert / class default.
-    let (sharing, preserve_sharing) = match body.sharing {
-        Some(s) => (s.into(), false),
-        None => (SharingMode::Tenant, true),
-    };
-    svc.put(
-        &ctx,
-        &key,
-        SecretValue::from(body.value),
-        WriteSpec::update(sharing, precondition)
-            .preserve_sharing(preserve_sharing)
-            .with_opts(opts),
-    )
-    .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
-}
-
-/// `GET /credstore/v1/secrets/{ref}`
-///
-/// # Errors
-///
-/// Returns a canonical `Problem` envelope on invalid reference (400), access denied (403),
-/// not found (404), or service unavailable (503).
-pub async fn get_secret(
+/// or not found (404).
+pub async fn get_credential(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
     Path(reference): Path<String>,
@@ -221,19 +178,29 @@ pub async fn get_secret(
             detail: e.to_string(),
         })
     })?;
-    match svc.get(&ctx, &key).await? {
-        Some(ref resp) => {
-            // Reject (don't lossily decode) a non-UTF-8 value before building headers.
-            let dto = GetSecretResponseDto::try_from_response(resp)?;
-            // Strong, generation-bound validator: the row UUID (fresh per
-            // recreated secret) plus the per-generation monotonic counter, so
-            // validators never repeat across delete+recreate (no ABA).
-            let etag = format!("\"{}.{}\"", resp.id, resp.version);
+    match svc.resolve_credential(&ctx, &key).await? {
+        Some((credential, weak_source)) => {
+            let dto = CredentialDto::try_from_credential(&credential)?;
+            let etag = match (&credential.validator, weak_source) {
+                (Some(v), _) => format!("\"{}.{}\"", v.id, v.version),
+                (None, Some((winner_id, winner_version))) => weak_etag(
+                    ctx.subject_tenant_id(),
+                    key.as_ref(),
+                    winner_id,
+                    winner_version,
+                ),
+                (None, None) => {
+                    // Structurally unreachable: `resolve_credential` only
+                    // returns `Some` with no validator when a winner exists.
+                    return Err(CanonicalError::from(DomainError::internal(
+                        "credential resolved with neither a strong nor a weak validator source",
+                    )));
+                }
+            };
             Ok((
                 StatusCode::OK,
                 [
                     (axum::http::header::ETAG, etag),
-                    // Secret material must never be cached by intermediaries.
                     (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
                 ],
                 Json(dto),
@@ -244,7 +211,233 @@ pub async fn get_secret(
     }
 }
 
-/// `DELETE /credstore/v1/secrets/{ref}`
+/// `GET /credstore/v1/credentials/{ref}/secret` (ADR-0004).
+///
+/// # Errors
+///
+/// Returns a canonical `Problem` envelope on invalid reference (400), access denied (403),
+/// or not found (404).
+pub async fn get_secret(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path(reference): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let key = SecretRef::new(reference).map_err(|e| {
+        CanonicalError::from(DomainError::InvalidSecretRef {
+            detail: e.to_string(),
+        })
+    })?;
+    match svc.get_secret(&ctx, &key).await? {
+        Some(ref secret) => {
+            let dto = SecretDto::try_from_secret(secret)?;
+            let etag = format!("\"{}.{}\"", secret.validator.id, secret.validator.version);
+            Ok((
+                StatusCode::OK,
+                [
+                    (axum::http::header::ETAG, etag),
+                    (axum::http::header::CACHE_CONTROL, "no-store".to_owned()),
+                ],
+                Json(dto),
+            )
+                .into_response())
+        }
+        None => Err(CanonicalError::from(DomainError::NotFound)),
+    }
+}
+
+/// `PUT /credstore/v1/credentials/{ref}` (ADR-0004) — create or replace the
+/// whole credential.
+///
+/// # Errors
+///
+/// Returns a canonical `Problem` envelope on invalid reference / malformed or
+/// conflicting preconditions (400), access denied (403), a trait or type
+/// violation (400/409), or a failed precondition (409).
+pub async fn put_credential(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path(reference): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<PutCredentialRequestDto>,
+) -> ApiResult<impl IntoResponse> {
+    let precondition = parse_put_precondition(&headers)?;
+    let key = SecretRef::new(reference).map_err(|e| {
+        CanonicalError::from(DomainError::InvalidSecretRef {
+            detail: e.to_string(),
+        })
+    })?;
+    let Some(raw_value) = body.value else {
+        return Err(CanonicalError::from(DomainError::InvalidRequest {
+            field: "value",
+            reason: reasons::VALUE_REQUIRED,
+            detail: "value is required".to_owned(),
+        }));
+    };
+    let secret_type = body
+        .secret_type
+        .as_deref()
+        .map(|s| parse_gts_type("type", s))
+        .transpose()?;
+    let expires_at = body
+        .expires_at
+        .as_deref()
+        .map(|s| parse_rfc3339("expires_at", s))
+        .transpose()?;
+
+    let write = CredentialWrite {
+        secret_type,
+        sharing: body.sharing.into(),
+        fallback: Fallback::from(body.fallback),
+        expires_at,
+        value: SecretValue::from(raw_value),
+    };
+    let outcome = svc.put(&ctx, &key, write, precondition).await?;
+    let etag = format!("\"{}.{}\"", outcome.validator.id, outcome.validator.version);
+    if outcome.created {
+        let location = format!("/credstore/v1/credentials/{}", key.as_ref());
+        Ok((
+            StatusCode::CREATED,
+            [
+                (axum::http::header::LOCATION, location),
+                (axum::http::header::ETAG, etag),
+            ],
+        )
+            .into_response())
+    } else {
+        Ok((StatusCode::NO_CONTENT, [(axum::http::header::ETAG, etag)]).into_response())
+    }
+}
+
+/// `PATCH /credstore/v1/credentials/{ref}` (ADR-0004, RFC 7396 JSON Merge
+/// Patch).
+///
+/// Requires `Content-Type: application/merge-patch+json` (415 otherwise).
+/// This is checked here, in the handler, rather than through the standard
+/// `Json<T>` extractor: the toolkit's `Json<T>` (like `axum::Json<T>`)
+/// requires the body's content type to be exactly `application/json` and
+/// answers 415 for anything else — the opposite of what RFC 7396 requires —
+/// so the route is registered for `OpenAPI` purposes with
+/// `.json_request::<CredentialPatchDto>(...)` (its `content_type` metadata
+/// therefore reads `application/json`, a stated documentation deviation),
+/// while the handler takes the raw body and checks the header itself.
+///
+/// # Errors
+///
+/// Returns a canonical `Problem` envelope on a missing/wrong `Content-Type`
+/// (415), invalid reference / malformed body / `If-None-Match` present (400),
+/// access denied (403), not found (404), an empty patch or a `null` on a
+/// non-nullable field (400), a type violation (400/409), or a failed
+/// precondition (409).
+pub async fn patch_credential(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path(reference): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> ApiResult<impl IntoResponse> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_owned());
+    if content_type.as_deref() != Some(MERGE_PATCH_CONTENT_TYPE) {
+        // A real 415: not a canonical category on its own, so this builds
+        // the error directly (rather than through `DomainError`) to attach
+        // the HTTP-status override — see `crate::infra::sdk_error_mapping`
+        // for the `CredentialResource` marker this mirrors.
+        return Err(
+            crate::infra::sdk_error_mapping::CredentialResource::invalid_argument()
+                .with_field_violation(
+                    "Content-Type",
+                    format!(
+                        "PATCH requires Content-Type: {MERGE_PATCH_CONTENT_TYPE}; got {}",
+                        content_type.as_deref().unwrap_or("<none>")
+                    ),
+                    "UNSUPPORTED_MEDIA_TYPE",
+                )
+                .with_override(toolkit_canonical_errors::transport::Http::status_code(415))
+                .create(),
+        );
+    }
+    if headers.contains_key(axum::http::header::IF_NONE_MATCH) {
+        return Err(CanonicalError::from(DomainError::InvalidRequest {
+            field: "If-None-Match",
+            reason: reasons::PRECONDITION_REQUIRED,
+            detail: "If-None-Match is not meaningful on PATCH; use If-Match".to_owned(),
+        }));
+    }
+    let precondition = parse_if_match(&headers)?;
+    let key = SecretRef::new(reference).map_err(|e| {
+        CanonicalError::from(DomainError::InvalidSecretRef {
+            detail: e.to_string(),
+        })
+    })?;
+    let dto: CredentialPatchDto = serde_json::from_slice(&body).map_err(|e| {
+        CanonicalError::from(DomainError::InvalidRequest {
+            field: "body",
+            reason: "INVALID_MERGE_PATCH_BODY",
+            detail: format!("the request body is not a readable JSON object: {e}"),
+        })
+    })?;
+
+    let secret_type = match dto.secret_type {
+        None => None,
+        Some(None) => {
+            return Err(CanonicalError::from(DomainError::InvalidRequest {
+                field: "type",
+                reason: reasons::NULL_NOT_ALLOWED,
+                detail: "type cannot be cleared to null; omit it to leave the type unchanged"
+                    .to_owned(),
+            }));
+        }
+        Some(Some(raw)) => Some(parse_gts_type("type", &raw)?),
+    };
+    let sharing = match dto.sharing {
+        None => None,
+        Some(None) => {
+            return Err(CanonicalError::from(DomainError::InvalidRequest {
+                field: "sharing",
+                reason: reasons::NULL_NOT_ALLOWED,
+                detail: "sharing cannot be cleared to null".to_owned(),
+            }));
+        }
+        Some(Some(s)) => Some(SharingMode::from(s)),
+    };
+    let fallback = match dto.fallback {
+        None => None,
+        Some(None) => {
+            return Err(CanonicalError::from(DomainError::InvalidRequest {
+                field: "fallback",
+                reason: reasons::NULL_NOT_ALLOWED,
+                detail: "fallback cannot be cleared to null; send \"inherit\" or \"none\""
+                    .to_owned(),
+            }));
+        }
+        Some(Some(f)) => Some(Fallback::from(f)),
+    };
+    let expires_at = match dto.expires_at {
+        None => PatchField::Absent,
+        Some(None) => PatchField::Null,
+        Some(Some(raw)) => PatchField::Set(parse_rfc3339("expires_at", &raw)?),
+    };
+    let value = match dto.value {
+        None => PatchField::Absent,
+        Some(None) => PatchField::Null,
+        Some(Some(raw)) => PatchField::Set(SecretValue::from(raw)),
+    };
+
+    let patch = CredentialPatch {
+        secret_type,
+        sharing,
+        fallback,
+        expires_at,
+        value,
+    };
+    let validator = svc.patch(&ctx, &key, patch, precondition).await?;
+    let etag = format!("\"{}.{}\"", validator.id, validator.version);
+    Ok((StatusCode::NO_CONTENT, [(axum::http::header::ETAG, etag)]).into_response())
+}
+
+/// `DELETE /credstore/v1/credentials/{ref}` (ADR-0004).
 ///
 /// `If-Match` is **mandatory** (a version validator, or `*` for an explicit
 /// delete-whatever-is-there); a stale version yields a canonical `Aborted`
@@ -255,7 +448,7 @@ pub async fn get_secret(
 /// Returns a canonical `Problem` envelope on invalid reference / malformed or
 /// missing `If-Match` (400), access denied (403), not found (404), version
 /// precondition failure (409), or service unavailable (503).
-pub async fn delete_secret(
+pub async fn delete_credential(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
     Path(reference): Path<String>,
