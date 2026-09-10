@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use toolkit_db::outbox::{EnqueueMessage, LeasedMessageHandler, MessageResult, OutboxMessage};
+use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage};
 
 use crate::api::{IngestOutcome, ProducerMode};
 use crate::error::EventBrokerError;
@@ -162,14 +162,12 @@ impl ProducerOutbox {
         let payload = serde_json::to_vec(&envelope).map_err(|err| {
             EventBrokerError::Internal(format!("serialize producer outbox envelope: {err}"))
         })?;
+        let message = toolkit_db::outbox::Record::to(&self.queue, partition)
+            .payload(payload, PRODUCER_OUTBOX_PAYLOAD_TYPE)
+            .build()
+            .map_err(|err| EventBrokerError::Internal(format!("producer outbox enqueue: {err}")))?;
         self.outbox
-            .enqueue(
-                runner,
-                &self.queue,
-                partition,
-                payload,
-                PRODUCER_OUTBOX_PAYLOAD_TYPE,
-            )
+            .enqueue(runner, message)
             .await
             .map_err(|err| EventBrokerError::Internal(format!("producer outbox enqueue: {err}")))
     }
@@ -179,7 +177,12 @@ impl ProducerOutbox {
         runner: &(impl toolkit_db::secure::DBRunner + Sync + ?Sized),
         events: impl IntoIterator<Item = E>,
     ) -> Result<Vec<toolkit_db::outbox::OutboxMessageId>, EventBrokerError> {
-        let mut items = Vec::new();
+        // Every event in the batch shares the queue and the payload type, so
+        // the batch states them once. No trace is attached: a produced event
+        // is already identified by its own id and `trace_parent`, and giving
+        // each one a trace row would be a record nobody reads.
+        let mut batch =
+            toolkit_db::outbox::Records::to(&self.queue).payload_type(PRODUCER_OUTBOX_PAYLOAD_TYPE);
         for event in events {
             let (partition, envelope) = self
                 .producer
@@ -188,14 +191,13 @@ impl ProducerOutbox {
             let payload = serde_json::to_vec(&envelope).map_err(|err| {
                 EventBrokerError::Internal(format!("serialize producer outbox envelope: {err}"))
             })?;
-            items.push(EnqueueMessage {
-                partition,
-                payload,
-                payload_type: PRODUCER_OUTBOX_PAYLOAD_TYPE,
-            });
+            batch = batch.push(partition, payload);
         }
+        let batch = batch.build().map_err(|err| {
+            EventBrokerError::Internal(format!("producer outbox batch enqueue: {err}"))
+        })?;
         self.outbox
-            .enqueue_batch(runner, &self.queue, &items)
+            .enqueue_batch(runner, batch)
             .await
             .map_err(|err| {
                 EventBrokerError::Internal(format!("producer outbox batch enqueue: {err}"))

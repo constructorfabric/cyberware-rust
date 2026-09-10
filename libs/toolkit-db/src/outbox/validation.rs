@@ -1,4 +1,14 @@
+//! Every rule the outbox applies to caller-supplied input, one named function
+//! per field.
+//!
+//! A rejection names the field and the rule it broke. It never reproduces the
+//! submitted value: an error body travels into logs, aggregators and bug
+//! reports that the original submission was never meant to reach, and the
+//! caller already knows what it sent. A derived measurement is not the value
+//! and may be reported.
+
 use super::types::OutboxError;
+use toolkit_utils::byte_size::KIB_LEN;
 
 /// Maximum queue name length (fits VARCHAR(1024) column).
 const MAX_QUEUE_NAME_LEN: usize = 1024;
@@ -6,22 +16,30 @@ const MAX_QUEUE_NAME_LEN: usize = 1024;
 /// Maximum payload type length.
 const MAX_PAYLOAD_TYPE_LEN: usize = 1024;
 
+/// Maximum trace length (fits VARCHAR(256) column).
+const MAX_TRACE_LEN: usize = 256;
+
+/// Maximum payload size in bytes.
+pub const MAX_PAYLOAD_SIZE: usize = 64 * KIB_LEN;
+
 /// Validate a queue name: `[a-zA-Z0-9._-]{1,1024}`, must start and end with
 /// alphanumeric.
 pub fn validate_queue_name(name: &str) -> Result<(), OutboxError> {
+    let reason = |reason| Err(OutboxError::InvalidQueueName { reason });
+
     if name.is_empty() || name.len() > MAX_QUEUE_NAME_LEN {
-        return Err(OutboxError::InvalidQueueName(name.to_owned()));
+        return reason("must be 1-1024 bytes");
     }
 
     let bytes = name.as_bytes();
 
     if !bytes[0].is_ascii_alphanumeric() || !bytes[bytes.len() - 1].is_ascii_alphanumeric() {
-        return Err(OutboxError::InvalidQueueName(name.to_owned()));
+        return reason("must start and end with an ASCII alphanumeric");
     }
 
     for &b in bytes {
         if !(b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-') {
-            return Err(OutboxError::InvalidQueueName(name.to_owned()));
+            return reason("must contain only ASCII alphanumerics, '.', '_' and '-'");
         }
     }
 
@@ -30,14 +48,52 @@ pub fn validate_queue_name(name: &str) -> Result<(), OutboxError> {
 
 /// Validate a payload type: 1-1024 printable ASCII chars (`0x20..=0x7E`).
 pub fn validate_payload_type(payload_type: &str) -> Result<(), OutboxError> {
+    let reason = |reason| Err(OutboxError::InvalidPayloadType { reason });
+
     if payload_type.is_empty() || payload_type.len() > MAX_PAYLOAD_TYPE_LEN {
-        return Err(OutboxError::InvalidPayloadType(payload_type.to_owned()));
+        return reason("must be 1-1024 bytes");
     }
 
     for &b in payload_type.as_bytes() {
         if !(0x20..=0x7E).contains(&b) {
-            return Err(OutboxError::InvalidPayloadType(payload_type.to_owned()));
+            return reason("must contain only printable ASCII (0x20-0x7E)");
         }
+    }
+
+    Ok(())
+}
+
+/// Validate a trace: 1-256 printable ASCII chars (`0x20..=0x7E`).
+pub fn validate_trace(trace: &str) -> Result<(), OutboxError> {
+    let reason = |reason| Err(OutboxError::InvalidTrace { reason });
+
+    if trace.is_empty() {
+        return reason("must not be empty");
+    }
+
+    if trace.len() > MAX_TRACE_LEN {
+        return Err(OutboxError::TraceTooLong {
+            size: trace.len(),
+            max: MAX_TRACE_LEN,
+        });
+    }
+
+    for &b in trace.as_bytes() {
+        if !(0x20..=0x7E).contains(&b) {
+            return reason("must contain only printable ASCII (0x20-0x7E)");
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a payload against the per-message size cap.
+pub fn validate_payload(payload: &[u8]) -> Result<(), OutboxError> {
+    if payload.len() > MAX_PAYLOAD_SIZE {
+        return Err(OutboxError::PayloadTooLarge {
+            size: payload.len(),
+            max: MAX_PAYLOAD_SIZE,
+        });
     }
 
     Ok(())
@@ -172,5 +228,81 @@ mod tests {
     #[test]
     fn payload_type_non_ascii() {
         assert!(validate_payload_type("\u{0434}\u{0430}\u{043d}\u{043d}\u{044b}\u{0435}").is_err());
+    }
+
+    // --- Trace ---
+
+    #[test]
+    fn trace_simple() {
+        assert!(validate_trace("order-4711").is_ok());
+        assert!(validate_trace("import 2026-09-08 #3").is_ok());
+    }
+
+    #[test]
+    fn trace_256_bytes() {
+        assert!(validate_trace(&"a".repeat(256)).is_ok());
+    }
+
+    #[test]
+    fn trace_empty() {
+        assert!(validate_trace("").is_err());
+    }
+
+    #[test]
+    fn trace_too_long_reports_the_measurement() {
+        let err = validate_trace(&"a".repeat(257)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "trace size 257 exceeds maximum 256",
+            "the rejection states the measurement, not the value"
+        );
+    }
+
+    #[test]
+    fn trace_non_printable() {
+        assert!(validate_trace("order\n4711").is_err());
+        assert!(validate_trace("order\u{0000}").is_err());
+        assert!(validate_trace("\u{0437}\u{0430}\u{043a}\u{0430}\u{0437}").is_err());
+    }
+
+    // --- Rejections carry the rule, never the value ---
+
+    #[test]
+    fn rejections_do_not_reproduce_the_input() {
+        let secret = "orders/../../etc/passwd?token=hunter2";
+        let queue = validate_queue_name(secret).unwrap_err().to_string();
+        assert!(
+            !queue.contains("hunter2"),
+            "queue rejection echoed the input"
+        );
+
+        let payload_type = validate_payload_type("json\n\u{0000}hunter2")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !payload_type.contains("hunter2"),
+            "payload-type rejection echoed the input"
+        );
+
+        let trace = validate_trace("trace\n\u{0000}hunter2")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !trace.contains("hunter2"),
+            "trace rejection echoed the input"
+        );
+    }
+
+    // --- Payload size ---
+
+    #[test]
+    fn payload_at_the_cap() {
+        assert!(validate_payload(&vec![0u8; MAX_PAYLOAD_SIZE]).is_ok());
+    }
+
+    #[test]
+    fn payload_over_the_cap() {
+        let err = validate_payload(&vec![0u8; MAX_PAYLOAD_SIZE + 1]).unwrap_err();
+        assert_eq!(err.to_string(), "payload size 65537 exceeds maximum 65536");
     }
 }

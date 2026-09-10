@@ -45,6 +45,7 @@ impl MigrationTrait for CreateOutboxSchema {
         let backend = conn.get_database_backend();
         let tables = &self.tables;
 
+        create_trace(conn, backend, tables).await?;
         create_body(conn, backend, tables).await?;
         create_partitions(conn, backend, tables).await?;
         create_incoming(conn, backend, tables).await?;
@@ -71,6 +72,7 @@ impl MigrationTrait for CreateOutboxSchema {
             self.tables.incoming(),
             self.tables.partitions(),
             self.tables.body(),
+            self.tables.trace(),
         ] {
             conn.execute_raw(Statement::from_string(
                 backend,
@@ -211,6 +213,137 @@ async fn create_index_if_absent(
     Ok(())
 }
 
+/// One row per traced batch: what it was, who is waiting for it, and how much
+/// of it is still outstanding.
+///
+/// `pending` counts down from `entities` as the ack carries each entity to a
+/// terminal state; reaching zero stamps `completed_at`. `owner_instance` is the
+/// instance that enqueued the batch, and is the only instance a completion is
+/// delivered to.
+async fn create_trace(
+    conn: &DatabaseExecutor<'_>,
+    backend: DatabaseBackend,
+    tables: &OutboxTables,
+) -> Result<(), DbErr> {
+    let trace = tables.trace();
+    conn.execute_raw(Statement::from_string(
+        backend,
+        match backend {
+            DatabaseBackend::Postgres => {
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {trace} (
+                id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                trace          VARCHAR(256) NOT NULL,
+                owner_instance VARCHAR(256) NOT NULL,
+                queue          VARCHAR(1024) NOT NULL,
+                entities       BIGINT NOT NULL,
+                pending        BIGINT NOT NULL,
+                failures       BIGINT NOT NULL DEFAULT 0,
+                attempts       BIGINT NOT NULL DEFAULT 0,
+                last_error     TEXT,
+                stalled_since  TIMESTAMPTZ,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+                completed_at   TIMESTAMPTZ,
+                notified_at    TIMESTAMPTZ
+            )"
+                )
+            }
+            DatabaseBackend::Sqlite => {
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {trace} (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace          TEXT    NOT NULL,
+                owner_instance TEXT    NOT NULL,
+                queue          TEXT    NOT NULL,
+                entities       INTEGER NOT NULL,
+                pending        INTEGER NOT NULL,
+                failures       INTEGER NOT NULL DEFAULT 0,
+                attempts       INTEGER NOT NULL DEFAULT 0,
+                last_error     TEXT,
+                stalled_since  TEXT,
+                created_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+                completed_at   TEXT,
+                notified_at    TEXT
+            )"
+                )
+            }
+            DatabaseBackend::MySql => {
+                format!(
+                    "CREATE TABLE IF NOT EXISTS {trace} (
+                id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+                trace          VARCHAR(256) CHARACTER SET ascii NOT NULL,
+                owner_instance VARCHAR(256) CHARACTER SET ascii NOT NULL,
+                queue          VARCHAR(1024) CHARACTER SET ascii NOT NULL,
+                entities       BIGINT NOT NULL,
+                pending        BIGINT NOT NULL,
+                failures       BIGINT NOT NULL DEFAULT 0,
+                attempts       BIGINT NOT NULL DEFAULT 0,
+                last_error     TEXT,
+                stalled_since  TIMESTAMP(6) NULL,
+                created_at     TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                completed_at   TIMESTAMP(6) NULL,
+                notified_at    TIMESTAMP(6) NULL
+            )"
+                )
+            }
+            _ => return Err(unsupported_backend(backend)),
+        },
+    ))
+    .await?;
+
+    // Undelivered mail for one instance. Partial on Postgres, so the index
+    // holds only what is actually waiting to be collected - normally nothing,
+    // which is what makes the notifier's poll an empty index probe.
+    let mail_filter = matches!(backend, DatabaseBackend::Postgres)
+        .then_some("completed_at IS NOT NULL AND notified_at IS NULL");
+    create_index_if_absent(
+        conn,
+        backend,
+        &IndexSpec {
+            unique: false,
+            name: tables.idx_trace_mail(),
+            table: tables.trace(),
+            columns: "owner_instance",
+            filter: mail_filter,
+        },
+    )
+    .await?;
+
+    // Traces of this instance that are stuck rather than merely slow. Partial
+    // on Postgres for the same reason as the mail index: a healthy instance
+    // has none, so the stall reporter's poll touches an empty index.
+    let stalled_filter = matches!(backend, DatabaseBackend::Postgres)
+        .then_some("completed_at IS NULL AND stalled_since IS NOT NULL");
+    create_index_if_absent(
+        conn,
+        backend,
+        &IndexSpec {
+            unique: false,
+            name: tables.idx_trace_stalled(),
+            table: tables.trace(),
+            columns: "owner_instance",
+            filter: stalled_filter,
+        },
+    )
+    .await?;
+
+    // Lookup by the caller's own trace, for reconciliation after a restart has
+    // lost the in-memory subscription.
+    create_index_if_absent(
+        conn,
+        backend,
+        &IndexSpec {
+            unique: false,
+            name: tables.idx_trace_key(),
+            table: tables.trace(),
+            columns: "trace",
+            filter: None,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 async fn create_body(
     conn: &DatabaseExecutor<'_>,
     backend: DatabaseBackend,
@@ -226,7 +359,8 @@ async fn create_body(
                 id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                 payload       BYTEA  NOT NULL,
                 payload_type  VARCHAR(1024) NOT NULL,
-                created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                trace_id      BIGINT NULL
             )"
                 )
             }
@@ -236,7 +370,8 @@ async fn create_body(
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 payload       BLOB   NOT NULL,
                 payload_type  TEXT   NOT NULL,
-                created_at    TEXT   NOT NULL DEFAULT (datetime('now'))
+                created_at    TEXT   NOT NULL DEFAULT (datetime('now')),
+                trace_id      INTEGER NULL
             )"
                 )
             }
@@ -246,7 +381,8 @@ async fn create_body(
                 id            BIGINT PRIMARY KEY,
                 payload       LONGBLOB NOT NULL,
                 payload_type  VARCHAR(1024) NOT NULL,
-                created_at    TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                created_at    TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                trace_id      BIGINT NULL
             )"
                 )
             }
@@ -254,6 +390,7 @@ async fn create_body(
         },
     ))
     .await?;
+
     Ok(())
 }
 
@@ -486,7 +623,8 @@ async fn create_dead_letters(
                 attempts     SMALLINT NOT NULL,
                 status       VARCHAR(32) NOT NULL DEFAULT 'pending',
                 completed_at TIMESTAMPTZ,
-                deadline     TIMESTAMPTZ
+                deadline     TIMESTAMPTZ,
+                trace_id     BIGINT NULL
             )"
                 )
             }
@@ -504,7 +642,8 @@ async fn create_dead_letters(
                 attempts     INTEGER NOT NULL,
                 status       TEXT    NOT NULL DEFAULT 'pending',
                 completed_at TEXT,
-                deadline     TEXT
+                deadline     TEXT,
+                trace_id     INTEGER NULL
             )"
                 )
             }
@@ -523,6 +662,7 @@ async fn create_dead_letters(
                 status       VARCHAR(32) NOT NULL DEFAULT 'pending',
                 completed_at TIMESTAMP(6) NULL,
                 deadline     TIMESTAMP(6) NULL,
+                trace_id     BIGINT NULL,
                 FOREIGN KEY (partition_id) REFERENCES {partitions}(id)
             )"
                 )
@@ -571,6 +711,7 @@ async fn create_dead_letters(
         filter: None,
     };
     create_index_if_absent(conn, backend, &status_failed_index).await?;
+
     Ok(())
 }
 
@@ -762,7 +903,12 @@ mod tests {
         };
 
         assert!(
-            matches!(err, OutboxError::InvalidTablePrefix(prefix) if prefix == "public.outbox")
+            matches!(
+                err,
+                OutboxError::InvalidTablePrefix { reason }
+                    if reason == "must contain only ASCII alphanumerics and '_'"
+            ),
+            "the rejection states the rule, not the prefix"
         );
     }
 
@@ -996,6 +1142,73 @@ mod tests {
             rows.iter()
                 .map(|row| row.try_get::<String>("", "name").expect("index name"))
                 .collect()
+        }
+
+        async fn columns_of(conn: &sea_orm::DatabaseConnection, table: &str) -> Vec<String> {
+            let rows = conn
+                .query_all_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    format!("SELECT name FROM pragma_table_info('{table}') ORDER BY name"),
+                ))
+                .await
+                .expect("list columns");
+            rows.iter()
+                .map(|row| row.try_get::<String>("", "name").expect("column name"))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn schema_carries_the_trace_table_and_its_identity_columns() {
+            let db = setup_shared_db("outbox_schema_shape").await;
+            let conn = db.sea_internal();
+            let manager = SchemaManager::new(&conn);
+            CreateOutboxSchema::default()
+                .up(&manager)
+                .await
+                .expect("up");
+            let tables = OutboxTables::default();
+
+            // Trace identity reaches both the body and its dead letter.
+            for table in [tables.body(), tables.dead_letters()] {
+                assert!(
+                    columns_of(&conn, table)
+                        .await
+                        .iter()
+                        .any(|c| c == "trace_id"),
+                    "{table} is missing trace_id"
+                );
+            }
+
+            let trace_columns = columns_of(&conn, tables.trace()).await;
+            assert!(!trace_columns.is_empty(), "the trace table was not created");
+            for column in [
+                "attempts",
+                "completed_at",
+                "created_at",
+                "entities",
+                "failures",
+                "id",
+                "last_error",
+                "notified_at",
+                "owner_instance",
+                "pending",
+                "queue",
+                "stalled_since",
+                "trace",
+            ] {
+                assert!(
+                    trace_columns.iter().any(|c| c == column),
+                    "the trace table is missing {column}"
+                );
+            }
+
+            let indexes = outbox_index_names(&conn).await;
+            for index in [tables.idx_trace_mail(), tables.idx_trace_key()] {
+                assert!(
+                    indexes.iter().any(|i| i == index),
+                    "missing index {index}: have {indexes:?}"
+                );
+            }
         }
 
         #[tokio::test]

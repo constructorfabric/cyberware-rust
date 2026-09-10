@@ -104,8 +104,7 @@ impl Sequencer {
                 break;
             }
 
-            #[allow(clippy::cast_possible_wrap)]
-            let item_count = claimed.len() as i64;
+            let item_count = i64::try_from(claimed.len()).unwrap_or(i64::MAX);
 
             #[allow(clippy::cast_possible_truncation)]
             let drained_this_iteration = (claimed.len() as u32) < self.config.batch_size;
@@ -313,6 +312,7 @@ impl Sequencer {
     }
 
     /// Atomically allocate sequence numbers for a partition.
+    ///
     /// Returns the `start_seq` (items get `start_seq` + 1, `start_seq` + 2, etc.).
     async fn allocate_sequences(
         &self,
@@ -323,12 +323,13 @@ impl Sequencer {
     ) -> Result<i64, OutboxError> {
         match store.allocate_sequences() {
             AllocSql::UpdateReturning(sql) => {
-                // Pg/SQLite: UPDATE ... RETURNING — $1 = partition_id, $2 = count
+                // Pg/SQLite: one UPDATE ... RETURNING.
                 let row = txn
                     .query_one_raw(Statement::from_sql_and_values(
                         store.backend(),
                         sql,
-                        [partition_id.into(), count.into()],
+                        // Statement order: the delta, then the row.
+                        [count.into(), partition_id.into()],
                     ))
                     .await?
                     .ok_or_else(|| {
@@ -342,8 +343,7 @@ impl Sequencer {
                 Ok(start_seq)
             }
             AllocSql::UpdateThenSelect { update, select } => {
-                // MySQL: UPDATE then SELECT
-                // ? order: (count, partition_id) matching SQL occurrence
+                // MySQL: UPDATE, then SELECT the start of the range.
                 txn.execute_raw(Statement::from_sql_and_values(
                     store.backend(),
                     update,

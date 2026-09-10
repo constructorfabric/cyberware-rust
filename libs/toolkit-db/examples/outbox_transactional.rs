@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use sea_orm::DatabaseExecutor;
 use toolkit_db::outbox::{
-    HandlerResult, Outbox, OutboxMessage, Partitions, TransactionalMessageHandler, WorkerTuning,
-    outbox_migrations,
+    HandlerResult, Outbox, OutboxMessage, Partitions, Record, TransactionalMessageHandler,
+    WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -76,10 +76,9 @@ async fn main() -> anyhow::Result<()> {
                         // payload_type is user-defined — convention: mime base + vendor domain type
                         .enqueue(
                             tx,
-                            "orders",
-                            i % 2,
-                            payload.into_bytes(),
-                            "application/json;orders.created.v1",
+                            Record::to("orders", i % 2)
+                                .payload(payload.into_bytes(), "application/json;orders.created.v1")
+                                .build()?,
                         )
                         .await
                         .map_err(|e| anyhow::anyhow!("{e}"))?;

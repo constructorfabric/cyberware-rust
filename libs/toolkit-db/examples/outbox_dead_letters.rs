@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use toolkit_db::outbox::{
     DeadLetterFilter, DeadLetterScope, LeasedMessageHandler, MessageResult, Outbox, OutboxMessage,
-    Partitions, WorkerTuning, outbox_migrations,
+    Partitions, Record, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -52,10 +52,12 @@ async fn main() -> anyhow::Result<()> {
         h1.outbox()
             .enqueue(
                 &conn,
-                "events",
-                0,
-                format!("evt-{i}").into_bytes(),
-                "text/plain;events.logged.v1",
+                Record::to("events", 0)
+                    .payload(
+                        format!("evt-{i}").into_bytes(),
+                        "text/plain;events.logged.v1",
+                    )
+                    .build()?,
             )
             .await?;
     }

@@ -44,10 +44,18 @@ pub struct VacuumTask {
     db: Db,
     statements: Arc<OutboxStatements>,
     batch_size: usize,
+    /// Nudged when bodies were actually deleted, since that is what can make a
+    /// trace collectable ahead of its own clock.
+    collectable_traces: Arc<tokio::sync::Notify>,
 }
 
 impl VacuumTask {
-    pub fn new(db: Db, statements: Arc<OutboxStatements>, batch_size: usize) -> Self {
+    pub fn new(
+        db: Db,
+        statements: Arc<OutboxStatements>,
+        batch_size: usize,
+        collectable_traces: Arc<tokio::sync::Notify>,
+    ) -> Self {
         assert!(
             batch_size > 0,
             "vacuum batch_size must be greater than zero"
@@ -56,6 +64,7 @@ impl VacuumTask {
             db,
             statements,
             batch_size,
+            collectable_traces,
         }
     }
 }
@@ -109,6 +118,13 @@ impl WorkerAction for VacuumTask {
             elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
             "vacuum: sweep complete",
         );
+
+        // Bodies were deleted, which may have been the last thing keeping a
+        // trace alive. Told conditionally: a sweep that collected nothing
+        // cannot have made any trace collectable, so it says nothing.
+        if total_deleted > 0 {
+            self.collectable_traces.notify_one();
+        }
 
         let report = VacuumReport {
             partitions_swept: dirty.len(),

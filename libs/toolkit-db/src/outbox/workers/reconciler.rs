@@ -62,6 +62,18 @@ pub struct ColdReconciler {
 
 impl WorkerAction for ColdReconciler {
     type Payload = ();
+    /// Deliberately infallible, unlike the outbox's other background workers.
+    ///
+    /// They report failures so the worker loop escalates its backoff, because
+    /// theirs delay something auxiliary. This one is the pipeline's liveness
+    /// net: it is the only path by which work enqueued by *another* instance
+    /// becomes visible here, since that instance's notification never reaches
+    /// this process. Delaying its retry delays discovery of work nothing else
+    /// will find.
+    ///
+    /// And escalating would buy nothing measurable anyway - its `retry_max` is
+    /// one minute and its `idle_interval` is one minute, so the backoff caps at
+    /// the pace it already keeps. The failure reaches the log either way.
     type Error = Infallible;
 
     async fn execute(&mut self, _cancel: &CancellationToken) -> Result<Directive, Self::Error> {

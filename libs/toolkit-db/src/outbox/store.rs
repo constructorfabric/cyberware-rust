@@ -1,8 +1,9 @@
-use sea_orm::{ConnectionTrait, DatabaseExecutor, DbBackend, DbErr, Statement};
+use sea_orm::{ConnectionTrait, DatabaseExecutor, DbBackend, DbErr, Statement, TransactionTrait};
 
 use super::dialect::{AllocSql, ClaimSql, Dialect, VacuumSql};
 use super::statements::{MySqlIdReservationStatements, OutboxStatements};
 use super::tables::OutboxTables;
+use super::trace::TraceAdvance;
 
 /// Runtime SQL context for one outbox table family on one database backend.
 ///
@@ -38,7 +39,7 @@ impl<'a> OutboxStore<'a> {
     pub(super) async fn exec_insert_body_batch(
         &self,
         conn: &DatabaseExecutor<'_>,
-        payloads: &[(&[u8], &str)],
+        payloads: &[(&[u8], &str, Option<i64>)],
     ) -> Result<Vec<i64>, DbErr> {
         if payloads.is_empty() {
             return Ok(Vec::new());
@@ -53,11 +54,12 @@ impl<'a> OutboxStore<'a> {
                 .reserve_mysql_ids(conn, reservation, payloads.len(), "body")
                 .await?;
             let sql = self.build_insert_body_batch_with_ids(payloads.len());
-            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(payloads.len() * 3);
-            for (id, &(payload, payload_type)) in ids.iter().zip(payloads) {
+            let mut values: Vec<sea_orm::Value> = Vec::with_capacity(payloads.len() * 4);
+            for (id, &(payload, payload_type, trace_id)) in ids.iter().zip(payloads) {
                 values.push((*id).into());
                 values.push(payload.to_vec().into());
                 values.push(payload_type.into());
+                values.push(trace_id.into());
             }
             conn.execute_raw(Statement::from_sql_and_values(self.backend(), &sql, values))
                 .await?;
@@ -67,10 +69,11 @@ impl<'a> OutboxStore<'a> {
         let sql = self
             .dialect()
             .build_insert_body_batch(self.tables(), payloads.len());
-        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(payloads.len() * 2);
-        for &(payload, payload_type) in payloads {
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(payloads.len() * 3);
+        for &(payload, payload_type, trace_id) in payloads {
             values.push(payload.to_vec().into());
             values.push(payload_type.into());
+            values.push(trace_id.into());
         }
 
         if self.dialect().supports_returning() {
@@ -215,9 +218,10 @@ impl<'a> OutboxStore<'a> {
         conn: &DatabaseExecutor<'_>,
         payload: Vec<u8>,
         payload_type: &str,
+        trace_id: Option<i64>,
     ) -> Result<i64, DbErr> {
         if self.backend() == DbBackend::MySql {
-            let payloads = [(payload.as_slice(), payload_type)];
+            let payloads = [(payload.as_slice(), payload_type, trace_id)];
             let mut ids = self.exec_insert_body_batch(conn, &payloads).await?;
             return ids
                 .pop()
@@ -225,8 +229,13 @@ impl<'a> OutboxStore<'a> {
         }
 
         let sql = self.statements.enqueue().insert_body();
-        self.exec_insert_returning_id(conn, sql, vec![payload.into(), payload_type.into()], "body")
-            .await
+        self.exec_insert_returning_id(
+            conn,
+            sql,
+            vec![payload.into(), payload_type.into(), trace_id.into()],
+            "body",
+        )
+        .await
     }
 
     /// Execute a single incoming INSERT and return the generated ID.
@@ -260,20 +269,237 @@ impl<'a> OutboxStore<'a> {
         partition_id: i64,
         payload: Vec<u8>,
         payload_type: &str,
+        trace_id: Option<i64>,
     ) -> Result<i64, DbErr> {
         if let Some(cte) = self.statements.enqueue().insert_body_and_incoming_cte() {
             self.exec_insert_returning_id(
                 conn,
                 cte,
-                vec![payload.into(), payload_type.into(), partition_id.into()],
+                vec![
+                    payload.into(),
+                    payload_type.into(),
+                    trace_id.into(),
+                    partition_id.into(),
+                ],
                 "incoming",
             )
             .await
         } else {
             // MySQL: two separate round-trips (no CTE INSERT support).
-            let body_id = self.exec_insert_body(conn, payload, payload_type).await?;
+            let body_id = self
+                .exec_insert_body(conn, payload, payload_type, trace_id)
+                .await?;
             self.exec_insert_incoming(conn, partition_id, body_id).await
         }
+    }
+
+    /// Insert one trace row and return its id.
+    ///
+    /// `pending` starts equal to `entities`; the ack counts it down and zero
+    /// is completion.
+    pub(super) async fn exec_insert_trace(
+        &self,
+        conn: &DatabaseExecutor<'_>,
+        trace: &str,
+        owner_instance: &str,
+        queue: &str,
+        entities: i64,
+    ) -> Result<i64, DbErr> {
+        let sql = self.statements.enqueue().insert_trace();
+        self.exec_insert_returning_id(
+            conn,
+            sql,
+            vec![
+                trace.into(),
+                owner_instance.into(),
+                queue.into(),
+                entities.into(),
+                entities.into(),
+            ],
+            "trace",
+        )
+        .await
+    }
+
+    pub(super) fn trace_retry(&self) -> &str {
+        self.statements.trace().retry()
+    }
+
+    pub(super) fn trace_status(&self) -> &str {
+        self.statements.trace().status()
+    }
+
+    pub(super) fn select_collectable_traces(&self) -> &str {
+        self.statements.sweep().select_collectable_traces()
+    }
+
+    pub(super) fn build_delete_traces(&self, count: usize) -> String {
+        self.dialect().build_delete_traces(self.tables(), count)
+    }
+
+    pub(super) fn trace_mail(&self) -> &str {
+        self.statements.trace().mail()
+    }
+
+    pub(super) fn trace_stalled(&self) -> &str {
+        self.statements.trace().stalled()
+    }
+
+    /// Claim one completed trace as delivered, returning what to deliver, or
+    /// `None` when the trace is unfinished, already delivered, or owned by
+    /// another instance.
+    /// Count a trace down, and say whether that advance completed it.
+    ///
+    /// `None` means the guard did not match - `pending` was already zero, so
+    /// somebody else's ack completed it. On a dialect with `RETURNING` this
+    /// costs the same one statement it always did and saves the caller the
+    /// claim on every advance that did not reach zero, which for a batch
+    /// spread over N partitions is N-1 guarded UPDATEs against the one row
+    /// they all contend for. Elsewhere it cannot be known without another
+    /// read, so the caller keeps claiming unconditionally.
+    pub(super) async fn exec_trace_advance(
+        &self,
+        conn: &DatabaseExecutor<'_>,
+        trace_id: i64,
+        terminal: i64,
+        failures: i64,
+        instance_id: &str,
+    ) -> Result<TraceAdvance, DbErr> {
+        let sql = self.statements.trace().advance();
+
+        if !self.dialect().supports_returning() {
+            // The claim rides the countdown here, so this is one statement
+            // rather than a countdown plus a guarded claim that can only
+            // match for one ack of the batch.
+            let affected = conn
+                .execute_raw(Statement::from_sql_and_values(
+                    self.backend(),
+                    sql,
+                    [
+                        terminal.into(),
+                        failures.into(),
+                        terminal.into(),
+                        terminal.into(),
+                        terminal.into(),
+                        instance_id.into(),
+                        trace_id.into(),
+                    ],
+                ))
+                .await?
+                .rows_affected();
+            return Ok(if affected == 0 {
+                TraceAdvance::NotAffected
+            } else {
+                TraceAdvance::Unknown
+            });
+        }
+
+        let values = [
+            terminal.into(),
+            failures.into(),
+            terminal.into(),
+            terminal.into(),
+            trace_id.into(),
+        ];
+
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(self.backend(), sql, values))
+            .await?;
+        let Some(row) = row else {
+            return Ok(TraceAdvance::NotAffected);
+        };
+        let pending: i64 = row
+            .try_get_by_index(0)
+            .map_err(|e| DbErr::Custom(format!("pending column: {e}")))?;
+        Ok(if pending <= 0 {
+            TraceAdvance::Completed
+        } else {
+            TraceAdvance::StillPending
+        })
+    }
+
+    /// Claim mail with no transaction of the caller's own, atomically on every
+    /// backend.
+    ///
+    /// The ack calls the primitive below inside its own transaction, so it is
+    /// already atomic there. The collector has none, and on a backend without
+    /// `RETURNING` the claim is an `UPDATE` followed by a `SELECT` - if the
+    /// second fails, the row is stamped delivered with nobody told, no record
+    /// and no retry, and the caller waits for ever. So that backend gets a
+    /// transaction; the others are one statement and need none.
+    pub(super) async fn claim_trace_mail_alone(
+        &self,
+        conn: &sea_orm::DatabaseConnection,
+        trace_id: i64,
+        instance_id: &str,
+    ) -> Result<Option<super::trace::TraceOutcome>, DbErr> {
+        if self.dialect().supports_returning() {
+            let runner = crate::secure::SeaOrmRunner::Conn(conn);
+            return self
+                .exec_claim_trace_mail(&runner.executor(), trace_id, instance_id)
+                .await;
+        }
+
+        let txn = conn.begin().await?;
+        let claimed = self
+            .exec_claim_trace_mail(&DatabaseExecutor::Transaction(&txn), trace_id, instance_id)
+            .await?;
+        txn.commit().await?;
+        Ok(claimed)
+    }
+
+    pub(super) async fn exec_claim_trace_mail(
+        &self,
+        conn: &DatabaseExecutor<'_>,
+        trace_id: i64,
+        instance_id: &str,
+    ) -> Result<Option<super::trace::TraceOutcome>, DbErr> {
+        let claim = self.statements.trace().claim_mail();
+
+        if self.dialect().supports_returning() {
+            let row = conn
+                .query_one_raw(Statement::from_sql_and_values(
+                    self.backend(),
+                    claim,
+                    [trace_id.into(), instance_id.into()],
+                ))
+                .await?;
+            return row.as_ref().map(Self::outcome_from_row).transpose();
+        }
+
+        // Nothing to claim: `exec_trace_advance` already stamped delivery in
+        // the same statement that counted down. This read is how we learn
+        // whether it did, and its guard is what makes that answer exact -
+        // only the ack that drove `pending` to zero can see a row, because
+        // every later advance is refused by `pending > 0`.
+        let row = conn
+            .query_one_raw(Statement::from_sql_and_values(
+                self.backend(),
+                self.statements.trace().claim_mail_outcome(),
+                [trace_id.into(), instance_id.into()],
+            ))
+            .await?;
+        row.as_ref().map(Self::outcome_from_row).transpose()
+    }
+
+    fn outcome_from_row(row: &sea_orm::QueryResult) -> Result<super::trace::TraceOutcome, DbErr> {
+        Ok(super::trace::TraceOutcome {
+            trace: row
+                .try_get_by_index(0)
+                .map_err(|e| DbErr::Custom(format!("trace column: {e}")))?,
+            entities: row
+                .try_get_by_index(1)
+                .map_err(|e| DbErr::Custom(format!("entities column: {e}")))?,
+            failures: row
+                .try_get_by_index(2)
+                .map_err(|e| DbErr::Custom(format!("failures column: {e}")))?,
+            attempts: row
+                .try_get_by_index(3)
+                .map_err(|e| DbErr::Custom(format!("attempts column: {e}")))?,
+            completed_at: row
+                .try_get_by_index(4)
+                .map_err(|e| DbErr::Custom(format!("completed_at column: {e}")))?,
+        })
     }
 
     pub(super) fn lock_partition(&self) -> Option<&str> {
@@ -493,10 +719,10 @@ impl<'a> OutboxStore<'a> {
 
     fn build_insert_body_batch_with_ids(&self, count: usize) -> String {
         let mut sql = format!(
-            "INSERT INTO {} (id, payload, payload_type) VALUES ",
+            "INSERT INTO {} (id, payload, payload_type, trace_id) VALUES ",
             self.tables().body()
         );
-        append_mysql_value_tuples(&mut sql, count, 3);
+        append_mysql_value_tuples(&mut sql, count, 4);
         sql
     }
 
@@ -548,7 +774,7 @@ mod tests {
 
         assert_eq!(
             sql,
-            "INSERT INTO toolkit_outbox_body (id, payload, payload_type) VALUES (?, ?, ?), (?, ?, ?)"
+            "INSERT INTO toolkit_outbox_body (id, payload, payload_type, trace_id) VALUES (?, ?, ?, ?), (?, ?, ?, ?)"
         );
     }
 

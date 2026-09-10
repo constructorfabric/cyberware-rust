@@ -16,6 +16,7 @@ pub struct OutboxTables {
     dead_letters: String,
     processor: String,
     vacuum_counter: String,
+    trace: String,
     body_id_sequence: String,
     incoming_id_sequence: String,
     idx_incoming_partition: String,
@@ -25,6 +26,9 @@ pub struct OutboxTables {
     idx_dl_replayable: String,
     idx_dl_status_deadline: String,
     idx_dl_status_failed: String,
+    idx_trace_mail: String,
+    idx_trace_stalled: String,
+    idx_trace_key: String,
     migration_name: String,
 }
 
@@ -50,6 +54,7 @@ impl OutboxTables {
             dead_letters: suffixed(&prefix, "dead_letters"),
             processor: suffixed(&prefix, "processor"),
             vacuum_counter: suffixed(&prefix, "vacuum_counter"),
+            trace: suffixed(&prefix, "trace"),
             body_id_sequence: suffixed(&prefix, "body_id_sequence"),
             incoming_id_sequence: suffixed(&prefix, "incoming_id_sequence"),
             idx_incoming_partition: indexed(&prefix, "incoming_partition"),
@@ -59,6 +64,9 @@ impl OutboxTables {
             idx_dl_replayable: indexed(&prefix, "dl_replayable"),
             idx_dl_status_deadline: indexed(&prefix, "dl_status_deadline"),
             idx_dl_status_failed: indexed(&prefix, "dl_status_failed"),
+            idx_trace_mail: indexed(&prefix, "trace_mail"),
+            idx_trace_stalled: indexed(&prefix, "trace_stalled"),
+            idx_trace_key: indexed(&prefix, "trace_key"),
             migration_name: migration_name(&prefix),
             prefix,
         };
@@ -100,6 +108,10 @@ impl OutboxTables {
         &self.vacuum_counter
     }
 
+    pub(crate) fn trace(&self) -> &str {
+        &self.trace
+    }
+
     pub(crate) fn body_id_sequence(&self) -> &str {
         &self.body_id_sequence
     }
@@ -109,7 +121,7 @@ impl OutboxTables {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn table_names(&self) -> [&str; 7] {
+    pub(crate) fn table_names(&self) -> [&str; 8] {
         [
             self.body(),
             self.partitions(),
@@ -118,6 +130,7 @@ impl OutboxTables {
             self.dead_letters(),
             self.processor(),
             self.vacuum_counter(),
+            self.trace(),
         ]
     }
 
@@ -149,6 +162,18 @@ impl OutboxTables {
         &self.idx_dl_status_failed
     }
 
+    pub(crate) fn idx_trace_mail(&self) -> &str {
+        &self.idx_trace_mail
+    }
+
+    pub(crate) fn idx_trace_stalled(&self) -> &str {
+        &self.idx_trace_stalled
+    }
+
+    pub(crate) fn idx_trace_key(&self) -> &str {
+        &self.idx_trace_key
+    }
+
     pub(crate) fn migration_name(&self) -> &str {
         &self.migration_name
     }
@@ -162,6 +187,7 @@ impl OutboxTables {
             self.dead_letters(),
             self.processor(),
             self.vacuum_counter(),
+            self.trace(),
             self.body_id_sequence(),
             self.incoming_id_sequence(),
             self.idx_incoming_partition(),
@@ -171,9 +197,14 @@ impl OutboxTables {
             self.idx_dl_replayable(),
             self.idx_dl_status_deadline(),
             self.idx_dl_status_failed(),
+            self.idx_trace_mail(),
+            self.idx_trace_stalled(),
+            self.idx_trace_key(),
         ] {
             if ident.len() > MAX_IDENTIFIER_LEN {
-                return Err(OutboxError::InvalidTablePrefix(self.prefix.clone()));
+                return Err(OutboxError::InvalidTablePrefix {
+                    reason: "derived table and index names must fit 63 bytes",
+                });
             }
         }
         Ok(())
@@ -181,18 +212,20 @@ impl OutboxTables {
 }
 
 fn validate_prefix(prefix: &str) -> Result<(), OutboxError> {
+    let reason = |reason| Err(OutboxError::InvalidTablePrefix { reason });
+
     if prefix.is_empty() || prefix.len() > MAX_PREFIX_LEN {
-        return Err(OutboxError::InvalidTablePrefix(prefix.to_owned()));
+        return reason("must be 1-36 bytes");
     }
 
     let bytes = prefix.as_bytes();
     if !bytes[0].is_ascii_alphabetic() {
-        return Err(OutboxError::InvalidTablePrefix(prefix.to_owned()));
+        return reason("must start with an ASCII letter");
     }
 
     for &b in bytes {
         if !(b.is_ascii_alphanumeric() || b == b'_') {
-            return Err(OutboxError::InvalidTablePrefix(prefix.to_owned()));
+            return reason("must contain only ASCII alphanumerics and '_'");
         }
     }
 

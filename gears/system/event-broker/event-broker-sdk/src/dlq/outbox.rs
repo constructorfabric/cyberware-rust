@@ -47,18 +47,15 @@ impl ConsumerDlqOutbox {
         let envelope = DeadLetterEnvelope::from_record(record);
         let payload = envelope.to_vec()?;
 
-        self.outbox
-            .enqueue(
-                runner,
-                &self.queue,
-                partition,
-                payload,
-                DeadLetterEnvelope::PAYLOAD_TYPE,
-            )
-            .await
+        let message = toolkit_db::outbox::Record::to(&self.queue, partition)
+            .payload(payload, DeadLetterEnvelope::PAYLOAD_TYPE)
+            .build()
             .map_err(|err| {
                 EventBrokerError::Internal(format!("enqueue dead-letter envelope: {err}"))
-            })
+            })?;
+        self.outbox.enqueue(runner, message).await.map_err(|err| {
+            EventBrokerError::Internal(format!("enqueue dead-letter envelope: {err}"))
+        })
     }
 }
 
