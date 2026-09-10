@@ -1,9 +1,9 @@
 ---
 status: accepted
-date: 2026-05-07
+date: 2026-09-03
 ---
 
-# Coordination plugin — separate `CoordinationPluginV1` contract
+# Coordination: consume the platform `cluster` gear's leader election
 
 <!-- toc -->
 
@@ -11,13 +11,18 @@ date: 2026-05-07
 - [Decision Drivers](#decision-drivers)
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
+  - [Why leader election and not the distributed lock](#why-leader-election-and-not-the-distributed-lock)
+  - [Advisory semantics and what QE requires](#advisory-semantics-and-what-qe-requires)
+  - [Startup validation replaces the bootstrap probe](#startup-validation-replaces-the-bootstrap-probe)
   - [Default deployment shape](#default-deployment-shape)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [Separate `CoordinationPluginV1` trait](#separate-coordinationpluginv1-trait)
+  - [Consume the platform `cluster` gear's leader election](#consume-the-platform-cluster-gears-leader-election)
+  - [Consume the platform `cluster` gear's distributed lock](#consume-the-platform-cluster-gears-distributed-lock)
+  - [Separate QE-owned `CoordinationPluginV1` trait](#separate-qe-owned-coordinationpluginv1-trait)
   - [Bundle coordination methods into `QuotaEnforcementStoragePluginV1`](#bundle-coordination-methods-into-quotaenforcementstoragepluginv1)
-  - [No in-process abstraction — external orchestration only](#no-in-process-abstraction--external-orchestration-only)
+  - [No in-process abstraction, external orchestration only](#no-in-process-abstraction-external-orchestration-only)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -25,138 +30,234 @@ date: 2026-05-07
 
 **ID**: `cpt-cf-quota-enforcement-adr-coordination-plugin`
 
+> **Revision history.** The first version of this record (2026-05-07) chose a QE-owned `CoordinationPluginV1` trait
+> with a QE-owned default plugin on the storage database. The platform `cluster` design (PRD, DESIGN, ADRs) already
+> existed at that time (2026-03-31) but was not considered. Its SDK and gear implementation landed on 2026-06-18, and
+> the gear became deployable out of process on 2026-08-25. This revision (2026-09-03) replaces the QE-owned contract
+> with the platform primitive. The record keeps its ID; the design components and features that reference it keep
+> their references.
+
 ## Context and Problem Statement
 
-Three QE background tasks — `LeaseSweeper`, `RetentionSweeper`, `NotificationDispatcher` — must run as cluster-wide
-singletons: only one replica may sweep expired leases / reclaim retention rows / drain the notification outbox at a
-time, otherwise duplicate work and at-least-once-becomes-at-least-twice semantics emerge. The singleton property is not
-just a performance hint: it underpins `cpt-cf-quota-enforcement-nfr-recovery` (RTO ≤ 15 min — a dead leader's slot must
-be re-acquirable within at most one TTL by any survivor).
+Two QE background tasks, `LeaseSweeper` and `RetentionSweeper`, must run as cluster-wide singletons. Only one replica
+should sweep expired leases or reclaim retention rows at a time; otherwise every replica does the same work. The
+singleton property also underpins `cpt-cf-quota-enforcement-nfr-recovery` (RTO ≤ 15 min): when the active replica
+dies, a survivor must take over within a bounded time.
 
-The natural realisation is a TTL-bounded distributed lock: every replica attempts to acquire a per-scope lock; the
-winner runs the task, renews the lock periodically, and either releases it on graceful shutdown or lets it auto-expire
-on crash. The mechanism behind that lock — Postgres advisory locks, MariaDB `GET_LOCK`, a lease-row +
-`SELECT … FOR UPDATE`, etcd / Consul, Redis Redlock, Kubernetes Lease objects, ZooKeeper, custom in-memory for tests —
-is operationally diverse and only weakly tied to the storage backend choice.
+The natural realisation is a TTL-bounded claim: every replica competes for a per-scope claim, the winner runs the
+task and renews the claim, and the claim expires on crash. The mechanism behind the claim (Postgres, Redis, etcd,
+Kubernetes Lease, in-memory for tests) is operationally diverse and only weakly tied to the storage backend choice.
 
-Question: where should this primitive live in the QE-core contract surface?
+The 2026-05-07 version of this record asked where such a primitive should live in the QE contract surface, and
+answered with a QE-owned trait plus a QE-owned default plugin. It did not consider the platform `cluster` design,
+which existed at the time. That design is now implemented: the `cluster` gear
+([PRD](../../../cluster/docs/PRD.md), [DESIGN](../../../cluster/docs/DESIGN.md)) provides exactly this primitive to
+every gear: named leader election with automatic renewal, TTL-bounded distributed locks, per-profile backend selection
+in operator YAML, and startup validation of declared capabilities. Its PRD names per-gear coordination code as the
+duplication it exists to remove (cluster PRD §1.3).
+
+Question: should QE keep its own coordination contract, or consume the platform primitive, and if so which one?
 
 ## Decision Drivers
 
-- **Sweeper / dispatcher singleton coordination** for `LeaseSweeper`, `RetentionSweeper`, `NotificationDispatcher`.
-- **NFR recovery (RTO ≤ 15 min)** — a crashed leader's lock MUST become acquirable within at most one TTL
+- **Sweeper singleton coordination** for `LeaseSweeper` and `RetentionSweeper`. The `NotificationDispatcher` is fenced
+  by the `toolkit-db` Outbox leased-handler model and needs no election (DESIGN §3.2).
+- **NFR recovery (RTO ≤ 15 min)**: a crashed leader's claim MUST become acquirable by a survivor within a bounded time
   (`cpt-cf-quota-enforcement-nfr-recovery`).
-- **Storage plugin contract minimality** — the storage trait already carries 13 invariants and ~20 methods; conflating
-  coordination semantics with persistence semantics inflates an already large contract.
-- **Independent operational evolution** — coordination backends evolve along a different axis than storage backends;
-  operators deploying Postgres for storage may want Redis / etcd / k8s for coordination as the cluster grows.
-- **Default-deployment ergonomics** — small / single-tenant deployments should not require a second ops dependency just
-  to run sweepers.
+- **Storage plugin contract minimality**: the storage trait carries 13 invariants and about 20 methods; coordination
+  semantics do not belong in it.
+- **Independent operational evolution**: the coordination backend evolves on a different axis than the storage
+  backend; an operator with Postgres storage may want Redis, etcd, or Kubernetes for coordination.
+- **Default-deployment ergonomics**: small deployments must not need a second infrastructure dependency to run the
+  sweepers.
+- **Platform reuse**: the platform owns one coordination gear with one contract, one conformance suite, and one
+  operator configuration model. A second, QE-owned coordination contract duplicates all three.
 
 ## Considered Options
 
-- **Separate `CoordinationPluginV1` trait** (chosen) — distinct plugin contract for TTL-bounded distributed locks,
-  decoupled from `QuotaEnforcementStoragePluginV1`.
-- **Bundle coordination methods into `QuotaEnforcementStoragePluginV1`** — add `acquire_lock` / `renew` / `release`
-  directly on the storage trait, alongside data methods.
-- **No in-process abstraction — external orchestration only** — defer singleton enforcement to an external orchestrator
-  (Kubernetes Lease object, StatefulSet-with-replica=1, Nomad job constraint), with no QE-core trait at all.
+- **Consume the platform `cluster` gear's leader election** (chosen): one named election per sweeper scope through
+  the `cluster-sdk` leader-election facade, wrapped in a thin QE port and adapter.
+- **Consume the platform `cluster` gear's distributed lock**: one TTL-bounded lock per sweeper scope through the
+  `cluster-sdk` lock facade, renewed by the sweeper.
+- **Separate QE-owned `CoordinationPluginV1` trait** (the 2026-05-07 decision): a QE plugin contract with
+  `try_lock`, `renew`, `release`, and a QE-owned default plugin on the storage database.
+- **Bundle coordination methods into `QuotaEnforcementStoragePluginV1`**: add lock methods to the storage trait.
+- **No in-process abstraction, external orchestration only**: Kubernetes Lease, a single-replica StatefulSet, or a
+  Nomad job constraint, with no QE-side abstraction.
 
 ## Decision Outcome
 
-Chosen option: **Separate `CoordinationPluginV1` trait**, because it (a) keeps both plugin contracts narrow and focused,
-(b) lets the coordination backend evolve independently of the storage backend, (c) makes coordination-backend choice an
-operator-deployment decision rather than a QE-core or storage-plugin code change, and (d) does not force an external
-orchestration dependency on small deployments.
+Chosen option: **Consume the platform `cluster` gear's leader election**, because it (a) removes a QE-owned contract,
+a QE-owned plugin crate, and a QE-owned vendor lookup, (b) gives the operator backend selection per deployment in the
+cluster profile YAML with no QE code change, (c) validates the backend guarantee QE needs at startup instead of at the
+first failover, and (d) is the primitive the cluster gear designs for singleton background work.
 
-The trait surface is intentionally minimal: three methods (`try_lock`, `renew`, `release`), a closed `LockScope` enum
-(`LeaseSweeper` / `RetentionSweeper` / `NotificationDispatcher`), an opaque `Lock` holder token, and a closed
-`CoordinationError` enum. TTL-bounded auto-release is an inviolable contract property — a lock MUST NOT outlive its TTL
-even if the holder process crashes silently. Bootstrap-time reachability is validated via a `try_lock` + `release` probe
-on each `LockScope::*` value (DESIGN §3.7); the contract has no separate health-check method. Full surface in DESIGN
-§3.3 "Coordination Plugin Trait".
+The shape on the QE side:
+
+- The `quota-enforcement` gear depends on `cluster-sdk` only and declares no `deps = [cluster]` edge (cluster DESIGN
+  §3.17.7): a deployed consumer links no cluster gear, so the edge would fail the registry build. Start ordering
+  comes from the cluster gear's `system` tier, and readiness gating from the SDK-submitted consumer registration. The
+  binary decides the profile: an embedded binary links the `cluster` gear, a provider plugin, and the mandatory
+  `grpc-hub`; a remote image enables QE's forwarding Cargo feature and links none of them. QE source is the same in
+  both.
+- QE defines one typed cluster profile marker, `QuotaEnforcementProfile`, with the profile name `quota-enforcement`.
+  The name appears in exactly two places: that marker and the operator's YAML.
+- In its lifecycle `start`, QE resolves the leader-election facade for that profile with the `Linearizable`
+  capability requirement and scopes it under the `qe` prefix.
+- QE keeps a closed scope enum, `SingletonScope`, with the variants `LeaseSweeper` and `RetentionSweeper`. Each
+  variant maps to one election name (`lease-sweeper`, `retention-sweeper`). Free-form names never reach the cluster
+  facade from QE code.
+- A thin domain port, `SingletonCoordinator`, exposes one operation: run a unit of work while this replica is the
+  leader of a scope. Its single infrastructure adapter, the `CoordinationAdapter` component
+  (`cpt-cf-quota-enforcement-component-coordination-plugin`), implements the port over the cluster facade. The port
+  exists for the domain-layer dependency rule; it is not a plugin extension point.
+- The adapter drives the election watch itself, with the same reactive pattern the cluster SDK's run loop
+  implements: the sweep body starts when this replica becomes leader and receives a child cancellation token; the
+  resolved cluster backend renews the claim on its own cadence; the token is cancelled when leadership is lost, and
+  the body is aborted after a stop timeout; the body restarts on re-election. The adapter keeps ownership of the watch so that on
+  graceful shutdown it can cancel the body and then call `resign`, which elects a successor without waiting for the
+  TTL. The SDK's own `run_while_leader` cannot do this: it consumes the watch, and a dropped watch performs no resign
+  I/O.
+- The election TTL and the missed-renewal budget are QE operator configuration, with the cluster defaults as the
+  defaults.
+
+### Why leader election and not the distributed lock
+
+The cluster lock forbids non-cluster remote I/O inside the critical section (cluster PRD §5.3, "No Remote I/O Inside
+the Critical Section", with a planned workspace lint). A sweeper writes to the storage backend for the whole
+duration of its cycle. That is exactly the shape the rule forbids. Leader election is the cluster primitive for
+"which replica runs this workload" (cluster DESIGN §3.3, consumer patterns), and it carries the renewal loop, the
+observation model, and the graceful step-down that the 2026-05-07 record specified by hand.
+
+### Advisory semantics and what QE requires
+
+Cluster leader election is advisory (cluster PRD §5.2, "Advisory Semantics, Not Mutual Exclusion"): two replicas can
+both observe themselves as leader for a window bounded by the election TTL plus observation lag. Both QE sweepers tolerate that window:
+
+- `LeaseSweeper` reclaims leases that are already expired by timestamp. Lazy semantic release (I4) keeps accounting
+  correct regardless of who reclaims, and a duplicate reclamation is a no-op on rows already transitioned.
+- `RetentionSweeper` deletes rows past their retention window. A duplicate delete finds nothing.
+
+So the singleton property QE needs is "at most one active sweeper in steady state, and a bounded takeover time", not
+strict mutual exclusion. QE still requires the `Linearizable` capability at resolve time: an eventually consistent
+backend can elect two leaders on every failover (cluster ADR-009), which would turn the bounded window into a steady
+state.
+
+### Startup validation replaces the bootstrap probe
+
+The 2026-05-07 record required a `try_lock` plus `release` probe per scope at bootstrap, with fail-fast abort. That
+probe goes away. The cluster resolver validates the declared capability against the bound backend (cluster PRD §5.5,
+"Capability Mismatch Fails Startup, Not Production"): in the embedded profile a mismatch or an unbound profile returns an error
+from `resolve()` and QE fails startup; in the deployed profile the same verdict arrives through the readiness gate.
+The QE health check names `cluster` as the failed dependency, the same way it names the storage plugin.
 
 ### Default deployment shape
 
-The P1 default `quota-enforcement-coordination-plugin` impl piggybacks on the storage backend's own locking primitives
-(Postgres advisory locks, MariaDB `GET_LOCK`, a `SELECT … FOR UPDATE` lease-row pattern, etc.), so default deployments
-incur no additional ops dependency. Operators may swap to an independent coordination backend (etcd, Consul, Redis
-Redlock, Kubernetes Lease, ZooKeeper) by replacing the plugin crate; QE-core and the storage plugin stay unchanged.
+The operator binds the `quota-enforcement` profile in the cluster section of the deployment YAML. With the
+`standalone` provider the election runs in-process, which is correct for a single-process deployment and for tests.
+With the `postgres` provider the election runs on a Postgres cache table; this may be the same Postgres server the QE
+storage plugin uses, so a default multi-instance deployment still adds no infrastructure dependency. Kubernetes Lease,
+Redis, etcd, and NATS backends are cluster plugins on the cluster roadmap; QE gains them by configuration.
 
-The contract is deliberately silent on transport, quorum semantics, or internal storage of lease state — those are
-plugin-internal. QE-core requires only the outcome: TTL-bounded acquisition, renew-or-fail semantics, and crash-safe
-auto-release.
+An operator who needs a decorrelated failure domain binds the QE profile to a different backend than the storage
+plugin uses. QE code does not change.
 
 ### Consequences
 
-- `quota-enforcement-coordination-plugin` ships as its own crate alongside `quota-enforcement-storage-plugin`. Both are
-  consumed by sweepers / dispatcher through ClientHub.
-- The trait travels in `quota-enforcement-sdk` so plugin authors implement against a single dependency (parallel to
-  `QuotaEnforcementStoragePluginV1`, `QuotaResolutionEngineV1`, `QuotaNotificationSinkV1`).
-- Bootstrap MUST run a `try_lock` + `release` reachability probe for each `LockScope::*` value before the gear joins
-  the platform readiness signal; failure aborts bootstrap fail-fast (DESIGN §3.7 bootstrap step).
-- Holders MUST `renew` on or before TTL/3 of cycle elapsed; missing the renew window surfaces `LockExpired` and forces
-  follower-mode fallback.
-- Plugin contract is versioned with the gear's major version per PRD §7.2 — the trait carries the matching `V<major>`
-  suffix (`CoordinationPluginV1`).
-- The default impl shares the storage backend's failure domain: if the storage database is unreachable, the default
-  coordination plugin also fails the `try_lock` + `release` bootstrap probe. Operators who need decorrelated failure
-  domains (e.g., coordination available while storage is degraded) deploy an independent coordination backend.
+- No `quota-enforcement-coordination-plugin` crate, no `CoordinationPluginV1` trait in `quota-enforcement-sdk`, no
+  `coordination_vendor` configuration, and no coordination GTS plugin spec. The gear depends on `cluster-sdk`; the
+  embedded binary, not QE, links the `cluster` gear, a provider plugin, and `grpc-hub`.
+- Four traceability IDs retire with this revision: the coordination-plugin contract entry in PRD §7.2 (replaced by
+  `cpt-cf-quota-enforcement-contract-cluster-coordination`, a consumed contract), the lock-primitive algorithm and
+  the lock state machine in the foundation feature, and the default-implementation definition of done (replaced by
+  `cpt-cf-quota-enforcement-dod-coordination-adapter`). The component ID and the interface ID stay and are re-scoped
+  to the adapter.
+- The sweeper features consume the adapter's run-while-leader semantics and no longer specify renewal cadence,
+  follower fallback, or jittered re-acquisition; the resolved cluster backend owns those.
+- The bootstrap probe step is removed from DESIGN §3.7 and from the foundation feature; the resolve step in `start`
+  replaces it.
+- The cluster gear versions the leader-election primitive per its own policy (cluster PRD §7.1). QE tracks the
+  `cluster-sdk` major version like any other platform SDK.
+- QE is the first gear in the workspace to wire cluster leader election in production code. Integration defects
+  surface in the foundation feature; the tests below run against both shipped cluster backends.
+- Multi-process deployments on a SQLite storage backend have no cluster backend today (the standalone provider is
+  in-process). QE does not target that shape; the record states it so an operator does not discover it in
+  production.
 
 ### Confirmation
 
-Confirmed by: trait surface review against DESIGN §3.3 / §3.2 component model, bootstrap-time `try_lock` + `release`
-probe coverage on each `LockScope::*` value (DESIGN §3.7), and a chaos drill that kills the active leader and verifies
-the survivor acquires the lock within ≤ 1 TTL (RTO ≤ 15 min per `cpt-cf-quota-enforcement-nfr-recovery`).
+Confirmed by: a resolve-time test that binds the `quota-enforcement` profile to an eventually consistent cache double
+and asserts `CapabilityNotMet` at startup; a handover test with two sweeper participants over one standalone backend
+that asserts one leader at a time and a successor after `resign`; the same handover test over the Postgres cluster
+backend; the chaos drill that kills the elected replica and verifies a survivor runs the sweep within one election
+TTL plus observation lag (RTO ≤ 15 min per `cpt-cf-quota-enforcement-nfr-recovery`); and two forced-overlap tests
+that run two sweep bodies at once against the same rows. Concurrent lease sweeps must produce one state transition,
+one capacity reversal, and one outbox event per lease. Concurrent retention sweeps must complete without error, with
+each expired row deleted once. The overlap tests are the evidence for the advisory-semantics argument above; the
+uniqueness and handover tests alone do not cover it.
 
 ## Pros and Cons of the Options
 
-### Separate `CoordinationPluginV1` trait
+### Consume the platform `cluster` gear's leader election
 
-- Good, because both plugin contracts (`StoragePluginV1`, `CoordinationPluginV1`) stay narrow and individually testable;
-  ~4 coordination methods vs. ~20 storage methods.
-- Good, because operators can choose a coordination backend independent of storage (Postgres storage + Redis
-  coordination, MariaDB storage + k8s Lease coordination, …).
-- Good, because the default impl can piggyback on the storage backend's native locks, so simple deployments incur zero
-  additional ops dependency.
-- Good, because failure-mode reasoning is local: a coordination backend outage silences sweepers (acceptable per
-  `cpt-cf-quota-enforcement-fr-lease-timeout` lazy semantic release, I4) without affecting the gateway hot path.
-- Bad, because two plugin crates instead of one increase the project surface (deployment manifest, dependency graph,
-  bootstrap probes).
-- Bad, because operators using the default impl must understand the failure-domain coupling between storage and
-  coordination (same backend = correlated failure).
+- Good, because QE ships no coordination contract, plugin crate, or conformance suite; the platform owns them once.
+- Good, because the operator selects the backend per deployment in YAML, with no QE recompilation.
+- Good, because the renewal loop, follower fallback, re-enrolment, and graceful step-down are cluster code, not
+  sweeper code.
+- Good, because the linearizable requirement is validated at startup, not discovered at the first failover.
+- Bad, because the semantics are advisory; QE must state, and its sweepers must keep, idempotent sweep bodies.
+- Bad, because the SDK's run loop consumes the watch and cannot resign; the adapter owns its own watch loop to keep
+  the immediate handover on graceful shutdown.
+- Bad, because QE is the first production consumer of cluster leader election in the workspace and carries the
+  integration risk.
+- Bad, because a multi-process deployment on SQLite storage has no cluster backend.
+
+### Consume the platform `cluster` gear's distributed lock
+
+- Good, because a lock is the closest shape to the 2026-05-07 record.
+- Bad, because the cluster lock forbids non-cluster remote I/O inside the critical section, and a sweep cycle is
+  storage I/O from start to end. The workspace lint planned for this rule would flag every sweeper.
+- Bad, because the sweeper would own the renewal loop again.
+
+### Separate QE-owned `CoordinationPluginV1` trait
+
+- Good, because QE controls the contract and its closed error type.
+- Good, because the default plugin on the storage database needed no second infrastructure dependency.
+- Bad, because it reimplements a platform primitive, against the cluster PRD goal of zero per-gear coordination code.
+- Bad, because operators would swap backends by replacing a QE crate instead of editing one YAML block.
+- Bad, because QE would carry its own probe, versioning, vendor lookup, and conformance tests for coordination.
 
 ### Bundle coordination methods into `QuotaEnforcementStoragePluginV1`
 
 - Good, because a single plugin crate is conceptually simpler for first-time readers.
-- Good, because the default impl (storage-piggyback) is already coupled to the storage backend, so the bundling matches
-  that reality directly.
-- Bad, because operators who want a distinct coordination backend (Redis / etcd / k8s) would have to fork the storage
-  plugin or layer adapters — coordination becomes hostage to storage choice.
-- Bad, because the storage trait already encodes 13 invariants and ~20 methods; adding lock semantics inflates an
-  already heavy contract and complicates plugin authoring.
-- Bad, because versioning becomes coupled — a coordination-only protocol change forces a storage-plugin-V`N+1` bump (and
-  vice versa).
+- Bad, because coordination becomes hostage to the storage backend choice.
+- Bad, because the storage trait already encodes 13 invariants and about 20 methods.
+- Bad, because a coordination-only change would force a storage-plugin major bump.
 
-### No in-process abstraction — external orchestration only
+### No in-process abstraction, external orchestration only
 
-- Good, because zero QE-side code for coordination; rely on Kubernetes Lease, StatefulSet-with-replica=1, Nomad job
-  constraints, or similar.
-- Bad, because it imposes an external-orchestrator dependency on every deployment, including small / dev / edge ones;
-  SQLite-backed single-process deployments would need a synthetic orchestrator.
-- Bad, because in-process awareness of leader / follower state (used for observability — per-`LockScope` sweeper state
-  surfacing in `gear-status` / gear readiness signal) becomes harder to plumb when there is no in-process
-  abstraction.
-- Bad, because the bootstrap probe (`try_lock` + `release` per `LockScope::*`, per DESIGN §3.7) cannot validate
-  external-orchestrator readiness uniformly across deployment shapes.
+- Good, because zero QE-side code for coordination.
+- Bad, because it imposes an external orchestrator on every deployment, including single-process ones.
+- Bad, because leader and follower state is not observable in-process for readiness and telemetry.
+- Bad, because the cluster gear already offers this shape as one plugin among others (Kubernetes Lease), so the
+  option adds nothing the chosen option lacks.
 
 ## More Information
 
-- DESIGN §3.2 "Component model" — `CoordinationPlugin` component definition.
-- DESIGN §3.3 "Coordination Plugin Trait" — full trait surface, domain types, and semantic guarantees.
-- DESIGN §3.6 "Sequences" — sweeper / dispatcher acquire / renew / fallback flows.
-- Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend` — defines the pluggable storage contract; the default
-  coordination impl piggybacks on the deployed storage plugin's locking primitives (whichever backend the plugin uses).
+- Cluster [PRD](../../../cluster/docs/PRD.md): §1.3 goals, §3.1 deployment shapes and profiles, §5.2 leader election,
+  §5.3 distributed locks and the no-remote-I/O rule, §5.5 consumer requirements and startup validation.
+- Cluster [DESIGN](../../../cluster/docs/DESIGN.md) §3.3: the three consumer patterns for singleton work and the
+  staleness bound of the leadership signal.
+- Cluster [ADR-009](../../../cluster/docs/ADR/009-leader-election-backend-safety.md): per-backend safety of
+  CAS-based leader election; why QE requires `Linearizable`.
+- Cluster [ADR-012](../../../cluster/docs/ADR/012-store-owned-leases.md): store-owned leases; why a cluster replica
+  restart does not revoke QE's claims.
+- Cluster [feature 003](../../../cluster/docs/features/003-leader-election.md): the leader-election primitive.
+- DESIGN §3.2 "Component model": the `CoordinationAdapter` component.
+- DESIGN §3.3 "Cluster Coordination": what QE requires from cluster and the shape of the QE port.
+- DESIGN §3.6 "Sequences": the sweeper election flow.
+- Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend`: the pluggable storage contract, which stays free of
+  coordination semantics.
 
 ## Traceability
 
@@ -165,13 +266,12 @@ the survivor acquires the lock within ≤ 1 TTL (RTO ≤ 15 min per `cpt-cf-quot
 
 This decision directly addresses:
 
-- `cpt-cf-quota-enforcement-fr-pluggable-storage` — keeps coordination orthogonal to the storage-pluggable contract;
-  backends evolve independently.
-- `cpt-cf-quota-enforcement-nfr-recovery` — TTL-bounded auto-release lets a survivor acquire a crashed leader's lock
-  within at most one TTL.
-- `cpt-cf-quota-enforcement-fr-lease-timeout` — `LeaseSweeper` consumes the coordination contract for singleton
-  execution.
-- `cpt-cf-quota-enforcement-fr-notification-plugin` — `NotificationDispatcher` consumes the coordination contract for
-  singleton outbox draining.
-- Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend` — the default coordination impl piggybacks on the storage
-  backend's locking primitives.
+- `cpt-cf-quota-enforcement-fr-pluggable-storage`: keeps coordination out of the storage-pluggable contract; the two
+  evolve independently.
+- `cpt-cf-quota-enforcement-nfr-recovery`: a crashed leader's claim lapses within the election TTL, and the cluster
+  gear elects a survivor without QE-side re-acquisition code.
+- `cpt-cf-quota-enforcement-fr-lease-timeout`: `LeaseSweeper` runs under the `lease-sweeper` election.
+- `cpt-cf-quota-enforcement-fr-notification-plugin`: the `NotificationDispatcher` is fenced by the `toolkit-db`
+  Outbox lease and joins no election; retained here for the history of the singleton outbox draining.
+- `cpt-cf-quota-enforcement-contract-cluster-coordination`: the consumed cluster contract this decision introduces.
+- Sibling ADR `cpt-cf-quota-enforcement-adr-storage-backend`: storage and coordination stay separate contracts.

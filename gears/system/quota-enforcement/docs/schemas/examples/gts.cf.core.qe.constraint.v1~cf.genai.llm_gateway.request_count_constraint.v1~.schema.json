@@ -1,0 +1,29 @@
+{
+  "$id": "gts://gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.request_count_constraint.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked owner example (ADR-0007): the arbitration contract attached to the request-count request contract. It carries only weight, an arbitration field with no request-side counterpart. It shows that an empty request contract does not force an empty constraint contract, because the two sides are owned and versioned separately.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.qe.constraint.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "weight": {
+              "type": "number",
+              "description": "Arbitration weight consumed by Policy expressions; no request-side counterpart."
+            }
+          },
+          "required": [
+            "weight"
+          ]
+        }
+      }
+    }
+  ]
+}

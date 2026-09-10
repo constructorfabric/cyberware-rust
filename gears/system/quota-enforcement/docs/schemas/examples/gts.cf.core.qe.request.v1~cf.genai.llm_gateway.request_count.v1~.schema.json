@@ -1,0 +1,25 @@
+{
+  "$id": "gts://gts.cf.core.qe.request.v1~cf.genai.llm_gateway.request_count.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked owner example (ADR-0007): the request contract for a metric whose operations carry no attributes. It declares no metadata properties, so a conforming caller sends the empty object. QE still wraps that object into the {type, metadata} envelope and validates the whole document; it never defaults an absent metadata field to {}.",
+  "x-gts-traits": {
+    "metric": "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1",
+    "constraint_contract": "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.request_count_constraint.v1~"
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.qe.request.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {}
+        }
+      }
+    }
+  ]
+}

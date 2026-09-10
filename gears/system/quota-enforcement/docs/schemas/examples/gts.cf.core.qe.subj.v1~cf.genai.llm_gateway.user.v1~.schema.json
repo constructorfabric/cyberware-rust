@@ -1,0 +1,18 @@
+{
+  "$id": "gts://gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked owner example (ADR-0007): the llm-gateway gear's user-scope subject projection. QE selects it from the caller-supplied user SubjectRef kind; operation metadata lives in the metric request contract.",
+  "x-gts-traits": {
+    "scope": "gts.cf.core.qe.scope.v1~cf.core.qe.user.v1",
+    "admitted_metrics": [
+      "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1",
+      "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_requests.v1"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.qe.subj.v1~"
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "$id": "gts://gts.cf.core.qe.constraint.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Abstract base for operator-authored arbitration constraints (ADR-0007). The metric owner attaches one derived constraint contract to the metric request contract; operators populate Quota.metadata at create/update, and QE validates it once before persistence (snapshot timing per ADR-0003). The request schema MUST NOT be reused here.",
+  "x-gts-abstract": true,
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "format": "gts-type-id",
+      "x-gts-ref": "gts.cf.core.qe.constraint.v1~",
+      "description": "The concrete owner-declared constraint contract."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Operator-populated arbitration object (quota.metadata), refined by the derived type; may carry fields such as regions or weight with no request-side counterpart."
+    }
+  },
+  "required": [
+    "type",
+    "metadata"
+  ]
+}
