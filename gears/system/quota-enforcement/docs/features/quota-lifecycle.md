@@ -102,7 +102,7 @@ of P1 per PRD §4.2).
 
 ### Quota Create
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-create`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-create`
 
 Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 
@@ -123,36 +123,21 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 - Metadata over the size limit or violating the owner's contract: rejected before persistence
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/quotas` with a `QuotaDraft` naming the explicit target
-   `(projection_type, subject_id)` under PDP scope (management DTOs retain explicit target identity); foundation
-   admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has attached `SecurityContext` and `AccessScope` - `inst-qcr-request`
-2. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-draft-validation` on the draft - `inst-qcr-validate`
-3. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-metric-validation`; the same lookup resolves the metric owner's
-   subject projection, metric request contract, and its attached constraint contract through the bounded LRU - `inst-qcr-metric`
-4. [ ] - `p1` - Invoke `cpt-cf-quota-enforcement-algo-catalog-membership` (projection-contracts feature): the
-   referenced projection must be registered, concrete, derived from the QE subject base, inside the configured
-   catalogue (`PROJECTION_NOT_RESOLVABLE` otherwise), and must admit the draft's metric - `inst-qcr-membership`
-5. [ ] - `p1` - Validate the draft's explicit `subject_id` against the declared scope discriminator of the resolved
-   contract (`gts.cf.core.qe.scope.v1~`, P1 well-known instances `user` and `tenant`, per ADR-0007); a
-   `subject_id` that violates the declared scope is rejected before persistence
-   (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qcr-subject-scope`
-6. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the draft carries `metadata`;
-   snapshot the accepted contract id/version - `inst-qcr-metadata`
-7. [ ] - `p1` - All validation above completes outside the storage transaction, so the database lock is held for the
-   minimum window - `inst-qcr-outside-tx`
-8. [ ] - `p1` - DB: `create_quota` in a single transaction: insert the `quotas` row (server-assigned UUIDv7
-   `quota_id`, status `active`), insert the `quota_allocation_counters` row for allocation type (consumption counter
-   rows are created lazily on first evaluate), enqueue `quota-changed (change_kind='created')` in the outbox (I11),
-   append the `operation_log` entry, and commit the transaction - `inst-qcr-persist`
-9. [ ] - `p1` - **IF** the registry-reported metric mode is `Direct` - `inst-qcr-direct-if`
-   1. [ ] - `p1` - Accept the Quota anyway (a metric's mode can flip over time, PRD §3.2); it is inert until the flip
-      and is surfaced through the `quota_for_direct_metric_total` gauge - `inst-qcr-direct`
-10. [ ] - `p1` - **RETURN** `201` with the Quota body; the SDK path returns `QuotaId` from
-    `QuotaManagerClientV1::create_quota` - `inst-qcr-return`
+1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/quotas` with a `QuotaDraft` naming the explicit target `(projection_type, subject_id)` under PDP scope (management DTOs retain explicit target identity); foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has attached `SecurityContext` and `AccessScope` - `inst-qcr-request`
+2. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-draft-validation` on the draft - `inst-qcr-validate`
+3. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-metric-validation`; the same lookup resolves the metric owner's subject projection, metric request contract, and its attached constraint contract through the bounded LRU - `inst-qcr-metric`
+4. [x] - `p1` - Invoke `cpt-cf-quota-enforcement-algo-catalog-membership` (projection-contracts feature): the referenced projection must be registered, concrete, derived from the QE subject base, inside the configured catalogue (`PROJECTION_NOT_RESOLVABLE` otherwise), and must admit the draft's metric - `inst-qcr-membership`
+5. [x] - `p1` - Validate the draft's explicit `subject_id` against the declared scope discriminator of the resolved contract (`gts.cf.core.qe.scope.v1~`, P1 well-known instances `user` and `tenant`, per ADR-0007); a `subject_id` that violates the declared scope is rejected before persistence (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qcr-subject-scope`
+6. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the draft carries `metadata`; snapshot the accepted contract id/version - `inst-qcr-metadata`
+7. [x] - `p1` - All validation above completes outside the storage transaction, so the database lock is held for the minimum window - `inst-qcr-outside-tx`
+8. [x] - `p1` - DB: `create_quota` in a single transaction: insert the `quotas` row (server-assigned UUIDv7 `quota_id`, status `active`), insert the `quota_allocation_counters` row for allocation type (consumption counter rows are created lazily on first evaluate), enqueue `quota-changed (change_kind='created')` in the outbox (I11), append the `operation_log` entry, and commit the transaction - `inst-qcr-persist`
+9. [x] - `p1` - **IF** the registry-reported metric mode is `Direct` - `inst-qcr-direct-if`
+   1. [x] - `p1` - Accept the Quota anyway (a metric's mode can flip over time, PRD §3.2); it is inert until the flip and is surfaced through the `quota_for_direct_metric_total` gauge - `inst-qcr-direct`
+10. [x] - `p1` - **RETURN** `201` with the Quota body; the SDK path returns `QuotaId` from `QuotaManagerClientV1::create_quota` - `inst-qcr-return`
 
 ### Quota Update
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-update`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-update`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-manager` (and
 `cpt-cf-quota-enforcement-actor-platform-operator` through the same endpoint)
@@ -171,30 +156,19 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 - The Quota is already deactivated: `QUOTA_DEACTIVATED` (`DomainError::QuotaDeactivated`)
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `PATCH /v1/quota-enforcement/quotas/{id}` with a `QuotaPatch` - `inst-qup-request`
-2. [ ] - `p1` - **IF** the patch references `type = rate` - `inst-qup-rate-if`
-   1. [ ] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501,
-      `NOT_YET_IMPLEMENTED`); the rate check runs before the breaking-change gate, so an update referencing `rate`
-      returns `Unimplemented` per the DESIGN rejection rule
-      (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qup-rate`
-3. [ ] - `p1` - **IF** the patch changes metric, type, period, or subject - `inst-qup-breaking-if`
-   1. [ ] - `p1` - **RETURN** rejection; breaking changes are performed by deactivating the original Quota and
-      creating a new one (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qup-breaking`
-4. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-draft-validation` on the patched shape (cap non-negative,
-   thresholds-require-bounded-cap) and `cpt-cf-quota-enforcement-algo-metric-validation` (metric identity is
-   revalidated at update time per `cpt-cf-quota-enforcement-fr-metric-identity-validation`) - `inst-qup-validate`
-5. [ ] - `p1` - **IF** the patch carries `metadata` - `inst-qup-meta-if`
-   1. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation`; metadata changes never invalidate
-      the quota ID - `inst-qup-meta`
-6. [ ] - `p1` - DB: `update_quota(quota_id, patch, events)` in a single transaction that also appends the
-   `operation_log` entry (I1); the cap-vs-consumed comparison is evaluated at the moment the transaction commits,
-   in-tx with a row-level lock (I6), never at request-receipt time, so concurrent debits cannot race the guard - `inst-qup-persist`
-7. [ ] - `p1` - **IF** the reduced or newly numeric cap is strictly below the active period's consumed amount
-   (consumption type) or the in-flight count (allocation type) - `inst-qup-guard-if`
-   1. [ ] - `p1` - **RETURN** `CAP_BELOW_CONSUMED` (`DomainError::CapBelowConsumed`); the operator first issues
-      credits, then reduces the cap - `inst-qup-guard`
-8. [ ] - `p1` - Enqueue `quota-changed (change_kind='updated')` in the same transaction (I11) - `inst-qup-event`
-9. [ ] - `p1` - **RETURN** success; the SDK path is `QuotaManagerClientV1::update_quota(id, patch)` returning `()` - `inst-qup-return`
+1. [x] - `p1` - Caller sends `PATCH /v1/quota-enforcement/quotas/{id}` with a `QuotaPatch` - `inst-qup-request`
+2. [x] - `p1` - **IF** the patch references `type = rate` - `inst-qup-rate-if`
+   1. [x] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501, `NOT_YET_IMPLEMENTED`); the rate check runs before the breaking-change gate, so an update referencing `rate` returns `Unimplemented` per the DESIGN rejection rule (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qup-rate`
+3. [x] - `p1` - **IF** the patch changes metric, type, period, or subject - `inst-qup-breaking-if`
+   1. [x] - `p1` - **RETURN** rejection; breaking changes are performed by deactivating the original Quota and creating a new one (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qup-breaking`
+4. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-draft-validation` on the patched shape (cap non-negative, thresholds-require-bounded-cap) and `cpt-cf-quota-enforcement-algo-metric-validation` (metric identity is revalidated at update time per `cpt-cf-quota-enforcement-fr-metric-identity-validation`) - `inst-qup-validate`
+5. [x] - `p1` - **IF** the patch carries `metadata` - `inst-qup-meta-if`
+   1. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation`; metadata changes never invalidate the quota ID - `inst-qup-meta`
+6. [x] - `p1` - DB: `update_quota(quota_id, patch, events)` in a single transaction that also appends the `operation_log` entry (I1); the cap-vs-consumed comparison is evaluated at the moment the transaction commits, in-tx with a row-level lock (I6), never at request-receipt time, so concurrent debits cannot race the guard - `inst-qup-persist`
+7. [x] - `p1` - **IF** the reduced or newly numeric cap is strictly below the active period's consumed amount (consumption type) or the in-flight count (allocation type) - `inst-qup-guard-if`
+   1. [x] - `p1` - **RETURN** `CAP_BELOW_CONSUMED` (`DomainError::CapBelowConsumed`); the operator first issues credits, then reduces the cap - `inst-qup-guard`
+8. [x] - `p1` - Enqueue `quota-changed (change_kind='updated')` in the same transaction (I11) - `inst-qup-event`
+9. [x] - `p1` - **RETURN** success; the SDK path is `QuotaManagerClientV1::update_quota(id, patch)` returning `()` - `inst-qup-return`
 
 ### Quota Deactivation Cascade
 
@@ -230,7 +204,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 
 ### Quota Read and List
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-read`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-read`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-manager` (and
 `cpt-cf-quota-enforcement-actor-platform-operator` through the same endpoints)
@@ -244,55 +218,37 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 - Rows outside the caller's tenant or `AccessScope` are unreachable by construction; they are absent, not errors
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `GET /v1/quota-enforcement/quotas/{id}` or `GET /v1/quota-enforcement/quotas` with
-   filter and page parameters - `inst-qrd-request`
-2. [ ] - `p1` - DB: `read_quotas(filter, page)` under the caller's `AccessScope` per
-   `cpt-cf-quota-enforcement-algo-pdp-constraint-composition` (foundation); reads are read-only (I3) - `inst-qrd-read`
-3. [ ] - `p1` - Deactivated Quotas remain readable; deactivation retains the record for read access - `inst-qrd-deactivated`
-4. [ ] - `p1` - Compute `currently_within_window` per `cpt-cf-quota-enforcement-algo-validity-window` for each
-   returned Quota - `inst-qrd-window`
-5. [ ] - `p1` - **RETURN** the Quota body or `PageResult<Quota>` including the full `metadata` object (subject to PDP
-   scoping) so callers can inspect the operator's gating intent - `inst-qrd-return`
+1. [x] - `p1` - Caller sends `GET /v1/quota-enforcement/quotas/{id}` or `GET /v1/quota-enforcement/quotas` with filter and page parameters - `inst-qrd-request`
+2. [x] - `p1` - DB: `read_quotas(filter, page)` under the caller's `AccessScope` per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition` (foundation); reads are read-only (I3) - `inst-qrd-read`
+3. [x] - `p1` - Deactivated Quotas remain readable; deactivation retains the record for read access - `inst-qrd-deactivated`
+4. [x] - `p1` - Compute `currently_within_window` per `cpt-cf-quota-enforcement-algo-validity-window` for each returned Quota - `inst-qrd-window`
+5. [x] - `p1` - **RETURN** the Quota body or `PageResult<Quota>` including the full `metadata` object (subject to PDP scoping) so callers can inspect the operator's gating intent - `inst-qrd-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### Quota Draft Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-quota-draft-validation`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-quota-draft-validation`
 
 **Input**: `QuotaDraft` (create) or the patched Quota shape (update)
 
 **Output**: a validated draft, or a canonical error before any storage call
 
 **Steps**:
-1. [ ] - `p1` - Require `quota_type` to be a GTS instance under `gts.cf.qe.quota.type.v1~` - `inst-qdv-type`
-2. [ ] - `p1` - **IF** `quota_type` is the reserved `rate` instance (`gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1`) - `inst-qdv-rate-if`
-   1. [ ] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501,
-      `NOT_YET_IMPLEMENTED`); the identifier and data-model slot stay reserved so P3 activation needs no migration of
-      existing `allocation`/`consumption` Quotas (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qdv-rate`
-3. [ ] - `p1` - **IF** `quota_type` is `allocation` and any period field is present - `inst-qdv-period-if`
-   1. [ ] - `p1` - **RETURN** rejection; allocation Quotas must reject any period field, while consumption Quotas
-      carry the period specification (period semantics themselves are owned by
-      `cpt-cf-quota-enforcement-fr-period-semantics` through the consumption-operations feature) - `inst-qdv-period`
-4. [ ] - `p1` - Require `enforcement_mode` to be a GTS instance under `gts.cf.qe.enforcement.type.v1~`; P1 accepts
-   only `gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1`; future modes arrive as new GTS instances without
-   API breakage (`cpt-cf-quota-enforcement-fr-enforcement-mode`) - `inst-qdv-mode`
-5. [ ] - `p1` - Require `source` to be a GTS instance under `gts.cf.qe.source.type.v1~`; P1 seeds `licensing`
-   (default) and `operator`; mutation rules are uniform across both values in P1, and a stored `source` never changes
-   silently - `inst-qdv-source`
-6. [ ] - `p1` - **IF** `cap` is numeric and negative - `inst-qdv-cap-if`
-   1. [ ] - `p1` - **RETURN** `CAP_MUST_BE_NON_NEGATIVE` (`DomainError::CapMustBeNonNegative`, canonical
-      `InvalidArgument`); `cap = 0` (deny-everything) and `cap = null` (unbounded, always satisfiable) are both
-      explicitly valid and are never auto-rejected - `inst-qdv-cap`
-7. [ ] - `p1` - **IF** `notification_thresholds` are present and `cap` is `null` - `inst-qdv-thresh-if`
-   1. [ ] - `p1` - **RETURN** `THRESHOLDS_REQUIRE_BOUNDED_CAP` (`DomainError::ThresholdsRequireBoundedCap`);
-      percentages of `null` are meaningless - `inst-qdv-thresh`
-8. [ ] - `p1` - Accept the optional validity window (start and end timestamps; absent means no time bounds) and the
-   optional failure-mode hint (`fail-closed` default, `fail-open` opt-in; informational metadata for callers) - `inst-qdv-optional`
-9. [ ] - `p1` - Never reject on the basis that another active Quota exists for the same `(subject, metric)` pair;
-   multiple Quotas per pair are resolved at evaluation time under the active Policy
-   (`cpt-cf-quota-enforcement-fr-multi-quota-evaluation`, owned by the resolution-policy-engine feature) - `inst-qdv-multi`
-10. [ ] - `p1` - **RETURN** the validated draft - `inst-qdv-return`
+1. [x] - `p1` - Require `quota_type` to be a GTS instance under `gts.cf.qe.quota.type.v1~` - `inst-qdv-type`
+2. [x] - `p1` - **IF** `quota_type` is the reserved `rate` instance (`gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1`) - `inst-qdv-rate-if`
+   1. [x] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501, `NOT_YET_IMPLEMENTED`); the identifier and data-model slot stay reserved so P3 activation needs no migration of existing `allocation`/`consumption` Quotas (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qdv-rate`
+3. [x] - `p1` - **IF** `quota_type` is `allocation` and any period field is present - `inst-qdv-period-if`
+   1. [x] - `p1` - **RETURN** rejection; allocation Quotas must reject any period field, while consumption Quotas carry the period specification (period semantics themselves are owned by `cpt-cf-quota-enforcement-fr-period-semantics` through the consumption-operations feature) - `inst-qdv-period`
+4. [x] - `p1` - Require `enforcement_mode` to be a GTS instance under `gts.cf.qe.enforcement.type.v1~`; P1 accepts only `gts.cf.qe.enforcement.type.v1~cf.qe.enforcement.hard.v1`; future modes arrive as new GTS instances without API breakage (`cpt-cf-quota-enforcement-fr-enforcement-mode`) - `inst-qdv-mode`
+5. [x] - `p1` - Require `source` to be a GTS instance under `gts.cf.qe.source.type.v1~`; P1 seeds `licensing` (default) and `operator`; mutation rules are uniform across both values in P1, and a stored `source` never changes silently - `inst-qdv-source`
+6. [x] - `p1` - **IF** `cap` is numeric and negative - `inst-qdv-cap-if`
+   1. [x] - `p1` - **RETURN** `CAP_MUST_BE_NON_NEGATIVE` (`DomainError::CapMustBeNonNegative`, canonical `InvalidArgument`); `cap = 0` (deny-everything) and `cap = null` (unbounded, always satisfiable) are both explicitly valid and are never auto-rejected - `inst-qdv-cap`
+7. [x] - `p1` - **IF** `notification_thresholds` are present and `cap` is `null` - `inst-qdv-thresh-if`
+   1. [x] - `p1` - **RETURN** `THRESHOLDS_REQUIRE_BOUNDED_CAP` (`DomainError::ThresholdsRequireBoundedCap`); percentages of `null` are meaningless - `inst-qdv-thresh`
+8. [x] - `p1` - Accept the optional validity window (start and end timestamps; absent means no time bounds) and the optional failure-mode hint (`fail-closed` default, `fail-open` opt-in; informational metadata for callers) - `inst-qdv-optional`
+9. [x] - `p1` - Never reject on the basis that another active Quota exists for the same `(subject, metric)` pair; multiple Quotas per pair are resolved at evaluation time under the active Policy (`cpt-cf-quota-enforcement-fr-multi-quota-evaluation`, owned by the resolution-policy-engine feature) - `inst-qdv-multi`
+10. [x] - `p1` - **RETURN** the validated draft - `inst-qdv-return`
 
 ### Metric Identity Validation
 
@@ -322,7 +278,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 
 ### Quota Metadata Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-quota-metadata-validation`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-quota-metadata-validation`
 
 **Input**: the draft or patch `metadata` JSON object, the owner's constraint contract resolved from
 `types-registry`
@@ -330,47 +286,30 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 **Output**: validated metadata with the snapshotted contract id/version, or rejection before persistence
 
 **Steps**:
-1. [ ] - `p1` - **IF** the canonical JSON serialization exceeds the single operator-configurable size limit
-   (default 4 KB per Quota) - `inst-qmd-size-if`
-   1. [ ] - `p1` - **RETURN** rejection at validation time (`cpt-cf-quota-enforcement-fr-quota-metadata`) - `inst-qmd-size`
-2. [ ] - `p1` - Validate the object against the constraint contract attached to the metric request contract (derived from
-   `gts.cf.core.qe.constraint.v1~`, published per the projection-contracts feature); the contract defines keys,
-   requiredness, types, enums, and nesting - `inst-qmd-contract`
-   1. [ ] - `p1` - Wrap the wire object into the contract envelope `{type, metadata}` and validate the whole document,
-      never the inner subschema alone (ADR-0007 envelope rule) - `inst-qmd-envelope`
-3. [ ] - `p1` - **IF** the object violates the contract - `inst-qmd-mismatch-if`
-   1. [ ] - `p1` - **RETURN** `DomainError::ConstraintContractMismatch` (canonical `FailedPrecondition`);
-      increment `contract_validation_failures_total` with the closed `arbitration` surface - `inst-qmd-mismatch`
-4. [ ] - `p1` - Snapshot the accepted contract id/version alongside the stored metadata; a stored value is not
-   revalidated during evaluation (write-time only, per ADR-0003/0007) - `inst-qmd-snapshot`
-5. [ ] - `p1` - Treat the content as semantically opaque: QE never interprets business meaning and never indexes
-   metadata for direct query; validated metadata is stored and forwarded verbatim to the active Engine as
-   the Engine's `arbitration` object (Engine consumption is owned by the resolution-policy-engine
-   feature) - `inst-qmd-opaque`
-6. [ ] - `p1` - Metadata must not carry PII or other regulated data (Platform Operational Data per PRD §6.2);
-   operators are responsible for the content respecting this classification - `inst-qmd-pii`
-7. [ ] - `p1` - **RETURN** the validated metadata; the full object is returned by every Quota read API subject to PDP
-   scoping - `inst-qmd-return`
+1. [x] - `p1` - **IF** the canonical JSON serialization exceeds the single operator-configurable size limit (default 4 KB per Quota) - `inst-qmd-size-if`
+   1. [x] - `p1` - **RETURN** rejection at validation time (`cpt-cf-quota-enforcement-fr-quota-metadata`) - `inst-qmd-size`
+2. [x] - `p1` - Validate the object against the constraint contract attached to the metric request contract (derived from `gts.cf.core.qe.constraint.v1~`, published per the projection-contracts feature); the contract defines keys, requiredness, types, enums, and nesting - `inst-qmd-contract`
+   1. [x] - `p1` - Wrap the wire object into the contract envelope `{type, metadata}` and validate the whole document, never the inner subschema alone (ADR-0007 envelope rule) - `inst-qmd-envelope`
+3. [x] - `p1` - **IF** the object violates the contract - `inst-qmd-mismatch-if`
+   1. [x] - `p1` - **RETURN** `DomainError::ConstraintContractMismatch` (canonical `FailedPrecondition`); increment `contract_validation_failures_total` with the closed `arbitration` surface - `inst-qmd-mismatch`
+4. [x] - `p1` - Snapshot the accepted contract id/version alongside the stored metadata; a stored value is not revalidated during evaluation (write-time only, per ADR-0003/0007) - `inst-qmd-snapshot`
+5. [x] - `p1` - Treat the content as semantically opaque: QE never interprets business meaning and never indexes metadata for direct query; validated metadata is stored and forwarded verbatim to the active Engine as the Engine's `arbitration` object (Engine consumption is owned by the resolution-policy-engine feature) - `inst-qmd-opaque`
+6. [x] - `p1` - Metadata must not carry PII or other regulated data (Platform Operational Data per PRD §6.2); operators are responsible for the content respecting this classification - `inst-qmd-pii`
+7. [x] - `p1` - **RETURN** the validated metadata; the full object is returned by every Quota read API subject to PDP scoping - `inst-qmd-return`
 
 ### Validity-Window Computation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-validity-window`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-validity-window`
 
 **Input**: a stored Quota's optional `validity_window` (start and end timestamps), the server clock
 
 **Output**: the stored window plus the server-computed boolean `currently_within_window`
 
 **Steps**:
-1. [ ] - `p1` - Store the `validity_window` verbatim as a structural field; when absent, the Quota has no time bounds
-   and remains evaluable until explicitly deactivated - `inst-qvw-store`
-2. [ ] - `p1` - The core never auto-deactivates a Quota when `now() > validity_end`; lifecycle (active vs
-   deactivated) and validity-window bounds are independent dimensions, and window behavior at evaluation time is
-   Engine-side (the default exclusion belongs to the resolution-policy-engine feature) - `inst-qvw-no-auto`
-3. [ ] - `p1` - Compute `currently_within_window` at read time as "the server clock falls inside
-   `[validity_start, validity_end]`", treating an absent bound as unbounded on that side, so callers render expiry
-   state without recomputing the comparison - `inst-qvw-compute`
-4. [ ] - `p1` - **RETURN** the window and the computed boolean on Quota reads; the snapshot-reads feature surfaces
-   the same two fields on Quota Snapshots per `cpt-cf-quota-enforcement-fr-quota-snapshot-read` - `inst-qvw-return`
+1. [x] - `p1` - Store the `validity_window` verbatim as a structural field; when absent, the Quota has no time bounds and remains evaluable until explicitly deactivated - `inst-qvw-store`
+2. [x] - `p1` - The core never auto-deactivates a Quota when `now() > validity_end`; lifecycle (active vs deactivated) and validity-window bounds are independent dimensions, and window behavior at evaluation time is Engine-side (the default exclusion belongs to the resolution-policy-engine feature) - `inst-qvw-no-auto`
+3. [x] - `p1` - Compute `currently_within_window` at read time as "the server clock falls inside `[validity_start, validity_end]`", treating an absent bound as unbounded on that side, so callers render expiry state without recomputing the comparison - `inst-qvw-compute`
+4. [x] - `p1` - **RETURN** the window and the computed boolean on Quota reads; the snapshot-reads feature surfaces the same two fields on Quota Snapshots per `cpt-cf-quota-enforcement-fr-quota-snapshot-read` - `inst-qvw-return`
 
 ## 4. States (CDSL)
 
@@ -398,7 +337,7 @@ lease-operations features.
 
 ### Quota Management Service and CRUD Surface
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-quota-crud`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-quota-crud`
 
 The system **MUST** deliver `QuotaManagementService`
 (`cpt-cf-quota-enforcement-component-quota-management-service`) with transactional create, update, deactivate, and
@@ -449,7 +388,7 @@ auto-deactivated.
 
 ### Quota Metadata Contract Enforcement
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-quota-metadata`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-quota-metadata`
 
 The system **MUST** validate the operator-authored `metadata` object at create and update time only: the
 operator-configurable canonical-JSON size limit (default 4 KB) and conformance to the metric owner's separate
@@ -493,7 +432,7 @@ the evaluation paths.
 
 ### Rate Quota-Type Rejection
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-rate-rejection`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-rate-rejection`
 
 The system **MUST** reserve the `rate` GTS instance (`gts.cf.qe.quota.type.v1~cf.qe.quota.rate.v1`) and reject Quota
 create and update requests referencing it with `DomainError::NotYetImplemented`, canonicalized as `Unimplemented`
