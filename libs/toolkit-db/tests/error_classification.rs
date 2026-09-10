@@ -30,7 +30,7 @@ use sea_orm_migration::prelude as mig;
 use sea_orm_migration::prelude::Iden;
 use sea_orm_migration::sea_query;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::secure::{ScopableEntity, secure_insert};
+use toolkit_db::secure::{ScopableEntity, ScopeError, secure_insert};
 use toolkit_db::{DbConnConfig, build_db};
 use toolkit_security::{AccessScope, pep_properties};
 use uuid::Uuid;
@@ -160,6 +160,35 @@ async fn assert_duplicate_insert_is_unique_violation(db: toolkit_db::Db) -> Resu
         err.is_unique_violation(),
         "is_unique_violation() must still recognise a real duplicate-key error \
          after the SeaORM/sqlx upgrade; classifier saw: {err}"
+    );
+
+    // The structured accessor must reach this error too, on every backend the
+    // workspace supports. What the code *means* differs per engine and is
+    // asserted where that difference matters (`db_error`'s SQLite test, and
+    // the PostgreSQL RESTRICT test below); what must hold everywhere is that a
+    // real driver refusal is reachable at all, since a gear classifying
+    // without `sqlx` has nothing else to read.
+    let ScopeError::Db(db_err) = &err else {
+        panic!("a duplicate insert must surface the database error: {err}");
+    };
+    let refusal = toolkit_db::db_error::driver_refusal(db_err)
+        .unwrap_or_else(|| panic!("driver_refusal must reach a real refusal: {err}"));
+    assert!(
+        !refusal.code().is_empty(),
+        "the driver must have reported a code: {refusal:?}"
+    );
+    // `DbBackend` has no `Display`; the name is enough to tell the lanes apart
+    // in a run's output.
+    let backend = match db.backend() {
+        sea_orm::DatabaseBackend::Postgres => "postgres",
+        sea_orm::DatabaseBackend::MySql => "mysql",
+        sea_orm::DatabaseBackend::Sqlite => "sqlite",
+        // `DatabaseBackend` is non-exhaustive.
+        _ => "unknown backend",
+    };
+    println!(
+        "{backend} reported code {} for the duplicate key",
+        refusal.code()
     );
 
     Ok(())

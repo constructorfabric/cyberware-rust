@@ -121,13 +121,33 @@ pub fn constraint_violation(sqlstate: &str) -> Option<ConstraintViolation> {
     }
 }
 
-/// The driver's code and constraint name inside a [`DbErr`], if the driver
-/// reported a refusal.
+/// The driver's code and constraint name for a statement the database refused.
 ///
-/// `None` means the error carries no driver-level refusal: a connection
-/// failure, an error `SeaORM` generated itself, or a build of this crate with
-/// no database driver at all. It never means "the refusal had no code" for an
-/// error that does carry one.
+/// # What `None` means, exactly
+///
+/// The error carries no refusal this function will read. Four ways to get
+/// there, and the last one is a limitation rather than a state:
+///
+/// * the error came from executing nothing — `SeaORM` produced it itself
+///   (`DbErr::Custom`, `DbErr::RecordNotFound`, a type conversion);
+/// * the error is a **connection** failure. Deliberately excluded even when it
+///   carries a code of its own: a connect-time `28P01` or `53300` is not a
+///   statement being refused, and a caller reading `constraint()` on it would
+///   answer a transient or auth condition as though a constraint had spoken.
+///   Retry decisions belong to [`crate::contention`], not here;
+/// * this crate was built with no database driver, which also means nothing
+///   could have produced a driver error;
+/// * the driver reported a refusal but gave no code at all. `sqlx` allows it
+///   in principle, and then this is indistinguishable from the cases above.
+///   No backend the workspace supports does it — `PostgreSQL` and `MySQL`
+///   always send a SQLSTATE, `SQLite` always an extended result code — so the
+///   code stays a `String` rather than costing every caller an extra `Option`
+///   for a state none of them can observe.
+///
+/// `Some` means one statement was refused and the driver said why. Whether the
+/// reason is one this platform acts on is [`DriverRefusal::violation`]'s
+/// answer, not this one's: a code outside class 23 (a syntax error, say) still
+/// arrives as `Some` with `violation() == None`.
 ///
 /// # Example
 ///
@@ -152,12 +172,11 @@ pub fn driver_refusal(err: &DbErr) -> Option<DriverRefusal> {
     // than a silent degradation.
     #[cfg(any(feature = "pg", feature = "mysql", feature = "sqlite"))]
     {
-        // The same shape `DbErr::sql_err` reads, plus `Conn`: transient
-        // connection codes (class 08, `57P01` and friends) arrive there, and a
-        // caller deciding whether to retry wants them.
+        // Exactly the shape `DbErr::sql_err` reads, and for the same reason:
+        // these two are a statement that ran and was refused. `DbErr::Conn` is
+        // not one -- see this function's documentation.
         let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
-        | DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err))
-        | DbErr::Conn(sea_orm::RuntimeErr::SqlxError(sqlx_err))) = err
+        | DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err))) = err
         else {
             return None;
         };

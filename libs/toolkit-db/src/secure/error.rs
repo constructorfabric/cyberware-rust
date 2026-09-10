@@ -206,6 +206,33 @@ mod tests {
         }
     }
 
+    /// The wording `PostgreSQL` 18 introduced for a `RESTRICT` refusal, on the
+    /// text path.
+    ///
+    /// The structured path is what recognises this in production (the SQLSTATE
+    /// is `23001`, and `crate::db_error` names both codes one condition). This
+    /// branch is the last resort, for an error that reached a classifier
+    /// stripped of its code — and it exists because 18 reworded the message
+    /// as well as renumbering it, so the pre-18 substrings no longer match
+    /// (issue #4645).
+    #[test]
+    fn the_postgres_18_restrict_wording_is_recognised_without_a_code() {
+        let restrict = DbErr::Custom(
+            "error returned from database: update or delete on table \"usage_type\" violates \
+             RESTRICT setting of foreign key constraint \"usage_records_gts_id_fk\" on table \
+             \"usage_records\""
+                .to_owned(),
+        );
+        assert!(
+            is_foreign_key_violation(&restrict),
+            "PostgreSQL 18's RESTRICT wording must classify as a foreign-key violation"
+        );
+        assert!(
+            !is_unique_violation(&restrict),
+            "and must not be confused with a duplicate key"
+        );
+    }
+
     #[test]
     fn foreign_key_and_unique_are_not_confused() {
         // They map to different domain answers -- "still referenced" versus
