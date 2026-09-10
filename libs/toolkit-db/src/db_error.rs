@@ -54,22 +54,29 @@ pub enum ConstraintViolation {
     Exclusion,
 }
 
-/// The SQLSTATE, and the constraint name when the driver named one.
+/// The code the driver reported for a refusal, and the constraint name when it
+/// named one.
 ///
 /// Owned rather than borrowed so the type carries nothing from the driver: the
 /// point of this module is that a gear can read a refusal without depending on
 /// `sqlx`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DriverRefusal {
-    sqlstate: String,
+    code: String,
     constraint: Option<String>,
 }
 
 impl DriverRefusal {
-    /// The five-character SQLSTATE, as the server sent it.
+    /// The code the driver reported, verbatim.
+    ///
+    /// On `PostgreSQL` and `MySQL` this is the five-character SQLSTATE. On
+    /// `SQLite` it is the extended result code (`2067` for a unique
+    /// violation), which is not a SQLSTATE and which
+    /// [`constraint_violation`] therefore names no condition for — the
+    /// accessor is called `code` rather than `sqlstate` for that reason.
     #[must_use]
-    pub fn sqlstate(&self) -> &str {
-        &self.sqlstate
+    pub fn code(&self) -> &str {
+        &self.code
     }
 
     /// The constraint the server named, when it named one.
@@ -82,10 +89,10 @@ impl DriverRefusal {
         self.constraint.as_deref()
     }
 
-    /// The condition this SQLSTATE names, if it is one the table covers.
+    /// The condition this code names, if it is one the table covers.
     #[must_use]
     pub fn violation(&self) -> Option<ConstraintViolation> {
-        constraint_violation(&self.sqlstate)
+        constraint_violation(&self.code)
     }
 }
 
@@ -114,8 +121,8 @@ pub fn constraint_violation(sqlstate: &str) -> Option<ConstraintViolation> {
     }
 }
 
-/// The SQLSTATE and constraint name inside a [`DbErr`], if the driver reported
-/// one.
+/// The driver's code and constraint name inside a [`DbErr`], if the driver
+/// reported a refusal.
 ///
 /// `None` means the error carries no driver-level refusal: a connection
 /// failure, an error `SeaORM` generated itself, or a build of this crate with
@@ -158,7 +165,7 @@ pub fn driver_refusal(err: &DbErr) -> Option<DriverRefusal> {
             return None;
         };
         Some(DriverRefusal {
-            sqlstate: db_err.code()?.into_owned(),
+            code: db_err.code()?.into_owned(),
             constraint: db_err.constraint().map(ToOwned::to_owned),
         })
     }
@@ -217,6 +224,60 @@ mod tests {
         assert_eq!(constraint_violation("23000"), None);
         assert_eq!(constraint_violation("40001"), None);
         assert_eq!(constraint_violation(""), None);
+    }
+
+    /// A refusal from a real driver, reached end to end, with no server to
+    /// start: `SQLite` in memory is enough to exercise the extraction path and
+    /// all three accessors.
+    ///
+    /// It also pins the documented `SQLite` behaviour rather than assuming it:
+    /// the driver reports an extended result code (`2067`), not a SQLSTATE, and
+    /// names no constraint — so the table names no condition for it and a
+    /// `SQLite` caller keeps using
+    /// [`crate::secure::is_unique_violation`]. The `PostgreSQL` half, where the
+    /// code *is* a SQLSTATE, is covered by
+    /// `tests/error_classification.rs::pg_restrict_delete_is_classified_as_foreign_key_violation`
+    /// against a real server.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_real_sqlite_refusal_is_reached_but_names_no_condition() {
+        use sea_orm::ConnectionTrait as _;
+
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        db.execute_unprepared("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT UNIQUE)")
+            .await
+            .expect("create");
+        db.execute_unprepared("INSERT INTO t (id, k) VALUES (1, 'a')")
+            .await
+            .expect("first insert");
+
+        let err = db
+            .execute_unprepared("INSERT INTO t (id, k) VALUES (2, 'a')")
+            .await
+            .expect_err("the unique index must refuse the second insert");
+
+        let refusal = driver_refusal(&err).expect("a driver refusal must be reachable");
+        assert_eq!(
+            refusal.code(),
+            "2067",
+            "SQLITE_CONSTRAINT_UNIQUE, the extended result code"
+        );
+        assert_eq!(
+            refusal.constraint(),
+            None,
+            "SQLite names no constraint in its error"
+        );
+        assert_eq!(
+            refusal.violation(),
+            None,
+            "an extended result code is not a SQLSTATE, so the table names no \
+             condition for it"
+        );
+        // The portable classifier still recognises it, which is the path a
+        // SQLite caller is meant to use.
+        assert!(crate::secure::is_unique_violation(&err));
     }
 
     /// An error `SeaORM` produced itself carries no driver refusal. Asserted

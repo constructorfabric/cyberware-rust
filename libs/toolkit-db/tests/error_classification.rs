@@ -528,12 +528,12 @@ async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<(
     });
     println!(
         "PostgreSQL reported SQLSTATE {} for the RESTRICT refusal",
-        refusal.sqlstate()
+        refusal.code()
     );
     assert!(
-        matches!(refusal.sqlstate(), "23001" | "23503"),
+        matches!(refusal.code(), "23001" | "23503"),
         "an FK refusal must arrive as one of the two codes that name it, got {}: {err}",
-        refusal.sqlstate()
+        refusal.code()
     );
     assert_eq!(
         refusal.violation(),
