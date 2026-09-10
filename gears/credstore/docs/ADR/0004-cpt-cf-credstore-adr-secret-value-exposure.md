@@ -17,7 +17,7 @@ Updated:  2026-09-10 by Constructor Tech
   - [Axis B — how a value is asked for](#axis-b--how-a-value-is-asked-for)
 - [Decision Outcome](#decision-outcome)
   - [Resulting surface](#resulting-surface)
-  - [Why one address per thing, in three arguments](#why-one-address-per-thing-in-three-arguments)
+  - [Why one address per thing, in four arguments](#why-one-address-per-thing-in-four-arguments)
   - [Why `credentials` and not `secrets`](#why-credentials-and-not-secrets)
   - [Why the path key stays a reference, not a UUID](#why-the-path-key-stays-a-reference-not-a-uuid)
   - [One write verb per resource: no `PATCH`, no `POST`](#one-write-verb-per-resource-no-patch-no-post)
@@ -86,7 +86,7 @@ Two questions must be answered together, because the answer to one constrains th
 - **D1 — correctness over continuity.** The target shape is chosen on its merits. Where it breaks something that ships today, the break is stated per surface in [Backward Compatibility by Mode](#backward-compatibility-by-mode) and paid for during rollout; it is not designed around. Continuity is an output of this ADR, never an input.
 - **D2 — three distinct privileges.** Enumerating entries, reading one record's metadata, and reading a secret value have different blast radius and must be separately grantable.
 - **D3 — a refusal is indistinguishable from absence.** Reads outside the caller's grants surface as the canonical 404, including per item inside a bulk response (`nfr-tenant-isolation`).
-- **D4 — a value-blind writer must still get a CAS validator.** Writes require `If-Match` (`fr-optimistic-concurrency`) and the strong validator is an HTTP header, so some response a metadata-only role may call has to carry the `ETag`.
+- **D4 — a value-blind writer must still get a CAS validator.** Writes require `If-Match` (`fr-optimistic-concurrency`) and the strong validator is an HTTP header, so some response a metadata-only role may call has to carry the `ETag`. This is a guarantee for a writer that also holds `read`. A writer holding no read action at all gets no validator by construction and writes set-once or last-writer-wins; that is the provisioning injector's contract (see the roles table), not a gap.
 - **D5 — value disclosure must be observable and throttleable by route.** The gateway matches route policies on **paths**, and audit should record "this subject read this value" from the operation, not by inspecting bodies.
 - **D6 — bulk reads may never exceed the caller's own read scope, and may never be walked.** A bulk value read is acceptable when the selector can only ever match what the caller is already entitled to read; it is unacceptable when it can be paginated through the catalogue, or when it silently truncates.
 - **D7 — bounded authorization cost on the hot path.** Applications read values continuously; the decision must not add PDP evaluations per request just to decide what to include.
@@ -142,9 +142,9 @@ Read against the four shipped addresses in the Context above, three things chang
 | `DELETE /credstore/v1/credentials/{ref}/secret` | — (204) | `write_secret` | clears the value and returns the record to `declared`: metadata, category and sharing survive, the reference stays reserved, and — as for any `declared` record — the reference stops resolving and stops shadowing an inherited value; `If-Match` required |
 | `POST /credstore/v1/credentials:read-secrets` | values for a bounded selection | `read_secret`, per item | bulk; see below |
 
-### Why one address per thing, in three arguments
+### Why one address per thing, in four arguments
 
-The table above spends eight addresses where four would do. That is the cost, and each of the three reasons below is on its own sufficient to pay it.
+The table above spends eight addresses where four would do. That is the cost, and each of the four reasons below is on its own sufficient to pay it.
 
 **One address, one schema.** A response body is fixed by the URL, not by who asked or by what was sent. A generated client gets one type per address; an OpenAPI reader sees one shape; a reviewer checking "can this path emit a secret" reads the schema rather than the handler. The alternative — one address whose body sometimes carries a value — makes the schema a function of the caller's grants, which is untypeable, and turns "does this leak" into a question about runtime state instead of about a document.
 
@@ -157,6 +157,8 @@ Change a category and omit the value: does the value get cleared, or preserved? 
 Rotation suffers too, though less. The rotator does hold `read` — D4 has it read the record for the `ETag` before a guarded write — so it *can* send the metadata back verbatim; but every rotation becomes a read-modify-write of fields it never meant to touch. That bites under the `If-Match: *` this ADR keeps for provisioning and healing flows: a routine rotation then overwrites a concurrent `sharing` or expiry change with the stale copy it read a moment earlier. With the value at its own address the same `If-Match: *` rotation cannot touch a metadata field, because none is in the body.
 
 Two addresses answer both without a rule to remember: each `PUT` carries the complete state of its own resource, absence means default, and the privilege is whatever that address requires. The record write cannot touch the value because the value is not in that resource, and the value write cannot reset the metadata for the same reason.
+
+**One address, one store.** The two resources are not a modelling preference layered over one row; they are already two stores. ADR-0001 put the metadata in the gear's own `credstore_secrets` table and the value in a backend plugin behind `CredStorePluginClientV1`, no transaction spans the two — a value write is a saga with a lifecycle status and a reaper — and the fence of ADR-0003 exists precisely because the two can disagree. Each address above maps onto exactly one store. A record read is one indexed query and never touches the backend, so the catalogue stays up when the vault is down; a value read is a backend round-trip plus a fence check. A record write is one insert or update with nothing to compensate, so the saga stays confined to the value write, where under a merged resource every category edit would have been a cross-store saga. And `declared` is not a state the API invented: it is the honest name for a metadata row with no backend entry, which the storage could already hold, just as `value_fp IS NULL` is the honest name for the opposite case. One address for both would have meant pretending the two stores are one and hiding the boundary the fence guards. This argument settles Axis A — that the record and the value are two resources — but not Axis B: a flag on a single address could still route to the backend on demand, and it is the three arguments above that rule that out.
 
 Suppression (the "disabled here" tombstone, if adopted) attaches to the record: `POST` / `DELETE /credstore/v1/credentials/{ref}/suppression`.
 
@@ -344,7 +346,9 @@ Cache-Control: no-store
 - Contract tests: the `Secret` schema contains exactly `reference`, `type`, `expires_at` and the value; `sharing`, `category`, `inheritance` and `status` appear in `Credential` only.
 - E2E: a record created without a value returns 404 on its secret **and** an ancestor's inherited value keeps resolving for descendants while the record stays empty.
 - E2E: the reaper leaves a deliberately empty record untouched across at least two sweep intervals.
-- Audit: one record per value returned by both the point read and the bulk read; no record claims a disclosure when the response carried none.
+- Audit: one record per value returned by both the point read and the bulk read, and one per value written or cleared; no record claims a disclosure when the response carried none.
+- E2E: a role with `read_secret` and not `read` receives 200 with the `Secret` envelope on `GET …/secret` and the canonical 404 on `GET /credentials/{ref}`; its filtered bulk read returns its in-scope items by name.
+- E2E: a role with `write_secret` and no read action completes a `declared` record with `If-None-Match: *`, rotates with `If-Match: *`, cannot perform a guarded write for want of a validator it has no way to obtain, and re-injects the known value into a fence-poisoned row so that the row resolves again.
 
 ## Backward Compatibility by Mode
 
@@ -369,13 +373,14 @@ Compatibility is recorded here, not optimized for (D1).
 
 **Why the authorization break is structural, not softened.** The tempting shortcut would be to accept the shipped `read` on the new surfaces so deployments roll forward untouched. It would leave a grant whose meaning is permanently ambiguous — a reviewer could not tell whether `read` was meant to include value disclosure — and since the premise of this ADR is that value disclosure is a separate privilege, an ambiguous grant defeats it. The type rename closes the question without a rule: shipped permissions name `secret.v1~`, the new operations authorize against `credential.v1~`, and the two never match. Re-granting is a release task with an explicit checklist: enumerate every role holding the shipped `read` or `write`, decide per role whether it needs the record, the catalogue, the value, or several, and issue the new grants.
 
-**Rollout ordering that follows.** Grants first, endpoints second. If endpoints ship before grants are re-issued, reads fail closed — empty pages and 404s — which is safe but reads like an outage. The reverse order is safe and invisible. HTTP consumers of the value migrate on their own schedule only if the old path is kept alive as a temporary alias; whether to provide that alias is a rollout decision, and this ADR does not require one.
+**Rollout ordering that follows.** Grants first, endpoints second. If endpoints ship before grants are re-issued, reads fail closed — empty pages and 404s — which is safe but reads like an outage. The reverse order is safe and invisible. The roles table under Authentication and authorization is the checklist for the re-grant. HTTP consumers of the value migrate on their own schedule only if the old path is kept alive as a temporary alias; whether to provide that alias is a rollout decision, and this ADR does not require one.
 
 ## Impact Analysis by Domain
 
 ### Security
 
 - **Assets and adversary.** The asset is the plaintext credential. The adversary of record is an over-granted or compromised principal inside the platform — a tenant user, an application token, a stolen bearer. Two goals are addressed: learning *which* credentials exist (reconnaissance) and obtaining *many* values in one action (exfiltration).
+- **Integrity, not only confidentiality.** `write_secret` without any read action can replace a value its holder cannot see. For a signing secret or an OAuth client that is a takeover, not a denial: a `webhook-hmac` set to a known key forges every webhook, an `oauth2-client` set to one's own diverts the traffic. The write path is therefore audited like the read path (Operations), and an injector is granted per category or per concrete type, never on a wildcard.
 - **Attack surface delta.** Metadata addresses widen only the reconnaissance surface, deliberately, because the catalogue is a product requirement, and each is gated by its own action. Exactly two addresses can disclose a value — `GET /credentials/{ref}/secret` and `POST /credentials:read-secrets` — and both must be audited and separately throttled. They do **not** share a path prefix: see the note above on why one glob does not cover them.
 - **Reconnaissance containment.** Every refusal is the canonical 404, byte-identical to absence, including per item in a bulk response. Timing is not equalized; that is a pre-existing, accepted property of the gear (a resolved credential consults the PDP and the registry, a missing one does not — DESIGN §5.4).
 - **Exfiltration containment.** No response can exceed the caller's own read scope, none is paginated, and the bulk endpoint fails rather than truncates above its cap. The worst case for a compromised application token is "the credentials that token was already entitled to read", which is the same bound as with N point reads, reached faster.
@@ -388,6 +393,21 @@ Compatibility is recorded here, not optimized for (D1).
 - **AuthZ model:** six actions on the renamed resource type `gts.cf.core.credstore.credential.v1~…`: `list`, `read`, `write`, `delete` on the record; `read_secret`, `write_secret` on the value. Plain verbs for the entity follow the platform convention (`read`/`write`/`delete` in every other gear); the `_secret` suffix follows its compound-action pattern (`set_reaction`, `upload_attachment`) and names the sub-resource, never the entity. The bulk endpoint introduces **no new action** — it evaluates `read_secret` per item, so it can never grant more than N point reads.
 - **Compatibility of the model:** deliberately not preserved; see the table above. The break is structural: a shipped permission on `secret.v1~` matches no operation on `credential.v1~`.
 - **Escalation path to watch.** Whoever may change a credential's `category` changes which application may read its value, and under the scoped selector that also changes which credentials appear in an application's bulk result. That right belongs to `write`, its values come from a registry, and the PDP policy owner must treat it as privileged rather than cosmetic.
+- **`write` is the most privileged metadata action.** Beyond `category` it moves `sharing`, which publishes a secret to every descendant, and it owns suppression. A role that may edit an expiry may therefore also publish; there is no finer split, on purpose — six atoms express every role below, and a seventh would buy a separation nobody has asked for. Policy owners treat `write` as a grant on policy, not on labels.
+- **Type-scoped grants come free, with one caveat.** A permission's resource type accepts GTS wildcard patterns (`…credential.v1~cf.core.credstore.basic_auth.v1~*`), so "may read the value of every basic-auth credential" needs no attribute predicate at all. The caveat: registering a custom type needs no credstore release, and every subtype registered later under a wildcard is granted the moment it exists. For a secret store that is the dangerous direction — a new *category* grants nothing until a policy names it — so grants on secret types name concrete types or an explicit set, and a wildcard on the base type is an operator's tool, not an application's.
+- **Implications between the actions**, stated so a policy author does not grant one believing it withholds another. `list` on a scope discloses every record `read` would, since the list item and the point record share one schema. `read_secret` on an item discloses that item's usage envelope and, through the filtered bulk read, the names of every readable item in scope. Separate grants therefore work downward — metadata without value, one record without the catalogue — never upward.
+- **The roles the six actions actually form.** Six grant sets in four scenario families; this table is the re-grant checklist the rollout section calls for, and the actors are the PRD's.
+
+| Scenario | Role | Grant | PRD actor |
+|---|---|---|---|
+| Runtime consumption | Consumer | `read_secret`, with `read` alongside so the record address does not 404 for a caller that may read the value | `integration-app`, `oagw`, `platform-gear` |
+| Runtime consumption | Self-rotating consumer | `read_secret` + `write_secret`; the `ETag` arrives with the value, so no `read` is needed | `self-rotating-app` |
+| Administration without plaintext | Value-blind configurator | `list` + `read` + `write` + `write_secret` + `delete`; never `read_secret` | `integrations-admin` |
+| Administration without plaintext | Catalogue and audit | `list` + `read` | `catalogue-auditor` |
+| Machine provisioning | Injector | `write_secret` alone: completes `declared` records, rotates and heals with `If-Match: *`, initializes with `If-None-Match: *`; `write` as well when it declares records itself | `provisioner` |
+| Full control | Tenant admin, break-glass operator | all six; the operator differs by scope, not by action set | `tenant-admin` |
+
+  Two of the six define no role on their own: `read` is the floor the others imply, and `delete` rides with `write` in every role above. They stay separate atoms for audit and for downward grants, not because any role needs them alone.
 
 ### Integration and contract
 
@@ -400,7 +420,7 @@ Compatibility is recorded here, not optimized for (D1).
 ### Operations
 
 - **Rate limiting.** Gateway route policies match paths, which is why exposure classes are separate paths: value reads get stricter rules than catalogue reads, and the bulk address gets its own.
-- **Audit.** One record per value returned, on both value addresses (`GET /credentials/{ref}/secret` and `POST /credentials:read-secrets` — named, not globbed). Metadata reads are not audited per record; the collection read may be sampled if volume warrants.
+- **Audit.** One record per value returned, on both value addresses (`GET /credentials/{ref}/secret` and `POST /credentials:read-secrets` — named, not globbed), and one record per value written or cleared (`PUT` and `DELETE …/secret`): `write_secret` is an integrity privilege whose blast radius equals disclosure for some types (Security), so who rotated what, and when, is recorded like who read what. Metadata reads are not audited per record; the collection read may be sampled if volume warrants.
 - **Metrics.** Bulk selector kind and result size distribution, per-item refusal counts by cause, cap rejections. Existing read-outcome and fence metrics extend unchanged.
 - **Runbook.** A spike of `TOO_MANY_MATCHES` or of per-item refusals is the operator-visible signal of a misbehaving or probing client.
 - **No new infrastructure.**
@@ -451,6 +471,8 @@ Compatibility is recorded here, not optimized for (D1).
 - The metadata collection acquires a use case that genuinely needs values inline; that would reopen B5 and require a new answer to walkability.
 - Empty records start accumulating in production because clients abandon the two-step create; the fix is a collection-level `POST` that carries record and value together, restoring atomicity.
 - False conflicts between metadata edits and value rotations become a real annoyance; the fix is an independent `ETag` per sub-resource instead of one shared `version`.
+- Types acquire a `default_category` trait, so that a provider-specific subtype (`…api_key.v1~cf.mail.sendgrid.v1~`) carries its purpose and a record's `category` becomes an override for polymorphic types only; the column would stay the single SQL truth, filled from the type at write time.
+- The gear becomes the successor of `credentials-storage`; the shared noun then has to become a shared contract, and the compatibility facade is a decision of its own.
 
 ## Pros and Cons of the Options
 

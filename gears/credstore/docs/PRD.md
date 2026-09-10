@@ -131,6 +131,14 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 **Role**: Configures a tenant's integrations (SMTP, provider keys, webhooks): creates and rotates credentials, retargets and disables them, and reads the catalogue. **Needs**: Read access to the credential catalogue and to a record's metadata; ability to create and replace credential records and to rotate their values under precondition control. Does not need the plaintext of the credentials being managed.
 <!-- cpt-cf-id-content -->
 
+#### Catalogue Auditor
+
+**ID**: `cpt-cf-credstore-actor-catalogue-auditor`
+
+<!-- cpt-cf-id-content -->
+**Role**: Reviews what a tenant has configured — which credentials exist, their types and categories, whether each is the tenant's own or inherited, when each expires — for compliance, support or migration planning. Changes nothing and reads no value. **Needs**: The credential catalogue and each record's metadata; nothing else.
+<!-- cpt-cf-id-content -->
+
 ### 2.2 System Actors
 
 #### Outbound API Gateway (OAGW)
@@ -147,6 +155,22 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 
 <!-- cpt-cf-id-content -->
 **Role**: A platform service (mail sender, billing connector) that reads the values of the credentials assigned to it, one by one or as its whole set, in the tenant it acts for. Never enumerates the catalogue.
+<!-- cpt-cf-id-content -->
+
+#### Self-Rotating Application
+
+**ID**: `cpt-cf-credstore-actor-self-rotating-app`
+
+<!-- cpt-cf-id-content -->
+**Role**: A service that both consumes and renews its own credential — refreshing an OAuth token, rotating an API key with its provider — and stores the new value back. **Needs**: To read the value of its credential and to rotate it under the validator that arrives with the value; no catalogue and no other record's metadata.
+<!-- cpt-cf-id-content -->
+
+#### Provisioning Injector
+
+**ID**: `cpt-cf-credstore-actor-provisioner`
+
+<!-- cpt-cf-id-content -->
+**Role**: A pipeline or synchronization job (CI/CD, a sync from an external vault) that places values into records someone else declared, rotates them on schedule, and re-injects a known value to heal a fence-poisoned row. Sees no value it did not itself supply and no catalogue. **Needs**: To write a value under a set-once or last-writer-wins precondition without holding any read action; optionally to declare records too, when it owns their definition.
 <!-- cpt-cf-id-content -->
 
 #### Platform Gear
