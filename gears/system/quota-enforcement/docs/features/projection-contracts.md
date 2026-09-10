@@ -462,6 +462,10 @@ NOT** appear as label values; permitted dimensions are the closed `surface` and 
 - **Test layering**: consistency-set and catalogue-mapping checks get unit tests against catalogue fixtures; ingress
   validation, PDP authorization, and registry-fault behavior get integration tests; attribution spoofing is an
   adversarial integration test.
+- **Bootstrap compatibility query (2026-09-09)**: the storage half of `cpt-cf-quota-enforcement-dod-projection-catalog`
+  landed with the quota-lifecycle feature: `read_active_projection_bindings()` is a distinct query over the reference
+  plugin's `qe_quotas` table, tested on SQLite and PostgreSQL. The Policy half still lands with the
+  resolution-policy-engine feature, so the Definition of Done stays open.
 - **Non-applicable review domains**: UX/accessibility is not applicable; there is no user-facing surface. No QE-side
   persistence is added, so no schema or retention concerns arise here. Contract documents must not carry secrets, per
   the ADR shape-only rule.

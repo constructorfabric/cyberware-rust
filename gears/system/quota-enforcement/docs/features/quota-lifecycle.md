@@ -574,10 +574,37 @@ respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, p
 
 - **Bootstrap compatibility query (tracked here)**: the projection-contracts feature checks the configured catalogue
   against `QuotaEnforcementStoragePluginV1::read_active_projection_bindings()` at bootstrap, the distinct
-  `(metric, projection_type)` pairs of active Quotas, implemented so far by the in-memory storage double only. This
-  feature adds the storage plugin's database query over the Quota table and its integration tests. Together with
-  Policy compatibility from the resolution-policy-engine feature, that closes
+  `(metric, projection_type)` pairs of active Quotas. This feature delivers the storage plugin's database query over
+  `qe_quotas` and its tests; together with Policy compatibility from the resolution-policy-engine feature, that closes
   `cpt-cf-quota-enforcement-dod-projection-catalog` of the projection-contracts feature.
+- **Delivered surface and open items (2026-09-09)**: the create, update, and read flows, the draft, metadata, and
+  validity-window algorithms, and the CRUD, metadata, and rate-rejection Definitions of Done are implemented: the
+  `QuotaManagementService`, the five REST endpoints, the `QuotaManagerClientV1` in-process client registered on the
+  ClientHub by the gear (the SDK trait; the public read shape is `QuotaView`, the create shape `QuotaSpec`), and the
+  reference storage plugin's `qe_quotas`, `qe_quota_allocation_counters`, `qe_operation_log` tables with the four
+  lifecycle primitives, the two platform-plane reads, and same-transaction enqueue on the toolkit outbox under the
+  `qe_outbox` prefix (the dispatcher binds the handle with the notifications feature; until then the primitives are
+  reached by tests only and the client stays unpublished per the foundation Definition of Done). The deactivation
+  flow, the state machine, and the cascade Definition of Done stay open: the orchestration (PDP admission, status
+  flip under the row lock, `quota-changed` event, operation-log entry, terminal `QUOTA_DEACTIVATED`) is implemented
+  and the lease half of the cascade lands with the lease-operations feature. The consumption arm of the I6 cap guard
+  (the active period's consumed amount) lands with the consumption-operations feature; the allocation arm reads the
+  in-flight counter under the row lock today. Storage enforces I14 (thresholds versus unbounded cap) on the merged row
+  in the transaction, with a PostgreSQL concurrency test; the gear's pre-check is a fast path.
+- **Metric classification gating**: classification is parsed into closed enums from a *proposed* provisional
+  contract (`kind`, `enforcement` on the metric instance document, DESIGN §3.2) behind a typed adapter with a bounded,
+  TTL-refreshed cache and explicit freshness (a stale entry serves writes within a bounded grace only, never a gauge
+  refresh). The namespace is platform-owned (PRD §3.2, §13), so the metric-validation algorithm and Definition of Done,
+  the lifecycle-gauge Definition of Done, and the PRD requirements they realise stay open until the platform publishes
+  the schema and the adapter is validated against the real registry; fixture tests alone do not close them.
+- **Lifecycle gauges decision**: the three gauges are storage-backed, refreshed on a bounded schedule by the replica
+  holding the `lifecycle-gauges` election, and observed without I/O; a sample exists only after a successful refresh
+  in the current term, is kept through failures until the staleness bound, is withdrawn on leadership loss, a
+  `Lagged`/`Reset` watch event, shutdown, or staleness, and followers publish nothing. All three count Quotas with
+  lifecycle status `active` only; the direct-metric gauge uses the classification current at each refresh.
+- **Period rule clarification**: consumption Quotas require an explicit valid period, `one_time` included
+  (`PERIOD_REQUIRED`), and allocation Quotas reject any period field, `null` included (`PERIOD_NOT_ALLOWED`); PRD §5.2
+  and DESIGN state the same rule. Period execution stays with the consumption-operations feature.
 - **Upstream catalogue gaps (tracked upstream prerequisites)**: PRD `cpt-cf-quota-enforcement-fr-quota-metadata`
   requires telemetry on metadata size distribution, and
   `cpt-cf-quota-enforcement-fr-metric-identity-validation` requires flagging Quotas whose metric was later removed;
