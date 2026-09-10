@@ -186,6 +186,13 @@ impl From<ScopeError> for DomainError {
                 tracing::error!("invalid scope: {msg}");
                 DomainError::internal(msg)
             }
+            // `ScopeError` is `#[non_exhaustive]`: variants this gear has no
+            // specific answer for (today the graph-query refusals, which it can
+            // never trigger) map to an internal error, like `Invalid`.
+            other => {
+                tracing::error!("invalid scope: {other}");
+                DomainError::internal(format!("invalid scope: {other}"))
+            }
         }
     }
 }

@@ -3,6 +3,9 @@ status: accepted
 date: 2026-05-24
 ---
 
+Created:  2026-05-22 by Virtuozzo International GmbH
+Updated:  2026-07-06 by Virtuozzo International GmbH
+
 # PDP-centric authorization for Usage Collector
 
 <!-- toc -->

@@ -171,6 +171,107 @@ async fn issues_default_to_open_like_github() {
 }
 
 #[tokio::test]
+async fn a_since_bound_with_fractions_excludes_the_second_it_falls_inside() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+
+    for (number, updated_at) in [
+        (1, "2026-01-01T00:00:00Z"),
+        (2, "2026-01-01T00:00:01Z"),
+        (3, "2026-01-01T00:00:02Z"),
+    ] {
+        let mut issue = issue_record(number, number, "row");
+        issue.updated_at = updated_at.to_owned();
+        service
+            .upsert_issue(&ctx, "acme", "widget", issue)
+            .await
+            .expect("issue seed must succeed");
+    }
+
+    let router = router_for(service, ctx);
+
+    let half_past = get(
+        router.clone(),
+        "/repos/acme/widget/issues?since=2026-01-01T00:00:00.500Z",
+    )
+    .await;
+    let numbers: Vec<i64> = body_json(half_past)
+        .await
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["number"].as_i64())
+        .collect();
+    assert_eq!(
+        numbers,
+        vec![2, 3],
+        "the row stamped 00:00:00Z is before the asked-for instant"
+    );
+
+    let on_the_second = get(
+        router,
+        "/repos/acme/widget/issues?since=2026-01-01T00:00:01Z",
+    )
+    .await;
+    let numbers: Vec<i64> = body_json(on_the_second)
+        .await
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["number"].as_i64())
+        .collect();
+    assert_eq!(
+        numbers,
+        vec![2, 3],
+        "a whole-second bound is inclusive of its own second"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_filter_value_is_refused_with_the_field_named() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+
+    let router = router_for(service, ctx);
+
+    for (query, field) in [
+        ("since=not-a-timestamp", "since"),
+        ("state=bogus", "state"),
+        ("sort=bogus", "sort"),
+        ("direction=sideways", "direction"),
+    ] {
+        let response = get(
+            router.clone(),
+            &format!("/repos/acme/widget/issues?{query}"),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "?{query} must be refused, not silently ignored"
+        );
+        let json = body_json(response).await;
+        assert_eq!(
+            json["message"], "Validation Failed",
+            "GitHub's wording for a rejected parameter: {json:?}"
+        );
+        assert_eq!(
+            json["errors"][0]["field"], field,
+            "the error must name the offending parameter: {json:?}"
+        );
+        assert_eq!(json["errors"][0]["code"], "invalid", "{json:?}");
+    }
+}
+
+#[tokio::test]
 async fn errors_on_the_compatible_surface_use_githubs_shape() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;
@@ -253,6 +354,166 @@ async fn issues_carry_the_fields_a_github_client_renders() {
     );
     assert_eq!(issue["comments"], 7);
     assert_eq!(issue["locked"], false);
+}
+
+#[tokio::test]
+async fn every_link_relation_carries_the_filters_the_caller_sent() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    for number in 1..=5 {
+        let mut issue = issue_record(number, number, "closed one");
+        issue.state = "closed".to_owned();
+        service
+            .upsert_issue(&ctx, "acme", "widget", issue)
+            .await
+            .expect("issue seed must succeed");
+    }
+
+    let router = router_for(service, ctx);
+
+    // Page 2 of 3, so all four relations are present at once.
+    let response = get(
+        router,
+        "/repos/acme/widget/issues?per_page=2&page=2&state=closed&sort=updated&direction=asc",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let links = response
+        .headers()
+        .get(axum::http::header::LINK)
+        .expect("a paginated listing must link")
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    for relation in ["next", "prev", "first", "last"] {
+        let rendered = format!(r#"rel="{relation}""#);
+        assert!(links.contains(&rendered), "{relation} is missing: {links}");
+    }
+    // One filter set per relation, and every relation carries all three.
+    assert_eq!(
+        links
+            .matches("&state=closed&sort=updated&direction=asc>")
+            .count(),
+        4,
+        "each of next, prev, first and last must keep the filters: {links}"
+    );
+}
+
+#[tokio::test]
+async fn the_offset_bound_and_its_links_agree_at_every_page_size() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    service
+        .upsert_issue(&ctx, "acme", "widget", issue_record(1, 1, "only one"))
+        .await
+        .expect("issue seed must succeed");
+
+    let router = router_for(service, ctx);
+
+    // 9_900 divides by 30 and 100 but not by 33, so the last reachable page
+    // is one further where the division leaves a remainder: the bound is on
+    // the offset, not on the last row.
+    for (per_page, last_page) in [(30_u64, 331_u64), (33, 301), (100, 100)] {
+        assert!(
+            (last_page - 1) * per_page <= 9_900,
+            "per_page={per_page}: page {last_page} must start at or before row 9,900"
+        );
+        assert!(
+            last_page * per_page > 9_900,
+            "per_page={per_page}: page {} must start past it",
+            last_page + 1
+        );
+
+        let ok = get(
+            router.clone(),
+            &format!("/repos/acme/widget/issues?per_page={per_page}&page={last_page}&state=all"),
+        )
+        .await;
+        assert_eq!(
+            ok.status(),
+            StatusCode::OK,
+            "per_page={per_page}: page {last_page} is the last reachable one"
+        );
+        if let Some(links) = ok.headers().get(axum::http::header::LINK) {
+            let links = links.to_str().unwrap();
+            assert!(
+                !links.contains(r#"rel="next""#),
+                "per_page={per_page}: the last reachable page must not link past itself: {links}"
+            );
+        }
+
+        let refused = get(
+            router.clone(),
+            &format!(
+                "/repos/acme/widget/issues?per_page={per_page}&page={}&state=all",
+                last_page + 1
+            ),
+        )
+        .await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::BAD_REQUEST,
+            "per_page={per_page}: page {} starts past the offset bound",
+            last_page + 1
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_since_filter_round_trips_through_every_link_relation() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    for number in 1..=5 {
+        service
+            .upsert_issue(
+                &ctx,
+                "acme",
+                "widget",
+                issue_record(number, number, "open one"),
+            )
+            .await
+            .expect("issue seed must succeed");
+    }
+
+    let router = router_for(service, ctx);
+
+    // Page 2 of 3 again, this time with a `since` whose encoded form (the
+    // `:` become `%3A`) has to survive the round trip.
+    let response = get(
+        router,
+        "/repos/acme/widget/issues?per_page=2&page=2&since=2020-01-01T00:00:00Z",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let links = response
+        .headers()
+        .get(axum::http::header::LINK)
+        .expect("a paginated listing must link")
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    for relation in ["next", "prev", "first", "last"] {
+        assert!(links.contains(&format!(r#"rel="{relation}""#)), "{links}");
+    }
+    assert_eq!(
+        links.matches("&since=2020-01-01T00%3A00%3A00Z>").count(),
+        4,
+        "every relation must carry the same encoded since: {links}"
+    );
 }
 
 #[tokio::test]

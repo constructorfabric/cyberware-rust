@@ -12,7 +12,7 @@ use super::db::{DbProducer, UnknownProducerAction};
 
 pub const PRODUCER_OUTBOX_ENVELOPE_VERSION: u16 = 1;
 pub const PRODUCER_OUTBOX_PAYLOAD_TYPE: &str =
-    "application/vnd.cyberware.event-broker.producer-outbox+json;version=1";
+    "application/vnd.constructorfabric.event-broker.producer-outbox+json;version=1";
 
 type ProducerOutboxCursorKey = (ProducerId, String, u32);
 type ProducerOutboxCursorMap = HashMap<ProducerOutboxCursorKey, i64>;

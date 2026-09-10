@@ -3,16 +3,7 @@
 //! Every method takes `runner: &impl DBRunner`, so one body serves both a pooled
 //! connection and a transaction; the last test exercises the transaction path.
 //!
-//! Two primitives are worth reading the tests for:
-//!
-//! * **The list read never translates GTS matching into SQL.** SQL narrows by a
-//!   prefix range over `gts_id` — exact, because the column has binary collation on
-//!   every backend — and `GtsId::matches_pattern` decides. Translating the pattern
-//!   grammar into SQL would be the local approximation of GTS semantics that
-//!   `constraint-gts-implementation` forbids.
-//! * **The closure walks direct edges iteratively, not with a recursive CTE.** A CTE
-//!   cannot be expressed through the typed builder, and `11_database_patterns.md`
-//!   forbids raw SQL outside migrations (SPEC D5).
+//! Covers GTS-filtered listing and bounded recursive dependency closure.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
@@ -21,9 +12,10 @@ mod common;
 use std::sync::Arc;
 
 use gts::GtsIdPattern;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
 use time::macros::datetime;
-use toolkit_db::secure::ScopeError;
+use toolkit_db::secure::{ScopeError, SecureEntityExt};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 use uuid::Uuid;
@@ -31,6 +23,7 @@ use uuid::Uuid;
 use common::{TestDir, allow_all, test_db, test_db_file};
 use types_registry::domain::enums::{DependencyKind, EntityKind, LifecycleStatus, OwnershipScope};
 use types_registry::domain::ports::NewEntity;
+use types_registry::infra::storage::entity::dependency;
 use types_registry::infra::storage::repo::{
     DependencyRepo, EntityRepo, PageRequest, VersionFamilyRepo,
 };
@@ -631,10 +624,8 @@ async fn closure_over_a_chain_returns_the_whole_chain_and_nothing_outside_it() {
     assert!(closure.missing_roots.is_empty());
 }
 
-/// A cycle is valid (ADR-0012), so the walk must terminate on one. This is why the
-/// traversal keeps a `seen` set rather than assuming the graph is acyclic.
 #[tokio::test]
-async fn closure_terminates_on_a_cycle() {
+async fn closure_terminates_on_a_row_that_contradicts_acyclicity() {
     let db = test_db().await;
     let pair = [
         gts_id!("acme.crm.a.type.v1~"),
@@ -691,9 +682,6 @@ async fn closure_reports_candidates_that_have_no_entity_row() {
     );
 }
 
-/// The closure bound applies to roots resolved before the first dependency hop.
-/// A large independent root set must not bypass it merely because no edge is
-/// discovered and the worklist loop exits immediately.
 #[tokio::test]
 async fn closure_rejects_more_than_512_resolved_roots_before_the_first_hop() {
     let db = test_db().await;
@@ -713,6 +701,93 @@ async fn closure_rejects_more_than_512_resolved_roots_before_the_first_hop() {
             toolkit_db::secure::ScopeError::Invalid(message)
                 if message.contains("512-entity store-build bound")
         ),
+        "unexpected closure error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn closure_refuses_a_fan_out_past_the_bound_and_admits_the_boundary() {
+    let db = test_db().await;
+    let hub = gts_id!("acme.crm.hub.type.v1~");
+    let leaves: Vec<String> = (0..512)
+        .map(|i| format!("gts.acme.crm.leaf{i:03}.type.v1~"))
+        .collect();
+    let mut all: Vec<&str> = vec![hub];
+    all.extend(leaves.iter().map(String::as_str));
+    seed(&db, &all).await;
+
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    let hub_id = entity_id(&db, hub).await;
+    let leaf_ids: Vec<i64> = EntityRepo::find_by_gts_ids(&conn, &scope, &leaves)
+        .await
+        .expect("leaves")
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(leaf_ids.len(), 512);
+
+    // 511 leaves plus the hub is exactly the bound, and must come back whole.
+    let edges: Vec<(DependencyKind, i64)> = leaf_ids[..511]
+        .iter()
+        .map(|id| (DependencyKind::SchemaRef, *id))
+        .collect();
+    DependencyRepo::replace_outgoing(&conn, &scope, hub_id, &edges)
+        .await
+        .expect("511 edges");
+    let closure = DependencyRepo::closure(&conn, &scope, &[hub.to_owned()])
+        .await
+        .expect("512 entities is the bound, not past it");
+    assert_eq!(closure.entities.len(), 512);
+
+    let edges: Vec<(DependencyKind, i64)> = leaf_ids
+        .iter()
+        .map(|id| (DependencyKind::SchemaRef, *id))
+        .collect();
+    DependencyRepo::replace_outgoing(&conn, &scope, hub_id, &edges)
+        .await
+        .expect("512 edges");
+    let err = DependencyRepo::closure(&conn, &scope, &[hub.to_owned()])
+        .await
+        .expect_err("the hub plus 512 dependencies exceeds the store-build bound");
+    assert!(
+        matches!(err, ScopeError::Invalid(message) if message.contains("512-entity store-build bound")),
+        "unexpected closure error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn closure_refuses_rather_than_truncating_a_chain_deeper_than_the_bound() {
+    let db = test_db().await;
+    let chain: Vec<String> = (0..600)
+        .map(|i| format!("gts.acme.crm.deep{i:03}.type.v1~"))
+        .collect();
+    let refs: Vec<&str> = chain.iter().map(String::as_str).collect();
+    seed(&db, &refs).await;
+
+    let conn = db.conn().expect("conn");
+    let scope = allow_all();
+    let mut rows = EntityRepo::find_by_gts_ids(&conn, &scope, &chain)
+        .await
+        .expect("chain");
+    // Zero-padded names, so lexicographic order is the chain's order.
+    rows.sort_by(|a, b| a.gts_id.cmp(&b.gts_id));
+    for pair in rows.windows(2) {
+        DependencyRepo::replace_outgoing(
+            &conn,
+            &scope,
+            pair[0].id,
+            &[(DependencyKind::SchemaRef, pair[1].id)],
+        )
+        .await
+        .expect("chain edge");
+    }
+
+    let err = DependencyRepo::closure(&conn, &scope, &[chain[0].clone()])
+        .await
+        .expect_err("a 600-deep chain is refused, never shortened to fit");
+    assert!(
+        matches!(err, ScopeError::Invalid(message) if message.contains("512-entity store-build bound")),
         "unexpected closure error: {err}"
     );
 }
@@ -783,10 +858,18 @@ async fn replace_outgoing_treats_a_repeated_edge_as_one() {
     .await
     .expect("a repeated edge is one edge, not a constraint violation");
 
-    let direct = DependencyRepo::direct_dependencies(&conn, &scope, &[from])
+    let rows = dependency::Entity::find()
+        .filter(dependency::Column::FromEntityId.eq(from))
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
         .await
         .expect("edges");
-    assert_eq!(direct, vec![to], "exactly one row, not two");
+    assert_eq!(
+        rows.iter().map(|r| r.to_entity_id).collect::<Vec<_>>(),
+        vec![to],
+        "exactly one row, not two"
+    );
 }
 
 // ---------------------------------------------------------------------------

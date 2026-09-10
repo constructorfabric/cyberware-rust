@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use cf_system_sdks::directory::DirectoryNotFound;
+use cf_system_sdks::directory::{DirectoryInvalidArgument, DirectoryNotFound};
 
 use crate::DirectoryClient;
 use crate::client_hub::ClientHub;
@@ -92,6 +92,22 @@ impl EndpointResolver for DirectoryEndpointResolver {
                 Ok(Some(ep.uri))
             }
             Err(e) if e.downcast_ref::<DirectoryNotFound>().is_some() => Ok(None),
+            Err(e) if e.downcast_ref::<DirectoryInvalidArgument>().is_some() => {
+                // A malformed provider name is a permanent configuration error,
+                // not a transient outage: re-resolving can never succeed. Log
+                // it distinctly from the generic backend-failure path (at
+                // `error`, not the caller's transient `warn`) so the actionable
+                // "fix your config" message is not mistaken for a directory
+                // outage, and still return `Err` so the call fails.
+                tracing::error!(
+                    gear,
+                    error = %e,
+                    "provider name permanently rejected by the directory (invalid \
+                     argument); this is a static configuration error, not a directory \
+                     outage, and will never resolve. Check the consumed gear name"
+                );
+                Err(ResolveError::new(gear, e))
+            }
             Err(e) => Err(ResolveError::new(gear, e)),
         }
     }
@@ -341,6 +357,37 @@ mod tests {
         let resolver = DirectoryEndpointResolver::new(dir);
 
         assert!(resolver.resolve_endpoint("billing").await.is_err());
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn invalid_argument_resolves_to_err_and_logs_config_error() {
+        // A malformed provider name is a permanent configuration error, handled
+        // by the dedicated arm. Unlike the not-found sentinel (`Ok(None)`), it
+        // must stay an `Err` so the call fails rather than being treated as a
+        // provider that is merely not ready yet. It must also be logged
+        // distinctly at `error` (a static configuration error) so it is not
+        // folded into the generic backend-failure path, which emits no log of
+        // its own at the resolver.
+        let dir = Arc::new(FailingDirectory {
+            make_error: |gear| DirectoryInvalidArgument::new(format!("bad name {gear}")).into(),
+        });
+        let resolver = DirectoryEndpointResolver::new(dir);
+
+        assert!(resolver.resolve_endpoint("Bad Name").await.is_err());
+
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .find(|line| line.contains("permanently rejected by the directory"))
+            {
+                Some(line) if line.contains("ERROR") => Ok(()),
+                Some(_) => Err("invalid-argument arm logged at the wrong level".to_owned()),
+                None => {
+                    Err("invalid-argument arm must emit a distinct config-error log".to_owned())
+                }
+            }
+        });
     }
 
     /// Mirrors the body `#[toolkit::consumes]` generates, so the wiring

@@ -508,3 +508,208 @@ async fn set_active_variant_by_index_unknown_index_is_not_found() {
         .unwrap_err();
     assert!(matches!(err, ChatEngineError::NotFound { .. }));
 }
+
+// ===========================================================================
+// switch_session_type end to end.
+//
+// This surface had no test at all, which is how a broken owner predicate in
+// `variant_repo::update_session_type` shipped: it compared the UUID-typed
+// `sessions.tenant_id` / `user_id` columns against the caller's id STRINGS,
+// matched zero rows, and returned `NotFound` — a 404 on
+// `POST /sessions/{id}/switch-type` for a session the caller owns.
+// @cpt-cf-chat-engine-fr-switch-session-type
+// ===========================================================================
+
+struct SwitchPlugin {
+    id: String,
+    capabilities: Vec<chat_engine_sdk::models::Capability>,
+    metadata: Option<JsonValue>,
+}
+
+impl SwitchPlugin {
+    fn new(id: &str, capability_names: &[&str], metadata: Option<JsonValue>) -> Arc<Self> {
+        Arc::new(Self {
+            id: id.to_owned(),
+            capabilities: capability_names
+                .iter()
+                .map(|name| chat_engine_sdk::models::Capability {
+                    name: (*name).to_owned(),
+                    value: serde_json::json!({ "type": "bool", "default_value": true }),
+                })
+                .collect(),
+            metadata,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl chat_engine_sdk::ChatEngineBackendPlugin for SwitchPlugin {
+    fn plugin_instance_id(&self) -> &str {
+        &self.id
+    }
+
+    async fn on_session_updated(
+        &self,
+        _ctx: chat_engine_sdk::plugin::SessionPluginCtx,
+    ) -> std::result::Result<
+        chat_engine_sdk::plugin::SessionPluginResponse,
+        chat_engine_sdk::PluginError,
+    > {
+        Ok(chat_engine_sdk::plugin::SessionPluginResponse {
+            capabilities: self.capabilities.clone(),
+            metadata: self.metadata.clone(),
+        })
+    }
+}
+
+/// Build a `VariantService` whose plugin hub actually carries `plugin`, so the
+/// switch reaches the session write instead of stopping at plugin resolution.
+fn variant_service_with_plugin(
+    db: &Arc<crate::infra::db::repo::ChatEngineDb>,
+    plugin_instance_id: &str,
+    plugin: Arc<dyn chat_engine_sdk::ChatEngineBackendPlugin>,
+    enforcer: PolicyEnforcer,
+) -> VariantService {
+    use crate::domain::service::test_support::{
+        message_repo, session_repo, session_type_repo, variant_repo,
+    };
+    use crate::infra::db::repo::plugin_config_repo::SeaPluginConfigRepo;
+
+    let hub = Arc::new(toolkit::ClientHub::new());
+    hub.register_scoped::<dyn chat_engine_sdk::ChatEngineBackendPlugin>(
+        toolkit::client_hub::ClientScope::gts_id(plugin_instance_id),
+        plugin,
+    );
+    let plugins = PluginService::new(hub, Arc::new(SeaPluginConfigRepo::new(Arc::clone(db))));
+    let message_service = Arc::new(MessageService::new(
+        session_repo(db),
+        session_type_repo(db),
+        message_repo(db),
+        plugins.clone(),
+        enforcer.clone(),
+    ));
+
+    VariantService::new(
+        session_repo(db),
+        session_type_repo(db),
+        message_repo(db),
+        variant_repo(db),
+        plugins,
+        message_service,
+        enforcer,
+    )
+}
+
+async fn seed_target_type(
+    db: &Arc<crate::infra::db::repo::ChatEngineDb>,
+    plugin_instance_id: &str,
+) -> Uuid {
+    use crate::domain::ports::NewSessionType;
+    use crate::domain::service::test_support::session_type_repo;
+
+    let now = OffsetDateTime::now_utc();
+    session_type_repo(db)
+        .insert(NewSessionType {
+            session_type_id: Uuid::new_v4(),
+            name: "target-type".to_owned(),
+            plugin_instance_id: Some(plugin_instance_id.to_owned()),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect("seed target session type")
+        .session_type_id
+}
+
+/// The owner switching an existing session's type gets the updated session,
+/// not a 404.
+#[tokio::test]
+async fn switch_session_type_owner_updates_the_session() {
+    const PLUGIN: &str = "gts.test.switch_owner.v1~";
+
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    let target = seed_target_type(&db, PLUGIN).await;
+
+    let svc = variant_service_with_plugin(
+        &db,
+        PLUGIN,
+        SwitchPlugin::new(PLUGIN, &["feedback"], None),
+        enforcer_allow(),
+    );
+
+    let updated = svc
+        .switch_session_type(&ctx_for_subject(user, tenant), sid, target)
+        .await
+        .expect("the owner must be able to switch its own session's type");
+    assert_eq!(updated.session_id, sid);
+    assert_eq!(updated.session_type_id, Some(target));
+    assert!(
+        updated.enabled_capabilities.is_some(),
+        "the plugin's capability list must be persisted on the session",
+    );
+}
+
+/// Plugin-returned metadata is merged into the session on a successful switch —
+/// the second legacy owner-filtered write on this path.
+#[tokio::test]
+async fn switch_session_type_merges_plugin_metadata() {
+    const PLUGIN: &str = "gts.test.switch_meta.v1~";
+
+    let db = inmem_db().await;
+    let (tenant, user, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, user).await;
+    let target = seed_target_type(&db, PLUGIN).await;
+
+    let svc = variant_service_with_plugin(
+        &db,
+        PLUGIN,
+        SwitchPlugin::new(
+            PLUGIN,
+            &["feedback"],
+            Some(serde_json::json!({ "greeting": "hi" })),
+        ),
+        enforcer_allow(),
+    );
+
+    let updated = svc
+        .switch_session_type(&ctx_for_subject(user, tenant), sid, target)
+        .await
+        .expect("switch with metadata merge");
+    assert_eq!(
+        updated
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("greeting"))
+            .and_then(serde_json::Value::as_str),
+        Some("hi"),
+        "plugin metadata must land on the session",
+    );
+}
+
+/// A stranger in the same tenant must still be refused — the owner guard runs
+/// before the PDP decision, so this is 404 regardless of policy.
+// @cpt-cf-chat-engine-nfr-authentication
+#[tokio::test]
+async fn switch_session_type_same_tenant_stranger_is_not_found() {
+    const PLUGIN: &str = "gts.test.switch_stranger.v1~";
+
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let target = seed_target_type(&db, PLUGIN).await;
+
+    let svc = variant_service_with_plugin(
+        &db,
+        PLUGIN,
+        SwitchPlugin::new(PLUGIN, &["feedback"], None),
+        crate::domain::service::test_support::enforcer_allow_tenant_only(),
+    );
+
+    let err = svc
+        .switch_session_type(&ctx_for_subject(Uuid::new_v4(), tenant), sid, target)
+        .await
+        .expect_err("a same-tenant stranger must not switch another user's session type");
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+}

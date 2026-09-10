@@ -24,37 +24,11 @@ use crate::infra::storage::sea_orm_repo::{
     SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
     SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
     SeaOrmReviewCommentRepository, SeaOrmReviewRepository, SeaOrmReviewThreadRepository,
-    SeaOrmTagRepository, SeaOrmWorkflowJobRepository, SeaOrmWorkflowRunRepository,
+    SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmWorkflowJobRepository,
+    SeaOrmWorkflowRunRepository,
 };
 
-type ConcreteService = Service<
-    SeaOrmRepoRepository,
-    SeaOrmIssueRepository,
-    SeaOrmPullRequestRepository,
-    SeaOrmCommitRepository,
-    SeaOrmCommentRepository,
-    SeaOrmReviewCommentRepository,
-    SeaOrmReviewRepository,
-    SeaOrmLabelRepository,
-    SeaOrmMilestoneRepository,
-    SeaOrmReleaseRepository,
-    SeaOrmBranchRepository,
-    SeaOrmContributorRepository,
-    SeaOrmWorkflowRunRepository,
-    SeaOrmPullRequestFileRepository,
-    SeaOrmTagRepository,
-    SeaOrmCommitFileRepository,
-    SeaOrmReviewThreadRepository,
-    SeaOrmCommitCommentRepository,
-    SeaOrmIssueEventRepository,
-    SeaOrmDeploymentRepository,
-    SeaOrmPullRequestCommitRepository,
-    SeaOrmCommitStatusRepository,
-    SeaOrmWorkflowJobRepository,
-    SeaOrmIssueReactionRepository,
-    SeaOrmCheckRunRepository,
-    SeaOrmIssueTimelineRepository,
->;
+type ConcreteService = Service;
 
 // This attribute is the one place the gear's name is written:
 // `service::GEAR_NAME` aliases the `MODULE_NAME` const it generates.
@@ -83,35 +57,36 @@ impl Gear for GithubMirrorGear {
         // letting every later fetch build garbage requests from it.
         cfg.resolved_api_base_url()
             .map_err(|e| anyhow::anyhow!("invalid github-mirror config: {e}"))?;
-        info!(api_base_url = %cfg.api_base_url, "Initializing github-mirror gear");
+        info!(gear = Self::MODULE_NAME, api_base_url = %cfg.api_base_url, "Initializing gear");
 
         let db = Arc::new(ctx.db_required()?);
-        let repo = Arc::new(SeaOrmRepoRepository::new());
-        let issues = Arc::new(SeaOrmIssueRepository::new());
-        let pull_requests = Arc::new(SeaOrmPullRequestRepository::new());
-        let commits = Arc::new(SeaOrmCommitRepository::new());
-        let comments = Arc::new(SeaOrmCommentRepository::new());
-        let review_comments = Arc::new(SeaOrmReviewCommentRepository::new());
-        let reviews = Arc::new(SeaOrmReviewRepository::new());
-        let labels = Arc::new(SeaOrmLabelRepository::new());
-        let milestones = Arc::new(SeaOrmMilestoneRepository::new());
-        let releases = Arc::new(SeaOrmReleaseRepository::new());
-        let branches = Arc::new(SeaOrmBranchRepository::new());
-        let contributors = Arc::new(SeaOrmContributorRepository::new());
-        let workflow_runs = Arc::new(SeaOrmWorkflowRunRepository::new());
-        let pull_request_files = Arc::new(SeaOrmPullRequestFileRepository::new());
-        let tags = Arc::new(SeaOrmTagRepository::new());
-        let commit_files = Arc::new(SeaOrmCommitFileRepository::new());
-        let review_threads = Arc::new(SeaOrmReviewThreadRepository::new());
-        let commit_comments = Arc::new(SeaOrmCommitCommentRepository::new());
-        let issue_events = Arc::new(SeaOrmIssueEventRepository::new());
-        let deployments = Arc::new(SeaOrmDeploymentRepository::new());
-        let pull_request_commits = Arc::new(SeaOrmPullRequestCommitRepository::new());
-        let commit_statuses = Arc::new(SeaOrmCommitStatusRepository::new());
-        let workflow_jobs = Arc::new(SeaOrmWorkflowJobRepository::new());
-        let issue_reactions = Arc::new(SeaOrmIssueReactionRepository::new());
-        let check_runs = Arc::new(SeaOrmCheckRunRepository::new());
-        let issue_timeline = Arc::new(SeaOrmIssueTimelineRepository::new());
+        let repo = Arc::new(SeaOrmRepoRepository::new(Arc::clone(&db)));
+        let issues = Arc::new(SeaOrmIssueRepository::new(Arc::clone(&db)));
+        let pull_requests = Arc::new(SeaOrmPullRequestRepository::new(Arc::clone(&db)));
+        let commits = Arc::new(SeaOrmCommitRepository::new(Arc::clone(&db)));
+        let comments = Arc::new(SeaOrmCommentRepository::new(Arc::clone(&db)));
+        let review_comments = Arc::new(SeaOrmReviewCommentRepository::new(Arc::clone(&db)));
+        let reviews = Arc::new(SeaOrmReviewRepository::new(Arc::clone(&db)));
+        let labels = Arc::new(SeaOrmLabelRepository::new(Arc::clone(&db)));
+        let milestones = Arc::new(SeaOrmMilestoneRepository::new(Arc::clone(&db)));
+        let releases = Arc::new(SeaOrmReleaseRepository::new(Arc::clone(&db)));
+        let branches = Arc::new(SeaOrmBranchRepository::new(Arc::clone(&db)));
+        let contributors = Arc::new(SeaOrmContributorRepository::new(Arc::clone(&db)));
+        let workflow_runs = Arc::new(SeaOrmWorkflowRunRepository::new(Arc::clone(&db)));
+        let pull_request_files = Arc::new(SeaOrmPullRequestFileRepository::new(Arc::clone(&db)));
+        let tags = Arc::new(SeaOrmTagRepository::new(Arc::clone(&db)));
+        let commit_files = Arc::new(SeaOrmCommitFileRepository::new(Arc::clone(&db)));
+        let review_threads = Arc::new(SeaOrmReviewThreadRepository::new(Arc::clone(&db)));
+        let commit_comments = Arc::new(SeaOrmCommitCommentRepository::new(Arc::clone(&db)));
+        let issue_events = Arc::new(SeaOrmIssueEventRepository::new(Arc::clone(&db)));
+        let deployments = Arc::new(SeaOrmDeploymentRepository::new(Arc::clone(&db)));
+        let pull_request_commits =
+            Arc::new(SeaOrmPullRequestCommitRepository::new(Arc::clone(&db)));
+        let commit_statuses = Arc::new(SeaOrmCommitStatusRepository::new(Arc::clone(&db)));
+        let workflow_jobs = Arc::new(SeaOrmWorkflowJobRepository::new(Arc::clone(&db)));
+        let issue_reactions = Arc::new(SeaOrmIssueReactionRepository::new(Arc::clone(&db)));
+        let check_runs = Arc::new(SeaOrmCheckRunRepository::new(Arc::clone(&db)));
+        let issue_timeline = Arc::new(SeaOrmIssueTimelineRepository::new(Arc::clone(&db)));
         let github: Arc<dyn GithubPort> = Arc::new(GithubClient::new(
             cfg.api_base_url.clone(),
             cfg.resolved_token()?,
@@ -124,7 +99,7 @@ impl Gear for GithubMirrorGear {
         let policy_enforcer = PolicyEnforcer::new(authz);
 
         let service = Arc::new(Service::new(
-            db,
+            Arc::clone(&db),
             repo,
             issues,
             pull_requests,
@@ -151,6 +126,7 @@ impl Gear for GithubMirrorGear {
             issue_reactions,
             check_runs,
             issue_timeline,
+            Arc::new(SeaOrmSyncWriter::new(Arc::clone(&db))),
             github,
             policy_enforcer,
             ServiceConfig {
@@ -184,7 +160,7 @@ impl RestApiCapability for GithubMirrorGear {
             .clone();
 
         let router = routes::register_routes(router, openapi, service);
-        info!("github-mirror REST routes registered");
+        info!(gear = Self::MODULE_NAME, "REST routes registered");
         Ok(router)
     }
 
@@ -205,7 +181,7 @@ struct GithubMirrorHealthcheck {
 #[async_trait]
 impl Healthcheck for GithubMirrorHealthcheck {
     fn name(&self) -> &'static str {
-        "github-mirror"
+        GithubMirrorGear::MODULE_NAME
     }
 
     /// A pooled-connection acquisition, no query — enough to catch the DB

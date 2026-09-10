@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — Entitlement Lifecycle (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Pricing (grant-set templates, incl. per-phase map), Rating (usage aggregates) | Downstream: OSS (enforcement), Billing/Rating (prepaid drawdown) | Owners: BSS Subscriptions team -->
 

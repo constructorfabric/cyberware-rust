@@ -1,3 +1,6 @@
+Created:  2026-07-08 by Virtuozzo International GmbH
+Updated:  2026-07-08 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — Technical Design (canonical index) -->
 <!-- Related: ./PRD.md, ./ADR/, ./design/ | Owners: @vstudzinskyi (BSS Billing Platform team) -->
 

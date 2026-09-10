@@ -21,7 +21,7 @@ The GTS naming conventions provide simple, human-readable, globally unique ident
 
 ## Detailed Overview
 
-![architecture.drawio.png](img/architecture.drawio.png)
+<img src="img/architecture.drawio.svg" alt="Gears architecture diagram">
 
 The diagram above illustrates the principal Gear architecture. The deployed component set depends on the target environment and build configuration; for example it can be a single executable for the desktop build or multiple containers for a cloud server.
 
@@ -701,7 +701,7 @@ Introduces an abstraction layer behind the real Outbound API Gateway. The main g
 
 ### Event Broker
 
-Multi-consumer, partitioned, append-only event streaming for Cyber Ware modules.
+Multi-consumer, partitioned, append-only event streaming for Gears modules.
 Typed events, at-least-once delivery, idempotent producers (chained/monotonic/stateless),
 pluggable storage backends, consumer-group cursor tracking.
 

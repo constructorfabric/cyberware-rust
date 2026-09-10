@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — Event Model & Billing Alignment (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Contracts (PriceOverride) | Downstream: Rating, Billing, OSS, Policy Engine, Analytics | Owners: BSS Subscriptions team -->
 

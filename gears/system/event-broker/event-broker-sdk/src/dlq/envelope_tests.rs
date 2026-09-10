@@ -44,7 +44,7 @@ fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
     assert_eq!(DeadLetterEnvelope::VERSION, 1);
     assert_eq!(
         DeadLetterEnvelope::PAYLOAD_TYPE,
-        "application/vnd.cyberfabric.event-broker.dlq+json"
+        "application/vnd.constructorfabric.event-broker.dlq+json"
     );
     assert_eq!(envelope.version, DeadLetterEnvelope::VERSION);
     assert_eq!(envelope.group_id, Some(group_id));

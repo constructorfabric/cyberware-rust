@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — Lifecycle Foundation (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md, ../DECISIONS.md | Upstream: Policy Engine (fail-closed gate), OSS Provisioning (work-order confirm), AMS (tenant identity) | Downstream: every capability slice, Rating, Billing | Owners: BSS Subscriptions team -->
 

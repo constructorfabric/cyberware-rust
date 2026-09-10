@@ -1507,17 +1507,17 @@ dependencies:
 
 ```bash
 # Minimal platform
-helm install my-platform oci://ghcr.io/cyberfabric/charts/toolkit-platform \
+helm install my-platform oci://ghcr.io/constructorfabric/charts/toolkit-platform \
   -f values-minimal.yaml
 
 # Custom overrides
-helm install my-platform oci://ghcr.io/cyberfabric/charts/toolkit-platform \
+helm install my-platform oci://ghcr.io/constructorfabric/charts/toolkit-platform \
   --set global.imageRegistry=my-registry.corp.com \
   --set mini-chat.enabled=true \
   --set mini-chat.replicaCount=3
 
 # Single gear standalone
-helm install mini-chat oci://ghcr.io/cyberfabric/charts/mini-chat \
+helm install mini-chat oci://ghcr.io/constructorfabric/charts/mini-chat \
   --set global.directoryEndpoint=dns:///flight-control.default.svc:50051
 ```
 
@@ -1529,7 +1529,7 @@ Every gear chart follows this `values.yaml` structure:
 replicaCount: 1
 
 image:
-  registry: ghcr.io/cyberfabric    # overridable by global.imageRegistry
+  registry: ghcr.io/constructorfabric    # overridable by global.imageRegistry
   repository: <gear-name>
   tag: ""                           # defaults to .Chart.AppVersion
 
@@ -1594,7 +1594,7 @@ chart change detected
   → helm dependency build (resolve toolkit-common)
   → helm lint
   → helm template (dry-run render)
-  → helm package → push to OCI registry (ghcr.io/cyberfabric/charts/<name>)
+  → helm package → push to OCI registry (ghcr.io/constructorfabric/charts/<name>)
 ```
 
 Published charts include the resolved `toolkit-common` library, so users install from the OCI registry without needing

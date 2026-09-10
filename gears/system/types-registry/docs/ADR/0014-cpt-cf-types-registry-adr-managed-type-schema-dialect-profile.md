@@ -79,7 +79,7 @@ This ADR does not decide the enforced compatibility mode or the comparison basel
 | Dialect | The JSON Schema draft a document declares through its top-level `$schema` URI. |
 | Resolution closure | The set of documents inlined to produce a Type Schema's effective form: every base in its `$id` chain plus every external `$ref` target reachable from its content, including targets referenced from inside `x-gts-traits-schema`. |
 | Leaf | The document being resolved — the one whose `$id` names the entity, as distinct from the bases and `$ref` targets composed into it. |
-| Dependency closure | The availability-blocking relation of ADR-0010. It is a different set from the resolution closure: it additionally contains `x-gts-ref` targets, which are instance-value constraints and are never inlined. |
+| Dependency closure | The availability-blocking relation of ADR-0010. For a Type Schema it follows the resolution-bearing base and `$ref` relationships; `x-gts-ref` targets are instance-value constraints and belong to neither closure. |
 
 ## Decision Drivers
 
@@ -132,7 +132,7 @@ When the admissible set widens, the rule that replaces the P1 restriction is **d
 
 Uniformity is decidable entirely from local state. ADR-0011 closes the managed–external boundary, so a managed resolution closure contains only Managed Entities, and admission already loads every closure member in order to resolve references and compute the effective schema. The check is therefore a comparison over documents already in hand.
 
-`x-gts-ref` targets are deliberately **not** subject to uniformity. An `x-gts-ref` is a constraint on an instance value, not a schema dependency to inline; the platform implementation excludes it from reference resolution for exactly that reason. It contributes to the dependency closure of ADR-0010 but never to the resolved effective schema, so it cannot be reinterpreted under another dialect.
+`x-gts-ref` targets are deliberately **not** subject to uniformity. An `x-gts-ref` is a constraint on an instance value, not a schema dependency to inline; the platform implementation excludes it from reference resolution for exactly that reason. It is also non-blocking under ADR-0010: the named entity contributes no content to the constraining schema's semantic contract, so it belongs to neither closure and cannot be reinterpreted under another dialect.
 
 P1 is the degenerate case of this rule rather than a separate regime: when only one dialect is admissible, every closure is trivially uniform. That is what makes the widening additive.
 

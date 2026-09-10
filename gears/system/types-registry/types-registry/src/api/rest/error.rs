@@ -120,19 +120,6 @@ fn opaque_internal(cause: &dyn std::fmt::Display, at: &'static str) -> Canonical
     CanonicalError::internal(OPAQUE_INTERNAL).create()
 }
 
-/// Log transient contention and give the caller a bounded retry instruction.
-fn retryable_unavailable(
-    cause: &dyn std::fmt::Display,
-    at: &'static str,
-    retry_after_seconds: u64,
-) -> CanonicalError {
-    tracing::warn!(error = %cause, at, "types_registry request is temporarily unavailable");
-    CanonicalError::service_unavailable()
-        .with_detail("The registry is busy. Repeat this submission under the same Idempotency-Key.")
-        .with_retry_after_seconds(retry_after_seconds)
-        .create()
-}
-
 impl From<ServiceError> for CanonicalError {
     fn from(e: ServiceError) -> Self {
         match e {
@@ -197,16 +184,13 @@ impl From<WorkerError> for CanonicalError {
                 &format!("entity '{gts_id}' (id {entity_id}) vanished mid-transaction"),
                 "admission",
             ),
+            // A retryable snapshot race, not a malformed candidate.
+            WorkerError::DependencyTargetAbsent { gts_id } => opaque_internal(
+                &format!("dependency target '{gts_id}' vanished before its edge was committed"),
+                "admission",
+            ),
             // Contention, not corruption: the request is correct and can be
             // repeated after the short hint advertised by the response.
-            WorkerError::FamilyLockUnavailable {
-                family_key,
-                retry_after_seconds,
-            } => retryable_unavailable(
-                &format!("could not acquire the version-family lock for '{family_key}' in time"),
-                "admission",
-                retry_after_seconds,
-            ),
             WorkerError::ResourceVersionExhausted { gts_id } => opaque_internal(
                 &format!("entity '{gts_id}' cannot advance resource_version after i64::MAX"),
                 "admission",
@@ -215,6 +199,14 @@ impl From<WorkerError> for CanonicalError {
                 &format!("entity '{gts_id}' cannot allocate a revision after i32::MAX"),
                 "admission",
             ),
+            // Exhaustive only: `process_item` records this as a failed item.
+            WorkerError::RefusedAfterWrite(failure) => {
+                opaque_internal(&failure.to_string(), "admission")
+            }
+            // Exhaustive only: `process_item` retries or records revalidation exhaustion.
+            WorkerError::RevalidationRequired(drift) => {
+                opaque_internal(&drift.to_string(), "admission")
+            }
             WorkerError::Storage(inner) => opaque_internal(&inner, "storage write"),
             WorkerError::Db(inner) => opaque_internal(&inner, "database write"),
         }
@@ -460,10 +452,12 @@ impl From<AcceptanceError> for CanonicalError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::admission::AdmissionFailureReason;
     use crate::domain::admission::acceptance::PolicyRefusalError;
+    use crate::domain::admission::vector::{VectorDrift, VectorRole};
+    use crate::domain::admission::worker::ItemFailure;
     use crate::domain::gts_store::StoreBuildError;
     use crate::domain::policy::PolicyRefusal;
-    use axum::response::IntoResponse;
     use toolkit_canonical_errors::Problem;
     use toolkit_db::DbError;
     use toolkit_db::secure::ScopeError;
@@ -711,9 +705,23 @@ mod tests {
             worker_problem(WorkerError::RevisionNumberExhausted {
                 gts_id: "revision-secret".to_owned(),
             }),
+            worker_problem(WorkerError::DependencyTargetAbsent {
+                gts_id: "dependency-secret".to_owned(),
+            }),
             worker_problem(WorkerError::ResourceVersionExhausted {
                 gts_id: "version-secret".to_owned(),
             }),
+            // Cover the variants whose `Display` includes caller-visible content.
+            worker_problem(WorkerError::RefusedAfterWrite(ItemFailure::new(
+                AdmissionFailureReason::Unknown("reason-secret".to_owned()),
+                "message-secret".to_owned(),
+            ))),
+            worker_problem(WorkerError::RevalidationRequired(VectorDrift::Moved {
+                gts_id: "drift-secret".to_owned(),
+                role: VectorRole::Dependent,
+                recorded: 1,
+                found: 2,
+            })),
             worker_problem(WorkerError::Storage(ScopeError::Invalid("storage-secret"))),
             worker_problem(WorkerError::Db(DbError::InvalidConfig(
                 "database-secret".to_owned(),
@@ -724,33 +732,6 @@ mod tests {
             assert_eq!(problem.detail, OPAQUE_INTERNAL);
             assert!(!problem.detail.contains("secret"));
         }
-    }
-
-    #[test]
-    fn family_lock_contention_is_retryable_service_unavailable() {
-        let error = WorkerError::FamilyLockUnavailable {
-            family_key: "family-secret".to_owned(),
-            retry_after_seconds: 5,
-        };
-        let problem = worker_problem(error);
-        assert_eq!(problem.status, Some(503));
-        assert_eq!(
-            problem.context.get("retry_after_seconds"),
-            Some(&serde_json::json!(5))
-        );
-        assert!(!problem.detail.contains("family-secret"));
-        assert!(problem.detail.contains("same Idempotency-Key"));
-
-        let response = CanonicalError::from(WorkerError::FamilyLockUnavailable {
-            family_key: "family-secret".to_owned(),
-            retry_after_seconds: 5,
-        })
-        .into_response();
-        assert_eq!(response.status(), 503);
-        assert_eq!(
-            response.headers().get(axum::http::header::RETRY_AFTER),
-            Some(&axum::http::HeaderValue::from_static("5"))
-        );
     }
 
     #[tokio::test]

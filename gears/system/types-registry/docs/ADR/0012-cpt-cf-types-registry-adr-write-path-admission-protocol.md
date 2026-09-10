@@ -83,7 +83,7 @@ Route paths, DTO field layout, operation retention, and table definitions belong
 * A stale writer must not overwrite a newer revision.
 * Expensive GTS checks must not hold a database transaction open.
 * Independent valid candidates should not fail only because another branch in the same batch is invalid.
-* Interdependent candidates, including reference cycles, must be registrable without exposing an inconsistent intermediate state.
+* Candidates with admission-order dependencies must be registrable in one batch without exposing an inconsistent intermediate state.
 * Types Registry must not depend on a global startup census.
 * P1 safety must not require P2 hooks.
 
@@ -106,7 +106,7 @@ For batch failure:
 
 * all-or-nothing;
 * unconstrained best effort;
-* dependency-aware partial admission with atomic dependency groups.
+* dependency-aware partial admission in dependency order.
 
 For startup:
 
@@ -115,13 +115,13 @@ For startup:
 
 ## Decision Outcome
 
-Chosen options, one per dimension: **always-asynchronous execution with no synchronous no-op path**, **request idempotency plus an explicit entity resource-version precondition**, **dependency-aware partial admission with atomic dependency groups**, and **caller-side read, reconcile, conditional registration, retry, and readiness gating**.
+Chosen options, one per dimension: **always-asynchronous execution with no synchronous no-op path**, **request idempotency plus an explicit entity resource-version precondition**, **dependency-aware partial admission in dependency order**, and **caller-side read, reconcile, conditional registration, retry, and readiness gating**.
 
 Together they provide:
 
 * one acceptance shape that does not depend on load, timing, or whether the batch changes anything;
 * a request key for replay and a resource version for stale-write protection;
-* independent candidate progress without losing dependency ordering or cycle atomicity;
+* independent candidate progress without losing dependency ordering;
 * caller-side readiness gating without putting Types Registry on the platform boot path.
 
 None of these choices has to be withdrawn when P2 hooks make operation duration unbounded.
@@ -264,15 +264,15 @@ In the last case, a precondition that permits creation can create a new logical 
 
 A batch is one durable operation on one plane, but it is not one all-or-nothing database transaction.
 
-The candidate dependency graph is resolved with the submitted candidates as an overlay. A reference to another candidate never silently falls back to that identifier's previously committed revision. The graph is condensed into strongly connected components and processed in topological order:
+The candidate dependency graph is resolved with the submitted candidates as an overlay. A reference to another candidate never silently falls back to that identifier's previously committed revision. The graph is processed in topological order:
 
-* one acyclic candidate is one admission unit;
-* one cyclic component is one atomic admission unit;
+* one candidate is one admission unit;
 * independent units that pass all checks commit even if another branch fails;
-* a dependent whose selected in-batch dependency fails is itself failed, with a reason distinguishing it from a candidate that was evaluated and rejected;
-* failure of one cyclic member rejects or blocks the whole cyclic unit.
+* a dependent whose selected in-batch dependency fails is itself failed, with a reason distinguishing it from a candidate that was evaluated and rejected.
 
-This is called **dependency-aware partial admission**, not best effort. “Best effort” does not state dependency ordering, overlay resolution, or cycle atomicity.
+This is called **dependency-aware partial admission**, not best effort. “Best effort” does not state dependency ordering or overlay resolution.
+
+**Admission keeps the dependency graph acyclic.** It rejects cycles in the combined `$ref` and derivation graph because both edge kinds are inlined into the effective artifact. Derivation alone is acyclic because each edge shortens the identifier chain, and Instance conformance cannot close a cycle. The full graph, including conformance and the predecessor edge below, is then processed topologically, one candidate per admission unit. Traversals still deduplicate converging paths and bound work if stored data violates the invariant.
 
 **The graph carries one implicit edge kind alongside authored edges.** Two minors of one major do not reference each other, yet `vM.n~` must follow `vM.(n-1)~` when both occur in a batch. An identifier-derived predecessor edge supplies that order. If the lower minor fails, it blocks the higher one rather than admitting it over a gap.
 
@@ -280,7 +280,7 @@ This edge provides determinism, not soundness. Without it, the higher minor fail
 
 The edge:
 
-* cannot create a cyclic component because strictly increasing minor numbers form an acyclic chain;
+* keeps the graph acyclic like every other edge kind, because minor numbers strictly increase along it;
 * is never stored in the `dependency` relation, for the compatibility-baseline reason above.
 
 The batch cannot mix ownership scopes. All candidates are tenant-owned by the one tenant context, or all are global under platform authority. The version-family row remains the single ownership authority, so concurrent first registration cannot make one family global and tenant-owned or assign it to two tenants.
@@ -338,7 +338,7 @@ This decision is confirmed when:
 * a failed in-batch dependency blocks its dependants;
 * the operation status takes only `pending`, `running`, or `completed`, and no operation-level field states whether the batch succeeded — a caller establishes that from the candidate statuses, and a mixed batch is `completed` exactly as a wholly successful one is;
 * an operation completed after its worker gave up is indistinguishable at the operation level from one whose candidates were rejected on their merits, and distinguishable per candidate, which is the level at which the difference is real;
-* a cyclic dependency component commits atomically or not at all;
+* cycles in the combined `$ref` and derivation graph are refused, both within one batch and by a revision that would close a cycle across operations;
 * concurrent first-family admission leaves exactly one owner;
 * the retention sweep removes a terminal operation exactly when no revision reaches any of its items, which is exercised on a successful deletion and a successful dry run — both of which carry `succeeded` items and no revision — as well as on an operation in which nothing succeeded;
 * a gear with current definitions performs only the batch read and reports `UpToDate`;
@@ -387,11 +387,11 @@ This decision is confirmed when:
 ### Unconstrained best effort
 
 * Good, because independent candidates may succeed.
-* Bad, because the term does not define dependency fallback, ordering, or cycle safety.
+* Bad, because the term does not define dependency fallback or ordering.
 
 ### Dependency-aware partial admission
 
-* Good, because it preserves independent progress and explicitly protects dependency units.
+* Good, because it preserves independent progress, orders dependencies, and blocks downstream candidates when a selected dependency fails.
 * Bad, because clients must inspect per-GTS-ID results and handle partial success.
 
 ### Sub-choices within the selected option

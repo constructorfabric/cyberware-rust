@@ -52,7 +52,7 @@ fn service_with_sentinel_pdp() -> (Arc<Service>, Arc<CountingUnreachableResolver
     let hub = Arc::new(ClientHub::new());
     let resolver = CountingUnreachableResolver::new();
     let enforcer = enforcer_for(Arc::clone(&resolver) as _);
-    let service = Arc::new(Service::new(hub, "cyberfabric".to_owned(), enforcer));
+    let service = Arc::new(Service::new(hub, "constructorfabric".to_owned(), enforcer));
     (service, resolver)
 }
 

@@ -339,17 +339,18 @@ impl PluginConfigRepo for StubPluginConfigRepo {
     }
 }
 
-fn make_session(
-    tenant_id: &str,
-    user_id: &str,
-    session_id: Uuid,
-    enabled_capabilities: Option<JsonValue>,
-) -> Session {
+/// Owner pair carried by every fixture session in this module; [`make_ctx`]
+/// builds a context for the same pair, so the caller is the session owner —
+/// what `owner_guard::ensure_session_owner` requires of an authorized op.
+const OWNER_TENANT: Uuid = Uuid::from_u128(0x0A11);
+const OWNER_USER: Uuid = Uuid::from_u128(0x0B22);
+
+fn make_session(session_id: Uuid, enabled_capabilities: Option<JsonValue>) -> Session {
     let now = OffsetDateTime::now_utc();
     Session {
         session_id,
-        tenant_id: tenant_id.into(),
-        user_id: user_id.into(),
+        tenant_id: OWNER_TENANT.to_string().into(),
+        user_id: OWNER_USER.to_string().into(),
         client_id: None,
         session_type_id: None,
         enabled_capabilities,
@@ -395,7 +396,7 @@ fn make_service_with_enforcer(
 }
 
 fn make_ctx() -> SecurityContext {
-    test_support::ctx_allow_tenants(&[Uuid::new_v4()])
+    test_support::ctx_for_subject(OWNER_USER, OWNER_TENANT)
 }
 
 // --------------------------- Unit tests -------------------------------
@@ -405,8 +406,6 @@ async fn set_reaction_returns_409_when_feedback_capability_missing() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "model", "value": "gpt-4" }])),
     );
@@ -433,8 +432,6 @@ async fn set_reaction_upserts_when_capability_enabled() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
     );
@@ -461,8 +458,6 @@ async fn set_reaction_deletes_on_none_with_applied_true() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
     );
@@ -488,8 +483,6 @@ async fn set_reaction_returns_404_on_unknown_session() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
     );
@@ -519,8 +512,6 @@ async fn set_reaction_returns_400_on_non_assistant_target() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
     );
@@ -543,8 +534,6 @@ async fn list_reactions_bypasses_capability_gate() {
     let message_id = Uuid::new_v4();
     // No feedback capability — the read path must still succeed.
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "model", "value": "gpt-4" }])),
     );
@@ -596,7 +585,7 @@ async fn list_for_messages_groups_reactions_by_message_id() {
         list_returns: Mutex::new(seeded),
         ..Default::default()
     });
-    let session = make_session("t", "u", session_id, None);
+    let session = make_session(session_id, None);
     let svc = make_service(
         StubSessionRepo::new(session),
         StubMessageRepo::assistant(session_id, m1),
@@ -618,7 +607,7 @@ async fn list_for_messages_groups_reactions_by_message_id() {
 
 #[tokio::test]
 async fn list_for_messages_empty_input_short_circuits() {
-    let session = make_session("t", "u", Uuid::new_v4(), None);
+    let session = make_session(Uuid::new_v4(), None);
     let svc = make_service(
         StubSessionRepo::new(session),
         StubMessageRepo::assistant(Uuid::new_v4(), Uuid::new_v4()),
@@ -633,8 +622,6 @@ async fn list_for_messages_empty_input_short_circuits() {
 async fn list_reactions_unknown_message_returns_empty() {
     let session_id = Uuid::new_v4();
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
     );
@@ -658,12 +645,12 @@ async fn list_reactions_unknown_message_returns_empty() {
 
 #[tokio::test]
 async fn list_reactions_excludes_reactions_for_mismatched_session() {
-    // A reaction exists for `message_id` in session A, but the caller lists it
-    // under a DIFFERENT session id. Because `message_id` does not belong to the
-    // requested session, the pair is invalid and the listing is empty — the
-    // reaction must not leak across the mismatched (session_id, message_id) pair.
-    let session_a = Uuid::new_v4();
-    let session_b = Uuid::new_v4();
+    // A reaction exists for `message_id`, but the message belongs to a
+    // DIFFERENT session than the one being listed. The pair is invalid, so the
+    // listing is empty — the reaction must not leak across a mismatched
+    // (session_id, message_id) pair inside an otherwise authorized session.
+    let authorized_session = Uuid::new_v4();
+    let other_session = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let now = OffsetDateTime::now_utc();
 
@@ -678,21 +665,51 @@ async fn list_reactions_excludes_reactions_for_mismatched_session() {
         ..Default::default()
     });
     let svc = make_service(
-        StubSessionRepo::new(make_session("t", "u", session_a, None)),
-        // Message lives in session A only.
-        StubMessageRepo::assistant(session_a, message_id),
+        StubSessionRepo::new(make_session(authorized_session, None)),
+        // The message lives in the other session only.
+        StubMessageRepo::assistant(other_session, message_id),
         reactions,
     );
 
-    // Same message_id, but listed under session B → pair invalid → empty.
     let listing = svc
-        .list_reactions(&make_ctx(), session_b, message_id)
+        .list_reactions(&make_ctx(), authorized_session, message_id)
         .await
         .expect("mismatched pair lists empty");
     assert_eq!(listing.message_id, message_id);
     assert!(
         listing.reactions.is_empty(),
         "reaction must not leak when message_id does not belong to session_id",
+    );
+}
+
+/// Listing reactions under a session the caller cannot reach is a 404, not an
+/// empty listing: the read is authorized at parent-session granularity, and an
+/// unreachable session must stay indistinguishable from a missing one.
+//
+// @cpt-cf-chat-engine-nfr-authentication
+#[tokio::test]
+async fn list_reactions_for_unreachable_session_is_not_found() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let svc = make_service(
+        StubSessionRepo::new(make_session(session_id, None)),
+        StubMessageRepo::assistant(session_id, message_id),
+        Arc::new(StubReactionRepo::default()),
+    );
+
+    let err = svc
+        .list_reactions(&make_ctx(), Uuid::new_v4(), message_id)
+        .await
+        .expect_err("an unreachable session must not list reactions");
+    assert!(
+        matches!(
+            err,
+            ChatEngineError::NotFound {
+                resource: "session",
+                ..
+            }
+        ),
+        "expected a session NotFound, got: {err:?}",
     );
 }
 
@@ -750,8 +767,6 @@ fn authz_fixture(enforcer: PolicyEnforcer) -> (ReactionService, Uuid, Uuid) {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let session = make_session(
-        "t",
-        "u",
         session_id,
         Some(serde_json::json!([{ "name": "feedback", "value": true }])),
     );
@@ -796,14 +811,17 @@ async fn delete_reaction_pdp_denied_returns_forbidden() {
 async fn list_reactions_real_db_read_returns_empty() {
     // Exercise the real read path (`list_by_message` over in-memory SQLite):
     // a message with no reactions gets an empty, non-error listing — the
-    // unrestricted query (post owner-column drop) executes end to end.
+    // unrestricted query (post owner-column drop) executes end to end. The
+    // parent session is owned by the caller, so the listing is authorized.
     let db = test_support::inmem_db().await;
     let svc = test_support::build_reaction_service(&db, test_support::enforcer_allow());
-    let ctx = test_support::ctx_allow_tenants(&[Uuid::new_v4()]);
+    let (tenant, user, session_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    test_support::seed_session(&db, session_id, tenant, user).await;
+    let ctx = test_support::ctx_for_subject(user, tenant);
 
     let message_id = Uuid::new_v4();
     let listing = svc
-        .list_reactions(&ctx, Uuid::new_v4(), message_id)
+        .list_reactions(&ctx, session_id, message_id)
         .await
         .expect("empty scoped read succeeds");
     assert_eq!(listing.message_id, message_id);
@@ -892,4 +910,91 @@ async fn set_reaction_real_repo_upserts_then_lists() {
         .await
         .expect("list after clear ok");
     assert!(after.reactions.is_empty(), "reaction removed after clear");
+}
+
+// ===========================================================================
+// Ownership guard under the PDP the platform actually ships (tenant-only
+// constraints). `message_reactions` is an unrestricted table, so the parent
+// session is the entire authorization boundary for both writes and reads.
+// @cpt-cf-chat-engine-nfr-authentication
+// ===========================================================================
+
+#[tokio::test]
+async fn reactions_by_same_tenant_stranger_are_not_found_under_tenant_only_pdp() {
+    use crate::domain::ports::NewUserMessage;
+    use crate::domain::service::test_support::{
+        build_reaction_service, build_session_service, ctx_for_subject, enforcer_allow,
+        enforcer_allow_tenant_only, inmem_db, message_repo, seed_session,
+    };
+
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+    let owner_ctx = ctx_for_subject(owner, tenant);
+
+    build_session_service(&db, enforcer_allow())
+        .update_capabilities(
+            &owner_ctx,
+            sid,
+            vec![chat_engine_sdk::models::CapabilityValue {
+                name: "feedback".into(),
+                value: serde_json::json!(true),
+            }],
+        )
+        .await
+        .expect("enable feedback capability");
+
+    let pair = message_repo(&db)
+        .insert_user_and_assistant_stub(NewUserMessage {
+            session_id: sid,
+            tenant_id: Some(tenant.to_string()),
+            user_id: Some(owner.to_string()),
+            parent_message_id: None,
+            parts: vec![chat_engine_sdk::models::MessagePartInput {
+                part_type: chat_engine_sdk::models::MessagePartType::Text,
+                content: serde_json::json!({ "text": "hi" }),
+                file_citations: vec![],
+                link_citations: vec![],
+                references: vec![],
+            }],
+            file_ids: None,
+            metadata: None,
+        })
+        .await
+        .expect("seed message");
+
+    let rx = build_reaction_service(&db, enforcer_allow_tenant_only());
+    let stranger = ctx_for_subject(Uuid::new_v4(), tenant);
+
+    let err = rx
+        .set_reaction(
+            &stranger,
+            sid,
+            pair.assistant_message_id,
+            ReactionType::Like,
+        )
+        .await
+        .expect_err("a same-tenant stranger must not react in another user's session");
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+
+    let err = rx
+        .list_reactions(&stranger, sid, pair.assistant_message_id)
+        .await
+        .expect_err("a same-tenant stranger must not read another user's reactions");
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+
+    // Control: the owner's own write/read path is unaffected by the guard.
+    rx.set_reaction(
+        &owner_ctx,
+        sid,
+        pair.assistant_message_id,
+        ReactionType::Like,
+    )
+    .await
+    .expect("owner reacts in its own session");
+    let listing = rx
+        .list_reactions(&owner_ctx, sid, pair.assistant_message_id)
+        .await
+        .expect("owner lists its own reactions");
+    assert!(!listing.reactions.is_empty());
 }

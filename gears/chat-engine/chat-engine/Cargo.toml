@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
-keywords = ["cyberfabric", "cyberfabric-modules"]
+keywords = ["constructorfabric", "cf-gears"]
 categories = ["artificial-intelligence"]
 
 [package.metadata.docs.rs]
@@ -82,3 +82,8 @@ k8s-openapi = { workspace = true, features = ["latest"], optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
+# The ownership-denial WARN assertion in `domain/authz/owner_guard_tests.rs`.
+# `no-env-filter` so the capture does not depend on the runner's `RUST_LOG`.
+# The event is emitted synchronously on the test thread, so this crate's
+# thread-local capture is sound here (it is not across `tokio::spawn`).
+tracing-test = { workspace = true, features = ["no-env-filter"] }

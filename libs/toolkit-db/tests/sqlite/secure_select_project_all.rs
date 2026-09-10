@@ -68,6 +68,9 @@ impl ScopableEntity for order_ent::Entity {
             _ => None,
         }
     }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![order_ent::Column::TenantId, order_ent::Column::Id]
+    }
 }
 
 mod item_ent {
@@ -121,6 +124,9 @@ impl ScopableEntity for item_ent::Entity {
             p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
             _ => None,
         }
+    }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![item_ent::Column::TenantId, item_ent::Column::Id]
     }
 }
 

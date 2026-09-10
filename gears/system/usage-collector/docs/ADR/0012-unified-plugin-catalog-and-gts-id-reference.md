@@ -4,6 +4,9 @@ date: 2026-06-02
 decision-makers: Usage Collector gear owners
 ---
 
+Created:  2026-05-22 by Virtuozzo International GmbH
+Updated:  2026-08-11 by Virtuozzo International GmbH
+
 # Unified plugin-DB usage-type catalog and gts_id reference model
 
 <!-- toc -->

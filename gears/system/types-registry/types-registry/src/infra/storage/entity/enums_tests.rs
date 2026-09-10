@@ -66,10 +66,13 @@ fn operation_kind_numbering() {
 fn dependency_kind_numbering() {
     assert_round_trip(&[
         (DependencyKind::SchemaRef, 1),
-        (DependencyKind::GtsRef, 2),
-        (DependencyKind::Derivation, 3),
-        (DependencyKind::InstanceOf, 4),
+        (DependencyKind::Derivation, 2),
+        (DependencyKind::InstanceOf, 3),
     ]);
+    assert!(
+        DependencyKind::try_from_value(&4).is_err(),
+        "the vocabulary has three values",
+    );
 }
 
 #[test]
@@ -110,7 +113,7 @@ fn no_vocabulary_has_grown_without_its_numbering_being_pinned() {
     assert_eq!(Plane::iter().count(), 2);
     assert_eq!(OperationStatus::iter().count(), 3);
     assert_eq!(OperationItemStatus::iter().count(), 5);
-    assert_eq!(DependencyKind::iter().count(), 4);
+    assert_eq!(DependencyKind::iter().count(), 3);
 }
 
 /// `database.sql`: *"Numbering is per column and deliberately NOT aligned

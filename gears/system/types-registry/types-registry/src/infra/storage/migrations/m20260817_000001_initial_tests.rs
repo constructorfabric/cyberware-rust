@@ -1,7 +1,7 @@
 //! Per-backend statement-list tests. `SQLite` is exercised for real by
 //! `tests/migration_test.rs`; Postgres and `MySQL` need a container, so what is
 //! pinned here is what a container run cannot tell us cheaply and what silently
-//! rots otherwise: that all three lists cover the same nine tables and four
+//! rots otherwise: that all three lists cover the same tables and the same four
 //! indexes, that neither federation table leaks in, and that each dialect's
 //! load-bearing lowering choices are actually present.
 
@@ -9,7 +9,7 @@
 
 use super::{DOWN_STATEMENTS, MYSQL_UP_STATEMENTS, PG_UP_STATEMENTS, SQLITE_UP_STATEMENTS};
 
-/// The nine tables of the P0 subset (SPEC §9).
+/// The tables of the P0 subset (SPEC §9), in creation order.
 const P0_TABLES: &[&str] = &[
     "types_registry__version_family",
     "types_registry__operation",
@@ -48,7 +48,7 @@ fn joined(statements: &[&str]) -> String {
 }
 
 #[test]
-fn every_backend_creates_all_nine_p0_tables() {
+fn every_backend_creates_all_p0_tables() {
     for (name, statements) in lists() {
         let sql = joined(statements);
         for table in P0_TABLES {
@@ -73,19 +73,22 @@ fn no_backend_creates_the_federation_tables() {
     for (name, statements) in lists() {
         let sql = joined(statements);
         for table in [
-            "types_registry__routing_config",
+            // federation, never in P0
             "types_registry__source_claim",
+            // never created anywhere: its state became the `routing` row of
+            // `coordination_state`
+            "types_registry__routing_config",
         ] {
             assert!(
                 !sql.contains(table),
-                "{name} creates {table}, which belongs to federation and is out of P0"
+                "{name} creates {table}, which this migration must not",
             );
         }
     }
 }
 
 #[test]
-fn down_drops_exactly_the_nine_tables_in_reverse_creation_order() {
+fn down_drops_exactly_the_p0_tables_in_reverse_creation_order() {
     let dropped: Vec<&str> = DOWN_STATEMENTS
         .iter()
         .map(|s| {

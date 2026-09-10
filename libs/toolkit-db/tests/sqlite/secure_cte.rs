@@ -65,6 +65,9 @@ impl ScopableEntity for node::Entity {
             _ => None,
         }
     }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![node::Column::TenantId, node::Column::Id]
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════

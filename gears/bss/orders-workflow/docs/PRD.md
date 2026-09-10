@@ -6,6 +6,9 @@ refs:
   - bss/prd/PRD-subscriptions-entitlements-202601120119
 ---
 
+Created:  2026-08-21 by Virtuozzo International GmbH
+Updated:  2026-09-01 by Virtuozzo International GmbH
+
 # PRD — Orders Workflow
 
 <!-- toc -->

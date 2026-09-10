@@ -4,6 +4,9 @@ date: 2026-06-17
 decision-makers: "@vstudzinskyi (BSS Billing Platform team)"
 ---
 
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-07-07 by Virtuozzo International GmbH
+
 # ADR-0001: Ledger Book Ownership — Only Selling Entities Own Billing Books
 
 <!-- toc -->

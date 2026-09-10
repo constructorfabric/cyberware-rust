@@ -53,7 +53,7 @@ use toolkit_macros::domain_model;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
-use crate::domain::authz::{actions, bypass, resource_types};
+use crate::domain::authz::{actions, bypass, owner_guard, resource_types};
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::MessageRole;
 use crate::domain::ports::MessageRepo;
@@ -230,9 +230,11 @@ impl ReactionService {
         Ok((response, mutation))
     }
 
-    /// List every reaction on a message. The capability gate is NOT
-    /// applied here — once a reaction exists, the owner can always read
-    /// it back.
+    /// List every reaction on a message, for a caller who owns the parent
+    /// session. The capability gate is NOT applied here — once a reaction
+    /// exists, the owner can always read it back — but the session
+    /// authorization below is, so an unreachable session is a 404 rather than
+    /// an empty listing.
     #[instrument(skip(self), fields(
         session_id = %session_id,
         message_id = %message_id,
@@ -244,15 +246,20 @@ impl ReactionService {
         message_id: Uuid,
     ) -> Result<ReactionsListing> {
         // Trust-parent: `message_reactions` is an unrestricted table with no
-        // owner columns; access is governed at the parent-message level. `ctx`
-        // carries no reaction-level PDP scope (unrestricted table).
-        //
+        // owner columns, so nothing about this read is scoped at the SQL layer
+        // — the parent session is the whole authorization boundary. The GET
+        // route reaches this method directly, so authorize that parent here:
+        // ownership is checked on the prefetched session and a foreign target
+        // fails closed to NotFound.
+        // @cpt-cf-chat-engine-seq-authz-point-op
+        // @cpt-cf-chat-engine-nfr-authentication
+        let (_session, _scope) = self
+            .authorize_session(ctx, session_id, actions::READ)
+            .await?;
+
         // Validate that `message_id` actually belongs to `session_id` before
         // listing: a mismatched or unknown pair yields an empty listing
-        // (anti-enumeration) rather than another session's reactions — the GET
-        // route reaches this method directly, so the pair is not validated
-        // upstream (unlike the set_reaction echo path).
-        let _ = ctx;
+        // (anti-enumeration) rather than another session's reactions.
         if self
             .messages
             .find_message_in_session(session_id, message_id)
@@ -452,6 +459,13 @@ impl ReactionService {
             .find_by_id_scoped(&bypass::system_read_scope(), session_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+
+        // Ownership is a gear invariant, not a PDP outcome: no shipped policy
+        // plugin constrains `owner_id`, so a tenant-only scope would admit a
+        // same-tenant stranger. Check the owner pair on the trusted prefetch
+        // before the decision; the PDP may only narrow from here.
+        // @cpt-cf-chat-engine-nfr-authentication
+        owner_guard::ensure_session_owner(ctx, &prefetch)?;
 
         // @cpt-cf-chat-engine-interface-pep
         let scope = self

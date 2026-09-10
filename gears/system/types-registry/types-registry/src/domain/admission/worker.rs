@@ -19,44 +19,44 @@
 //! already final. So the two travel in different positions: `Err(WorkerError)`
 //! versus `Ok(_)` with a failed item.
 //!
-//! # P0 scope
+//! # Current admission scope (through T16)
 //!
-//! One acyclic, reference-free candidate per unit, each item its own unit,
-//! processed in `item_no` order. Creations and content revisions both land here —
-//! the item's stored precondition chooses which commit runs.
+//! Each item is its own unit, processed in `item_no` order. References resolve
+//! against committed dependencies plus this candidate; `gts-rust` validation
+//! rejects circular `$ref`s. T19 adds the batch-wide candidate overlay,
+//! topological ordering and cycle detection over combined `$ref`/derivation edges.
+//! Creations and content revisions both land here — the item's stored precondition
+//! chooses which commit runs.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, ScopeError};
-use toolkit_db::{DBProvider, DbError, DbLockGuard, LockConfig};
+use toolkit_db::{DBProvider, DbError};
 use toolkit_macros::domain_model;
+use tracing::{Instrument, Span};
 use uuid::Uuid;
 
 pub use super::errors::{ItemFailure, WorkerError};
-use super::unit::{
-    CommittedUnit, EvaluatedUnit, RevisionCommit, commit_creation, commit_revision, evaluate,
-};
-use crate::config::WorkerSettings;
+use super::revision::{CommittedUnit, RevisionCommit};
+use super::unchanged;
+use super::unit::{PreparedUnit, commit_creation, commit_revision, evaluate};
+use super::vector::VectorDrift;
+use crate::config::{Limits, WorkerSettings};
+use crate::domain::admission::AdmissionFailureReason;
 use crate::domain::admission::Precondition;
 use crate::domain::enums::{OperationItemStatus, OperationStatus};
-use crate::domain::family::{FamilyKey, lock_order};
+use crate::domain::ports::metrics::{AdmissionMetrics, RefusalStage, TerminalStatus};
 use crate::domain::ports::{OperationItemRow, OperationRow, Stores, commit_write, snapshot_read};
+use crate::observability;
 
-/// The advisory-lock namespace every types-registry lock is taken under.
-pub const LOCK_GEAR: &str = "types_registry";
-
-/// Prefix on the family lock key, so a future lock on some other thing in this
-/// gear cannot collide with a family key that happens to spell the same bytes.
-const FAMILY_LOCK_PREFIX: &str = "family:";
-
-/// The advisory-lock key one version family is serialized under.
-///
-/// Public so that a test can probe the key the worker actually takes. A test that
-/// spelled the key itself would keep passing after this function changed it.
-#[must_use]
-pub fn family_lock_key(family_key: &FamilyKey) -> String {
-    format!("{FAMILY_LOCK_PREFIX}{family_key}")
+/// The two configuration sections one admission pass obeys, carried together.
+#[derive(Clone, Copy)]
+pub struct Tuning<'a> {
+    pub limits: &'a Limits,
+    pub worker: &'a WorkerSettings,
+    pub metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
 /// What one pass over an operation produced.
@@ -85,9 +85,7 @@ pub struct ItemOutcome {
 
 /// Perform one full admission pass over an operation.
 ///
-/// Directly callable and returning a result: no `sleep`, no timer, no polling. The
-/// transient store is built inside each unit and dropped with it, so nothing is
-/// retained between invocations and a second pass re-reads the database.
+/// Each invocation rebuilds its transient store and re-reads the database.
 ///
 /// # Errors
 /// [`WorkerError`] for an infrastructure failure. A candidate-level refusal is
@@ -96,25 +94,42 @@ pub async fn run_operation(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
+    tuning: Tuning<'_>,
     operation_id: Uuid,
     now: OffsetDateTime,
-    settings: WorkerSettings,
+) -> Result<OperationOutcome, WorkerError> {
+    // Open before the first read; populate operation fields after loading it.
+    let span = observability::operation_span(operation_id);
+    let started = Instant::now();
+    let outcome = run_operation_inner(stores, db, scope, tuning, operation_id, now)
+        .instrument(span)
+        .await;
+    // Include failed passes in the duration histogram.
+    tuning.metrics.observe_operation_duration(started.elapsed());
+    outcome
+}
+
+/// [`run_operation`]'s body, running inside the operation span.
+async fn run_operation_inner(
+    stores: &Arc<dyn Stores>,
+    db: &DBProvider<WorkerError>,
+    scope: &AccessScope,
+    tuning: Tuning<'_>,
+    operation_id: Uuid,
+    now: OffsetDateTime,
 ) -> Result<OperationOutcome, WorkerError> {
     // Step 1: the operation and its items under one snapshot. `mark_running` below
     // touches only the operation row, so reading the items before it rather than
     // after changes nothing — and it makes the pair consistent, which two
     // separately-snapshotted reads would not be.
     let (operation, items) = read_operation(stores, db, scope, operation_id).await?;
+    observability::record_operation_facts(&Span::current(), operation.kind, operation.dry_run);
 
     // A redelivered message finds the operation terminal and reports the stored
     // outcomes. Delivery is at-least-once (T21), so this is the shape that makes
     // duplicate delivery a no-op rather than a second admission.
     if operation.status == OperationStatus::Completed {
-        return Ok(OperationOutcome {
-            operation_id,
-            already_terminal: true,
-            items: items.iter().map(stored_outcome).collect(),
-        });
+        return Ok(already_terminal(operation_id, &items));
     }
 
     if !mark_running(stores, db, scope, operation_id, now).await? {
@@ -126,7 +141,14 @@ pub async fn run_operation(
 
     let mut outcomes = Vec::with_capacity(items.len());
     for item in items {
-        outcomes.push(process_item(stores, db, scope, operation_id, &item, now, settings).await?);
+        // Instrument each item without splitting `process_item` to own the span.
+        let span =
+            observability::unit_span(operation_id, &item.gts_id, item.kind, item.dry_run, item.id);
+        outcomes.push(
+            process_item(stores, db, scope, tuning, operation_id, &item, now)
+                .instrument(span)
+                .await?,
+        );
     }
 
     mark_completed(stores, db, scope, operation_id, now).await?;
@@ -158,128 +180,61 @@ const fn retryable_db_err(e: &WorkerError) -> Option<&sea_orm::DbErr> {
     }
 }
 
-/// Take the advisory lock on each named family, in [`lock_order`]'s order.
-///
-/// The guards are returned rather than held here because they must outlive the
-/// commit transaction: the window they close spans `create_or_get`, the three family
-/// rules and the entity insert.
-///
-/// # Errors
-/// [`WorkerError::FamilyLockUnavailable`] when the wait budget expires — contention,
-/// not a statement about the candidate, so a redelivery re-drives it. Any guard
-/// already taken is explicitly released before the error is returned.
-async fn lock_families(
+async fn prepare(
+    stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
-    family_keys: &[FamilyKey],
-    operation_id: Uuid,
-    operation_item_id: i64,
-    max_wait: std::time::Duration,
-) -> Result<Vec<DbLockGuard>, WorkerError> {
-    let handle = db.db();
-    let mut guards = Vec::with_capacity(family_keys.len());
-    for key in lock_order(family_keys) {
-        let lock_key = family_lock_key(&key);
-        let config = LockConfig {
-            max_wait: Some(max_wait),
-            ..LockConfig::default()
-        };
-        match handle.try_lock(LOCK_GEAR, &lock_key, config).await {
-            Ok(Some(guard)) => guards.push(guard),
-            Ok(None) => {
-                release_family_locks(guards, operation_id, operation_item_id).await;
-                return Err(WorkerError::FamilyLockUnavailable {
-                    family_key: key.as_str().to_owned(),
-                    retry_after_seconds: max_wait.as_secs().max(1),
-                });
-            }
-            Err(error) => {
-                release_family_locks(guards, operation_id, operation_item_id).await;
-                return Err(error.into());
-            }
-        }
+    scope: &AccessScope,
+    item: &OperationItemRow,
+    payload: &str,
+    tuning: Tuning<'_>,
+) -> Result<Result<PreparedUnit, ItemFailure>, WorkerError> {
+    let prepared = evaluate(
+        stores,
+        db,
+        scope,
+        &item.gts_id,
+        payload,
+        item.id,
+        tuning.limits,
+        Some(item),
+    )
+    .await?;
+    let hit = matches!(&prepared, Ok(PreparedUnit::Unchanged(_)));
+    tuning.metrics.unchanged_probe(hit);
+    if hit {
+        tracing::debug!(operation_item_id = item.id, gts_id = %item.gts_id, "types_registry unchanged probe hit");
     }
-    Ok(guards)
-}
-
-/// Release every acquired family lock deterministically.
-///
-/// Used on the normal commit path and on partial acquisition failures. A release
-/// error cannot change an already-decided commit or replace the acquisition error;
-/// the session still bounds the lock lifetime, so the failure is logged.
-async fn release_family_locks(
-    guards: Vec<DbLockGuard>,
-    operation_id: Uuid,
-    operation_item_id: i64,
-) {
-    for guard in guards {
-        if let Err(error) = guard.release().await {
-            tracing::warn!(
-                %operation_id,
-                operation_item_id,
-                %error,
-                "types_registry could not release a version-family lock; it expires with the \
-                 session"
-            );
-        }
-    }
+    Ok(prepared)
 }
 
 /// Groups the per-item commit inputs so the transaction boundary stays readable
 /// without crossing Clippy's argument-count threshold.
 struct CommitRequest<'a> {
-    evaluated: &'a Arc<EvaluatedUnit>,
+    prepared: &'a PreparedUnit,
     item: &'a OperationItemRow,
-    operation_id: Uuid,
     now: OffsetDateTime,
-    family_lock_timeout: std::time::Duration,
+    limits: Limits,
+    metrics: &'a Arc<dyn AdmissionMetrics>,
 }
 
-/// Steps 4a and 4b: take the family lock a creation needs, run the commit
-/// transaction, and release the lock however the commit ended.
+/// Run the serialized commit transaction (SPEC step 4b).
 ///
-/// Its own function so the lock's lifetime is a single lexical scope: the guard is
-/// taken before the transaction and released after it on every path.
-async fn commit_evaluated(
+/// Its first statement claims `entity_write_order`, replacing the former family locks.
+async fn commit_prepared(
     db: &DBProvider<WorkerError>,
     stores: &Arc<dyn Stores>,
     scope: &AccessScope,
     request: CommitRequest<'_>,
 ) -> Result<Result<RevisionCommit, ItemFailure>, WorkerError> {
     let CommitRequest {
-        evaluated,
+        prepared,
         item,
-        operation_id,
         now,
-        family_lock_timeout,
+        limits,
+        metrics,
     } = request;
-    // Step 4a: serialize the family rules, for a **creation** only.
-    //
-    // `create_or_get`'s unique key decides which of two concurrent admissions founds
-    // a family, and nothing more: the kind, minor-shape and minor-contiguity rules
-    // are check-then-act reads inside a READ COMMITTED transaction, so two admissions
-    // of two *different* new members of one family — `…v1~` and `…v1.0~`, or a Type
-    // Schema beside an Instance — can each pass and both commit an invariant
-    // violation nothing later repairs. The lock is taken here rather than in the
-    // repository because it lives on the `Db` handle and must be held **across** the
-    // transaction, which a repository inside one cannot do.
-    //
-    // A revision takes nothing: it adds no member, so it asks none of the rules.
     let precondition = item.precondition;
-    let family_lock = match precondition {
-        Precondition::MustNotExist => {
-            lock_families(
-                db,
-                std::slice::from_ref(&evaluated.family_key),
-                operation_id,
-                item.id,
-                family_lock_timeout,
-            )
-            .await?
-        }
-        Precondition::Version(_) => Vec::new(),
-    };
-
-    // Step 4b: a short READ COMMITTED transaction containing only rechecks and
+    // A short READ COMMITTED transaction containing only rechecks and
     // writes. The `Arc` keeps transaction retries from cloning the artifacts.
     //
     // Retried on lock contention: every statement in both commit paths re-reads
@@ -294,16 +249,33 @@ async fn commit_evaluated(
     // *enforced* here, by a commit that refuses an absent identifier.
     let tx_scope = scope.clone();
     let tx_stores = Arc::clone(stores);
-    let committed = db
-        .db()
+    // The `'static` retry closure owns each attempt's handles.
+    let tx_metrics = Arc::clone(metrics);
+    // Copy limits into the `'static` retry closure.
+    let tx_limits = limits;
+    db.db()
         .transaction_with_retry(commit_write(&db.db()), retryable_db_err, |tx| {
-            let unit = Arc::clone(evaluated);
+            let prepared = prepared.clone();
             let tx_scope = tx_scope.clone();
             let tx_stores = Arc::clone(&tx_stores);
+            let tx_metrics = Arc::clone(&tx_metrics);
             Box::pin(async move {
+                let unit = match &prepared {
+                    PreparedUnit::Unchanged(candidate) => {
+                        return unchanged::commit(
+                            tx_stores.as_ref(),
+                            tx,
+                            &tx_scope,
+                            candidate,
+                            now,
+                        )
+                        .await;
+                    }
+                    PreparedUnit::Evaluated(unit) => unit,
+                };
                 match precondition {
                     Precondition::MustNotExist => {
-                        commit_creation(tx_stores.as_ref(), tx, &tx_scope, unit.as_ref(), now)
+                        commit_creation(tx_stores.as_ref(), tx, &tx_scope, unit, &tx_limits, now)
                             .await
                             .map(|r| r.map(RevisionCommit::Admitted))
                     }
@@ -312,35 +284,30 @@ async fn commit_evaluated(
                             tx_stores.as_ref(),
                             tx,
                             &tx_scope,
-                            unit.as_ref(),
+                            unit,
                             expected,
+                            &tx_limits,
                             now,
+                            &tx_metrics,
                         )
                         .await
                     }
                 }
             })
         })
-        .await;
-
-    // Released deterministically rather than on `Drop`, which the toolkit documents
-    // as best-effort: a sibling admission is waiting on this key. A failed release is
-    // logged, not propagated — the commit above is already decided.
-    release_family_locks(family_lock, operation_id, item.id).await;
-
-    committed
+        .await
 }
 
-/// Evaluate and commit one non-terminal operation item, or report the durable
-/// outcome an overlapping pass already established.
+/// Evaluate and commit one non-terminal item.
+/// Revision-vector drift triggers a fresh evaluation up to the configured attempt limit.
 async fn process_item(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
     scope: &AccessScope,
+    tuning: Tuning<'_>,
     operation_id: Uuid,
     item: &OperationItemRow,
     now: OffsetDateTime,
-    settings: WorkerSettings,
 ) -> Result<ItemOutcome, WorkerError> {
     if item.status != OperationItemStatus::Pending && item.status != OperationItemStatus::Running {
         return Ok(stored_outcome(item));
@@ -351,86 +318,215 @@ async fn process_item(
         .as_deref()
         .ok_or(WorkerError::MissingPayload { item_id: item.id })?;
 
-    // Step 3: evaluation releases its snapshot before CPU-heavy validation.
-    let evaluated = match evaluate(stores, db, scope, &item.gts_id, payload, item.id).await? {
-        Ok(evaluated) => Arc::new(evaluated),
-        Err(failure) => {
-            return record_failure(stores, db, scope, operation_id, item, failure, now).await;
-        }
+    let attempts = tuning.worker.max_revalidation_attempts;
+    let mut last_drift: Option<VectorDrift> = None;
+    // Probe once in the initial evaluation snapshot. A miss stays on ordinary
+    // evaluation even if a concurrent write makes the authored content identical.
+    let mut initial = if attempts > 0 {
+        Some(prepare(stores, db, scope, item, payload, tuning).await?)
+    } else {
+        None
     };
+    // Log attempts using one-based numbering.
+    for attempt in 1..=attempts {
+        let prepared = match initial.take() {
+            Some(prepared) => prepared,
+            None => {
+                evaluate(
+                    stores,
+                    db,
+                    scope,
+                    &item.gts_id,
+                    payload,
+                    item.id,
+                    tuning.limits,
+                    None,
+                )
+                .await?
+            }
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                return record_failure(
+                    stores,
+                    db,
+                    scope,
+                    operation_id,
+                    item,
+                    failure,
+                    now,
+                    tuning.metrics,
+                )
+                .await;
+            }
+        };
 
-    let committed = commit_evaluated(
-        db,
+        let committed = match commit_prepared(
+            db,
+            stores,
+            scope,
+            CommitRequest {
+                prepared: &prepared,
+                item,
+                now,
+                limits: *tuning.limits,
+                metrics: tuning.metrics,
+            },
+        )
+        .await
+        {
+            Ok(committed) => committed,
+            // Another pass terminalized the item; this pass rolled back.
+            Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
+                return stored_item(stores, db, scope, operation_id, item_id).await;
+            }
+            // Terminalize a post-write refusal after its transaction rolls back.
+            Err(WorkerError::RefusedAfterWrite(failure)) => {
+                return record_failure(
+                    stores,
+                    db,
+                    scope,
+                    operation_id,
+                    item,
+                    failure,
+                    now,
+                    tuning.metrics,
+                )
+                .await;
+            }
+            // Guard or artifact CAS drift rolls the transaction back.
+            Err(WorkerError::RevalidationRequired(drift)) => {
+                tuning.metrics.revalidation_retried(&drift);
+                tracing::info!(
+                    %operation_id,
+                    operation_item_id = item.id,
+                    gts_id = %item.gts_id,
+                    attempt,
+                    max_attempts = attempts,
+                    drift = %drift,
+                    "types_registry revalidating a candidate whose evaluation went stale"
+                );
+                last_drift = Some(drift);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        return match committed {
+            Ok(commit) => Ok(committed_outcome(
+                operation_id,
+                item,
+                commit,
+                attempt,
+                tuning.metrics,
+            )),
+            Err(failure) => {
+                record_failure(
+                    stores,
+                    db,
+                    scope,
+                    operation_id,
+                    item,
+                    failure,
+                    now,
+                    tuning.metrics,
+                )
+                .await
+            }
+        };
+    }
+
+    // Every attempt drifted.
+    let drift = last_drift.map_or_else(
+        || "no attempt was made".to_owned(),
+        |drift| drift.to_string(),
+    );
+    let failure = ItemFailure::new(
+        AdmissionFailureReason::RevalidationExhausted,
+        format!(
+            "the state this candidate was validated against kept moving: {attempts} \
+             revalidation attempts were exhausted, the last on {drift}"
+        ),
+    );
+    record_failure(
         stores,
+        db,
         scope,
-        CommitRequest {
-            evaluated: &evaluated,
-            item,
-            operation_id,
-            now,
-            family_lock_timeout: settings.family_lock_timeout,
-        },
+        operation_id,
+        item,
+        failure,
+        now,
+        tuning.metrics,
     )
-    .await;
+    .await
+}
 
-    let committed = match committed {
-        Ok(committed) => committed,
-        // The competing pass's terminal item is authoritative; this pass rolled
-        // its entity write back with `ItemAlreadyTerminal`.
-        Err(WorkerError::ItemAlreadyTerminal { item_id }) => {
-            return stored_item(stores, db, scope, operation_id, item_id).await;
-        }
-        Err(error) => return Err(error),
-    };
-
-    match committed {
-        Ok(RevisionCommit::Admitted(CommittedUnit {
+/// Report, log, and count a successful commit.
+fn committed_outcome(
+    operation_id: Uuid,
+    item: &OperationItemRow,
+    commit: RevisionCommit,
+    attempt: u32,
+    metrics: &Arc<dyn AdmissionMetrics>,
+) -> ItemOutcome {
+    match commit {
+        RevisionCommit::Admitted(CommittedUnit {
             gts_uuid,
             revision_no,
-            resource_version,
-        })) => {
-            tracing::info!(
-                %operation_id,
-                operation_item_id = item.id,
-                gts_id = %item.gts_id,
-                revision_no,
-                resource_version,
-                "types_registry candidate admitted"
-            );
-            Ok(ItemOutcome {
-                gts_id: item.gts_id.clone(),
-                status: OperationItemStatus::Succeeded,
-                gts_uuid: Some(gts_uuid),
-                resource_version: Some(resource_version),
-                revision_no: Some(revision_no),
-                failure: None,
-            })
-        }
-        // Terminal and successful, and deliberately not `Succeeded`: no revision
-        // number was allocated, so reporting one would name a revision that does
-        // not exist (ADR-0005).
-        Ok(RevisionCommit::Unchanged {
-            gts_uuid,
             resource_version,
         }) => {
             tracing::info!(
                 %operation_id,
                 operation_item_id = item.id,
                 gts_id = %item.gts_id,
+                revision_no,
                 resource_version,
+                attempt,
+                "types_registry candidate admitted"
+            );
+            metrics.candidate_terminalized(TerminalStatus::Succeeded);
+            ItemOutcome {
+                gts_id: item.gts_id.clone(),
+                status: OperationItemStatus::Succeeded,
+                gts_uuid: Some(gts_uuid),
+                resource_version: Some(resource_version),
+                revision_no: Some(revision_no),
+                failure: None,
+            }
+        }
+        // Terminal and successful, and deliberately not `Succeeded`: no revision
+        // number was allocated, so reporting one would name a revision that does
+        // not exist (ADR-0005).
+        RevisionCommit::Unchanged {
+            gts_uuid,
+            resource_version,
+        } => {
+            tracing::info!(
+                %operation_id,
+                operation_item_id = item.id,
+                gts_id = %item.gts_id,
+                resource_version,
+                attempt,
                 "types_registry candidate content already current"
             );
-            Ok(ItemOutcome {
+            metrics.candidate_terminalized(TerminalStatus::Unchanged);
+            ItemOutcome {
                 gts_id: item.gts_id.clone(),
                 status: OperationItemStatus::Unchanged,
                 gts_uuid: Some(gts_uuid),
                 resource_version: Some(resource_version),
                 revision_no: None,
                 failure: None,
-            })
+            }
         }
-        Err(failure) => record_failure(stores, db, scope, operation_id, item, failure, now).await,
     }
+}
+
+/// The `reason` label a refusal counts under.
+#[must_use]
+pub fn reason_label(reason: &AdmissionFailureReason) -> &'static str {
+    reason.metric_label()
 }
 
 /// Record a candidate-level failure and return the outcome to report for it.
@@ -443,6 +539,7 @@ async fn process_item(
 /// and reported instead of the failure this pass computed. For a deterministic
 /// refusal the two agree; where they do not, the store is right and this pass is
 /// the duplicate.
+#[allow(clippy::too_many_arguments)]
 async fn record_failure(
     stores: &Arc<dyn Stores>,
     db: &DBProvider<WorkerError>,
@@ -451,6 +548,7 @@ async fn record_failure(
     item: &OperationItemRow,
     failure: ItemFailure,
     now: OffsetDateTime,
+    metrics: &Arc<dyn AdmissionMetrics>,
 ) -> Result<ItemOutcome, WorkerError> {
     let tx_stores = Arc::clone(stores);
     let tx_scope = scope.clone();
@@ -468,6 +566,9 @@ async fn record_failure(
         .await?;
 
     if recorded {
+        // Count only the pass that won the item CAS.
+        metrics.candidate_terminalized(TerminalStatus::Failed);
+        metrics.refused(RefusalStage::Admission, reason_label(&failure.reason));
         tracing::warn!(
             %operation_id,
             operation_item_id = item.id,
@@ -485,6 +586,20 @@ async fn record_failure(
         });
     }
     stored_item(stores, db, scope, operation_id, item_id).await
+}
+
+/// The outcome a redelivered pass reports: every stored item, nothing written.
+fn already_terminal(operation_id: Uuid, items: &[OperationItemRow]) -> OperationOutcome {
+    tracing::debug!(
+        %operation_id,
+        "types_registry operation was already terminal; the redelivered pass reports \
+         the stored outcomes"
+    );
+    OperationOutcome {
+        operation_id,
+        already_terminal: true,
+        items: items.iter().map(stored_outcome).collect(),
+    }
 }
 
 /// The outcome the store holds for one item, re-read outside any transaction this
@@ -602,3 +717,7 @@ fn stored_outcome(item: &OperationItemRow) -> ItemOutcome {
         failure: item.error_payload.as_deref().map(ItemFailure::from_payload),
     }
 }
+
+#[cfg(test)]
+#[path = "worker_tests.rs"]
+mod worker_tests;

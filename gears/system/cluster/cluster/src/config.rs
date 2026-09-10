@@ -17,6 +17,31 @@
 
 use serde::Deserialize;
 
+/// The reserved [`BackendBinding::provider`] name meaning "the SDK default backend
+/// over this profile's cache" — the omit-default behaviour, but as an *explicit*
+/// binding that can carry options.
+///
+/// Omitting a primitive entirely and binding it to `default` resolve to the same
+/// backend; the difference is that a binding has somewhere to put options.
+///
+/// The only such option today is `allow_weak_consistency`, which a profile over an
+/// eventually-consistent cache needs in order to start at all: both CAS-based SDK
+/// defaults reject such a cache, so without the opt-in a profile binding
+/// `cache: { provider: redis }` and omitting `leader_election` or `lock` fails
+/// startup (ADR-009). The option is accepted on `leader_election` and `lock`, whose
+/// defaults have that consistency guard. It defaults to `false`, so the loud startup
+/// failure stays the default behaviour, and it does **not** launder capability
+/// validation — a consumer
+/// requiring [`CacheCapability::Linearizable`](cluster_sdk::CacheCapability::Linearizable)
+/// against the same profile still fails startup regardless.
+///
+/// It is a reserved name, not a registry entry: `ClusterWiring::from_config`
+/// intercepts it *before* any [`ProviderRegistry`](crate::ProviderRegistry)
+/// lookup, so a plugin that registered a provider literally called `default` would
+/// never be reached. It is rejected outright on the `cache` binding — the cache is
+/// the anchor the defaults wrap, so there is no default cache to resolve to.
+pub const DEFAULT_PROVIDER: &str = "default";
+
 /// The whole cluster section of operator YAML: a set of named profiles.
 ///
 /// ```yaml
@@ -113,6 +138,12 @@ pub struct BackendBinding {
     /// The backend provider name, e.g. `standalone`, `postgres`, `redis`,
     /// `k8s-lease`. Matched against the registered providers at wiring time; an
     /// unknown provider fails startup with `ClusterError::InvalidConfig`.
+    ///
+    /// [`DEFAULT_PROVIDER`] (`default`) is reserved: on `leader_election` or `lock`
+    /// it selects the SDK default backend over this
+    /// profile's cache — the same backend omitting the primitive would produce,
+    /// but as a binding that can carry `allow_weak_consistency`. It is rejected
+    /// on `cache`.
     pub provider: String,
     /// A provisional, OPEN reference to the credential the backend uses to reach
     /// its infrastructure (DESIGN §3 open question — credential wiring is deferred

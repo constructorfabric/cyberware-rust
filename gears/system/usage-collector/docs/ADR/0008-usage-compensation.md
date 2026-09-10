@@ -4,6 +4,9 @@ date: 2026-05-29
 decision-makers: usage-collector spec owners
 ---
 
+Created:  2026-05-22 by Virtuozzo International GmbH
+Updated:  2026-06-10 by Virtuozzo International GmbH
+
 # Usage compensation as a signed negative entry on the unified ingestion path
 
 <!-- toc -->

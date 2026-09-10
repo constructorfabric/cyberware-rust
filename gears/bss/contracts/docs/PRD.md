@@ -7,6 +7,9 @@ refs:
   - bss/prd/PRD-subscriptions-entitlements-202601120119/PRD-subscriptions-entitlements-202601120119.md
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # PRD — Contracts & Agreements
 
 > **Status: first draft (2026-08-17).** Harvested from three sources: (a) the consumer-side

@@ -1,0 +1,26 @@
+[package]
+name = "cf-gears-toolkit-sea-orm-pgq"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "SQL/PGQ (GRAPH_TABLE) AST and renderer for sea_query — security-agnostic"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_sea_orm_pgq"
+
+[lints]
+workspace = true
+
+[dependencies]
+# sea_query arrives through sea-orm's re-export rather than as a direct
+# dependency: no crate in this workspace depends on `sea-query` directly, and a
+# direct dependency could drift from the version sea-orm resolves.
+sea-orm = { workspace = true }
+thiserror = { workspace = true }

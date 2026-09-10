@@ -90,6 +90,13 @@ pub(super) fn map_scope_err(err: ScopeError) -> DomainError {
             diagnostic: format!("unexpected access denied in credstore repo: {msg}"),
             cause: None,
         },
+        // `ScopeError` is `#[non_exhaustive]`: variants this gear has no
+        // specific answer for (today the graph-query refusals, which it can
+        // never trigger) map to an internal error, like `Invalid`.
+        other => DomainError::Internal {
+            diagnostic: format!("scope invalid: {other}"),
+            cause: None,
+        },
     }
 }
 

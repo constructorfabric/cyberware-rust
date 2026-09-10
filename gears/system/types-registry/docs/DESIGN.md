@@ -38,7 +38,7 @@
 
 Types Registry is a control plane for type contracts. It owns the identity, definition, evolution, and platform-facing usability of GTS Type Schemas and registered GTS Instances, but none of the runtime objects that conform to them. Consumers use one versioned SDK and REST surface regardless of origin. Managed guarantees are decided entirely from registry-owned state; externally managed definitions are delegated live to their owning Registry Source Plugin and never projected locally. The identifier spaces are disjoint: managed admission enforces the closed boundary, while external sources contractually owe the same rule and their returned content is not parsed to re-enforce it (ADR-0002, ADR-0007, ADR-0011).
 
-A Registry Reference is a deterministic UUID derived from the canonical GTS Identifier and persisted by domain gears in place of the identifier string (ADR-0001). A managed identifier names a logical entity with immutable authored history: a major-only identifier is mutable through retained revisions, while a minor-bearing identifier is admitted once and pins references at that minor. Minor sequences are contiguous; compatibility is enforced across each stable Type Schema major except where a cross-minor waiver is explicitly recorded, while major 0 is exempt and quarantined from stable entities (ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0015). Revisions retain admission snapshots, while the current-state projection materializes effective artifacts and may change when floating dependencies advance.
+A Registry Reference is a deterministic UUID derived from the canonical GTS Identifier and persisted by domain gears in place of the identifier string (ADR-0001). A managed identifier names a logical entity with immutable authored history: a major-only identifier is mutable through retained revisions, while a minor-bearing identifier is admitted once and pins references at that minor. Minor sequences are contiguous; compatibility is enforced across each stable Type Schema major except where a cross-minor waiver is explicitly recorded, while major 0 is exempt and quarantined from stable schemas' resolution closures and derivation chains (ADR-0003, ADR-0004, ADR-0005, ADR-0006, ADR-0015). Revisions retain admission snapshots, while the current-state projection materializes effective artifacts and may change when floating dependencies advance.
 
 Registration and deletion use one asynchronous read/reconcile/conditional-write protocol. Acceptance binds the `Idempotency-Key` to the request fingerprint, persists the operation and candidates with a ToolKit outbox message in one transaction, and returns the operation; a worker performs dependency-aware partial admission and records an outcome for every candidate. Purge is the only mutation outside this path: synchronous, operator-invoked, and disabled by default (ADR-0012, ADR-0013). The read and query shape follows from GTS identity: `chain_ids()` derives hierarchy without graph traversal, canonical identifiers support indexed range prefilters confirmed by the GTS matcher, and relationships needed for deletion safety and impact analysis are stored as flat managed dependency edges.
 
@@ -55,7 +55,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | `cpt-cf-types-registry-fr-minor-version-profile` | Per-major choice between mutable major-only identity and a gap-free immutable minor sequence opening at `M.0`; `force` waives one cross-minor check and is recorded. See *Compatibility & Evolution Policy* and *Dependency-aware partial admission* in §3.2. |
 | `cpt-cf-types-registry-fr-validate-type-derivation` | Identifier-derived chain validation against every managed base under one resolution-closure dialect. See *Compatibility & Evolution Policy* in §3.2. |
 | `cpt-cf-types-registry-fr-gts-validation` | All GTS semantics come from `gts-rust`; the managed profile adds Draft-07 and identifier restrictions, while federation does not reinterpret source content. See §2.2, *Admission Pipeline*, and *Compatibility & Evolution Policy* in §3.2. |
-| `cpt-cf-types-registry-fr-ref-tracking` | Flat managed dependency edges for derivation, `$ref`, `x-gts-ref`, and Instance-to-schema relationships; used for deletion safety, impact analysis, and the major-0 quarantine. See *Dependency Graph & Deletion Safety* in §3.2. |
+| `cpt-cf-types-registry-fr-ref-tracking` | Flat managed dependency edges for derivation, `$ref`, and Instance-to-schema relationships; used for deletion safety and impact analysis. `x-gts-ref` creates no edge. See *Dependency Graph & Deletion Safety* in §3.2. |
 | `cpt-cf-types-registry-fr-type-query-assistance` | Indexed identifier-range prefilter plus authoritative GTS matching, source-major federation, and a bounded complete Registry Reference set. See *Query Assistance & Discovery* in §3.2. |
 | `cpt-cf-types-registry-fr-tenant-ownership` | Global or tenant ownership stored on each Managed Entity; tenant visibility follows the directed descendant relation, computed from the subject tenant; boolean `read`/`list` grants gate the operation without altering that relation. See *Visibility Resolver* and *Read authorization* in §3.2. |
 | `cpt-cf-types-registry-fr-registration-authority` | Global writes use `PlatformSecurityContext`; tenant writes use PDP grants over the candidate identifier, evaluated before identifier availability. See *Tenant-plane authorization* and *Platform-plane authorization* in §3.2. |
@@ -246,7 +246,7 @@ An installation has one authoritative database served by many pods; every guaran
 
 Storage behaves identically on SQLite, PostgreSQL, and MySQL. The repository layer owns explicit identifier-range bounds, UUID representation, backend-safe set chunking, and compare-and-swap; none leaks into the domain.
 
-Transitive dependency queries use one repository-owned recursive CTE over `dependency`; no closure is materialized. ToolKit outbox already requires MySQL 8.0+ for `FOR UPDATE SKIP LOCKED`, so the recursive CTE does not raise the backend floor. Because the graph may contain cycles, the CTE uses `UNION`, never `UNION ALL`, and its recursive term carries no depth or per-row accumulator that would defeat deduplication. The normative query constraints live beside the table in [database.sql](./database.sql); §4 records the outstanding `sea-query` and MySQL verification.
+Reverse-impact queries use a repository-owned recursive CTE over `dependency`, built with `toolkit-db`'s `SecureCteSelect::recursive_cte` (ADR-0001); no closure or raw query is maintained separately. The CTE uses `UNION`, applies `limits.activation_write_set` as its depth cap, and returns distinct entity IDs for converging paths. Admissions exceeding that set bound are refused; [database.sql](./database.sql) defines the exact query constraints. To guarantee that every traversal allowed by the application bound can complete on `MySQL`, every Types Registry session must have `cte_max_recursion_depth` at least as large as that bound. This is an operational capacity prerequisite over the actual session value, not validation against a vendor default. A shallower traversal can still complete with a lower database limit; if a traversal exhausts it, the ordinary storage error aborts and rolls back the admission transaction.
 
 **ADRs**: `cpt-cf-types-registry-adr-storage-identity-query-model`
 
@@ -297,9 +297,9 @@ A managed GTS Identifier names a logical entity that is mutable when major-only 
 | Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, the owning gear, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
 | Revision | One immutable admitted definition or value, with the content hash and the specification and implementation versions in force at its admission | `type_schema_revision`, `instance_revision` |
 | Version Family | The set of Version Successors of one another, named by the family key of ADR-0004. Holds an ownership scope and nothing else | `version_family` |
-| Dependency | A direct edge between two Registry Entities: `$ref`, `x-gts-ref`, immediate derivation base, or Instance conformance. Nothing transitive is stored | `dependency` |
+| Dependency | A direct edge between two Registry Entities: `$ref`, immediate derivation base, or Instance conformance. An `x-gts-ref` target is not one. Nothing transitive is stored | `dependency` |
 | Operation | One accepted mutation: its scoped request identity, its client-visible progress, and one durable outcome per candidate identifier | `operation`, `operation_item` |
-| Registry Source | Where an identifier is authoritative — managed storage, or an External Registry Source behind a claim. Managed storage is implicit; a claim is a projection of a plugin's registered Instance and outlives it as a reservation | `source_claim`, `routing_config` |
+| Registry Source | Where an identifier is authoritative — managed storage, or an External Registry Source behind a claim. Managed storage is implicit; a claim is a projection of a plugin's registered Instance and outlives it as a reservation | `source_claim`, plus the `routing` state row of `coordination_state` |
 
 #### Current state is not a cache of the revision
 
@@ -338,7 +338,7 @@ erDiagram
     OPERATION_ITEM   ||--o| TYPE_SCHEMA_REVISION : "produced"
     OPERATION_ITEM   ||--o| INSTANCE_REVISION : "produced"
     INSTANCE_REVISION ||--o{ SOURCE_CLAIM : "plugin instance projected as"
-    ROUTING_CONFIG   ||--o{ SOURCE_CLAIM : "serializes mutation of"
+    ROUTING_STATE    ||--o{ SOURCE_CLAIM : "one generation covers"
 ```
 
 Four of these carry an invariant worth stating outright, because none of them is enforced by the relationship alone.
@@ -431,7 +431,7 @@ Acceptance reads no registry entity state. It decides only from the request, pla
 5. **Managed identifier profile** — refuses an explicit UUID tail on any candidate (ADR-0001), and a minor or major 0 in the **last segment** of a registered Instance identifier (ADR-0004, ADR-0015). A minor on a Type Schema identifier is admissible under any prefix.
 6. **Declared dialect, Type Schema candidates** — refuses an absent top-level `$schema`, a value outside the closed Draft-07 spelling set, and a `$schema` below the document root that differs from it (ADR-0014). The set is canonical `http://json-schema.org/draft-07/schema#`, that URI without `#`, and either form under `https`; every accepted form normalizes to the canonical one.
 7. **`force`, per candidate** — refuses the flag where `allow_compatibility_force` is off, and where the candidate has no cross-minor check to waive: major-only, the first minor of its major, or major 0 (ADR-0004).
-8. **ADR-0015 quarantine** — refuses a stable candidate whose immediate derivation base, `$ref` targets, or `x-gts-ref` targets include a major-0 identifier.
+8. **ADR-0015 quarantine** — refuses a stable candidate whose immediate derivation base or `$ref` targets include a major-0 identifier. `x-gts-ref` is an instance-value constraint and is outside the quarantine in every form.
 9. **Canonicalization and request identity** — canonicalizes each authored schema or Instance value through `gts-rust`, computes the request fingerprint, and resolves the mandatory `Idempotency-Key`.
 
 Three ordering invariants are load-bearing:
@@ -485,29 +485,30 @@ The sweep reaches no admitted content, identity, or tombstone and therefore does
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-input-bounds`
 
-All five bounds are deployment configuration (§3.8); this section fixes their defaults and purpose.
+All six bounds are deployment configuration (§3.8); this section fixes their defaults and purpose.
 
 | Input | Default | Purpose |
 |---|---:|---|
 | Authored document | **256 KB** | Bounds retained input; repository schemas are 3–7 KB typically and 14 KB at most. |
 | Resolved document | **1 MB** | Separately bounds derivation expansion, which the authored limit cannot constrain. |
 | Resolution closure | **64 documents** | Bounds reference resolution and composition work. This also bounds derivation depth because each level contributes a document. |
-| Batch | **100 candidates** | Rejected synchronously before storage. It covers the largest current gear (26 definitions) and is also the largest admissible dependency cycle, whose members cannot be split. |
+| Batch | **100 candidates** | Rejected synchronously before storage. It covers the largest current gear (26 definitions); larger inventories may be split and reconciled. |
 | Type-filter expansion | **1000 references** | Bounds the server-side result; about 36 KB of JSON and practical to chunk into a consumer's `IN` predicate. |
+| Reverse-impact set | **512 entities** | Bounds the entities walked and refreshed by one revision. The largest measured repository set is 27. |
 
-Dependents and retained revisions remain unbounded. Capping dependents would prevent new uses of widely shared base types; their recursive-CTE processing already runs off the request path and outside a transaction. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Entities per tenant is an abuse-control or billing quota, not a correctness guard, and is outside this design.
+Total dependents and retained revisions remain unbounded, but `limits.activation_write_set` bounds the impact of one admission. Capping total dependents would prevent reuse of shared base types. Revision count does not affect admission cost because ADR-0003 selects one comparison baseline. Per-tenant quotas remain outside this design.
 
 ##### Dependency-aware partial admission
 
 The P1 batch mode is **dependency-aware partial admission**, deterministic for one committed baseline:
 
-1. build the candidate graph from the authored references between candidates, plus the one implicit edge described below;
-2. condense it into strongly connected components and process them in topological order;
-3. treat each acyclic candidate as one admission unit and every cyclic component as one **atomic** unit;
-4. validate each unit outside a long-lived transaction and commit only database rechecks and writes; §4 records the still-open bound for an unbounded reverse-impact write set;
+1. overlay candidate `$ref`, immediate derivation, and Instance conformance edges on the committed graph, then add the implicit predecessor edge below;
+2. reject cycles in the combined `$ref` and derivation graph, then process the complete graph in topological order (ADR-0012);
+3. treat each candidate as one admission unit;
+4. validate outside a long-lived transaction and commit only rechecks and writes, bounded by `limits.activation_write_set`;
 5. record a durable outcome for every candidate GTS Identifier.
 
-Independent passing branches commit despite failures elsewhere. In-batch references resolve against the candidate overlay, never a previously committed revision. A failed selected dependency produces `blocked_by_dependency`; failure within an atomic component fails or blocks the whole component.
+Independent passing branches commit despite failures elsewhere. In-batch references resolve against the candidate overlay, never a previously committed revision. A failed selected dependency produces `blocked_by_dependency` for everything downstream of it.
 
 For determinism, the graph adds an implicit edge `vM.(n-1)~` → `vM.n~`. It makes a failed lower minor block the higher one as `blocked_by_predecessor`; without it, the higher minor would fail retryably and succeed on the next reconciliation cycle. The edge is acyclic by construction and is not stored in `dependency` (§3.7).
 
@@ -515,14 +516,16 @@ For determinism, the graph adds an implicit edge `vM.(n-1)~` → `vM.n~`. It mak
 
 Outside the transaction, the worker runs parsing, resolution, compatibility, derivation, reference, and dependent-revalidation checks through `gts-rust`, recording the target revision, the complete reverse-impact identifier set for each updated schema, and a revision vector for every correctness-relevant dependency or dependant. That vector contains each entity's `resource_version` and, where effective Type Schema content was consumed, its `resolution_fingerprint`.
 
+For the managed–external boundary, the worker classifies entity-naming `x-gts-ref` values and rejects targets covered by active or retired Source Claims. It loads no target and creates no dependency edge; the commit rechecks the relevant claims.
+
 A registered Instance is rejected when its conforming Type Schema is in the major-0 unstable profile, even though the minor or major marker is in a preceding identifier segment rather than the Instance's own last segment. This is distinct from the stable-reference quarantine: an unstable schema cannot carry a registered Instance because later unchecked evolution would make its current validation record untruthful (ADR-0006, ADR-0015).
 
 The registration commit transaction then:
 
-1. enforces the caller precondition: creation requires the exact identifier to remain absent; update requires `entity.resource_version == expected_resource_version`;
-2. locks or creates every candidate family in canonical order, then locks candidate and revision-vector entity/current rows in canonical identifier order; deletion uses the same family-then-entity order;
-3. under each update target's entity lock, re-derives its reverse-impact identifier set and compares both membership and the complete revision vector; a new, removed, or moved dependency/dependant rolls the transaction back and restarts validation within the bounded retry policy;
-4. for each new managed identifier, locks `routing_config` after all family locks and rechecks that no active or retired Source Claim covers it;
+1. advances the `entity_write_order` row of `types_registry__coordination_state` as its first statement, thereby claiming it for the transaction before any read;
+2. enforces the caller precondition and acquires any family and entity locks in canonical order;
+3. rebuilds the affected committed-plus-candidate graph, rechecks acyclicity, and compares the reverse-impact set and revision vector, retrying boundedly on drift;
+4. rechecks active and retired Source Claims for a new managed identifier and any entity-naming `x-gts-ref` target;
 5. repeats the predecessor test for each minor-bearing candidate;
 6. inserts the immutable revision, replaces the current-state projection, and replaces the entity's dependency edges;
 7. refreshes the affected current effective schemas;
@@ -531,10 +534,13 @@ The registration commit transaction then:
 The three guards cover distinct races:
 
 - The caller precondition detects target movement since the caller's read; mismatch is terminal per-item `precondition_failed`, with no silent rebase.
-- The reverse-impact set and revision vector detect both movement of a known dependency/dependant and a phantom dependant created after the initial scan; the worker reloads and revalidates within a bounded retry policy.
-- Canonically ordered `version_family` locks serialize first registration under competing owners, predecessor removal by purge, and multi-family units. Locking dependency entity rows serializes a new edge against target deletion. When routing state also participates, every path takes family locks, then entity/current rows, then the singleton routing lock.
+- The reverse-impact set and revision vector detect movement since validation; the worker reloads and revalidates within a bounded retry policy.
+- Updating `entity_write_order` serializes every entity-state commit, preventing a dependency edge from appearing between graph validation and commit. A database row binds exclusion to the transaction, unlike a session-scoped advisory lock.
+- Canonical family and entity lock ordering prevents deadlocks. Source Claim mutations follow those locks, and the `routing` generation advances last.
 
-Deletion has its own short commit protocol. It requires a positive `expected_resource_version`, locks the target family and entity row, rechecks the target is `ACTIVE` at that version and has no direct registered dependants, then changes lifecycle to `DELETED`, increments `resource_version`, and records the outcome atomically. Because admission locks every dependency target entity before writing its edges, a new dependent cannot appear between the deletion check and lifecycle transition. Deleting a Registry Source Plugin additionally locks `routing_config` after the family and entity locks, stamps `retired_at` on its active claims — the only column deletion touches, so each reservation keeps the projection recording which plugin revision issued it — and increments the routing generation in the same transaction; source unreachability never triggers this path.
+Only commit transactions are serialized; validation remains concurrent and outside the transaction. Impact refresh is bounded by `limits.activation_write_set`, and lock timeout is treated as retryable contention. A future graph-generation compare-and-swap may restore parallel commits if measurements justify it.
+
+Deletion follows the same writer order. It rechecks the positive `expected_resource_version`, `ACTIVE` status, and absence of direct registered dependants before atomically marking the entity `DELETED` and recording the outcome. Deleting a Registry Source Plugin also stamps `retired_at` on active claims and advances the `routing` generation last; source unreachability never triggers deletion.
 
 The unique family row is the ownership authority. Creation uses backend-specific insert-if-absent followed by a locked read; admission requires the requested owner to equal the stored one. The entity's owner is only a SecureORM projection and changes while this lock is held.
 
@@ -794,9 +800,11 @@ It computes and returns; it does not act. It never mutates an entity, filters ge
 
 ##### Responsibility scope
 
-Maintains every direct managed-to-managed dependency: `$ref`, `x-gts-ref`, Instance conformance, and immediate derivation base. For `x-gts-ref`, the target is the exact identifier or the pattern's longest valid identifier prefix—not its open match set. Patterns naming no entity (`gts.*`) and GTS §9.6 relative JSON pointers (`/$id`, `./properties/id`) create no edge. New matches therefore require no re-expansion.
+Maintains every direct managed-to-managed dependency: `$ref`, Instance conformance, and immediate derivation base.
 
-Both endpoints are always Managed Entities. Direct rows decide deletion safety. A recursive CTE finds the reverse impact set for a revision; a second edge read supports the worker's SCC condensation and topological ordering. Dry Run exposes the resulting mutation verdict, so no separate graph API is provided.
+**`x-gts-ref` is classified, not stored.** It constrains an Instance value without resolving an entity, so it creates no dependency and does not affect compatibility, quarantine, refresh, availability, or deletion. Managed admission classifies the candidate; Source Claim activation reclassifies current schemas. Both use an exact identifier or a pattern's longest valid identifier prefix only to enforce the managed–external boundary; `gts.*` and relative JSON pointers name no entity.
+
+Both endpoints are always Managed Entities. Direct rows decide deletion safety. A recursive CTE finds the reverse impact set for a revision; a second edge read supplies the worker's topological ordering, which needs no condensation step because the relation is acyclic (ADR-0012). Dry Run exposes the resulting mutation verdict, so no separate graph API is provided.
 
 ##### Responsibility boundaries
 
@@ -848,7 +856,7 @@ It returns concrete references, never a normalized predicate or an executable pl
 
 ##### Responsibility scope
 
-A closed, in-process validator set for platform-defined control-plane types. It enforces Source Claim invariants — pattern grammar and non-overlap — rejects tenant-scoped control-plane types and instances, and rejects claims overlapping retired reservations because ADR-0011 provides no runtime transfer.
+A closed, in-process validator set for platform-defined control-plane types. It enforces Source Claim pattern grammar and non-overlap, including against `x-gts-ref` authority identifiers reclassified from current Managed Type Schemas. It also rejects tenant-scoped control-plane types and instances and claims overlapping retired reservations.
 
 ##### Responsibility boundaries
 
@@ -867,22 +875,23 @@ A Registry Source Plugin registers as a well-known GTS Instance of a Types Regis
 
 The base schema provides the plugin `id`, `vendor`, lower-wins `priority`, and generic `properties`. The derived schema adds one thing: a set of Source Claims, each a GTS Identifier pattern. Nothing else is declared — the federation contract is total, so implementing the trait is the whole obligation and there is no profile to state or check, and entity kind is not declared either because the trailing `~` of each identifier already carries it (ADR-0007). `source_claim.priority` and `source_claim.plugin_entity_gts_id` project the base `priority` and `id`.
 
-Registration is ordinary platform-plane Instance admission under ADR-0012, including operation, idempotency, and audit; there is no separate plugin API. Outside the transaction, the Control-Plane Validator rejects claims overlapping an active claim, retired reservation, or managed identifier range (checked by prefix range over `entity.gts_id`) and rejects a malformed pattern.
+Registration is ordinary platform-plane Instance admission under ADR-0012, including operation, idempotency, and audit; there is no separate plugin API. Outside the transaction, the Control-Plane Validator rejects malformed claims and overlap with active claims, retired reservations, managed identifier ranges, or `x-gts-ref` authority identifiers reclassified from current Managed Type Schemas.
 
 The commit transaction atomically:
 
-1. takes every affected `version_family` lock, then locks `routing_config`;
-2. rechecks the proposed patterns against active and retired claims and against managed `entity.gts_id` rows while no competing claim or managed creation can commit;
-3. admits the Instance and writes its `source_claim` projection;
-4. increments `routing_config.generation`.
+1. advances `entity_write_order`, thereby claiming it as the transaction's **first statement, before any read**;
+2. takes every affected `version_family` lock;
+3. rechecks the proposed patterns against active and retired claims, managed `entity.gts_id` rows, and authority identifiers reclassified from current Managed Type Schemas;
+4. admits the Instance and writes its `source_claim` projection;
+5. advances `routing.state_seq` — the routing generation — as the transaction's closing mutation.
 
-The lock serializes overlap validation because intersecting patterns such as `gts.acme.*` and `gts.acme.foo.*` cannot be constrained by string uniqueness. The generation reloads in-memory claims and invalidates federated cursors. P1 compilation into the same binary changes neither this contract nor ADR-0011's managed–external boundary.
+`entity_write_order` serializes overlap validation because string uniqueness cannot constrain intersecting patterns such as `gts.acme.*` and `gts.acme.foo.*`. The final `routing` advance reloads claims and invalidates federated cursors; it is not a second lock. P1 compilation into the same binary changes neither this contract nor ADR-0011's boundary.
 
 Retirement is explicit governance, never a liveness reaction: an unreachable plugin retains its claims and dependent requests fail closed. A retired reservation cannot transfer at runtime. The registry stores none of the predecessor's external identifiers, revisions, or hashes with which to verify a successor's continuity claim, so ADR-0011 defines no takeover operation.
 
 Replacing code behind the same plugin GTS Identity is an ordinary Instance revision: projection and generation change, with no reservation. Changing the plugin identity instead requires either ADR-0013 purge, which releases the namespace, or preferably a shipped migration that retargets it while continuously reserved. Such a migration must:
 
-- increment `routing_config.generation` under its row lock, reloading routing and invalidating cursors and freshness validators;
+- follow the common writer order, advancing `routing.state_seq` last to invalidate routing, cursors, and freshness validators;
 - keep the successor Instance document consistent with `source_claim`, because ordinary validation later re-derives the projection and would remove undeclared rows.
 
 The P2 Validation Hook declaration remains D1 in §4.
@@ -897,7 +906,7 @@ These policy-free adapters and maintenance job are defined together to avoid emp
 | Operation Store | `cpt-cf-types-registry-component-operation-store` | Public async operations with scoped key/fingerprint, per-ID preconditions, state, results, and diagnostics; atomically enqueues operation UUIDs through dedicated `toolkit-db` outbox tables. Times out stalled operations and sweeps retained, unpinned terminal ones | The operation is the request receipt. Outbox tables own leases, attempts, retries, and dead letters; registry tables own client-visible state. Payloads contain no candidate content. Sweeping touches neither admitted content nor identity and is not ADR-0013 purge |
 | Tenant Hierarchy Client | `cpt-cf-types-registry-component-tenant-hierarchy-client` | Ancestor chain of a tenant from `tenant-resolver` with barrier traversal disabled, cached with a version participating in the resolution validator | Does not interpret tenancy semantics; supplies the chain only |
 | Plugin Client Adapter | `cpt-cf-types-registry-component-plugin-client-adapter` | Scoped ClientHub access to Registry Source Plugins, timeouts, concurrency limits, and per-source failure classification | Applies no platform policy to responses; conformance validation belongs to the federation router |
-| Purge Job | `cpt-cf-types-registry-component-purge-job` | Synchronous operator purge/dry run by GTS pattern on the platform plane. Expands the pattern; locks all affected `version_family` rows in canonical order through commit; when purging a Registry Source Plugin, locks `routing_config` next and removes that plugin's claims first, so the rows go before the revisions they reference; then removes Instances before Type Schemas, their revisions, entity rows, and empty families, and increments the routing generation in the same transaction. It leaves operation history to ordinary retention and returns a per-ID report | Never scheduled; disabled by default. Rechecks deletion preconditions and refuses to release a minor below another admitted minor (ADR-0013). The family-then-routing lock order matches admission. Creates no operation, candidate, or request-identity row: the sole mutation outside ADR-0012's async path |
+| Purge Job | `cpt-cf-types-registry-component-purge-job` | Synchronous operator purge/dry run by GTS pattern. Follows the common writer order; removes Source Claims before referenced plugin revisions, Instances before Type Schemas, then empty families; advances the routing generation last; and returns a per-ID report. Operation history remains subject to ordinary retention | Never scheduled; disabled by default. Rechecks deletion and minor-suffix preconditions (ADR-0013). Creates no operation, candidate, or request-identity row: the sole mutation outside ADR-0012's async path |
 
 ### 3.3 API Contracts
 
@@ -1002,7 +1011,7 @@ Its body field is `items`, the same name registration and `:batchDelete` use, so
 
 Optional `dry_run` defaults false and preserves the `202` operation shape. It runs full admission through the commit boundary, so it is not cheaper validation.
 
-`items` is non-empty and synchronously capped by `limits.batch_candidates` (default 100). Splitting removes the candidate overlay between batches: acyclic dependencies can converge through retry as `cpt-cf-types-registry-fr-two-phase-init` requires, but a dependency cycle cannot be split and the limit is therefore also the maximum cycle size.
+`items` is non-empty and synchronously capped by `limits.batch_candidates` (default 100). Splitting removes the candidate overlay between batches, which costs a retry rather than correctness: dependencies converge through the reconciliation loop `cpt-cf-types-registry-fr-two-phase-init` already requires, and since the graph is acyclic (ADR-0012) no group of candidates has to travel together.
 
 Each item contains authored GTS JSON and optional `expected_resource_version`: present requires that version; absent requires nonexistence. Literal `0` is invalid because absence already expresses creation and versions never equal zero.
 
@@ -2084,10 +2093,10 @@ The P1 reference schema is a PostgreSQL document, not a migration; backend migra
 | `type_schema` | Current Type Schema state: artifacts resolved against dependencies current now |
 | `instance` | Current Instance state: the current-revision pointer, with no derived artifact to hold |
 | `dependency` | The single direct dependency relation between Managed Entities |
-| `routing_config` | Singleton row serializing claim mutation and carrying the routing generation |
+| `coordination_state` | `entity_write_order` serializes entity-state commits; `routing` carries the federation generation and advances last |
 | `source_claim` | Active claims and permanent retired reservations |
 
-`database.sql` is the normative physical-schema target except for the explicitly identified platform-principal alignment prerequisite below; implementation must update that file before treating the schema as ready. The inventory above supplies table purpose without duplicating its blocks. The initial migration must seed `routing_config` with `(id = 1, generation = 1)` before any claim mutation; a singleton constraint alone does not create the row that `SELECT … FOR UPDATE` must lock.
+`database.sql` is the normative physical-schema target except for the explicitly identified platform-principal alignment prerequisite below; implementation must update that file before treating the schema as ready. The inventory above supplies table purpose without duplicating its blocks. The federation migration must seed the `routing` row of `coordination_state` before any claim mutation; a schema alone does not create the row a writer must advance.
 
 #### Persistence alignment
 
@@ -2124,7 +2133,7 @@ The leased ToolKit outbox gives multi-pod exclusion without leader election. Dat
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-deployment-config`
 
-Two capability switches, one retention window, one registration policy, and five input bounds are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
+Two capability switches, one retention window, one registration policy, and six input bounds are per-deployment rather than per-request, and they live in the gear's typed configuration at the ToolKit path `gears.<name>.config`, the gear's registered name being `types-registry`:
 
 ```yaml
 gears:
@@ -2139,6 +2148,7 @@ gears:
         resolution_closure: 64
         batch_candidates: 100
         expansion_references: 1000
+        activation_write_set: 512
       registration_policy:               # §3.2, Registration policy
         "gts.acme.*":                     # onboard one vendor
           allowed_vendors: [acme]
@@ -2159,10 +2169,12 @@ gears:
 | `allow_compatibility_force` | bool | `false` | Enables candidate `force`. When disabled, real and Dry Run requests receive a deployment-configuration refusal rather than silent ignore |
 | `allow_purge` | bool | `false` | Whether the operator purge-job entry point exists in this deployment. Where false the job refuses execution before scanning |
 | `operation_retention` | duration | `30d` | How long a terminal, unpinned operation is kept before the sweep may remove it |
-| `limits.*` | size or count | §3.2 | The five admission and query bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
+| `limits.*` | size or count | §3.2 | The six admission and query bounds of §3.2, *Bounded inputs*, which records what each default is derived from |
 | `registration_policy` | map of GTS pattern to `allowed_vendors` and `tenant_ownable` | empty | Opens otherwise closed regions (§3.2). Invalid patterns or parameters fail startup. `allowed_vendors: ["*"]` admits every vendor; omitted parameters inherit by the per-parameter resolution rule. Operators document effective values; refusals name region and parameter |
 
 Limits change request admissibility, so Dry Run is relative to both installation state and configuration (`cpt-cf-types-registry-constraint-single-installation`). A refusal names the bound and configured value.
+
+On `MySQL`, operators must configure `@@SESSION.cte_max_recursion_depth >= limits.activation_write_set` on every pooled connection to guarantee support for the full configured application bound. Configure the global or persisted value before Types Registry opens its pool, then verify the session value. Types Registry neither assumes the vendor default nor changes this database-owned guard. MySQL checks the limit while a recursive CTE runs, not when it receives the application bound: a traversal that finishes earlier still succeeds. If the database stops a traversal at its own recursion limit, the error follows the ordinary storage-error path: the transaction rolls back, the database error is logged, and the caller receives only an opaque internal error. It is never recorded as `activation_write_set_exceeded`, because the interrupted query did not establish the size of the impact set.
 
 Configuration is read at process start and requires restart to change. Disabled controls are explicit:
 
@@ -2194,19 +2206,21 @@ Only P2 construction questions belong here. Known P1 blockers are stated separat
 
 *Pending: a versioned production profile for `cpt-cf-types-registry-nfr-lookup-latency` and `cpt-cf-types-registry-nfr-query-latency`, fixing backend, entity counts by kind/owner, derivation depth, dependency fan-out, tenant depth, revision history, active source count, and non-local reference share. ADR-0007 uses its measurements to reconsider memoization or circuit breaking.*
 
+### Future scaling
+
+`limits.activation_write_set` (§3.2, default **512**) bounds one atomic refresh; larger candidates are refused rather than partially committed. If an installation legitimately reaches the limit, benchmark the reverse-impact CTE on its graph and consider a generation/staging protocol that raises the limit without exposing mixed state. The largest reverse-impact set measured today is 27.
+
 ### Implementation prerequisites
 
-Eight prerequisites block implementation: the benchmark profile above; three external confirmations below; and the four protocol/contract/schema alignments below.
+Six prerequisites block implementation: the benchmark profile above, two external confirmations, and three protocol/contract/schema alignments below.
 
-The ADR-0015 quarantine preflight is **not** among them. A scan for stable subjects directly referencing major-0 targets would establish the rule's base case over pre-existing state, and there is no pre-existing state: the release that introduces the check is the release that first persists a managed entity. The obligation it leaves behind is a negative one — the rule must not be enabled against a registry populated by a build that had the storage but not the check, because those edges were admitted under no rule at all.
+No ADR-0015 quarantine preflight is needed because the release introducing the check is also the first to persist Managed Entities. The rule must not be enabled over data admitted by a build that had storage but lacked the check.
 
 **Finalize the identity-to-permission binding used by the PDP.** [`PERMISSION_GTS_TYPE.md`](../../../../docs/arch/authorization/PERMISSION_GTS_TYPE.md) currently defers the durable grant model, so it cannot yet serve as the P1 authority contract for namespace grants. The accepted binding must preserve GTS-pattern resource expressions and the per-identifier check in §3.2, and must additionally satisfy the two PDP obligations of *The PDP resource shape*: a Region predicate resolved against `resource.properties.gts_id` rather than returned as a constraint, and a decision that resolves no registry state. It is also what delivers the baseline `read` and `list` grants the release must ship, since a tenant subject holding none cannot resolve even a platform contract.
 
 **Align operation principal persistence with the two authentication planes.** The audit and idempotency scope require a versioned canonical representation of either the tenant subject UUID or the full `PlatformIdentity` variant. `database.sql` currently exposes only UUID `principal_id`; before implementation it must gain a lossless tagged representation, and `idempotency_scope_hash` must cover those exact canonical bytes. This is a schema alignment with the accepted two-plane contract, not a new authorization choice.
 
 **Bound worker liveness.** Fix the operation timeout and the maximum dependency-revalidation attempts, their configuration/defaults, and the atomic terminalization rule that marks every unfinished item `failed` after exhaustion. The public status vocabulary is settled; these remaining values decide when it reaches a terminal state.
-
-**Resolve the unbounded activation write set.** Semantic validation stays outside the transaction, but a widely used schema may have an unbounded reverse-impact set whose effective projections must become current consistently with the new revision. Before implementation, choose and document either the permitted transaction-size/timeout profile for that atomic write or a generation/staging protocol that exposes no mixed current state; “short transaction” alone is not a bound.
 
 **Confirm these eight GTS implementation capabilities** required by `cpt-cf-types-registry-constraint-gts-implementation`. Missing behavior requires an upstream change, never local approximation:
 
@@ -2220,8 +2234,6 @@ The ADR-0015 quarantine preflight is **not** among them. A scan for stable subje
 8. **Pattern containment** for Source Claim overlap. Rooted grammar provides anchoring, and ADR-0011 prevents claims slicing into a chain.
 
 **Approve reliance on `toolkit-db/preview-outbox`.** P1 will reuse its leased outbox rather than implement another. `ledger`, `file-storage`, and `chat-engine` already use it; Types Registry needs the same sign-off.
-
-**Verify parameterized recursive CTE support in `sea-query`** for `cpt-cf-types-registry-component-dependency-graph` under `cpt-cf-types-registry-constraint-multi-backend`. Benchmark MySQL, the weakest backend; if inadequate, add transitive closure only as a cache over authoritative direct rows.
 
 ## 5. Traceability
 

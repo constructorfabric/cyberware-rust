@@ -4,6 +4,9 @@ date: 2026-07-11
 decision-makers: "BSS Rating/Tariffs owner (single owner for both parts)"
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # ADR-0002: One `rating` Gear — Consolidate Tariffs (Evaluation Core) and the Rating Pipeline
 
 <!-- toc -->

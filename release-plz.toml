@@ -133,6 +133,11 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
+name = "cf-gears-toolkit-sea-orm-pgq"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
 name = "cf-gears-toolkit-gts-macros"
 changelog_update = false
 git_release_enable = false

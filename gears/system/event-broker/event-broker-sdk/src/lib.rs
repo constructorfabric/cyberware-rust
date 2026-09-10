@@ -1,6 +1,6 @@
 //! Event Broker SDK
 //!
-//! High-level typed event publishing and consumption for the Cyberfabric Event Broker.
+//! High-level typed event publishing and consumption for the `event-broker` gear.
 //!
 //! See [`EventBrokerApi`] for the entry point; obtain it from `ClientHub`:
 //! ```ignore

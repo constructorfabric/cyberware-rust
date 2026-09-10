@@ -53,6 +53,9 @@ mod node {
                 _ => None,
             }
         }
+        fn scope_columns() -> Vec<Column> {
+            vec![Column::TenantId, Column::Id]
+        }
     }
 }
 
@@ -95,6 +98,9 @@ mod item {
                 p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
                 _ => None,
             }
+        }
+        fn scope_columns() -> Vec<Column> {
+            vec![Column::TenantId, Column::Id]
         }
     }
 }

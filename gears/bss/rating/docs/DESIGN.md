@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Commercial Pricing Logic — Technical Design (canonical index) -->
 <!-- Related: ./PRD.md, ./SEAMS.md, ./ADR/, ./design/ | Owners: BSS Rating team -->
 

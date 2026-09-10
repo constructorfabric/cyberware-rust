@@ -390,12 +390,19 @@ impl PluginConfigRepo for StubPluginConfigRepo {
 
 // ----- Helpers -----------------------------------------------------
 
+/// Owner pair every fixture session carries. The `SecurityContext` returned by
+/// [`ctx`] is built from the same pair so the ownership guard
+/// (`owner_guard::ensure_session_owner`) sees the caller as the owner; tests
+/// that need a stranger build their own context.
+const OWNER_TENANT: Uuid = Uuid::from_u128(0x0A11);
+const OWNER_USER: Uuid = Uuid::from_u128(0x0B22);
+
 fn make_session(session_id: Uuid, metadata: Option<JsonValue>) -> Session {
     let now = OffsetDateTime::now_utc();
     Session {
         session_id,
-        tenant_id: "t".into(),
-        user_id: "u".into(),
+        tenant_id: OWNER_TENANT.to_string().into(),
+        user_id: OWNER_USER.to_string().into(),
         client_id: None,
         session_type_id: None,
         enabled_capabilities: None,
@@ -463,7 +470,7 @@ fn make_service_with_enforcer(
 }
 
 fn ctx() -> SecurityContext {
-    test_support::ctx_allow_tenants(&[Uuid::new_v4()])
+    test_support::ctx_for_subject(OWNER_USER, OWNER_TENANT)
 }
 
 // ----- evaluate_retention_policy ----------------------------------
@@ -597,7 +604,10 @@ async fn run_retention_cleanup_is_idempotent() {
         make_message(session_id, Some(parent), 2),
     ]);
     let svc = make_service(sessions.clone(), msgs.clone());
-    let report = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
+    let report = svc
+        .run_retention_cleanup_for_tenant(&OWNER_TENANT.to_string())
+        .await
+        .unwrap();
     assert_eq!(report.sessions.len(), 1);
     assert_eq!(report.sessions[0].messages_deleted, 2);
     let first_deletes = msgs.deletes.lock().clone();
@@ -607,7 +617,10 @@ async fn run_retention_cleanup_is_idempotent() {
     // deletes (the mock repo doesn't actually remove rows) but never
     // panics — the real repo returns Ok(0) for missing roots, which
     // is the contract the algorithm relies on.
-    let report2 = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
+    let report2 = svc
+        .run_retention_cleanup_for_tenant(&OWNER_TENANT.to_string())
+        .await
+        .unwrap();
     assert_eq!(report2.sessions.len(), 1);
 }
 
@@ -1019,8 +1032,7 @@ async fn summarize_happy_path_persists_on_complete() {
     let (svc, _sessions, msgs) =
         make_service_with_plugin(plugin_id, plugin_dyn, session_type_id, row);
 
-    let tenant = Uuid::new_v4();
-    let caller = test_support::ctx_for_subject(Uuid::new_v4(), tenant);
+    let caller = test_support::ctx_for_subject(OWNER_USER, OWNER_TENANT);
     let cancel = CancellationToken::new();
     let mut stream = svc
         .summarize_session(&caller, session_id, cancel)
@@ -1049,7 +1061,7 @@ async fn summarize_happy_path_persists_on_complete() {
     // (denormalized owning tenant), threaded from the JWT identity.
     assert_eq!(
         summaries[0].2.as_deref(),
-        Some(tenant.to_string().as_str()),
+        Some(OWNER_TENANT.to_string().as_str()),
         "summary must inherit the identity tenant_id",
     );
 }
@@ -1158,7 +1170,10 @@ async fn run_cleanup_records_none_policy_without_lock_or_delete() {
     let sessions = MockSessionRepo::new(vec![row]);
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service(sessions, msgs.clone());
-    let report = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
+    let report = svc
+        .run_retention_cleanup_for_tenant(&OWNER_TENANT.to_string())
+        .await
+        .unwrap();
     assert_eq!(report.sessions.len(), 1);
     assert_eq!(report.sessions[0].policy_type, "none");
     assert_eq!(report.sessions[0].messages_deleted, 0);
@@ -1173,7 +1188,10 @@ async fn run_cleanup_ignores_other_tenants() {
     let sessions = MockSessionRepo::new(vec![row]);
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service(sessions, msgs);
-    let report = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
+    let report = svc
+        .run_retention_cleanup_for_tenant(&OWNER_TENANT.to_string())
+        .await
+        .unwrap();
     assert!(report.sessions.is_empty());
 }
 
@@ -1191,7 +1209,10 @@ async fn run_cleanup_caps_sessions_per_tick_and_defers_remainder() {
     let sessions = MockSessionRepo::new(rows);
     let msgs = MockMessageRepo::new(vec![]);
     let svc = make_service(sessions, msgs).with_retention_caps(2, 1000);
-    let report = svc.run_retention_cleanup_for_tenant("t").await.unwrap();
+    let report = svc
+        .run_retention_cleanup_for_tenant(&OWNER_TENANT.to_string())
+        .await
+        .unwrap();
     assert_eq!(
         report.sessions.len(),
         2,
@@ -1216,7 +1237,7 @@ async fn run_cleanup_cursor_pages_all_sessions_across_ticks() {
     let tick_ids = |svc: &IntelligenceService| {
         let svc = svc.clone();
         async move {
-            svc.run_retention_cleanup_for_tenant("t")
+            svc.run_retention_cleanup_for_tenant(&OWNER_TENANT.to_string())
                 .await
                 .unwrap()
                 .sessions

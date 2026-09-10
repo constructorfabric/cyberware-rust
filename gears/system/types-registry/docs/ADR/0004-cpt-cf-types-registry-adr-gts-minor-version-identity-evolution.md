@@ -55,7 +55,7 @@ The choice is coupled to identity mutability:
 
 Optional minor versions appear flexible but give otherwise similar GTS IDs different stability semantics. A `$ref` may be immutable and pinned in one family but mutable and floating in another. A major-only GTS ID can also be both a concrete identifier and, in pattern matching, a selector that covers minor-versioned candidates. This ambiguity affects exact resolution, deterministic Registry References, caches, derived types, federation, and version-membership queries.
 
-Only a minor can express one useful property. Under a mutable major-only entity, every `$ref`, `x-gts-ref`, and derivation base floats to the current revision. Publishing a compatible change therefore gives it to every dependent, whether requested or not. Backward compatibility makes that safe; it does not make it *wanted*.
+Only a minor can express one useful property. Under a mutable major-only entity, every `$ref` and derivation base floats to the current revision. Publishing a compatible change therefore gives it to every dependent, whether requested or not. Backward compatibility makes that safe; it does not make it *wanted*.
 
 An owner may instead want a separately addressable safe upgrade that existing dependents adopt deliberately. A new major provides non-adoption but discards the compatibility statement, because it denotes an incompatible change. A minor fills that gap: separately addressable, checked as a safe upgrade, and never applied automatically.
 
@@ -118,9 +118,9 @@ Major-only remains the recommendation and the overwhelmingly common case. It is 
 
 This is what a minor means, and it is the only thing it means.
 
-A `$ref`, derivation base, or `x-gts-ref` that names an entity names its exact identifier, including its minor. Under ADR-0003, a reference to a mutable entity floats to its current revision.
+A `$ref` or derivation base names an entity by its exact identifier, including its minor. Under ADR-0003, a reference to a mutable entity floats to its current revision.
 
-GTS §9.6 also permits an `x-gts-ref` that names no entity: `gts.*` constrains a field to contain some valid identifier, while a relative JSON pointer names a location in the holder's document. Neither pins an entity and neither is a boundary discussed here.
+`x-gts-ref` is not a pinning boundary. It validates an instance value against an identifier pattern without resolving an entity, so it may accept identifiers from any minor or major while creating no dependency on them. GTS §9.6 also permits `gts.*`, which accepts any valid identifier, and relative JSON pointers that name a location in the holder's document.
 
 **A minor-bearing entity is not mutable.** It is admitted once with one revision, and its authored content never changes. Publishing the next minor creates a different identifier and Registry Reference; existing dependents do not move. Adoption requires the dependent's owner to re-author its reference.
 

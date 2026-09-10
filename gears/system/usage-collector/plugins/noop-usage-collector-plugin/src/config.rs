@@ -14,7 +14,7 @@ pub struct NoopUsageCollectorPluginConfig {
 impl Default for NoopUsageCollectorPluginConfig {
     fn default() -> Self {
         Self {
-            vendor: "cyberfabric".to_owned(),
+            vendor: "constructorfabric".to_owned(),
             priority: 100,
         }
     }

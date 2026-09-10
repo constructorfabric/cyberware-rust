@@ -70,7 +70,7 @@ use toolkit_macros::domain_model;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::domain::authz::{actions, bypass, resource_types};
+use crate::domain::authz::{actions, bypass, owner_guard, resource_types};
 use crate::domain::error::{ChatEngineError, Result};
 use crate::domain::message::{
     StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
@@ -809,6 +809,13 @@ impl IntelligenceService {
             .find_by_id_scoped(&bypass::system_read_scope(), session_id)
             .await?
             .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+
+        // The PDP is asked for a decision, but ownership is a gear invariant:
+        // no shipped policy plugin constrains `owner_id`, so a tenant-only
+        // scope would admit a same-tenant stranger. Enforce the owner pair on
+        // the trusted prefetch first — the PDP may only narrow from here.
+        // @cpt-cf-chat-engine-nfr-authentication
+        owner_guard::ensure_session_owner(ctx, &prefetch)?;
 
         // @cpt-cf-chat-engine-interface-pep
         // @cpt-cf-chat-engine-constraint-fail-closed-authz

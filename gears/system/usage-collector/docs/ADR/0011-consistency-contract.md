@@ -3,6 +3,9 @@ status: accepted
 date: 2026-05-31
 ---
 
+Created:  2026-05-22 by Virtuozzo International GmbH
+Updated:  2026-07-20 by Virtuozzo International GmbH
+
 # Consistency contract for usage-collector read/write paths
 
 <!-- toc -->

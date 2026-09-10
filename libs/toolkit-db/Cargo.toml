@@ -53,6 +53,17 @@ mysql = [
     "sea-orm-migration/sqlx-mysql",
 ]
 
+# SQL/PGQ (GRAPH_TABLE) support. Implies `pg`, so a gear cannot even name the
+# secure graph builder on a build without a Postgres backend: `GRAPH_TABLE`
+# exists on PostgreSQL 19+ and nowhere else, and the CTE support this sits
+# beside is asserted on all three backends. A compile-time incompatibility is
+# deliberate — discovering non-portability from a runtime error in production
+# would be strictly worse (docs/arch/secure-orm/ADR/0002, "Backend gating").
+#
+# NB `metadata.docs.rs.all-features = true`, so the gated code has to compile in
+# the docs build too.
+pgq = ["pg", "dep:toolkit-sea-orm-pgq"]
+
 integration = []
 
 # Test-only surface for external integration-test suites that need to observe
@@ -81,6 +92,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 toolkit-security = { workspace = true }
+# SQL/PGQ syntax layer; optional, pulled in by the `pgq` feature. Nothing
+# outside that feature names its types: `ScopeError::GraphSyntax` carries the
+# syntax layer's message as a `String`, so a gear without a Postgres backend
+# never links this crate (docs/arch/secure-orm/ADR/0002, "Backend gating").
+toolkit-sea-orm-pgq = { workspace = true, optional = true }
 toolkit-odata = { workspace = true }
 toolkit-utils = { workspace = true, features = ["humantime-serde"] }
 bigdecimal = { workspace = true }

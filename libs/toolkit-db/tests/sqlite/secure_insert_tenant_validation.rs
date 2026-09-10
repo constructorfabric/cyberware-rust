@@ -52,6 +52,9 @@ impl ScopableEntity for tenant_ent::Entity {
             _ => None,
         }
     }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        vec![tenant_ent::Column::TenantId]
+    }
 }
 
 mod unrestricted_ent {
@@ -88,6 +91,9 @@ impl ScopableEntity for unrestricted_ent::Entity {
     }
     fn resolve_property(_property: &str) -> Option<<Self as EntityTrait>::Column> {
         None
+    }
+    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
+        Vec::new()
     }
 }
 

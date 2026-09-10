@@ -14,7 +14,7 @@ paginate: true
 
 Vendor-agnostic identity & access · query-level enforcement · compile-time safety
 
-By the **Cyber Fabric Foundation** · Apache-2.0
+By the **Constructor Fabric Foundation** · Apache-2.0
 
 June 23, 2026
 

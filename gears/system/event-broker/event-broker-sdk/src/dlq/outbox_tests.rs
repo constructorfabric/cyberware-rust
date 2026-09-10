@@ -156,6 +156,6 @@ async fn consumer_dlq_outbox_maps_enqueue_failures_to_consumer_error() {
 fn dead_letter_envelope_payload_type_is_used_by_processors() {
     assert_eq!(
         DeadLetterEnvelope::PAYLOAD_TYPE,
-        "application/vnd.cyberfabric.event-broker.dlq+json"
+        "application/vnd.constructorfabric.event-broker.dlq+json"
     );
 }

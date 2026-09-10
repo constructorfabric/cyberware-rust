@@ -4,6 +4,9 @@ date: 2026-07-15
 decision-makers: "BSS Subscriptions team"
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # ADR-0001: Keep the Manifest Status Enum Closed (Trials, Pause, and Intents Are Attributes)
 
 <!-- toc -->

@@ -6,6 +6,7 @@
 // @cpt-cf-chat-engine-component-policy-enforcer
 
 pub mod bypass;
+pub mod owner_guard;
 pub mod resource_types;
 
 /// Canonical PEP action names, passed as the `action` argument to

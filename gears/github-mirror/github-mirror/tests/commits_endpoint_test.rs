@@ -61,6 +61,72 @@ async fn get(router: Router, uri: &str) -> axum::http::Response<Body> {
 }
 
 #[tokio::test]
+async fn the_since_filter_narrows_the_commit_listing() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(&ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    for (sha, committed_at) in [
+        ("aaa111", "2026-01-01T00:00:00Z"),
+        ("bbb222", "2026-01-01T00:00:01Z"),
+        ("ccc333", "2026-01-01T00:00:02Z"),
+    ] {
+        service
+            .upsert_commit(
+                &ctx,
+                "acme",
+                "widget",
+                commit_record(sha, committed_at, "message"),
+            )
+            .await
+            .expect("commit seed must succeed");
+    }
+
+    let router = router_for(service, ctx);
+
+    let shas = |json: serde_json::Value| -> Vec<String> {
+        json.as_array()
+            .expect("items")
+            .iter()
+            .filter_map(|item| item["sha"].as_str().map(ToOwned::to_owned))
+            .collect()
+    };
+
+    let all = body_json(get(router.clone(), "/repos/acme/widget/commits").await).await;
+    assert_eq!(shas(all).len(), 3, "no since means every commit");
+
+    let from_the_second = body_json(
+        get(
+            router.clone(),
+            "/repos/acme/widget/commits?since=2026-01-01T00:00:01Z",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        shas(from_the_second),
+        vec!["ccc333".to_owned(), "bbb222".to_owned()],
+        "a whole-second bound includes its own second, newest first"
+    );
+
+    let fractional = body_json(
+        get(
+            router,
+            "/repos/acme/widget/commits?since=2026-01-01T00:00:00.500Z",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        shas(fractional),
+        vec!["ccc333".to_owned(), "bbb222".to_owned()],
+        "the same rounding-up boundary as issues and pull requests"
+    );
+}
+
+#[tokio::test]
 async fn commits_are_listed_newest_first() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;

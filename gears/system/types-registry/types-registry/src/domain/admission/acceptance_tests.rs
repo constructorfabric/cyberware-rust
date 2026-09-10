@@ -15,6 +15,10 @@ use crate::config::{PolicyEntry, TypesRegistryConfig};
 use crate::domain::enums::OperationKind;
 use crate::domain::policy::RegistrationPolicy;
 
+fn noop_metrics() -> std::sync::Arc<dyn crate::domain::ports::metrics::AdmissionMetrics> {
+    std::sync::Arc::new(crate::domain::ports::metrics::NoopMetrics)
+}
+
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
 const ACME_TYPE: &str = gts_id!("acme.crm.customer.type.v1~");
 
@@ -75,6 +79,7 @@ fn run(
         &AcceptanceContext {
             policy: &pair.0,
             config: &pair.1,
+            metrics: &noop_metrics(),
         },
         request,
     )

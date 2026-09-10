@@ -1,8 +1,8 @@
 use github_mirror_sdk::{
-    Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
-    Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
-    PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review, ReviewComment,
-    ReviewThread, Tag, WorkflowJob, WorkflowRun,
+    Actor, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
+    Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, LabelRef, Milestone,
+    PullRequest, PullRequestCommit, PullRequestFile, Release, ReleaseAsset, Repo, Review,
+    ReviewComment, ReviewThread, Tag, WorkflowJob, WorkflowRun, WorkflowStep,
 };
 
 use super::entity::{
@@ -11,6 +11,212 @@ use super::entity::{
     milestones, pull_request_commits, pull_request_files, pull_requests, releases, repositories,
     review_comments, review_threads, reviews, tags, workflow_jobs, workflow_runs,
 };
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredActor {
+    login: String,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(rename = "type", default)]
+    account_type: Option<String>,
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    site_admin: Option<bool>,
+}
+
+impl From<StoredActor> for Actor {
+    fn from(a: StoredActor) -> Self {
+        Self {
+            login: a.login,
+            id: a.id,
+            node_id: a.node_id,
+            account_type: a.account_type,
+            avatar_url: a.avatar_url,
+            html_url: a.html_url,
+            site_admin: a.site_admin,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredLabel {
+    name: String,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(rename = "default", default)]
+    is_default: Option<bool>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl From<StoredLabel> for LabelRef {
+    fn from(l: StoredLabel) -> Self {
+        Self {
+            id: l.id,
+            node_id: l.node_id,
+            name: l.name,
+            color: l.color,
+            is_default: l.is_default,
+            description: l.description,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredAsset {
+    name: String,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    size: Option<i64>,
+    #[serde(default)]
+    download_count: Option<i64>,
+    #[serde(default)]
+    browser_download_url: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+impl From<StoredAsset> for ReleaseAsset {
+    fn from(a: StoredAsset) -> Self {
+        Self {
+            id: a.id,
+            node_id: a.node_id,
+            name: a.name,
+            label: a.label,
+            content_type: a.content_type,
+            size: a.size,
+            download_count: a.download_count,
+            browser_download_url: a.browser_download_url,
+            created_at: a.created_at,
+            updated_at: a.updated_at,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub(super) struct StoredStep {
+    name: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    number: Option<i64>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    completed_at: Option<String>,
+    /// Everything GitHub sent that the six typed fields do not name.
+    ///
+    /// `steps_json` holds GitHub's own step payload, which used to reach
+    /// clients whole; keeping the rest here means typing the known fields
+    /// costs no data.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl From<StoredStep> for WorkflowStep {
+    fn from(st: StoredStep) -> Self {
+        Self {
+            name: st.name,
+            status: st.status,
+            conclusion: st.conclusion,
+            number: st.number,
+            started_at: st.started_at,
+            completed_at: st.completed_at,
+            extra: st.extra,
+        }
+    }
+}
+
+/// Most bytes of stored JSON one column may hand the deserializer.
+///
+/// These payloads are GitHub objects the mirror wrote itself - the largest,
+/// an issue-timeline entry, runs to a few kilobytes - so the cap is a guard
+/// against a corrupt or tampered row, not an expected limit.
+const MAX_STORED_JSON_BYTES: usize = 1 << 20;
+
+/// Which row a stored JSON column belongs to.
+///
+/// Every issue shares the column name `labels_json`, so the column alone does
+/// not say which row failed to decode. Carrying the repository and the row's
+/// own number or id means a corrupt payload can be found and repaired rather
+/// than only counted.
+#[derive(Clone, Copy)]
+pub(super) struct StoredRow {
+    pub repo_id: i64,
+    /// The row's own key: an issue or pull-request number, or the GitHub id
+    /// of a release or workflow job.
+    pub key: i64,
+}
+
+impl StoredRow {
+    pub(super) const fn new(repo_id: i64, key: i64) -> Self {
+        Self { repo_id, key }
+    }
+}
+
+pub(super) fn decode<T: serde::de::DeserializeOwned>(
+    field: &str,
+    row: StoredRow,
+    raw: Option<&str>,
+) -> Option<T> {
+    let raw = raw?;
+    if raw.len() > MAX_STORED_JSON_BYTES {
+        tracing::warn!(
+            field,
+            repo_id = row.repo_id,
+            key = row.key,
+            bytes = raw.len(),
+            limit = MAX_STORED_JSON_BYTES,
+            "stored JSON exceeds the decode limit; serving the empty value"
+        );
+        return None;
+    }
+    match serde_json::from_str::<T>(raw) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(
+                field,
+                repo_id = row.repo_id,
+                key = row.key,
+                error = %e,
+                bytes = raw.len(),
+                "stored JSON could not be decoded; serving the empty value"
+            );
+            None
+        }
+    }
+}
+
+pub(super) fn decode_list<S, T>(field: &str, row: StoredRow, raw: Option<&str>) -> Vec<T>
+where
+    S: serde::de::DeserializeOwned + Into<T>,
+{
+    decode::<Vec<S>>(field, row, raw)
+        .unwrap_or_default()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
 
 impl From<repositories::Model> for Repo {
     fn from(m: repositories::Model) -> Self {
@@ -33,6 +239,7 @@ impl From<repositories::Model> for Repo {
 
 impl From<issues::Model> for Issue {
     fn from(m: issues::Model) -> Self {
+        let row = StoredRow::new(m.repo_id, m.number);
         Self {
             id: m.id,
             node_id: m.node_id,
@@ -47,9 +254,14 @@ impl From<issues::Model> for Issue {
             closed_at: m.closed_at,
             html_url: m.html_url,
             author_login: m.author_login,
-            author_json: m.author_json,
-            assignees_json: m.assignees_json,
-            labels_json: m.labels_json,
+            author: decode::<StoredActor>("author_json", row, m.author_json.as_deref())
+                .map(Into::into),
+            assignees: decode_list::<StoredActor, _>(
+                "assignees_json",
+                row,
+                m.assignees_json.as_deref(),
+            ),
+            labels: decode_list::<StoredLabel, _>("labels_json", row, m.labels_json.as_deref()),
             comments_count: m.comments_count,
             locked: m.locked,
         }
@@ -58,6 +270,7 @@ impl From<issues::Model> for Issue {
 
 impl From<pull_requests::Model> for PullRequest {
     fn from(m: pull_requests::Model) -> Self {
+        let row = StoredRow::new(m.repo_id, m.number);
         Self {
             id: m.id,
             node_id: m.node_id,
@@ -80,12 +293,21 @@ impl From<pull_requests::Model> for PullRequest {
             head_ref: m.head_ref,
             base_ref: m.base_ref,
             author_login: m.author_login,
-            author_json: m.author_json,
-            assignees_json: m.assignees_json,
-            labels_json: m.labels_json,
+            author: decode::<StoredActor>("author_json", row, m.author_json.as_deref())
+                .map(Into::into),
+            assignees: decode_list::<StoredActor, _>(
+                "assignees_json",
+                row,
+                m.assignees_json.as_deref(),
+            ),
+            labels: decode_list::<StoredLabel, _>("labels_json", row, m.labels_json.as_deref()),
             comments_count: m.comments_count,
             locked: m.locked,
-            requested_reviewers_json: m.requested_reviewers_json,
+            requested_reviewers: decode_list::<StoredActor, _>(
+                "requested_reviewers_json",
+                row,
+                m.requested_reviewers_json.as_deref(),
+            ),
         }
     }
 }
@@ -213,7 +435,11 @@ impl From<releases::Model> for Release {
             created_at: m.created_at,
             published_at: m.published_at,
             html_url: m.html_url,
-            assets_json: m.assets_json,
+            assets: decode_list::<StoredAsset, _>(
+                "assets_json",
+                StoredRow::new(m.repo_id, m.id),
+                m.assets_json.as_deref(),
+            ),
         }
     }
 }
@@ -434,7 +660,11 @@ impl From<workflow_jobs::Model> for WorkflowJob {
             started_at: m.started_at,
             completed_at: m.completed_at,
             html_url: m.html_url,
-            steps_json: m.steps_json,
+            steps: decode_list::<StoredStep, _>(
+                "steps_json",
+                StoredRow::new(m.repo_id, m.id),
+                m.steps_json.as_deref(),
+            ),
         }
     }
 }
@@ -475,16 +705,49 @@ impl From<check_runs::Model> for CheckRun {
     }
 }
 
+/// The stored timeline entry, or a stand-in naming the event when the row
+/// cannot be decoded: the entry's shape is GitHub's, not the mirror's, so
+/// there is nothing else to fall back to.
+///
+/// The warning carries the row's own key, since every timeline payload lives
+/// in the same column and an operator repairing one needs to know which row
+/// it was.
+pub(super) fn timeline_payload(
+    repo_id: i64,
+    issue_number: i64,
+    position: i64,
+    event: &str,
+    raw: Option<&str>,
+) -> serde_json::Value {
+    decode::<serde_json::Value>("payload_json", StoredRow::new(repo_id, issue_number), raw)
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                repo_id,
+                issue_number,
+                position,
+                event,
+                "issue-timeline payload could not be decoded; serving the event name alone"
+            );
+            serde_json::json!({ "event": event })
+        })
+}
+
 impl From<issue_timeline::Model> for IssueTimelineEvent {
     fn from(m: issue_timeline::Model) -> Self {
         Self {
             repo_id: m.repo_id,
             issue_number: m.issue_number,
             position: m.position,
+            payload: timeline_payload(
+                m.repo_id,
+                m.issue_number,
+                m.position,
+                &m.event,
+                Some(&m.payload_json),
+            ),
             event: m.event,
             created_at: m.created_at,
             actor_login: m.actor_login,
-            payload_json: m.payload_json,
         }
     }
 }

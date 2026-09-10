@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — Plan & Quantity Changes (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Pricing (plan-change classification), Contracts (ramps), Registry (overlap key) | Downstream: Rating (proration math + usage slicing), Billing (proration artifacts) | Owners: BSS Subscriptions team -->
 

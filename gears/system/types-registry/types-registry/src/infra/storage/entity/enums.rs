@@ -148,23 +148,20 @@ pub enum OperationItemStatus {
     Failed,
 }
 
-/// `dependency.kind` — 1 `schema_ref` (`$ref`), 2 `gts_ref` (`x-gts-ref` target),
-/// 3 derivation (immediate base), 4 `instance_of` (conforming Type Schema).
+/// `dependency.kind` — 1 `schema_ref` (`$ref`), 2 derivation (immediate base),
+/// 3 `instance_of` (conforming Type Schema).
 ///
-/// `x-gts-ref` constrains what a value may *name* and is not itself a
-/// schema-resolution dependency, which is why the strict reference extractor in
-/// `gts-rust` excludes it from resolution. Its edge protects the entity the value
-/// or the constraint names, not constraint satisfiability.
+/// `x-gts-ref` is not represented: it constrains an instance value without resolving
+/// or inlining a target. The numbering is append-only after the first release, and
+/// `ck_tr_dependency_kind` admits exactly these three values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum DependencyKind {
     #[sea_orm(num_value = 1)]
     SchemaRef,
     #[sea_orm(num_value = 2)]
-    GtsRef,
-    #[sea_orm(num_value = 3)]
     Derivation,
-    #[sea_orm(num_value = 4)]
+    #[sea_orm(num_value = 3)]
     InstanceOf,
 }
 
@@ -217,7 +214,7 @@ bridge_enum!(
     Unchanged,
     Failed
 );
-bridge_enum!(DependencyKind, SchemaRef, GtsRef, Derivation, InstanceOf);
+bridge_enum!(DependencyKind, SchemaRef, Derivation, InstanceOf);
 
 #[cfg(test)]
 #[path = "enums_tests.rs"]

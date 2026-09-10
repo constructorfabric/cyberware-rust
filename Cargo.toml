@@ -57,6 +57,7 @@ members = [
     "libs/toolkit-macros",
     "libs/toolkit-macros-tests",
     "libs/test-containers",
+    "libs/toolkit-sea-orm-pgq",
     "libs/toolkit-db",
     "libs/toolkit-db-macros",
     "libs/toolkit-auth",
@@ -103,6 +104,7 @@ members = [
     "gears/system/cluster/cluster-conformance",
     "gears/system/cluster/plugins/standalone-cluster-plugin",
     "gears/system/cluster/plugins/postgres-cluster-plugin",
+    "gears/system/cluster/plugins/redis-cluster-plugin",
     "gears/system/grpc-hub",
     "gears/system/nodes-registry/nodes-registry",
     "gears/system/nodes-registry/nodes-registry-sdk",
@@ -309,6 +311,9 @@ toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-
 toolkit-db = { package = "cf-gears-toolkit-db", version = "0.14.1", path = "libs/toolkit-db" }
 toolkit-db-macros = { package = "cf-gears-toolkit-db-macros", version = "0.6.5", path = "libs/toolkit-db-macros" }
 toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.1.5", path = "libs/toolkit-gts" }
+# SQL/PGQ AST + renderer (docs/arch/secure-orm/ADR/0002). Security-agnostic:
+# toolkit-db owns the scope injection, this crate only knows the syntax.
+toolkit-sea-orm-pgq = { package = "cf-gears-toolkit-sea-orm-pgq", version = "0.1.0", path = "libs/toolkit-sea-orm-pgq" }
 toolkit-gts-macros = { package = "cf-gears-toolkit-gts-macros", version = "0.1.4", path = "libs/toolkit-gts-macros" }
 toolkit-macros = { package = "cf-gears-toolkit-macros", version = "0.6.6", path = "libs/toolkit-macros" }
 toolkit-node-info = { package = "cf-gears-toolkit-node-info", version = "0.6.6", path = "libs/toolkit-node-info" }
@@ -584,6 +589,61 @@ sea-orm-migration = { version = "2.0", default-features = false, features = [
 # (not runtime-tokio-rustls) to avoid pulling in ring.
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs"] }
 
+# Redis/Valkey client, used only by the Redis cluster plugin
+# (gears/system/cluster/plugins/redis-cluster-plugin, see its docs/DESIGN.md §3.1).
+#
+# TLS note, and it is the same trap as the sea-orm one above: `enable-rustls`
+# activates tokio-rustls/aws_lc_rs, matching the workspace provider. fred also
+# offers `enable-rustls-ring`, which activates tokio-rustls/ring -- do NOT use it,
+# for exactly the reason recorded in the sea-orm comment above: two active rustls
+# providers make rustls 0.23 panic at runtime process-wide, not just in this plugin.
+#
+# The interface features are named individually rather than via fred's `i-std`
+# umbrella, which would additionally pull in i-lists/i-sets/i-streams/i-sorted-sets.
+# Leaving i-lists out is deliberate and load-bearing: it makes BLPOP and the rest of
+# the blocking-command family unreachable at compile time, which is what the plugin's
+# docs/TESTING.md §6 "no blocking commands" rule wants (a blocking command on a
+# shared Redis parks a connection the plugin's shutdown budget has to wait out).
+#
+# `sha-1` is deliberately absent. It gates fred's `Script::from_lua`, which hashes
+# the script client-side; the plugin instead uses the SHA that `SCRIPT LOAD` returns
+# (DESIGN.md §3.2 step 3), keeping a SHA-1 implementation out of a FIPS-gated
+# workspace's graph for what is only script-cache addressing.
+#
+# What each enabled feature buys, in the order they appear below:
+#   i-keys            GET/SET/DEL/EXISTS/PEXPIRE/PERSIST/PTTL
+#   i-hashes          HGET/HSET/HMGET/HINCRBY (the cache entry encoding)
+#   i-pubsub          PUBLISH/SUBSCRIBE/PSUBSCRIBE/PUBSUB NUMPAT
+#   i-server          INFO, WAIT
+#   i-scripts         SCRIPT LOAD / EVALSHA
+#   i-config          CONFIG GET / CONFIG SET (the startup preflight)
+#   i-cluster         Redis Cluster routing + CLUSTER COUNTKEYSINSLOT
+#   subscriber-client fred::clients::SubscriberClient (watch + lock waiters)
+#   sentinel-client   Sentinel topology discovery
+#   enable-rustls     rediss:// -- see the TLS note above
+#   partial-tracing   fred's own spans, behind the workspace tracing stack
+#
+# The mapping lives here rather than as trailing comments on the array entries,
+# and that is a tooling constraint rather than a style preference:
+# `tools/scripts/check_packaging_metadata.py` collapses multi-line inline tables
+# onto one line so Python's strict `tomllib` accepts them, and it does not strip
+# comments while doing so — a `#` inside these braces therefore swallows the
+# closing `] }` and makes the whole manifest unparseable to `make
+# check-packaging-metadata`. Keep comments about this dependency above it.
+fred = { version = "10.1", default-features = false, features = [
+    "i-keys",
+    "i-hashes",
+    "i-pubsub",
+    "i-server",
+    "i-scripts",
+    "i-config",
+    "i-cluster",
+    "subscriber-client",
+    "sentinel-client",
+    "enable-rustls",
+    "partial-tracing",
+] }
+
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # File rotation for logging
@@ -591,6 +651,9 @@ file-rotate = "0.8"
 
 # Time handling
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
+
+# Enum helpers (variant iteration)
+strum = { version = "0.27", features = ["derive"] }
 
 # Kubernetes client (optional, for k8s feature gate)
 kube = { version = "3.0", default-features = false }
@@ -696,7 +759,7 @@ trybuild = "1"
 serial_test = { version = "3", features = ["file_locks"] }
 criterion = { version = "0.8", default-features = false }
 testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql"] }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql", "redis"] }
 httpmock = "0.8"
 flate2 = "1"
 

@@ -51,6 +51,17 @@ fn restrict_violation_is_also_type_referenced() {
     );
 }
 #[test]
+fn restrict_violation_is_type_referenced() {
+    // PostgreSQL 18 reports an `ON DELETE RESTRICT` refusal as `23001` rather
+    // than `23503`. Both must reach `ForeignKeyViolation`, or `delete` answers
+    // `Internal` instead of `UsageTypeReferenced` on one PostgreSQL major --
+    // which is exactly how this surfaced, as a version-dependent test failure.
+    assert_eq!(
+        classify_db("23001", Some("usage_records_gts_id_fk")),
+        DbErrorClass::ForeignKeyViolation
+    );
+}
+#[test]
 fn connection_class_is_transient() {
     assert_eq!(classify_db("08006", None), DbErrorClass::Transient);
     assert_eq!(classify_db("57P03", None), DbErrorClass::Transient);

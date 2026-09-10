@@ -27,6 +27,12 @@ pub(crate) use definitions::{
     TOKEN_REJECTION_REASON_MISSING_TENANT, TOKEN_REJECTION_REASON_UNTRUSTED_ISSUER,
 };
 
+/// Seconds-scale bucket boundaries for the authn duration histograms;
+/// the SDK default boundaries are millisecond-scale.
+const AUTHN_DURATION_BOUNDARIES_SECS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+
 /// OpenTelemetry-backed metrics handle shared across plugin components.
 #[domain_model]
 pub struct AuthNMetrics {
@@ -100,11 +106,13 @@ impl AuthNMetrics {
                 .f64_histogram(AUTHN_JWKS_FETCH_DURATION_SECONDS)
                 .with_description("JWKS network fetch duration")
                 .with_unit("s")
+                .with_boundaries(AUTHN_DURATION_BOUNDARIES_SECS.to_vec())
                 .build(),
             request_success_duration_seconds: meter
                 .f64_histogram(AUTHN_REQUEST_SUCCESS_DURATION_SECONDS)
                 .with_description("Successful authentication request duration")
                 .with_unit("s")
+                .with_boundaries(AUTHN_DURATION_BOUNDARIES_SECS.to_vec())
                 .build(),
             request_failures_total: meter
                 .u64_counter(AUTHN_REQUEST_FAILURES_TOTAL)

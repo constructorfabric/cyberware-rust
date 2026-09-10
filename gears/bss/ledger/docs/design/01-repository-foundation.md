@@ -1,3 +1,6 @@
+Created:  2026-07-07 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- migration-note: migrated from the legacy Virtuozzo design set to the gears-sdlc design-slice layout (cpt-* sub-IDs). This is the Repository-Foundation (shared double-entry engine); it also carries the naming/glossary-alignment discipline (§4.1) and the three ledger-wide normative statements (§4.2–4.4). Sibling slice designs 01a–07 live in this folder — see README.md for the index. Original preserved unchanged at vhp-architecture docs/bss/design/DESIGN-billing-ledger-balances-202606091200/ (files 00 naming-alignment, 01 repository-foundation). Confluence metadata preserved below. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — Repository-foundation (shared double-entry engine) + Naming Alignment (Design) -->
 <!-- Related: PRD.md | Upstream: Rating, Subscriptions, Catalog, Contracts, AMS provisioning | Downstream: ERP/GL, Payments | Owners: @vstudzinskyi (BSS Billing Platform team) -->

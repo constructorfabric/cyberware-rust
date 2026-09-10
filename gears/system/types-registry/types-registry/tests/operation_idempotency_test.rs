@@ -36,6 +36,7 @@ use types_registry::infra::storage::repo::OperationRepo;
 
 mod common;
 use common::{TestDir, allow_all, stores, test_db, test_db_file};
+use types_registry::domain::ports::metrics::AdmissionMetrics;
 
 const NOW: OffsetDateTime = datetime!(2026-08-18 09:15:30 UTC);
 const CF_TYPE: &str = gts_id!("cf.core.example.type.v1~");
@@ -121,8 +122,13 @@ fn provider(db: &Arc<DBProvider<DbError>>) -> DBProvider<AcceptanceError> {
 fn context<'a>(
     policy: &'a RegistrationPolicy,
     config: &'a TypesRegistryConfig,
+    metrics: &'a Arc<dyn AdmissionMetrics>,
 ) -> AcceptanceContext<'a> {
-    AcceptanceContext { policy, config }
+    AcceptanceContext {
+        policy,
+        config,
+        metrics,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +148,7 @@ async fn an_accepted_request_writes_one_operation_its_items_and_one_dispatch() {
         &stores(),
         &provider,
         &allow_all(),
-        &context(&policy, &config),
+        &context(&policy, &config, &common::metrics()),
         &dispatch,
         &request(KEY, schema(CF_TYPE)),
         NOW,
@@ -204,7 +210,7 @@ async fn maximum_batch_is_inserted_across_sqlite_bind_chunks() {
         &stores(),
         &provider,
         &allow_all(),
-        &context(&policy, &config),
+        &context(&policy, &config, &common::metrics()),
         &dispatch,
         &request,
         NOW,
@@ -243,7 +249,7 @@ async fn a_dispatch_failure_rolls_the_whole_acceptance_back() {
         &stores(),
         &provider,
         &allow_all(),
-        &context(&policy, &config),
+        &context(&policy, &config, &common::metrics()),
         &dispatch,
         &request(KEY, schema(CF_TYPE)),
         NOW,
@@ -257,10 +263,13 @@ async fn a_dispatch_failure_rolls_the_whole_acceptance_back() {
         OperationRepo::find_by_idempotency(
             &conn,
             &allow_all(),
-            validate(&context(&policy, &config), &request(KEY, schema(CF_TYPE)))
-                .expect("validated")
-                .idempotency_scope_hash
-                .as_bytes(),
+            validate(
+                &context(&policy, &config, &common::metrics()),
+                &request(KEY, schema(CF_TYPE))
+            )
+            .expect("validated")
+            .idempotency_scope_hash
+            .as_bytes(),
             KEY,
         )
         .await
@@ -287,7 +296,7 @@ async fn a_synchronous_refusal_writes_no_operation() {
         &stores(),
         &provider,
         &allow_all(),
-        &context(&policy, &config),
+        &context(&policy, &config, &common::metrics()),
         &dispatch,
         &refused,
         NOW,
@@ -325,7 +334,8 @@ async fn a_replay_with_a_matching_fingerprint_returns_the_stored_operation() {
     let config = TypesRegistryConfig::default();
     let recorder = Arc::new(RecordingDispatch::default());
     let dispatch: Arc<dyn OperationDispatch> = recorder.clone();
-    let ctx = context(&policy, &config);
+    let metrics = common::metrics();
+    let ctx = context(&policy, &config, &metrics);
 
     let first = accept(
         &stores(),
@@ -382,7 +392,8 @@ async fn a_terminal_replay_reports_terminality() {
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(RecordingDispatch::default());
-    let ctx = context(&policy, &config);
+    let metrics = common::metrics();
+    let ctx = context(&policy, &config, &metrics);
 
     let first = accept(
         &stores(),
@@ -438,7 +449,8 @@ async fn a_different_fingerprint_under_one_key_is_a_conflict() {
     let policy = RegistrationPolicy::default();
     let config = TypesRegistryConfig::default();
     let dispatch: Arc<dyn OperationDispatch> = Arc::new(RecordingDispatch::default());
-    let ctx = context(&policy, &config);
+    let metrics = common::metrics();
+    let ctx = context(&policy, &config, &metrics);
 
     let first = accept(
         &stores(),
@@ -483,7 +495,8 @@ async fn a_refused_dry_run_does_not_reserve_the_idempotency_key() {
     let config = TypesRegistryConfig::default();
     let recorder = Arc::new(RecordingDispatch::default());
     let dispatch: Arc<dyn OperationDispatch> = recorder.clone();
-    let ctx = context(&policy, &config);
+    let metrics = common::metrics();
+    let ctx = context(&policy, &config, &metrics);
 
     let mut dry = request(KEY, schema(CF_TYPE));
     dry.dry_run = true;
@@ -545,7 +558,7 @@ async fn concurrent_acceptance_on_one_key_yields_one_operation() {
                     &stores(),
                     &provider,
                     &allow_all(),
-                    &context(&policy, &config),
+                    &context(&policy, &config, &common::metrics()),
                     &dispatch,
                     &request(KEY, schema(CF_TYPE)),
                     NOW,
@@ -628,7 +641,7 @@ async fn acceptance_reads_no_entity_state() {
         &stores(),
         &provider,
         &allow_all(),
-        &context(&policy, &config),
+        &context(&policy, &config, &common::metrics()),
         &dispatch,
         &request(KEY, schema(CF_TYPE)),
         NOW,

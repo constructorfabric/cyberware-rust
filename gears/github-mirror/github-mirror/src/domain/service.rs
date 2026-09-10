@@ -6,15 +6,16 @@ use chrono::{DateTime, Utc};
 use github_mirror_sdk::{
     Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
     Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
-    PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review, ReviewComment,
-    ReviewThread, Tag, WorkflowJob, WorkflowRun,
+    MirrorStatus, PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review,
+    ReviewComment, ReviewThread, SyncSummary, Tag, WorkflowJob, WorkflowRun,
 };
 use toolkit_macros::domain_model;
-use toolkit_odata::{CursorV1, ODataQuery, Page, PageInfo, SortDir};
-use toolkit_security::{AccessScope, SecurityContext, pep_properties};
+use toolkit_odata::{ODataQuery, Page, PageInfo};
+use toolkit_security::{SecurityContext, pep_properties};
 
 use super::error::DomainError;
-use super::ports::github::{GithubPort, ListingCompleteness};
+
+use super::ports::github::GithubPort;
 use super::repo::{
     BranchRecord, BranchRepository, CheckRunRecord, CheckRunRepository, CommentRecord,
     CommentRepository, CommitCommentRecord, CommitCommentRepository, CommitFileRecord,
@@ -23,50 +24,37 @@ use super::repo::{
     DeploymentRepository, IssueEventRecord, IssueEventRepository, IssueReactionRecord,
     IssueReactionRepository, IssueRecord, IssueRepository, IssueTimelineEventRecord,
     IssueTimelineRepository, LabelRecord, LabelRepository, ListingFilter, MilestoneRecord,
-    MilestoneRepository, PullRequestCommitRecord, PullRequestCommitRepository,
+    MilestoneRepository, PageWindow, PullRequestCommitRecord, PullRequestCommitRepository,
     PullRequestFileRecord, PullRequestFileRepository, PullRequestRecord, PullRequestRepository,
     ReleaseRecord, ReleaseRepository, RepoRecord, RepoRepository, ReviewCommentRecord,
     ReviewCommentRepository, ReviewRecord, ReviewRepository, ReviewThreadRecord,
-    ReviewThreadRepository, TagRecord, TagRepository, WorkflowJobRecord, WorkflowJobRepository,
-    WorkflowRunRecord, WorkflowRunRepository,
+    ReviewThreadRepository, SyncWriter, TagRecord, TagRepository, WorkflowJobRecord,
+    WorkflowJobRepository, WorkflowRunRecord, WorkflowRunRepository,
 };
+use super::validate::{repo_full_name, validate_commit_sha};
 
 /// The gear's name, taken from the `#[toolkit::gear]` attribute so the
 /// literal exists in exactly one place.
 pub const GEAR_NAME: &str = crate::gear::GithubMirrorGear::MODULE_NAME;
 
-/// How many stored contributors one merge reads back. A repository with more
-/// distinct people than this loses nothing already written — the merge simply
-/// cannot widen the rows it did not see.
-const CONTRIBUTOR_MERGE_LIMIT: u64 = 10_000;
-
-/// The earlier of two optional instants, ignoring a missing one.
-///
-/// `flatten()` first, because `Option`'s own ordering puts `None` below every
-/// `Some`: plain `a.min(b)` would answer `None` whenever one side is missing.
-/// The mirror image needs no helper — `Option::max` already skips `None` for
-/// the same reason, which is why only this direction is written out.
-fn earliest(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
-    [a, b].into_iter().flatten().min()
+/// Release the per-repo sync lock, logging a failed release rather than
+/// turning it into the sync's outcome: the guard's `Drop` has already queued
+/// a best-effort release, and the sync succeeded or failed on its own merits.
+async fn release_sync_lock(lock: toolkit_db::DbLockGuard, lock_key: &str) {
+    if let Err(e) = lock.release().await {
+        tracing::warn!(lock_key, error = %e, "sync advisory lock release failed");
+    }
 }
 
-/// The current instant as RFC3339 text, matching how every other timestamp
-const DEFAULT_LIST_LIMIT: u64 = 50;
+/// Longest a single repository's fetch may run before the sync gives up.
+///
+/// The fetch is one long sequence of GitHub calls with their own per-request
+/// timeouts and rate-limit back-offs; this is the only bound on the whole of
+/// it, and it is what stops a slow upstream from holding the per-repo
+/// advisory lock indefinitely.
+const SYNC_FETCH_BUDGET: std::time::Duration = std::time::Duration::from_mins(30);
 
 pub(crate) type DbProvider = toolkit_db::DBProvider<toolkit_db::DbError>;
-
-/// One mirrored table's upsert pass: writes every fetched record of
-/// `$field` and evaluates to how many rows the pass wrote.
-macro_rules! sync_table {
-    ($self:ident, $conn:expr, $scope:expr, $tenant:expr, $field:ident, $records:expr) => {{
-        let mut synced: u64 = 0;
-        for record in $records {
-            $self.$field.upsert($conn, $scope, $tenant, record).await?;
-            synced += 1;
-        }
-        synced
-    }};
-}
 
 pub(crate) const REPO_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.repo",
@@ -214,107 +202,35 @@ pub struct ServiceConfig {
 }
 
 #[domain_model]
-#[derive(Debug, Clone)]
-pub struct MirrorStatus {
-    pub gear: String,
-    /// The gear crate's own version (`CARGO_PKG_VERSION`) — the version of
-    /// this mirror implementation, not of GitHub's API or of any mirrored
-    /// repository.
-    pub version: String,
-    pub api_base_url: String,
-}
-
-/// What one sync pass wrote, returned to the caller.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncSummary {
-    pub repository: String,
-    pub issues_synced: u64,
-    pub pull_requests_synced: u64,
-    pub commits_synced: u64,
-    pub comments_synced: u64,
-    pub review_comments_synced: u64,
-    pub reviews_synced: u64,
-    pub labels_synced: u64,
-    pub milestones_synced: u64,
-    pub releases_synced: u64,
-    pub branches_synced: u64,
-    pub contributors_synced: u64,
-    pub workflow_runs_synced: u64,
-    pub pull_request_files_synced: u64,
-    pub tags_synced: u64,
-    pub commit_files_synced: u64,
-    pub review_threads_synced: u64,
-    pub commit_comments_synced: u64,
-    pub issue_events_synced: u64,
-    pub deployments_synced: u64,
-    pub pull_request_commits_synced: u64,
-    pub commit_statuses_synced: u64,
-    pub workflow_jobs_synced: u64,
-    pub issue_reactions_synced: u64,
-    pub check_runs_synced: u64,
-    pub issue_timeline_synced: u64,
-    /// Rows hard-deleted because a complete listing no longer contained them
-    /// (upstream deletion reconciliation).
-    pub stale_rows_deleted: u64,
-}
-
-#[domain_model]
-pub struct Service<
-    R: RepoRepository,
-    I: IssueRepository,
-    P: PullRequestRepository,
-    C: CommitRepository,
-    M: CommentRepository,
-    V: ReviewCommentRepository,
-    W: ReviewRepository,
-    L: LabelRepository,
-    N: MilestoneRepository,
-    E: ReleaseRepository,
-    B: BranchRepository,
-    O: ContributorRepository,
-    F: WorkflowRunRepository,
-    G: PullRequestFileRepository,
-    T: TagRepository,
-    D: CommitFileRepository,
-    H: ReviewThreadRepository,
-    K: CommitCommentRepository,
-    X: IssueEventRepository,
-    Y: DeploymentRepository,
-    Z: PullRequestCommitRepository,
-    S: CommitStatusRepository,
-    J: WorkflowJobRepository,
-    Q: IssueReactionRepository,
-    U: CheckRunRepository,
-    A: IssueTimelineRepository,
-> {
+pub struct Service {
     db: Arc<DbProvider>,
-    repo: Arc<R>,
-    issues: Arc<I>,
-    pull_requests: Arc<P>,
-    commits: Arc<C>,
-    comments: Arc<M>,
-    review_comments: Arc<V>,
-    reviews: Arc<W>,
-    labels: Arc<L>,
-    milestones: Arc<N>,
-    releases: Arc<E>,
-    branches: Arc<B>,
-    contributors: Arc<O>,
-    workflow_runs: Arc<F>,
-    pull_request_files: Arc<G>,
-    tags: Arc<T>,
-    commit_files: Arc<D>,
-    review_threads: Arc<H>,
-    commit_comments: Arc<K>,
-    issue_events: Arc<X>,
-    deployments: Arc<Y>,
-    pull_request_commits: Arc<Z>,
-    commit_statuses: Arc<S>,
-    workflow_jobs: Arc<J>,
-    issue_reactions: Arc<Q>,
-    check_runs: Arc<U>,
-    issue_timeline: Arc<A>,
+    repo: Arc<dyn RepoRepository>,
+    issues: Arc<dyn IssueRepository>,
+    pull_requests: Arc<dyn PullRequestRepository>,
+    commits: Arc<dyn CommitRepository>,
+    comments: Arc<dyn CommentRepository>,
+    review_comments: Arc<dyn ReviewCommentRepository>,
+    reviews: Arc<dyn ReviewRepository>,
+    labels: Arc<dyn LabelRepository>,
+    milestones: Arc<dyn MilestoneRepository>,
+    releases: Arc<dyn ReleaseRepository>,
+    branches: Arc<dyn BranchRepository>,
+    contributors: Arc<dyn ContributorRepository>,
+    workflow_runs: Arc<dyn WorkflowRunRepository>,
+    pull_request_files: Arc<dyn PullRequestFileRepository>,
+    tags: Arc<dyn TagRepository>,
+    commit_files: Arc<dyn CommitFileRepository>,
+    review_threads: Arc<dyn ReviewThreadRepository>,
+    commit_comments: Arc<dyn CommitCommentRepository>,
+    issue_events: Arc<dyn IssueEventRepository>,
+    deployments: Arc<dyn DeploymentRepository>,
+    pull_request_commits: Arc<dyn PullRequestCommitRepository>,
+    commit_statuses: Arc<dyn CommitStatusRepository>,
+    workflow_jobs: Arc<dyn WorkflowJobRepository>,
+    issue_reactions: Arc<dyn IssueReactionRepository>,
+    check_runs: Arc<dyn CheckRunRepository>,
+    issue_timeline: Arc<dyn IssueTimelineRepository>,
+    sync_writer: Arc<dyn SyncWriter>,
     github: Arc<dyn GithubPort>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
@@ -327,35 +243,7 @@ pub struct Service<
 ///
 /// Exists so a caller can obtain an owned handle to hand into a `'static`
 /// closure (e.g. a DB transaction) without borrowing `&self` across it.
-impl<
-    R: RepoRepository,
-    I: IssueRepository,
-    P: PullRequestRepository,
-    C: CommitRepository,
-    M: CommentRepository,
-    V: ReviewCommentRepository,
-    W: ReviewRepository,
-    L: LabelRepository,
-    N: MilestoneRepository,
-    E: ReleaseRepository,
-    B: BranchRepository,
-    O: ContributorRepository,
-    F: WorkflowRunRepository,
-    G: PullRequestFileRepository,
-    T: TagRepository,
-    D: CommitFileRepository,
-    H: ReviewThreadRepository,
-    K: CommitCommentRepository,
-    X: IssueEventRepository,
-    Y: DeploymentRepository,
-    Z: PullRequestCommitRepository,
-    S: CommitStatusRepository,
-    J: WorkflowJobRepository,
-    Q: IssueReactionRepository,
-    U: CheckRunRepository,
-    A: IssueTimelineRepository,
-> Clone for Service<R, I, P, C, M, V, W, L, N, E, B, O, F, G, T, D, H, K, X, Y, Z, S, J, Q, U, A>
-{
+impl Clone for Service {
     fn clone(&self) -> Self {
         Self {
             db: Arc::clone(&self.db),
@@ -385,6 +273,7 @@ impl<
             issue_reactions: Arc::clone(&self.issue_reactions),
             check_runs: Arc::clone(&self.check_runs),
             issue_timeline: Arc::clone(&self.issue_timeline),
+            sync_writer: Arc::clone(&self.sync_writer),
             github: Arc::clone(&self.github),
             policy_enforcer: self.policy_enforcer.clone(),
             config: self.config.clone(),
@@ -392,64 +281,37 @@ impl<
     }
 }
 
-impl<
-    R: RepoRepository,
-    I: IssueRepository,
-    P: PullRequestRepository,
-    C: CommitRepository,
-    M: CommentRepository,
-    V: ReviewCommentRepository,
-    W: ReviewRepository,
-    L: LabelRepository,
-    N: MilestoneRepository,
-    E: ReleaseRepository,
-    B: BranchRepository,
-    O: ContributorRepository,
-    F: WorkflowRunRepository,
-    G: PullRequestFileRepository,
-    T: TagRepository,
-    D: CommitFileRepository,
-    H: ReviewThreadRepository,
-    K: CommitCommentRepository,
-    X: IssueEventRepository,
-    Y: DeploymentRepository,
-    Z: PullRequestCommitRepository,
-    S: CommitStatusRepository,
-    J: WorkflowJobRepository,
-    Q: IssueReactionRepository,
-    U: CheckRunRepository,
-    A: IssueTimelineRepository,
-> Service<R, I, P, C, M, V, W, L, N, E, B, O, F, G, T, D, H, K, X, Y, Z, S, J, Q, U, A>
-{
+impl Service {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<DbProvider>,
-        repo: Arc<R>,
-        issues: Arc<I>,
-        pull_requests: Arc<P>,
-        commits: Arc<C>,
-        comments: Arc<M>,
-        review_comments: Arc<V>,
-        reviews: Arc<W>,
-        labels: Arc<L>,
-        milestones: Arc<N>,
-        releases: Arc<E>,
-        branches: Arc<B>,
-        contributors: Arc<O>,
-        workflow_runs: Arc<F>,
-        pull_request_files: Arc<G>,
-        tags: Arc<T>,
-        commit_files: Arc<D>,
-        review_threads: Arc<H>,
-        commit_comments: Arc<K>,
-        issue_events: Arc<X>,
-        deployments: Arc<Y>,
-        pull_request_commits: Arc<Z>,
-        commit_statuses: Arc<S>,
-        workflow_jobs: Arc<J>,
-        issue_reactions: Arc<Q>,
-        check_runs: Arc<U>,
-        issue_timeline: Arc<A>,
+        repo: Arc<dyn RepoRepository>,
+        issues: Arc<dyn IssueRepository>,
+        pull_requests: Arc<dyn PullRequestRepository>,
+        commits: Arc<dyn CommitRepository>,
+        comments: Arc<dyn CommentRepository>,
+        review_comments: Arc<dyn ReviewCommentRepository>,
+        reviews: Arc<dyn ReviewRepository>,
+        labels: Arc<dyn LabelRepository>,
+        milestones: Arc<dyn MilestoneRepository>,
+        releases: Arc<dyn ReleaseRepository>,
+        branches: Arc<dyn BranchRepository>,
+        contributors: Arc<dyn ContributorRepository>,
+        workflow_runs: Arc<dyn WorkflowRunRepository>,
+        pull_request_files: Arc<dyn PullRequestFileRepository>,
+        tags: Arc<dyn TagRepository>,
+        commit_files: Arc<dyn CommitFileRepository>,
+        review_threads: Arc<dyn ReviewThreadRepository>,
+        commit_comments: Arc<dyn CommitCommentRepository>,
+        issue_events: Arc<dyn IssueEventRepository>,
+        deployments: Arc<dyn DeploymentRepository>,
+        pull_request_commits: Arc<dyn PullRequestCommitRepository>,
+        commit_statuses: Arc<dyn CommitStatusRepository>,
+        workflow_jobs: Arc<dyn WorkflowJobRepository>,
+        issue_reactions: Arc<dyn IssueReactionRepository>,
+        check_runs: Arc<dyn CheckRunRepository>,
+        issue_timeline: Arc<dyn IssueTimelineRepository>,
+        sync_writer: Arc<dyn SyncWriter>,
         github: Arc<dyn GithubPort>,
         policy_enforcer: PolicyEnforcer,
         config: ServiceConfig,
@@ -482,6 +344,7 @@ impl<
             issue_reactions,
             check_runs,
             issue_timeline,
+            sync_writer,
             github,
             policy_enforcer,
             config,
@@ -511,10 +374,9 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         self.repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)
     }
@@ -543,16 +405,15 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
         self.issues
-            .find_by_number(&conn, &scope, repository.id, number)
+            .find_by_number(&scope, repository.id, number)
             .await?
             .ok_or(DomainError::NotFound)
     }
@@ -581,16 +442,15 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
         self.pull_requests
-            .find_by_number(&conn, &scope, repository.id, number)
+            .find_by_number(&scope, repository.id, number)
             .await?
             .ok_or(DomainError::NotFound)
     }
@@ -607,6 +467,7 @@ impl<
         name: &str,
         sha: &str,
     ) -> Result<Commit, DomainError> {
+        validate_commit_sha(sha)?;
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -619,16 +480,15 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
         self.commits
-            .find_by_sha(&conn, &scope, repository.id, sha)
+            .find_by_sha(&scope, repository.id, sha)
             .await?
             .ok_or(DomainError::NotFound)
     }
@@ -664,42 +524,32 @@ impl<
             )
             .await?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let conn = self.db.conn()?;
+        self.repo.list(&scope, query).await
+    }
 
-        // Keyset pagination on the unique sort key: fetch one row past the
-        // page to learn whether a next page exists at all.
-        let after = query
-            .cursor
-            .as_ref()
-            .and_then(|c| c.k.first())
-            .map(String::as_str);
-        let mut items = self.repo.list(&conn, &scope, limit + 1, after).await?;
-        let next_cursor = if items.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
-            items.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-            items.last().and_then(|last| {
-                CursorV1 {
-                    k: vec![last.full_name.clone()],
-                    o: SortDir::Asc,
-                    s: "full_name".to_owned(),
-                    f: None,
-                    d: "fwd".to_owned(),
-                }
-                .encode()
-                .ok()
-            })
-        } else {
-            None
-        };
+    /// One numbered page of mirrored repositories, for the
+    /// GitHub-compatible `GET /user/repos`.
+    ///
+    /// # Errors
+    /// `Forbidden` on PDP denial, `Database`/`Internal` on storage failures.
+    pub async fn list_repos_page(
+        &self,
+        ctx: &SecurityContext,
+        window: PageWindow,
+    ) -> Result<Vec<Repo>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &REPO_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
 
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+        self.repo.list_window(&scope, window).await
     }
 
     /// Insert or update a mirrored repository row for the caller's tenant.
@@ -725,53 +575,7 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        self.repo.upsert(&conn, &scope, tenant_id, record).await
-    }
-
-    /// List mirrored issues of one repository (`owner/name`), tenant-scoped.
-    ///
-    /// # Errors
-    /// `DomainError::NotFound` when the repository is not mirrored for this
-    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
-    /// `state`: GitHub's filter — `Some("open")`, `Some("closed")`, or `None`
-    /// for every state. GitHub's own default is `open`, applied by the handler.
-    /// How many rows the matching listing has in total, so the `Link`
-    /// header can name its last page.
-    ///
-    /// # Errors
-    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
-    /// as usual.
-    pub async fn count_issues(
-        &self,
-        ctx: &SecurityContext,
-        owner: &str,
-        name_arg: &str,
-        filter: ListingFilter<'_>,
-    ) -> Result<u64, DomainError> {
-        let scope = self
-            .policy_enforcer
-            .access_scope_with(
-                ctx,
-                &ISSUE_RESOURCE,
-                actions::LIST,
-                None,
-                &AccessRequest::new()
-                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
-            )
-            .await?;
-
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name_arg}");
-        let repository = self
-            .repo
-            .find_by_full_name(&conn, &scope, &full_name)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
-        self.issues
-            .count_by_repo(&conn, &scope, repository.id, filter)
-            .await
+        self.repo.upsert(&scope, tenant_id, record).await
     }
 
     /// The repository's issues, filtered as GitHub's list endpoint filters.
@@ -787,9 +591,9 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
-        filter: ListingFilter<'_>,
-    ) -> Result<Page<Issue>, DomainError> {
+        window: PageWindow,
+        filter: ListingFilter,
+    ) -> Result<(Page<Issue>, u64), DomainError> {
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -802,27 +606,32 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
+        let (items, total) = self
             .issues
-            .list_by_repo(&conn, &scope, repository.id, limit, filter)
+            .page_by_repo(&scope, repository.id, window, filter)
             .await?;
 
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
+        // Counted on the scope and repository already resolved above: the
+        // GitHub-compatible listings report a total, and doing it here saves
+        // a second policy evaluation and repository lookup per request.
+
+        Ok((
+            Page::new(
+                items,
+                PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: window.limit(),
+                },
+            ),
+            total,
         ))
     }
 
@@ -853,11 +662,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -865,52 +673,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.issues.upsert(&conn, &scope, tenant_id, record).await
-    }
-
-    /// List mirrored pull requests of one repository (`owner/name`), tenant-scoped.
-    ///
-    /// # Errors
-    /// `DomainError::NotFound` when the repository is not mirrored for this
-    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
-    /// `state`: GitHub's filter — `Some("open")`, `Some("closed")`, or `None`
-    /// for every state. GitHub's own default is `open`, applied by the handler.
-    /// How many rows the matching listing has in total, so the `Link`
-    /// header can name its last page.
-    ///
-    /// # Errors
-    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
-    /// as usual.
-    pub async fn count_pull_requests(
-        &self,
-        ctx: &SecurityContext,
-        owner: &str,
-        name_arg: &str,
-        filter: ListingFilter<'_>,
-    ) -> Result<u64, DomainError> {
-        let scope = self
-            .policy_enforcer
-            .access_scope_with(
-                ctx,
-                &PULL_REQUEST_RESOURCE,
-                actions::LIST,
-                None,
-                &AccessRequest::new()
-                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
-            )
-            .await?;
-
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name_arg}");
-        let repository = self
-            .repo
-            .find_by_full_name(&conn, &scope, &full_name)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
-        self.pull_requests
-            .count_by_repo(&conn, &scope, repository.id, filter)
-            .await
+        self.issues.upsert(&scope, tenant_id, record).await
     }
 
     /// The repository's pull requests, filtered as GitHub's list endpoint
@@ -927,9 +690,9 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
-        filter: ListingFilter<'_>,
-    ) -> Result<Page<PullRequest>, DomainError> {
+        window: PageWindow,
+        filter: ListingFilter,
+    ) -> Result<(Page<PullRequest>, u64), DomainError> {
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -942,27 +705,32 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
+        let (items, total) = self
             .pull_requests
-            .list_by_repo(&conn, &scope, repository.id, limit, filter)
+            .page_by_repo(&scope, repository.id, window, filter)
             .await?;
 
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
+        // Counted on the scope and repository already resolved above: the
+        // GitHub-compatible listings report a total, and doing it here saves
+        // a second policy evaluation and repository lookup per request.
+
+        Ok((
+            Page::new(
+                items,
+                PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: window.limit(),
+                },
+            ),
+            total,
         ))
     }
 
@@ -993,11 +761,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1005,52 +772,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.pull_requests
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
-    }
-
-    /// List mirrored commits of one repository (`owner/name`), tenant-scoped,
-    /// newest first.
-    ///
-    /// # Errors
-    /// `DomainError::NotFound` when the repository is not mirrored for this
-    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
-    /// How many rows the matching listing has in total, so the `Link`
-    /// header can name its last page.
-    ///
-    /// # Errors
-    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
-    /// as usual.
-    pub async fn count_commits(
-        &self,
-        ctx: &SecurityContext,
-        owner: &str,
-        name_arg: &str,
-    ) -> Result<u64, DomainError> {
-        let scope = self
-            .policy_enforcer
-            .access_scope_with(
-                ctx,
-                &COMMIT_RESOURCE,
-                actions::LIST,
-                None,
-                &AccessRequest::new()
-                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
-            )
-            .await?;
-
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name_arg}");
-        let repository = self
-            .repo
-            .find_by_full_name(&conn, &scope, &full_name)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
-        self.commits
-            .count_by_repo(&conn, &scope, repository.id)
-            .await
+        self.pull_requests.upsert(&scope, tenant_id, record).await
     }
 
     /// The repository's mirrored commits, newest first.
@@ -1063,8 +785,9 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
-    ) -> Result<Page<Commit>, DomainError> {
+        window: PageWindow,
+        since: Option<DateTime<Utc>>,
+    ) -> Result<(Page<Commit>, u64), DomainError> {
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -1077,27 +800,32 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
+        let (items, total) = self
             .commits
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .page_by_repo(&scope, repository.id, window, since)
             .await?;
 
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
+        // Counted on the scope and repository already resolved above: the
+        // GitHub-compatible listings report a total, and doing it here saves
+        // a second policy evaluation and repository lookup per request.
+
+        Ok((
+            Page::new(
+                items,
+                PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: window.limit(),
+                },
+            ),
+            total,
         ))
     }
 
@@ -1128,11 +856,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1140,7 +867,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.commits.upsert(&conn, &scope, tenant_id, record).await
+        self.commits.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored comments of one issue/PR (`owner/name` + number),
@@ -1155,7 +882,7 @@ impl<
         owner: &str,
         name: &str,
         issue_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Comment>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1169,18 +896,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .comments
-            .list_by_issue(&conn, &scope, repository.id, issue_number, limit)
+            .list_by_issue(&scope, repository.id, issue_number, window)
             .await?;
 
         Ok(Page::new(
@@ -1188,7 +913,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1218,11 +943,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1230,7 +954,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.comments.upsert(&conn, &scope, tenant_id, record).await
+        self.comments.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored review comments of one pull request, tenant-scoped,
@@ -1245,7 +969,7 @@ impl<
         owner: &str,
         name: &str,
         pull_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<ReviewComment>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1259,18 +983,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .review_comments
-            .list_by_pull(&conn, &scope, repository.id, pull_number, limit)
+            .list_by_pull(&scope, repository.id, pull_number, window)
             .await?;
 
         Ok(Page::new(
@@ -1278,7 +1000,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1308,11 +1030,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1320,9 +1041,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.review_comments
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.review_comments.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored reviews of one pull request, tenant-scoped, oldest
@@ -1337,7 +1056,7 @@ impl<
         owner: &str,
         name: &str,
         pull_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Review>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1351,18 +1070,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .reviews
-            .list_by_pull(&conn, &scope, repository.id, pull_number, limit)
+            .list_by_pull(&scope, repository.id, pull_number, window)
             .await?;
 
         Ok(Page::new(
@@ -1370,7 +1087,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1400,11 +1117,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1412,7 +1128,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.reviews.upsert(&conn, &scope, tenant_id, record).await
+        self.reviews.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored labels of one repository (`owner/name`), tenant-scoped,
@@ -1426,7 +1142,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Label>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1440,18 +1156,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .labels
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .list_by_repo(&scope, repository.id, window)
             .await?;
 
         Ok(Page::new(
@@ -1459,7 +1173,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1489,11 +1203,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1501,7 +1214,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.labels.upsert(&conn, &scope, tenant_id, record).await
+        self.labels.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored milestones of one repository (`owner/name`),
@@ -1515,7 +1228,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Milestone>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1529,18 +1242,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .milestones
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .list_by_repo(&scope, repository.id, window)
             .await?;
 
         Ok(Page::new(
@@ -1548,7 +1259,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1578,11 +1289,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1590,9 +1300,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.milestones
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.milestones.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored releases of one repository (`owner/name`),
@@ -1606,7 +1314,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Release>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1620,18 +1328,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .releases
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .list_by_repo(&scope, repository.id, window)
             .await?;
 
         Ok(Page::new(
@@ -1639,7 +1345,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1669,11 +1375,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1681,7 +1386,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.releases.upsert(&conn, &scope, tenant_id, record).await
+        self.releases.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored branch heads of one repository (`owner/name`),
@@ -1695,7 +1400,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Branch>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1709,18 +1414,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .branches
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .list_by_repo(&scope, repository.id, window)
             .await?;
 
         Ok(Page::new(
@@ -1728,7 +1431,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1758,11 +1461,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1770,7 +1472,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.branches.upsert(&conn, &scope, tenant_id, record).await
+        self.branches.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored contributors of one repository (`owner/name`),
@@ -1784,7 +1486,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Contributor>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -1798,18 +1500,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .contributors
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .list_by_repo(&scope, repository.id, window)
             .await?;
 
         Ok(Page::new(
@@ -1817,7 +1517,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -1847,11 +1547,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -1859,125 +1558,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.contributors
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
-    }
-
-    /// List mirrored workflow runs of one repository (`owner/name`),
-    /// tenant-scoped, newest first.
-    ///
-    /// # Errors
-    /// `DomainError::NotFound` when the repository is not mirrored for this
-    /// tenant; `Forbidden`/`Database`/`Internal` as usual.
-    /// How many workflow runs this repository has, across every page.
-    ///
-    /// # Errors
-    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
-    /// as usual.
-    pub async fn count_workflow_runs(
-        &self,
-        ctx: &SecurityContext,
-        owner: &str,
-        name_arg: &str,
-    ) -> Result<u64, DomainError> {
-        let scope = self
-            .policy_enforcer
-            .access_scope_with(
-                ctx,
-                &WORKFLOW_RUN_RESOURCE,
-                actions::LIST,
-                None,
-                &AccessRequest::new()
-                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
-            )
-            .await?;
-
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name_arg}");
-        let repository = self
-            .repo
-            .find_by_full_name(&conn, &scope, &full_name)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
-        self.workflow_runs
-            .count_by_repo(&conn, &scope, repository.id)
-            .await
-    }
-
-    /// How many jobs this workflow run has, across every page.
-    ///
-    /// # Errors
-    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
-    /// as usual.
-    pub async fn count_workflow_jobs(
-        &self,
-        ctx: &SecurityContext,
-        owner: &str,
-        name_arg: &str,
-        run_id: i64,
-    ) -> Result<u64, DomainError> {
-        let scope = self
-            .policy_enforcer
-            .access_scope_with(
-                ctx,
-                &WORKFLOW_JOB_RESOURCE,
-                actions::LIST,
-                None,
-                &AccessRequest::new()
-                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
-            )
-            .await?;
-
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name_arg}");
-        let repository = self
-            .repo
-            .find_by_full_name(&conn, &scope, &full_name)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
-        self.workflow_jobs
-            .count_by_run(&conn, &scope, repository.id, run_id)
-            .await
-    }
-
-    /// How many check runs this commit has, across every page.
-    ///
-    /// # Errors
-    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
-    /// as usual.
-    pub async fn count_check_runs(
-        &self,
-        ctx: &SecurityContext,
-        owner: &str,
-        name_arg: &str,
-        head_sha: &str,
-    ) -> Result<u64, DomainError> {
-        let scope = self
-            .policy_enforcer
-            .access_scope_with(
-                ctx,
-                &CHECK_RUN_RESOURCE,
-                actions::LIST,
-                None,
-                &AccessRequest::new()
-                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
-            )
-            .await?;
-
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name_arg}");
-        let repository = self
-            .repo
-            .find_by_full_name(&conn, &scope, &full_name)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
-        self.check_runs
-            .count_by_commit(&conn, &scope, repository.id, head_sha)
-            .await
+        self.contributors.upsert(&scope, tenant_id, record).await
     }
 
     /// # Errors
@@ -1988,8 +1569,8 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
-    ) -> Result<Page<WorkflowRun>, DomainError> {
+        window: PageWindow,
+    ) -> Result<(Page<WorkflowRun>, u64), DomainError> {
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -2002,27 +1583,31 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
+        // Both statements run on one transaction, and on the scope and
+        // repository already resolved above: the total describes the page it
+        // is returned with, and one policy evaluation covers both.
+        let (items, total) = self
             .workflow_runs
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .page_by_repo(&scope, repository.id, window)
             .await?;
 
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
+        Ok((
+            Page::new(
+                items,
+                PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: window.limit(),
+                },
+            ),
+            total,
         ))
     }
 
@@ -2051,11 +1636,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2063,9 +1647,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.workflow_runs
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.workflow_runs.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored changed files of one pull request, tenant-scoped, by
@@ -2080,7 +1662,7 @@ impl<
         owner: &str,
         name: &str,
         pull_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<PullRequestFile>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -2094,18 +1676,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .pull_request_files
-            .list_by_pull(&conn, &scope, repository.id, pull_number, limit)
+            .list_by_pull(&scope, repository.id, pull_number, window)
             .await?;
 
         Ok(Page::new(
@@ -2113,7 +1693,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -2144,11 +1724,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2157,7 +1736,7 @@ impl<
             ..record
         };
         self.pull_request_files
-            .upsert(&conn, &scope, tenant_id, record)
+            .upsert(&scope, tenant_id, record)
             .await
     }
 
@@ -2172,7 +1751,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Tag>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -2186,18 +1765,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .tags
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .list_by_repo(&scope, repository.id, window)
             .await?;
 
         Ok(Page::new(
@@ -2205,7 +1782,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -2235,11 +1812,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2247,7 +1823,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.tags.upsert(&conn, &scope, tenant_id, record).await
+        self.tags.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored changed files of one commit, tenant-scoped, by file
@@ -2264,6 +1840,7 @@ impl<
         commit_sha: &str,
         query: &ODataQuery,
     ) -> Result<Page<CommitFile>, DomainError> {
+        validate_commit_sha(commit_sha)?;
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -2276,28 +1853,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
-            .commit_files
-            .list_by_commit(&conn, &scope, repository.id, commit_sha, limit)
-            .await?;
-
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+        self.commit_files
+            .list_by_commit(&scope, repository.id, commit_sha, query)
+            .await
     }
 
     /// Insert or update a mirrored commit-file row for the caller's tenant.
@@ -2325,11 +1890,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2337,9 +1901,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.commit_files
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.commit_files.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored review threads of one pull request, tenant-scoped, by
@@ -2368,28 +1930,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
-            .review_threads
-            .list_by_pull(&conn, &scope, repository.id, pull_number, limit)
-            .await?;
-
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
-        ))
+        self.review_threads
+            .list_by_pull(&scope, repository.id, pull_number, query)
+            .await
     }
 
     /// Insert or update a mirrored review-thread row for the caller's tenant.
@@ -2417,11 +1967,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2429,9 +1978,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.review_threads
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.review_threads.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored comments of one commit, tenant-scoped, oldest first.
@@ -2445,8 +1992,9 @@ impl<
         owner: &str,
         name: &str,
         commit_sha: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<CommitComment>, DomainError> {
+        validate_commit_sha(commit_sha)?;
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -2459,18 +2007,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .commit_comments
-            .list_by_commit(&conn, &scope, repository.id, commit_sha, limit)
+            .list_by_commit(&scope, repository.id, commit_sha, window)
             .await?;
 
         Ok(Page::new(
@@ -2478,7 +2024,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -2509,11 +2055,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2521,9 +2066,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.commit_comments
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.commit_comments.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored events of one issue, tenant-scoped, oldest first.
@@ -2537,7 +2080,7 @@ impl<
         owner: &str,
         name: &str,
         issue_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<IssueEvent>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -2551,18 +2094,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .issue_events
-            .list_by_issue(&conn, &scope, repository.id, issue_number, limit)
+            .list_by_issue(&scope, repository.id, issue_number, window)
             .await?;
 
         Ok(Page::new(
@@ -2570,7 +2111,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -2600,11 +2141,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2612,9 +2152,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.issue_events
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.issue_events.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored deployments of one repository (`owner/name`),
@@ -2628,7 +2166,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<Deployment>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -2642,18 +2180,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .deployments
-            .list_by_repo(&conn, &scope, repository.id, limit)
+            .list_by_repo(&scope, repository.id, window)
             .await?;
 
         Ok(Page::new(
@@ -2661,7 +2197,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -2691,11 +2227,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2703,9 +2238,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.deployments
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.deployments.upsert(&scope, tenant_id, record).await
     }
 
     /// List the mirrored commits of one pull request, tenant-scoped,
@@ -2720,7 +2253,7 @@ impl<
         owner: &str,
         name: &str,
         pull_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<PullRequestCommit>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -2734,18 +2267,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .pull_request_commits
-            .list_by_pull(&conn, &scope, repository.id, pull_number, limit)
+            .list_by_pull(&scope, repository.id, pull_number, window)
             .await?;
 
         Ok(Page::new(
@@ -2753,7 +2284,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -2784,11 +2315,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2797,7 +2327,7 @@ impl<
             ..record
         };
         self.pull_request_commits
-            .upsert(&conn, &scope, tenant_id, record)
+            .upsert(&scope, tenant_id, record)
             .await
     }
 
@@ -2812,8 +2342,9 @@ impl<
         owner: &str,
         name: &str,
         commit_sha: &str,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<CommitStatus>, DomainError> {
+        validate_commit_sha(commit_sha)?;
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -2826,18 +2357,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .commit_statuses
-            .list_by_commit(&conn, &scope, repository.id, commit_sha, limit)
+            .list_by_commit(&scope, repository.id, commit_sha, window)
             .await?;
 
         Ok(Page::new(
@@ -2845,7 +2374,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -2876,11 +2405,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2888,9 +2416,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.commit_statuses
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.commit_statuses.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored jobs of one workflow run, tenant-scoped, by job id.
@@ -2904,8 +2430,8 @@ impl<
         owner: &str,
         name: &str,
         run_id: i64,
-        query: &ODataQuery,
-    ) -> Result<Page<WorkflowJob>, DomainError> {
+        window: PageWindow,
+    ) -> Result<(Page<WorkflowJob>, u64), DomainError> {
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -2918,27 +2444,30 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
+        // Both statements run on one transaction, and on the scope and
+        // repository already resolved above.
+        let (items, total) = self
             .workflow_jobs
-            .list_by_run(&conn, &scope, repository.id, run_id, limit)
+            .page_by_run(&scope, repository.id, run_id, window)
             .await?;
 
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
+        Ok((
+            Page::new(
+                items,
+                PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: window.limit(),
+                },
+            ),
+            total,
         ))
     }
 
@@ -2967,11 +2496,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -2979,9 +2507,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.workflow_jobs
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.workflow_jobs.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored reactions of one issue or pull request, tenant-scoped.
@@ -2995,7 +2521,7 @@ impl<
         owner: &str,
         name: &str,
         issue_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<IssueReaction>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -3009,18 +2535,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .issue_reactions
-            .list_by_issue(&conn, &scope, repository.id, issue_number, limit)
+            .list_by_issue(&scope, repository.id, issue_number, window)
             .await?;
 
         Ok(Page::new(
@@ -3028,7 +2552,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -3058,11 +2582,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -3070,9 +2593,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.issue_reactions
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.issue_reactions.upsert(&scope, tenant_id, record).await
     }
 
     /// List mirrored check runs of one commit, tenant-scoped, by check-run id.
@@ -3086,8 +2607,9 @@ impl<
         owner: &str,
         name: &str,
         head_sha: &str,
-        query: &ODataQuery,
-    ) -> Result<Page<CheckRun>, DomainError> {
+        window: PageWindow,
+    ) -> Result<(Page<CheckRun>, u64), DomainError> {
+        validate_commit_sha(head_sha)?;
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -3100,27 +2622,30 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
-        let items = self
+        // Both statements run on one transaction, and on the scope and
+        // repository already resolved above.
+        let (items, total) = self
             .check_runs
-            .list_by_commit(&conn, &scope, repository.id, head_sha, limit)
+            .page_by_commit(&scope, repository.id, head_sha, window)
             .await?;
 
-        Ok(Page::new(
-            items,
-            PageInfo {
-                next_cursor: None,
-                prev_cursor: None,
-                limit,
-            },
+        Ok((
+            Page::new(
+                items,
+                PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: window.limit(),
+                },
+            ),
+            total,
         ))
     }
 
@@ -3149,11 +2674,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -3161,9 +2685,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.check_runs
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.check_runs.upsert(&scope, tenant_id, record).await
     }
 
     /// List the mirrored timeline of one issue or pull request, in the order
@@ -3178,7 +2700,7 @@ impl<
         owner: &str,
         name: &str,
         issue_number: i64,
-        query: &ODataQuery,
+        window: PageWindow,
     ) -> Result<Page<IssueTimelineEvent>, DomainError> {
         let scope = self
             .policy_enforcer
@@ -3192,18 +2714,16 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
-        let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT);
         let items = self
             .issue_timeline
-            .list_by_issue(&conn, &scope, repository.id, issue_number, limit)
+            .list_by_issue(&scope, repository.id, issue_number, window)
             .await?;
 
         Ok(Page::new(
@@ -3211,7 +2731,7 @@ impl<
             PageInfo {
                 next_cursor: None,
                 prev_cursor: None,
-                limit,
+                limit: window.limit(),
             },
         ))
     }
@@ -3241,11 +2761,10 @@ impl<
             )
             .await?;
 
-        let conn = self.db.conn()?;
-        let full_name = format!("{owner}/{name}");
+        let full_name = repo_full_name(owner, name)?;
         let repository = self
             .repo
-            .find_by_full_name(&conn, &scope, &full_name)
+            .find_by_full_name(&scope, &full_name)
             .await?
             .ok_or(DomainError::NotFound)?;
 
@@ -3253,9 +2772,7 @@ impl<
             repo_id: repository.id,
             ..record
         };
-        self.issue_timeline
-            .upsert(&conn, &scope, tenant_id, record)
-            .await
+        self.issue_timeline.upsert(&scope, tenant_id, record).await
     }
 
     /// Cheap DB reachability probe for the platform's readiness aggregation
@@ -3265,129 +2782,6 @@ impl<
     #[must_use]
     pub(crate) fn db_reachable(&self) -> bool {
         self.db.conn().is_ok()
-    }
-
-    /// Fold this sync's derived contributors into the rows already stored.
-    ///
-    /// A derived contributor is only ever evidence of what the sync saw: a
-    /// run narrowed to issues cannot know that someone also reviewed pull
-    /// requests last month. So roles union and the seen-at window widens — a
-    /// person is never demoted by a narrower run.
-    async fn merge_known_contributors<DBR: toolkit_db::secure::DBRunner>(
-        &self,
-        conn: &DBR,
-        scope: &AccessScope,
-        repo_id: i64,
-        derived: Vec<ContributorRecord>,
-    ) -> Result<Vec<ContributorRecord>, DomainError> {
-        if derived.is_empty() {
-            return Ok(derived);
-        }
-
-        let known = self
-            .contributors
-            .list_by_repo(conn, scope, repo_id, CONTRIBUTOR_MERGE_LIMIT)
-            .await?;
-        let known: std::collections::HashMap<i64, Contributor> =
-            known.into_iter().map(|c| (c.user_id, c)).collect();
-
-        Ok(derived
-            .into_iter()
-            .map(|mut record| {
-                let Some(stored) = known.get(&record.user_id) else {
-                    return record;
-                };
-                for role in &stored.roles {
-                    if !record.roles.iter().any(|held| held == role) {
-                        record.roles.push(role.clone());
-                    }
-                }
-                record.roles.sort();
-                record.first_seen_at = earliest(record.first_seen_at, stored.first_seen_at);
-                record.last_seen_at = record.last_seen_at.max(stored.last_seen_at);
-                record
-            })
-            .collect())
-    }
-
-    /// Hard-delete rows this sync did not see, family by family, but only
-    /// where the listing was walked to its final page: absence from a
-    /// truncated listing proves nothing (PRD 5.2's "complete and verifiable
-    /// local replica" requires reconciling upstream deletions; the
-    /// completeness gate is what makes doing so safe).
-    // Ten identical completeness-gated delete calls, one per family; the
-    // repetition is the clearest shape and splitting it would hide the gate.
-    #[allow(clippy::cognitive_complexity)]
-    async fn reconcile_stale<DBR: toolkit_db::secure::DBRunner>(
-        &self,
-        conn: &DBR,
-        scope: &AccessScope,
-        complete: ListingCompleteness,
-        repo_id: i64,
-        watermark: DateTime<Utc>,
-    ) -> Result<u64, DomainError> {
-        let mut deleted = 0;
-        if complete.issues {
-            deleted += self
-                .issues
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.pull_requests {
-            deleted += self
-                .pull_requests
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.commits {
-            deleted += self
-                .commits
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.comments {
-            deleted += self
-                .comments
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.review_comments {
-            deleted += self
-                .review_comments
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.labels {
-            deleted += self
-                .labels
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.milestones {
-            deleted += self
-                .milestones
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.releases {
-            deleted += self
-                .releases
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.branches {
-            deleted += self
-                .branches
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        if complete.tags {
-            deleted += self
-                .tags
-                .delete_stale(conn, scope, repo_id, watermark)
-                .await?;
-        }
-        Ok(deleted)
     }
 
     /// Fetch one repository from GitHub (first slice: repo + first page of
@@ -3413,35 +2807,7 @@ impl<
         ctx: &SecurityContext,
         owner: &str,
         name: &str,
-    ) -> Result<SyncSummary, DomainError>
-    where
-        R: 'static,
-        I: 'static,
-        P: 'static,
-        C: 'static,
-        M: 'static,
-        V: 'static,
-        W: 'static,
-        L: 'static,
-        N: 'static,
-        E: 'static,
-        B: 'static,
-        O: 'static,
-        F: 'static,
-        G: 'static,
-        T: 'static,
-        D: 'static,
-        H: 'static,
-        K: 'static,
-        X: 'static,
-        Y: 'static,
-        Z: 'static,
-        S: 'static,
-        J: 'static,
-        Q: 'static,
-        U: 'static,
-        A: 'static,
-    {
+    ) -> Result<SyncSummary, DomainError> {
         let tenant_id = ctx.subject_tenant_id();
 
         let scope = self
@@ -3455,15 +2821,23 @@ impl<
             )
             .await?;
 
-        // Two uncoordinated syncs of the same repo would interleave two
-        // different GitHub snapshots across the 26 tables, so the whole run
-        // holds a per-repo advisory lock (one non-blocking attempt): the
-        // second caller gets a conflict instead of racing. The key is
-        // tenant-scoped — tenants have separate rows, so they never contend.
         let lock_key = format!("sync/{tenant_id}/{owner}/{name}");
         let sync_lock = match self.db.db().lock(GEAR_NAME, &lock_key).await {
             Ok(guard) => guard,
             Err(toolkit_db::DbError::Lock(toolkit_db::DbLockError::AlreadyHeld { .. })) => {
+                // Logged as well as returned: on the file-marker backend the
+                // library takes no lock back automatically (a TTL or a PID
+                // check can steal a live one), so a marker left by a killed
+                // process keeps answering 409 until someone removes it. The
+                // key is what an operator needs to find it.
+                // The repository, not the composite key: the key carries the
+                // tenant id, which is an authorization identifier and not
+                // something every log consumer needs to see.
+                tracing::warn!(
+                    owner,
+                    name,
+                    "sync lock already held; a repeated 409 with no sync                      running means a stale marker for this repository"
+                );
                 return Err(DomainError::Conflict(format!(
                     "a sync for {owner}/{name} is already running"
                 )));
@@ -3471,267 +2845,36 @@ impl<
             Err(e) => return Err(DomainError::Database(e)),
         };
 
-        // Captured before any row is written: every upsert in this sync stamps
-        // `extracted_at` with a later instant, so "extracted_at < watermark"
-        // identifies exactly the rows this sync did not touch.
         let watermark = Utc::now();
-        let fetched = self.github.fetch_repository(owner, name).await?;
-        let complete = fetched.complete;
+        let fetched = match tokio::time::timeout(
+            SYNC_FETCH_BUDGET,
+            self.github.fetch_repository(owner, name),
+        )
+        .await
+        {
+            Ok(Ok(fetched)) => fetched,
+            Ok(Err(fetch_error)) => {
+                release_sync_lock(sync_lock, &lock_key).await;
+                return Err(fetch_error);
+            }
+            Err(_elapsed) => {
+                release_sync_lock(sync_lock, &lock_key).await;
+                return Err(DomainError::internal(format!(
+                    "the sync of {owner}/{name} ran past its {} second budget",
+                    SYNC_FETCH_BUDGET.as_secs()
+                )));
+            }
+        };
 
-        // All ~26 tables are written as one transaction: a failure partway
-        // through must not leave some tables current and others stale.
-        let service = self.clone();
         let summary = self
-            .db
-            .db()
-            .transaction_ref_mapped(move |tx| {
-                Box::pin(async move {
-                    let repository = service
-                        .repo
-                        .upsert(tx, &scope, tenant_id, fetched.repository)
-                        .await?;
-
-                    let issues_synced =
-                        sync_table!(service, tx, &scope, tenant_id, issues, fetched.issues);
-
-                    let pull_requests_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        pull_requests,
-                        fetched.pull_requests
-                    );
-
-                    let commits_synced =
-                        sync_table!(service, tx, &scope, tenant_id, commits, fetched.commits);
-
-                    let comments_synced =
-                        sync_table!(service, tx, &scope, tenant_id, comments, fetched.comments);
-
-                    let review_comments_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        review_comments,
-                        fetched.review_comments
-                    );
-
-                    let reviews_synced =
-                        sync_table!(service, tx, &scope, tenant_id, reviews, fetched.reviews);
-
-                    let labels_synced =
-                        sync_table!(service, tx, &scope, tenant_id, labels, fetched.labels);
-
-                    let milestones_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        milestones,
-                        fetched.milestones
-                    );
-
-                    let releases_synced =
-                        sync_table!(service, tx, &scope, tenant_id, releases, fetched.releases);
-
-                    let branches_synced =
-                        sync_table!(service, tx, &scope, tenant_id, branches, fetched.branches);
-
-                    // Contributors are derived from whatever this sync
-                    // happened to fetch, so writing them straight would
-                    // narrow the set every time the scope narrows. Merge
-                    // with what earlier syncs already learned instead.
-                    let contributors = service
-                        .merge_known_contributors(tx, &scope, repository.id, fetched.contributors)
-                        .await?;
-                    let contributors_synced =
-                        sync_table!(service, tx, &scope, tenant_id, contributors, contributors);
-
-                    let workflow_runs_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        workflow_runs,
-                        fetched.workflow_runs
-                    );
-
-                    let pull_request_files_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        pull_request_files,
-                        fetched.pull_request_files
-                    );
-
-                    let tags_synced =
-                        sync_table!(service, tx, &scope, tenant_id, tags, fetched.tags);
-
-                    let commit_files_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        commit_files,
-                        fetched.commit_files
-                    );
-
-                    let review_threads_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        review_threads,
-                        fetched.review_threads
-                    );
-
-                    let commit_comments_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        commit_comments,
-                        fetched.commit_comments
-                    );
-
-                    let issue_events_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        issue_events,
-                        fetched.issue_events
-                    );
-
-                    let deployments_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        deployments,
-                        fetched.deployments
-                    );
-
-                    let pull_request_commits_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        pull_request_commits,
-                        fetched.pull_request_commits
-                    );
-
-                    let commit_statuses_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        commit_statuses,
-                        fetched.commit_statuses
-                    );
-
-                    let workflow_jobs_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        workflow_jobs,
-                        fetched.workflow_jobs
-                    );
-
-                    let issue_reactions_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        issue_reactions,
-                        fetched.issue_reactions
-                    );
-
-                    let check_runs_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        check_runs,
-                        fetched.check_runs
-                    );
-                    // Rows are keyed by position, so a shorter timeline would
-                    // leave the old tail behind: clear each fetched issue
-                    // before rewriting it.
-                    let refetched: Vec<i64> = fetched
-                        .issue_timeline
-                        .iter()
-                        .map(|event| event.issue_number)
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    service
-                        .issue_timeline
-                        .delete_by_issues(tx, &scope, repository.id, &refetched)
-                        .await?;
-                    let issue_timeline_synced = sync_table!(
-                        service,
-                        tx,
-                        &scope,
-                        tenant_id,
-                        issue_timeline,
-                        fetched.issue_timeline
-                    );
-
-                    let stale_rows_deleted = service
-                        .reconcile_stale(tx, &scope, complete, repository.id, watermark)
-                        .await?;
-                    if stale_rows_deleted > 0 {
-                        tracing::info!(
-                            repository = %repository.full_name,
-                            stale_rows_deleted,
-                            "reconciled upstream deletions"
-                        );
-                    }
-
-                    Ok(SyncSummary {
-                        repository: repository.full_name,
-                        issues_synced,
-                        pull_requests_synced,
-                        commits_synced,
-                        comments_synced,
-                        review_comments_synced,
-                        reviews_synced,
-                        labels_synced,
-                        milestones_synced,
-                        releases_synced,
-                        branches_synced,
-                        contributors_synced,
-                        workflow_runs_synced,
-                        pull_request_files_synced,
-                        tags_synced,
-                        commit_files_synced,
-                        review_threads_synced,
-                        commit_comments_synced,
-                        issue_events_synced,
-                        deployments_synced,
-                        pull_request_commits_synced,
-                        commit_statuses_synced,
-                        workflow_jobs_synced,
-                        issue_reactions_synced,
-                        check_runs_synced,
-                        issue_timeline_synced,
-                        stale_rows_deleted,
-                    })
-                })
-            })
+            .sync_writer
+            .write_sync(&scope, tenant_id, fetched, watermark)
             .await;
 
         // Deterministic unlock on the way out; a failed release is only
         // logged — the guard's Drop already queued a best-effort release,
         // and the sync itself succeeded or failed on its own merits.
-        if let Err(e) = sync_lock.release().await {
-            tracing::warn!(lock_key, error = %e, "sync advisory lock release failed");
-        }
+        release_sync_lock(sync_lock, &lock_key).await;
         summary
     }
 }

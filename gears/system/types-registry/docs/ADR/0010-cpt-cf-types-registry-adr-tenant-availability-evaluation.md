@@ -104,7 +104,8 @@ Applying this rule to the relationships known today:
 |---|---|---|
 | Registered Instance → its conforming Type Schema | Yes | The schema defines the meaning and validity of the registered value. |
 | Type Schema → each base in its GTS derivation chain | Yes | Inherited constraints remain part of the derived contract. |
-| Type Schema → targets of `$ref` and `x-gts-ref` in its content | Yes | Referenced definitions contribute to the effective contract. |
+| Type Schema → targets of `$ref` in its content | Yes | Referenced definitions are inlined and contribute to the effective contract. |
+| Type Schema → targets named by `x-gts-ref` in its content | **No** | The keyword constrains an Instance value, but the named entity contributes no content to the schema's semantic contract. |
 | P2 Alias → its target | Yes | An Alias owns no target content; using it means using its target. |
 | Target → entities that depend on it | **No** | This is traversal against the dependency direction. A dependent's state says nothing about whether its target can be used. |
 | Entity → its version-family siblings | **No** | Family membership does not make one member part of another member's semantic contract. |
@@ -146,7 +147,7 @@ Types Registry therefore materializes no dependency closure and traverses none w
 ### Consequences
 
 * Disabling a base, referenced schema, conforming schema, or Alias target for a tenant makes its semantic dependents unavailable for that tenant.
-* Tenant policy cannot be bypassed by wrapping a disabled entity in a derived schema, Registered Instance, reference, or Alias.
+* Tenant policy cannot be bypassed by wrapping a disabled entity in a derived schema, Registered Instance, resolution-bearing reference, or Alias.
 * A verdict can change without mutation of the subject entity, so an entity resource version alone cannot validate a cached resolution result.
 * A change can affect every entity that reaches the changed target through blocking edges. DESIGN must provide an implementation and invalidation strategy that meets the lookup NFR.
 * Materialized and on-demand resolution must return the same Tenant Availability State for the same registry and tenant state.
@@ -159,7 +160,7 @@ Types Registry therefore materializes no dependency closure and traverses none w
 This decision is confirmed when:
 
 * a Registered Instance becomes unavailable when its conforming Type Schema is unavailable;
-* a Type Schema becomes unavailable when any base or `$ref`/`x-gts-ref` target in its transitive semantic closure is unavailable;
+* a Type Schema becomes unavailable when any base or `$ref` target in its transitive semantic closure is unavailable, while an unavailable entity named only by `x-gts-ref` does not affect the verdict;
 * no blocking relationship crosses the managed–external boundary in either direction, and the availability of an externally managed entity is obtained live from its source rather than composed with stored managed state;
 * a P2 Alias becomes unavailable when its target is unavailable;
 * a materialized effective schema and an on-demand equivalent produce the same verdict;

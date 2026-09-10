@@ -124,8 +124,8 @@ fn ensure_can_transition_path_used_by_service_for_archive() {
 
 use crate::domain::service::test_support::{
     build_session_service, ctx_allow_tenants, ctx_for_subject, enforcer_allow,
-    enforcer_allow_unconstrained, enforcer_compile_fail, enforcer_deny, enforcer_failing, inmem_db,
-    seed_session,
+    enforcer_allow_tenant_only, enforcer_allow_unconstrained, enforcer_compile_fail, enforcer_deny,
+    enforcer_failing, inmem_db, seed_session,
 };
 use toolkit_odata::ODataQuery;
 
@@ -373,6 +373,92 @@ async fn cross_tenant_update_on_deleted_session_is_not_found_not_conflict() {
         matches!(err, ChatEngineError::NotFound { .. }),
         "cross-tenant update on a deleted session must be NotFound (not Conflict), got: {err:?}",
     );
+}
+
+// --- ownership guard: the PDP scopes the tenant, the gear scopes the owner --
+
+/// Regression: under the PDP the platform actually ships (`static-authz` /
+/// `tr-authz`), the compiled scope constrains `owner_tenant_id` only. Before
+/// the ownership guard, that scope let any authenticated subject read a
+/// same-tenant stranger's session (NFR-006 violation). It must be 404 —
+/// NotFound rather than Forbidden, so the caller cannot enumerate sessions.
+//
+// @cpt-cf-chat-engine-nfr-authentication
+#[tokio::test]
+async fn get_session_same_tenant_stranger_is_not_found_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+
+    let svc = build_session_service(&db, enforcer_allow_tenant_only());
+    let err = svc
+        .get_session(&ctx_for_subject(Uuid::new_v4(), tenant), sid)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "a same-tenant stranger must not read another user's session, got: {err:?}",
+    );
+}
+
+/// The same guard must hold for mutations, not just reads.
+//
+// @cpt-cf-chat-engine-nfr-authentication
+#[tokio::test]
+async fn mutations_by_same_tenant_stranger_are_not_found_under_tenant_only_pdp() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+
+    let svc = build_session_service(&db, enforcer_allow_tenant_only());
+    let stranger = ctx_for_subject(Uuid::new_v4(), tenant);
+
+    let err = svc
+        .update_metadata(&stranger, sid, serde_json::json!({ "title": "pwned" }))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+
+    let err = svc.archive_session(&stranger, sid).await.unwrap_err();
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+
+    let err = svc.delete_session(&stranger, sid, false).await.unwrap_err();
+    assert!(matches!(err, ChatEngineError::NotFound { .. }), "{err:?}");
+
+    // The row is untouched: the owner still sees an Active session.
+    let still_there = svc
+        .get_session(&ctx_for_subject(owner, tenant), sid)
+        .await
+        .expect("owner still reads its session");
+    assert_eq!(still_there.lifecycle_state, LifecycleState::Active);
+    assert!(still_there.metadata.is_none(), "metadata must be unchanged");
+}
+
+/// A PDP that allows without any constraint compiles to an unconstrained scope
+/// (`allow_all`). The prefetch behind it is read under the system bypass, so
+/// without the guard that path would hand over any session in any tenant.
+//
+// @cpt-cf-chat-engine-nfr-authentication
+#[tokio::test]
+async fn get_session_unconstrained_allow_still_enforces_ownership() {
+    let db = inmem_db().await;
+    let (tenant, owner, sid) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    seed_session(&db, sid, tenant, owner).await;
+
+    let svc = build_session_service(&db, enforcer_allow_unconstrained());
+    let err = svc
+        .get_session(&ctx_for_subject(Uuid::new_v4(), Uuid::new_v4()), sid)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ChatEngineError::NotFound { .. }),
+        "an unconstrained allow must not bypass ownership, got: {err:?}",
+    );
+
+    // Control: the owner is unaffected by the same PDP.
+    svc.get_session(&ctx_for_subject(owner, tenant), sid)
+        .await
+        .expect("owner reads its own session under an unconstrained allow");
 }
 
 // --- happy path: owner can read its own session ---------------------------

@@ -1350,6 +1350,9 @@ mod tests {
                     _ => None,
                 }
             }
+            fn scope_columns() -> Vec<Column> {
+                vec![Column::TenantId, Column::Id]
+            }
         }
     }
 
@@ -1412,6 +1415,9 @@ mod tests {
             fn resolve_property(_property: &str) -> Option<Column> {
                 None
             }
+            fn scope_columns() -> Vec<Column> {
+                Vec::new()
+            }
         }
     }
 
@@ -1451,6 +1457,9 @@ mod tests {
                     "id" => Self::resource_col(),
                     _ => None,
                 }
+            }
+            fn scope_columns() -> Vec<Column> {
+                vec![Column::Id]
             }
         }
     }
@@ -1665,6 +1674,9 @@ mod tests {
                     "city_id" => Some(Column::CityId),
                     _ => None,
                 }
+            }
+            fn scope_columns() -> Vec<Column> {
+                vec![Column::TenantId, Column::Id, Column::UserId, Column::CityId]
             }
         }
     }
@@ -1945,6 +1957,9 @@ mod tests {
                     "score" => Some(Column::Score),
                     _ => None,
                 }
+            }
+            fn scope_columns() -> Vec<Column> {
+                vec![Column::TenantId, Column::Id, Column::Score]
             }
         }
     }

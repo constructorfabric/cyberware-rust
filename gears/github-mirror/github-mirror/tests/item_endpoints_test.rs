@@ -267,6 +267,6 @@ async fn get_commit_returns_stats_and_files() {
     assert_eq!(json["stats"]["total"], 5);
     assert_eq!(json["files"][0]["filename"], "src/lib.rs");
 
-    let missing = get(router, "/repos/acme/widget/commits/zzz").await;
+    let missing = get(router, "/repos/acme/widget/commits/bbb").await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 }

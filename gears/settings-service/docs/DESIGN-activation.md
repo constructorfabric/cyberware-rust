@@ -1,3 +1,6 @@
+Created:  2026-07-28 by Virtuozzo International GmbH
+Updated:  2026-08-30 by Virtuozzo International GmbH
+
 # Technical Design — Settings Activation
 
 <!-- toc -->

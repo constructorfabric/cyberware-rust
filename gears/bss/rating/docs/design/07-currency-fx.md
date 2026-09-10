@@ -1,3 +1,6 @@
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 <!-- CONFLUENCE_TITLE: [BSS]: Rating — Multi-Currency & FX (Design) -->
 <!-- Related: ../PRD.md, ../DESIGN.md, ../SEAMS.md | Upstream: Finance (FX), Pricing (Product Catalog), Subscriptions, Promotions | Downstream: Rating, Billing | Owners: BSS Rating team -->
 

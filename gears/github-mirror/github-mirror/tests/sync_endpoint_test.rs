@@ -8,382 +8,14 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use github_mirror::api::rest::routes::{ConcreteService, register_routes};
-use github_mirror::domain::ports::github::{FetchedRepository, ListingCompleteness};
+use github_mirror::domain::ports::github::{FetchedRepository, Listing, ListingCompleteness};
 use github_mirror::domain::repo::{
-    BranchRecord, CheckRunRecord, CommentRecord, CommitCommentRecord, CommitFileRecord,
-    CommitRecord, CommitStatusRecord, ContributorRecord, DeploymentRecord, IssueEventRecord,
-    IssueReactionRecord, IssueRecord, IssueTimelineEventRecord, LabelRecord, MilestoneRecord,
-    PullRequestCommitRecord, PullRequestFileRecord, PullRequestRecord, ReleaseRecord, RepoRecord,
-    ReviewCommentRecord, ReviewRecord, ReviewThreadRecord, TagRecord, WorkflowJobRecord,
-    WorkflowRunRecord,
+    ContributorRecord, IssueRecord, IssueTimelineEventRecord, RepoRecord,
 };
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit_security::SecurityContext;
 use tower::ServiceExt;
 use uuid::Uuid;
-
-/// An RFC3339 literal as the instant the mirror stores.
-fn instant(raw: &str) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .expect("test timestamps must be valid RFC3339")
-        .with_timezone(&chrono::Utc)
-}
-
-fn fetched() -> FetchedRepository {
-    FetchedRepository {
-        complete: ListingCompleteness::all_complete(),
-        repository: RepoRecord {
-            node_id: None,
-            id: 42,
-            owner: "rust-lang".to_owned(),
-            name: "rust".to_owned(),
-            full_name: "rust-lang/rust".to_owned(),
-            default_branch: "master".to_owned(),
-            private: false,
-            pushed_at: Some("2026-08-20T00:00:00Z".to_owned()),
-            stars: 100_000,
-            forks: 13_000,
-            description: Some("the compiler".to_owned()),
-            clone_url: None,
-        },
-        issues: vec![IssueRecord {
-            author_login: Some("alice".to_owned()),
-            author_json: None,
-            assignees_json: None,
-            labels_json: None,
-            comments_count: None,
-            locked: None,
-            node_id: None,
-            id: 1,
-            repo_id: 42,
-            number: 11,
-            title: "an issue".to_owned(),
-            body: None,
-            state: "open".to_owned(),
-            is_pull_request: false,
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-            closed_at: None,
-            html_url: None,
-        }],
-        pull_requests: vec![PullRequestRecord {
-            author_login: Some("alice".to_owned()),
-            author_json: None,
-            assignees_json: None,
-            labels_json: None,
-            comments_count: None,
-            locked: None,
-            requested_reviewers_json: None,
-            node_id: None,
-            id: 2,
-            repo_id: 42,
-            number: 12,
-            title: "a pr".to_owned(),
-            body: None,
-            state: "open".to_owned(),
-            draft: false,
-            merged: false,
-            head_sha: Some("h1".to_owned()),
-            base_sha: Some("b1".to_owned()),
-            lines_added: 0,
-            lines_removed: 0,
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-            closed_at: None,
-            merged_at: None,
-            html_url: Some("https://github.com/rust-lang/rust/pull/12".to_owned()),
-            head_ref: Some("feature".to_owned()),
-            base_ref: Some("master".to_owned()),
-        }],
-        commits: vec![
-            CommitRecord {
-                repo_id: 42,
-                sha: "c1".to_owned(),
-                message: "first".to_owned(),
-                author_login: None,
-                committer_login: None,
-                authored_at: None,
-                committed_at: Some("2026-08-19T00:00:00Z".to_owned()),
-                additions: 0,
-                deletions: 0,
-            },
-            CommitRecord {
-                repo_id: 42,
-                sha: "c2".to_owned(),
-                message: "second".to_owned(),
-                author_login: None,
-                committer_login: None,
-                authored_at: None,
-                committed_at: Some("2026-08-20T00:00:00Z".to_owned()),
-                additions: 0,
-                deletions: 0,
-            },
-        ],
-        comments: vec![CommentRecord {
-            id: 9,
-            repo_id: 42,
-            issue_number: 11,
-            author_login: Some("carol".to_owned()),
-            body: Some("looks good".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-            html_url: None,
-        }],
-        review_comments: vec![ReviewCommentRecord {
-            id: 21,
-            repo_id: 42,
-            pull_number: 12,
-            author_login: Some("dave".to_owned()),
-            body: Some("rename this".to_owned()),
-            path: Some("src/lib.rs".to_owned()),
-            diff_hunk: None,
-            in_reply_to_id: None,
-            commit_id: Some("h1".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-            html_url: None,
-            position: Some(7),
-            original_position: Some(4),
-            pull_request_review_id: Some(31),
-            line: Some(12),
-            original_line: Some(12),
-            start_line: None,
-            original_start_line: None,
-            side: Some("RIGHT".to_owned()),
-            start_side: None,
-            subject_type: Some("line".to_owned()),
-        }],
-        reviews: vec![ReviewRecord {
-            id: 31,
-            repo_id: 42,
-            pull_number: 12,
-            author_login: Some("erin".to_owned()),
-            state: "APPROVED".to_owned(),
-            body: Some("ship it".to_owned()),
-            commit_id: Some("h1".to_owned()),
-            submitted_at: Some("2026-08-20T00:00:00Z".to_owned()),
-            html_url: None,
-        }],
-        labels: vec![LabelRecord {
-            id: 41,
-            repo_id: 42,
-            name: "bug".to_owned(),
-            color: "d73a4a".to_owned(),
-            is_default: true,
-            description: Some("Something is not working".to_owned()),
-        }],
-        milestones: vec![MilestoneRecord {
-            id: 51,
-            repo_id: 42,
-            number: 1,
-            title: "v1.0".to_owned(),
-            state: "open".to_owned(),
-            description: Some("first stable".to_owned()),
-            open_issues: 3,
-            closed_issues: 7,
-            due_on: Some("2026-09-30T00:00:00Z".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-            closed_at: None,
-            html_url: None,
-        }],
-        releases: vec![ReleaseRecord {
-            id: 61,
-            repo_id: 42,
-            tag_name: "v1.0.0".to_owned(),
-            name: Some("First stable".to_owned()),
-            draft: false,
-            prerelease: false,
-            body: Some("changelog".to_owned()),
-            author_login: Some("erin".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            published_at: Some("2026-08-20T00:00:00Z".to_owned()),
-            html_url: None,
-            assets_json: None,
-        }],
-        branches: vec![BranchRecord {
-            repo_id: 42,
-            name: "master".to_owned(),
-            commit_sha: "c2".to_owned(),
-            protected: true,
-        }],
-        contributors: vec![ContributorRecord {
-            repo_id: 42,
-            user_id: 71,
-            login: Some("alice".to_owned()),
-            account_type: "User".to_owned(),
-            avatar_url: None,
-            html_url: None,
-            roles: vec!["author".to_owned()],
-            first_seen_at: Some(instant("2026-08-18T00:00:00Z")),
-            last_seen_at: Some(instant("2026-08-20T00:00:00Z")),
-        }],
-        workflow_runs: vec![WorkflowRunRecord {
-            id: 81,
-            repo_id: 42,
-            workflow_id: 8,
-            run_number: 300,
-            run_attempt: 1,
-            name: Some("CI".to_owned()),
-            event: "push".to_owned(),
-            status: Some("completed".to_owned()),
-            conclusion: Some("success".to_owned()),
-            head_branch: Some("master".to_owned()),
-            head_sha: "c2".to_owned(),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-            html_url: None,
-            actor_login: Some("alice".to_owned()),
-        }],
-        pull_request_files: vec![PullRequestFileRecord {
-            patch: None,
-            repo_id: 42,
-            pull_number: 12,
-            filename: "src/lib.rs".to_owned(),
-            status: "modified".to_owned(),
-            additions: 10,
-            deletions: 2,
-            changes: 12,
-            previous_filename: None,
-            sha: Some("blob1".to_owned()),
-        }],
-        tags: vec![TagRecord {
-            repo_id: 42,
-            name: "v1.0.0".to_owned(),
-            commit_sha: "c1".to_owned(),
-        }],
-        commit_files: vec![CommitFileRecord {
-            repo_id: 42,
-            commit_sha: "c1".to_owned(),
-            filename: "src/lib.rs".to_owned(),
-            status: "modified".to_owned(),
-            additions: 4,
-            deletions: 1,
-            changes: 5,
-            previous_filename: None,
-            sha: Some("blob9".to_owned()),
-        }],
-        review_threads: vec![ReviewThreadRecord {
-            id: "PRRT_thread1".to_owned(),
-            repo_id: 42,
-            pull_number: 12,
-            is_resolved: true,
-            is_outdated: false,
-            path: Some("src/lib.rs".to_owned()),
-            line: Some(10),
-            resolved_by: Some("erin".to_owned()),
-            comments_count: 3,
-        }],
-        commit_comments: vec![CommitCommentRecord {
-            id: 91,
-            repo_id: 42,
-            commit_sha: "c1".to_owned(),
-            path: None,
-            position: None,
-            author_login: Some("frank".to_owned()),
-            body: Some("nice commit".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-            html_url: None,
-        }],
-        issue_events: vec![IssueEventRecord {
-            id: 101,
-            repo_id: 42,
-            issue_number: 11,
-            event: "labeled".to_owned(),
-            actor_login: Some("grace".to_owned()),
-            label_name: Some("bug".to_owned()),
-            assignee_login: None,
-            milestone_title: None,
-            commit_id: None,
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-        }],
-        deployments: vec![DeploymentRecord {
-            id: 111,
-            repo_id: 42,
-            git_ref: "master".to_owned(),
-            sha: "c2".to_owned(),
-            environment: "production".to_owned(),
-            task: "deploy".to_owned(),
-            description: Some("ship".to_owned()),
-            creator_login: Some("heidi".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-        }],
-        pull_request_commits: vec![PullRequestCommitRecord {
-            repo_id: 42,
-            pull_number: 12,
-            sha: "pc1".to_owned(),
-            message: "pr commit".to_owned(),
-            author_login: Some("ivan".to_owned()),
-            committer_login: Some("ivan".to_owned()),
-            authored_at: Some("2026-08-20T00:00:00Z".to_owned()),
-            committed_at: Some("2026-08-20T00:00:00Z".to_owned()),
-        }],
-        commit_statuses: vec![CommitStatusRecord {
-            id: 121,
-            repo_id: 42,
-            commit_sha: "c1".to_owned(),
-            state: "success".to_owned(),
-            context: "ci/build".to_owned(),
-            description: Some("build passed".to_owned()),
-            target_url: None,
-            creator_login: Some("judy".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-            updated_at: "2026-08-20T00:00:00Z".to_owned(),
-        }],
-        workflow_jobs: vec![WorkflowJobRecord {
-            id: 910,
-            repo_id: 42,
-            run_id: 7,
-            run_attempt: 1,
-            name: "build".to_owned(),
-            status: Some("completed".to_owned()),
-            conclusion: Some("success".to_owned()),
-            head_sha: "c1".to_owned(),
-            runner_name: Some("ubuntu-latest".to_owned()),
-            started_at: Some("2026-08-20T00:00:00Z".to_owned()),
-            completed_at: Some("2026-08-20T00:05:00Z".to_owned()),
-            html_url: None,
-            steps_json: Some(r#"[{"name":"Checkout","number":1}]"#.to_owned()),
-        }],
-        issue_reactions: vec![IssueReactionRecord {
-            id: 555,
-            repo_id: 42,
-            issue_number: 11,
-            content: "heart".to_owned(),
-            user_login: Some("kate".to_owned()),
-            created_at: "2026-08-20T00:00:00Z".to_owned(),
-        }],
-        check_runs: vec![CheckRunRecord {
-            id: 771,
-            repo_id: 42,
-            head_sha: "c1".to_owned(),
-            name: "clippy".to_owned(),
-            status: Some("completed".to_owned()),
-            conclusion: Some("success".to_owned()),
-            started_at: Some("2026-08-20T00:00:00Z".to_owned()),
-            completed_at: Some("2026-08-20T00:03:00Z".to_owned()),
-            html_url: None,
-            details_url: None,
-            check_suite_id: Some(900),
-            app_slug: Some("github-actions".to_owned()),
-            app_name: Some("GitHub Actions".to_owned()),
-            output_title: Some("no warnings".to_owned()),
-            output_summary: None,
-            annotations_count: 0,
-        }],
-        issue_timeline: vec![IssueTimelineEventRecord {
-            repo_id: 42,
-            issue_number: 11,
-            position: 0,
-            event: "labeled".to_owned(),
-            created_at: Some("2026-08-20T00:00:00Z".to_owned()),
-            actor_login: Some("kate".to_owned()),
-            payload_json: r#"{"event":"labeled","label":{"name":"bug"}}"#.to_owned(),
-        }],
-    }
-}
 
 fn router_for(service: Arc<ConcreteService>, ctx: SecurityContext) -> Router {
     let openapi = OpenApiRegistryImpl::new();
@@ -417,7 +49,7 @@ async fn sync_fills_all_twenty_six_tables_and_reads_serve_them() {
         db,
         "https://api.github.com",
         Arc::new(common::FakeGithub {
-            result: Some(fetched()),
+            result: Some(common::fetched_repository()),
         }),
     );
     let router = router_for(service, ctx);
@@ -658,10 +290,22 @@ async fn sync_is_idempotent() {
         db,
         "https://api.github.com",
         Arc::new(common::FakeGithub {
-            result: Some(fetched()),
+            result: Some(common::fetched_repository()),
         }),
     );
     let router = router_for(service, ctx);
+
+    let listings = [
+        "/repos/rust-lang/rust/issues",
+        "/repos/rust-lang/rust/pulls",
+        "/repos/rust-lang/rust/commits",
+        "/repos/rust-lang/rust/labels",
+        "/repos/rust-lang/rust/milestones",
+        "/repos/rust-lang/rust/releases",
+        "/repos/rust-lang/rust/branches",
+        "/repos/rust-lang/rust/tags",
+        "/repos/rust-lang/rust/contributors",
+    ];
 
     let first = post(
         router.clone(),
@@ -669,6 +313,20 @@ async fn sync_is_idempotent() {
     )
     .await;
     assert_eq!(first.status(), StatusCode::OK);
+
+    let mut after_first = Vec::new();
+    for path in listings {
+        let response = get(router.clone(), path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path} must list");
+        let listed = body_json(response).await;
+        after_first.push(
+            listed
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} must answer with an array"))
+                .len(),
+        );
+    }
+
     let second = post(
         router.clone(),
         "/github-mirror/v1/repos/rust-lang/rust/sync",
@@ -676,8 +334,22 @@ async fn sync_is_idempotent() {
     .await;
     assert_eq!(second.status(), StatusCode::OK);
 
-    let repos = body_json(get(router, "/github-mirror/v1/repos").await).await;
+    let repos = body_json(get(router.clone(), "/github-mirror/v1/repos").await).await;
     assert_eq!(repos["items"].as_array().expect("items").len(), 1);
+
+    for (path, expected) in listings.into_iter().zip(after_first) {
+        let response = get(router.clone(), path).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path} must list");
+        let listed = body_json(response).await;
+        assert_eq!(
+            listed
+                .as_array()
+                .unwrap_or_else(|| panic!("{path} must answer with an array"))
+                .len(),
+            expected,
+            "{path} must hold the same rows after a second sync, not duplicates"
+        );
+    }
 }
 
 #[tokio::test]
@@ -689,7 +361,7 @@ async fn a_concurrent_sync_for_the_same_repo_is_rejected_with_a_conflict() {
         db.clone(),
         "https://api.github.com",
         Arc::new(common::FakeGithub {
-            result: Some(fetched()),
+            result: Some(common::fetched_repository()),
         }),
     );
 
@@ -713,6 +385,15 @@ async fn a_concurrent_sync_for_the_same_repo_is_rejected_with_a_conflict() {
         "the second sync must be told a sync is already running, not race it"
     );
 
+    // The body is the intended public detail, pinned here so it cannot drift:
+    // the repository is the one the caller itself asked to sync, and it is
+    // told which of the two things went wrong rather than a bare "conflict".
+    let json = body_json(response).await;
+    assert_eq!(
+        json["detail"], "a sync for rust-lang/rust is already running",
+        "the caller must learn a sync is running, and for which repo: {json:?}"
+    );
+
     // A different repo is not blocked by this repo's lock.
     let other = post(
         router.clone(),
@@ -731,7 +412,7 @@ async fn a_concurrent_sync_for_the_same_repo_is_rejected_with_a_conflict() {
 /// A repo with exactly the given issues, everything else empty; `issues`
 /// listing completeness as given.
 fn recon_fetched(issue_ids: &[i64], issues_complete: bool) -> FetchedRepository {
-    let mut result = fetched();
+    let mut result = common::fetched_repository();
     result.repository = RepoRecord {
         node_id: None,
         id: 77,
@@ -793,10 +474,9 @@ fn recon_fetched(issue_ids: &[i64], issues_complete: bool) -> FetchedRepository 
     result.issue_reactions = vec![];
     result.check_runs = vec![];
     result.issue_timeline = vec![];
-    result.complete = ListingCompleteness {
-        issues: issues_complete,
-        ..ListingCompleteness::all_complete()
-    };
+    let mut complete = ListingCompleteness::all_complete();
+    complete.set(Listing::Issues, issues_complete);
+    result.complete = complete;
     result
 }
 
@@ -870,8 +550,8 @@ fn contributor_fetched(user_id: i64, login: &str, roles: &[&str], seen: &str) ->
         avatar_url: None,
         html_url: None,
         roles: roles.iter().map(|r| (*r).to_owned()).collect(),
-        first_seen_at: Some(instant(seen)),
-        last_seen_at: Some(instant(seen)),
+        first_seen_at: Some(common::instant(seen)),
+        last_seen_at: Some(common::instant(seen)),
     }];
     result
 }

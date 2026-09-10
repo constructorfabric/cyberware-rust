@@ -61,7 +61,6 @@ fn the_defaults_are_the_ones_the_spec_documents() {
     assert_eq!(cfg.limits.activation_write_set, 512);
     assert_eq!(cfg.limits.page_size_default, 100);
     assert_eq!(cfg.limits.page_size_max, 1000);
-    assert_eq!(cfg.worker.family_lock_timeout, Duration::from_secs(5));
     assert_eq!(cfg.worker.operation_timeout, Duration::from_mins(5));
     assert_eq!(cfg.worker.max_revalidation_attempts, 8);
 }
@@ -131,7 +130,6 @@ fn the_documented_configuration_block_parses_and_validates() {
             },
         },
         "worker": {
-            "family_lock_timeout": "5s",
             "operation_timeout": "5m",
             "max_revalidation_attempts": 8,
         },
@@ -304,15 +302,6 @@ fn a_zero_page_size_fails_startup() {
     }
 }
 
-#[test]
-fn a_zero_family_lock_timeout_fails_startup() {
-    let cfg = parse(json!({ "worker": { "family_lock_timeout": "0s" } }));
-    let err = cfg
-        .validate()
-        .expect_err("a zero lock wait budget cannot give contention a fair attempt");
-    assert!(matches!(err, ConfigError::Worker(_)), "got {err}");
-}
-
 // ---------------------------------------------------------------------------
 // Keys P0 accepts and does not enforce
 // ---------------------------------------------------------------------------
@@ -333,18 +322,6 @@ fn the_defaults_report_no_inert_keys() {
 fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
     for (limits, expected) in [
         (
-            json!({ "resolved_document": "2MB" }),
-            "limits.resolved_document",
-        ),
-        (
-            json!({ "resolution_closure": 128 }),
-            "limits.resolution_closure",
-        ),
-        (
-            json!({ "activation_write_set": 1024 }),
-            "limits.activation_write_set",
-        ),
-        (
             json!({ "page_size_default": 50 }),
             "limits.page_size_default",
         ),
@@ -358,36 +335,39 @@ fn each_unenforced_key_is_named_when_it_is_moved_off_its_default() {
         );
     }
 
-    for (worker, expected) in [
-        (
-            json!({ "operation_timeout": "30s" }),
-            "worker.operation_timeout",
-        ),
-        (
-            json!({ "max_revalidation_attempts": 3 }),
-            "worker.max_revalidation_attempts",
-        ),
-    ] {
-        let cfg = parse(json!({ "worker": worker.clone() }));
-        assert_eq!(
-            cfg.inert_limit_keys(),
-            vec![expected],
-            "setting {worker} must be reported as inert",
-        );
-    }
+    let worker = json!({ "operation_timeout": "30s" });
+    let cfg = parse(json!({ "worker": worker }));
+    assert_eq!(
+        cfg.inert_limit_keys(),
+        vec!["worker.operation_timeout"],
+        "setting {worker} must be reported as inert",
+    );
 }
 
-/// The two keys that *are* enforced are never reported, whatever they are set to —
+/// The keys that *are* enforced are never reported, whatever they are set to —
 /// otherwise the warning would train an operator to ignore it.
 #[test]
 fn the_enforced_limits_are_never_reported_as_inert() {
     let cfg = parse(json!({
-        "limits": { "authored_document": "1MB", "batch_candidates": 7 }
+        "limits": {
+            "authored_document": "1MB", "batch_candidates": 7, "activation_write_set": 8,
+            "resolved_document": "2MB", "resolution_closure": 128
+        },
+        "worker": { "max_revalidation_attempts": 3 }
     }));
     assert!(cfg.inert_limit_keys().is_empty());
-    // And they really are the enforced pair, read back as configured.
     assert_eq!(cfg.limits.authored_document.bytes(), 1024 * 1024);
     assert_eq!(cfg.limits.batch_candidates, 7);
+    assert_eq!(cfg.limits.resolved_document.bytes(), 2 * 1024 * 1024);
+    assert_eq!(cfg.limits.resolution_closure, 128);
+    assert_eq!(
+        cfg.limits.activation_write_set, 8,
+        "T14 enforces this one: the reverse-impact refusal and the CTE's depth cap"
+    );
+    assert_eq!(
+        cfg.worker.max_revalidation_attempts, 3,
+        "T15 enforces this one: the bound on the revalidation loop"
+    );
 }
 
 /// A configuration that sets several of them is reported once, in full: an operator
@@ -395,28 +375,28 @@ fn the_enforced_limits_are_never_reported_as_inert() {
 #[test]
 fn several_inert_keys_are_reported_together() {
     let cfg = parse(json!({
-        "limits": { "activation_write_set": 1024, "page_size_max": 500 },
+        "limits": { "page_size_default": 50, "page_size_max": 500 },
         "worker": { "operation_timeout": "10m" }
     }));
     assert_eq!(
         cfg.inert_limit_keys(),
         vec![
-            "limits.activation_write_set",
+            "limits.page_size_default",
             "limits.page_size_max",
             "worker.operation_timeout",
         ],
     );
 }
 
-/// Zero is refused for the two limits that *are* enforced, for the same reason as
-/// the page sizes: such a deployment boots and then refuses every request that
-/// reaches it, naming a limit the operator chose without meaning this.
 #[test]
 fn a_zero_enforced_limit_fails_startup() {
     for limits in [
         json!({ "batch_candidates": 0 }),
         json!({ "authored_document": 0 }),
         json!({ "authored_document": "0KB" }),
+        json!({ "resolved_document": 0 }),
+        json!({ "resolution_closure": 0 }),
+        json!({ "activation_write_set": 0 }),
     ] {
         let cfg = parse(json!({ "limits": limits.clone() }));
         let err = cfg
@@ -424,6 +404,22 @@ fn a_zero_enforced_limit_fails_startup() {
             .expect_err(&format!("a zero limit must fail startup: {limits}"));
         assert!(matches!(err, ConfigError::Limits(_)), "got {err}");
     }
+}
+
+#[test]
+fn the_minimum_positive_resolution_budgets_are_valid_configuration() {
+    let cfg = parse(json!({ "limits": { "resolved_document": 1, "resolution_closure": 1 } }));
+    cfg.validate().expect("positive budgets are valid");
+    assert!(cfg.inert_limit_keys().is_empty());
+}
+
+#[test]
+fn a_zero_revalidation_budget_fails_startup() {
+    let cfg = parse(json!({ "worker": { "max_revalidation_attempts": 0 } }));
+    let err = cfg
+        .validate()
+        .expect_err("a zero attempt budget must fail startup");
+    assert!(matches!(err, ConfigError::Worker(_)), "got {err}");
 }
 
 /// The defaults themselves validate. Trivial to state and the one case a

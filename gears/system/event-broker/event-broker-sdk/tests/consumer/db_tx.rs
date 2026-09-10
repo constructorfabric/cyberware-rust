@@ -70,6 +70,9 @@ mod dlq_row {
         fn resolve_property(_property: &str) -> Option<Self::Column> {
             None
         }
+        fn scope_columns() -> Vec<Self::Column> {
+            Vec::new()
+        }
     }
 }
 

@@ -264,6 +264,15 @@ so the unchecked boxes below read as "not yet", not "abandoned".
   `direction` and `since` are honored. An unsupported filter is ignored rather
   than rejected, so a client relying on it gets a wider result set than it
   asked for — the mirrored data is there, the narrowing is not
+- `since` is an inclusive bound: a row stamped exactly at the given instant is
+  returned. GitHub's own wording is "updated after", and `ALGORITHMS.md` §3.3
+  covers the sync cutoff rather than this endpoint, so the choice is the
+  mirror's. It is inclusive because the stored timestamps are GitHub's own,
+  at whole-second precision: an exclusive bound would drop a row updated later
+  in the same second, while an inclusive one at worst hands an incremental
+  client one row it already had, and every write is an idempotent upsert. A
+  `since` carrying fractional seconds is rounded up to the next whole second,
+  so `00:00:00.500Z` excludes a row stamped `00:00:00Z`
 - Security synchronization (§5.2 `cpt-cf-github-mirror-fr-security-sync`): security
   advisories, Dependabot alerts and code-scanning alerts have no entities, tables or
   endpoints yet; they need token scopes the shared credential cannot be assumed to

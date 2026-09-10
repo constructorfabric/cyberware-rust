@@ -36,6 +36,7 @@ use toolkit_db::secure::{AccessScope, ScopeError};
 use toolkit_macros::domain_model;
 
 use super::key::{FamilyKey, sibling_id};
+use crate::domain::admission::AdmissionFailureReason;
 use crate::domain::enums::EntityKind;
 use crate::domain::ports::{Stores, VersionFamilyRow};
 
@@ -73,12 +74,12 @@ pub enum FamilyRefusal {
 impl FamilyRefusal {
     /// The stable machine reason recorded on the operation item.
     #[must_use]
-    pub const fn reason(&self) -> &'static str {
+    pub const fn reason(&self) -> AdmissionFailureReason {
         match self {
-            Self::KindConflict { .. } => "family_kind_conflict",
-            Self::MinorShape { .. } => "family_shape_conflict",
-            Self::MissingPredecessor { .. } => "missing_predecessor",
-            Self::UnreadableVersion { .. } => "unreadable_version",
+            Self::KindConflict { .. } => AdmissionFailureReason::FamilyKindConflict,
+            Self::MinorShape { .. } => AdmissionFailureReason::FamilyShapeConflict,
+            Self::MissingPredecessor { .. } => AdmissionFailureReason::MissingPredecessor,
+            Self::UnreadableVersion { .. } => AdmissionFailureReason::UnreadableVersion,
         }
     }
 }

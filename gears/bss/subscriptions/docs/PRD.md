@@ -12,6 +12,9 @@ refs:
   - bss/prd/PRD-tariffs-pricing-logic-202604011200
 ---
 
+Created:  2026-08-24 by Virtuozzo International GmbH
+Updated:  2026-08-24 by Virtuozzo International GmbH
+
 # PRD — Subscriptions — End-to-End Lifecycle (Multi-Tenant Revenue Object)
 
 <!-- CONFLUENCE_TITLE: [BSS]: Subscriptions — End-to-End Lifecycle (Multi-Tenant Revenue Object) -->
