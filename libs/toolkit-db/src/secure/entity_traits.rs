@@ -144,9 +144,17 @@ pub trait ScopableEntity: EntityTrait {
     /// list cannot describe different sets.
     ///
     /// Usually the tenant, resource and owner columns plus any `pep_prop(...)`
-    /// columns, keyed by property name. Two entries may name one column.
+    /// columns, keyed by property name.
     /// [`type_col`](Self::type_col) belongs to no entry: no property name
     /// addresses it, so no scope can address it either.
+    ///
+    /// Two entries may name one column — a `pep_prop` pointing at the tenant
+    /// column, say. The table stays as written and
+    /// [`ScopeProperties::scope_columns`] then reports that column once per
+    /// entry, because the list is a view of the table rather than a set. That
+    /// is what the previous, separately-written list did too, and the only
+    /// consumer that cares deduplicates: a property-graph declaration adds
+    /// each column to an element's `PROPERTIES` once.
     ///
     /// `#[derive(Scopable)]` generates the table from the `#[secure(...)]`
     /// attributes. A manual implementation writes it out:
@@ -207,9 +215,10 @@ pub trait ScopeProperties: ScopableEntity {
     /// The columns a scope predicate can be compiled against: the columns of
     /// [`ScopableEntity::SCOPE_PROPERTIES`], in declaration order.
     ///
-    /// [`resolve_property`](Self::resolve_property) answers for one property
-    /// and cannot be enumerated, and the SQL/PGQ graph declaration needs the
-    /// whole set. A scope column left out of an element's `PROPERTIES` list
+    /// One entry, one column, in order: a column two properties both name is
+    /// reported twice. [`resolve_property`](Self::resolve_property) answers for
+    /// one property and cannot be enumerated, and the SQL/PGQ graph declaration
+    /// needs the whole set. A scope column left out of an element's `PROPERTIES` list
     /// cannot be filtered on inside `MATCH` (`docs/arch/secure-orm/ADR/0002`,
     /// Policy 3), and an element whose set is empty is refused up front rather
     /// than compiling to a deny-all traversal (Policy 2).
@@ -390,6 +399,63 @@ mod tests {
         check::<derived::Entity>("derived");
         check::<manual::Entity>("manual");
         check::<unrestricted::Entity>("unrestricted");
+    }
+
+    /// A column two properties both name is reported once per entry, and the
+    /// lookup answers for both names.
+    ///
+    /// The list is a view of the table, not a set — which is what the
+    /// separately-written list did before this change too. The only consumer
+    /// that cares deduplicates: a property-graph declaration adds each column
+    /// to an element's `PROPERTIES` once, so a repeat costs nothing there.
+    #[test]
+    fn a_column_two_properties_name_is_listed_per_entry() {
+        mod shared_column {
+            use sea_orm::entity::prelude::*;
+
+            // `nickname` is a second property for the tenant column.
+            #[derive(
+                Clone, Debug, PartialEq, Eq, DeriveEntityModel, toolkit_db_macros::Scopable,
+            )]
+            #[sea_orm(table_name = "scope_properties_shared_column")]
+            #[secure(
+                tenant_col = "tenant_id",
+                no_resource,
+                no_owner,
+                no_type,
+                pep_prop(nickname = "tenant_id")
+            )]
+            pub struct Model {
+                #[sea_orm(primary_key, auto_increment = false)]
+                pub id: Uuid,
+                pub tenant_id: Uuid,
+            }
+
+            #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+            pub enum Relation {}
+
+            impl ActiveModelBehavior for ActiveModel {}
+        }
+
+        assert_eq!(
+            table_of::<shared_column::Entity>(),
+            vec![
+                (pep_properties::OWNER_TENANT_ID, "tenant_id"),
+                ("nickname", "tenant_id"),
+            ]
+        );
+        assert_eq!(
+            listed_columns::<shared_column::Entity>(),
+            vec!["tenant_id", "tenant_id"],
+            "one column per entry, in order"
+        );
+        for property in [pep_properties::OWNER_TENANT_ID, "nickname"] {
+            assert_eq!(
+                shared_column::Entity::resolve_property(property).map(|c| c.as_str()),
+                Some("tenant_id"),
+                "both names must resolve to the shared column"
+            );
+        }
     }
 
     /// A property no entry names resolves to nothing, which every caller reads
