@@ -394,8 +394,8 @@ Quota Enforcement participates. In practice:
   reliably reflect consumption. Every write/preview operation (`debit`, `credit`, `rollback`, `reserve`, `commit`,
   `release`, batch-debit, `evaluate-preview`) targeting such a Quota **MUST** be rejected with `METRIC_NOT_QUOTA_GATED`
   — no counter mutation, no idempotency / operation-log / lease record. Quota Snapshot reads still succeed so operators
-  can clean up. Create is permitted (a metric's mode can flip over time) but increments `quota_for_direct_metric_total`
-  telemetry.
+  can clean up. Create is permitted (a metric's mode can flip over time); while such a Quota stays active it is counted by the
+  `quota_for_direct_metric_total` gauge.
 - **A `QuotaGated` metric with no matching Quota for the operation's subject is rejected.** Quota Enforcement returns
   `Denied(violated_quota_ids=[], reason="NO_APPLICABLE_QUOTA")` — `QuotaGated` means every consumption requires explicit
   quota authorization, so absence of an applicable Quota is treated as absence of permission, not as unconstrained
@@ -758,7 +758,9 @@ assignment-binding concept. Each Quota **MUST** carry:
   `cpt-cf-quota-enforcement-fr-metric-identity-validation`),
 - a quota type (`allocation` or `consumption`; `rate` is reserved for future use and is rejected at creation time in P1
   per `cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`),
-- a period specification (consumption types only; allocation types **MUST** reject any period field),
+- a period specification: consumption types **MUST** carry an explicit valid period, the non-recurring `one_time`
+  included, and a missing or null period is rejected (`PERIOD_REQUIRED`); allocation types **MUST** reject any
+  period field, a null period included (`PERIOD_NOT_ALLOWED`),
 - an `enforcement_mode` value (the Quota's behavior at the cap boundary); in P1 only strict rejection at the cap
   boundary is supported; future modes are added as new GTS instances per `cpt-cf-quota-enforcement-fr-enforcement-mode`,
 - a cap (units defined by the metric; either a non-negative integer or `null` for an **unbounded** Quota; negative caps
@@ -856,8 +858,8 @@ commits, not at request-receipt time, to avoid TOCTOU races with concurrent debi
   metric before per-tenant caps are configured, and bridging cap-bump approval workflows. Notification thresholds are
   not allowed on unbounded Quotas (per the field constraints above) — percentages of `null` are meaningless.
 
-The system **MUST** surface telemetry counters `quota_cap_zero_total` and `quota_cap_unbounded_total` listing the active
-counts of `cap = 0` and `cap = null` Quotas respectively. The system **MUST NOT** auto-reject either value — operators
+The system **MUST** surface the telemetry gauges `quota_cap_zero_total` and `quota_cap_unbounded_total` counting the
+Quotas with lifecycle status `active` whose `cap = 0` and `cap = null` respectively, whatever their validity window. The system **MUST NOT** auto-reject either value — operators
 are responsible for the choice.
 
 **Validity-window semantics — Engine-driven, with a default exclusion.** A Quota's `validity_window` is a structural
@@ -2356,11 +2358,12 @@ gauges that surface QE-internal policy decisions and guard-rail rejections invis
 - **`debit_plan_invariant_violations_total`** — Decisions rejected for violating Debit-Plan invariants per
   `cpt-cf-quota-enforcement-fr-quota-resolution-engine`, labelled by invariant from the closed set
   `{quota_id_outside_applicable_set, negative_amount, amount_exceeds_request_amount, result_plan_inconsistency}`.
-- **`quota_cap_zero_total`**, **`quota_cap_unbounded_total`** — gauges of active `cap = 0` and `cap = null` Quotas
-  respectively, per `cpt-cf-quota-enforcement-fr-quota-lifecycle` cap value semantics (operator misconfiguration
-  surfaces).
-- **`quota_for_direct_metric_total`** — gauge of Quotas whose metric is classified `Direct` in `types-registry` per the
-  §3.2 inertness rule (surfaces operator misconfigurations where a Quota was declared on a non-gated metric).
+- **`quota_cap_zero_total`**, **`quota_cap_unbounded_total`** — gauges of the Quotas with lifecycle status `active`
+  whose `cap = 0` and `cap = null` respectively, whatever their validity window, per
+  `cpt-cf-quota-enforcement-fr-quota-lifecycle` cap value semantics (operator misconfiguration surfaces).
+- **`quota_for_direct_metric_total`** — gauge of the Quotas with lifecycle status `active` whose metric is currently
+  classified `Direct` in `types-registry` per the §3.2 inertness rule (surfaces operator misconfigurations where a
+  Quota was declared on a non-gated metric); deactivation and a mode change take effect at the next refresh.
 - **`contract_validation_failures_total`** — rejected contract instances by closed validation surface/reason.
 - **`admitted_metric_violations_total`** — projection/metric incompatibilities by closed validation surface.
 - **`notification_dispatch_failures_total`** — per-sink dispatch failures, by `sink_id` and `event_kind`.
@@ -3197,7 +3200,7 @@ on behalf of a tenant administrator)
   documented semantics (`hard` Quota with `cap=0` denies every debit); `cap = null` (unbounded) is permitted with
   documented semantics (always satisfiable, counter still increments, `remaining` reported as `null`);
   `notification_thresholds` on unbounded Quotas are rejected at create/update with `THRESHOLDS_REQUIRE_BOUNDED_CAP`;
-  `quota_cap_zero_total` and `quota_cap_unbounded_total` telemetry counters are populated
+  the `quota_cap_zero_total` and `quota_cap_unbounded_total` gauges count the active Quotas of each kind
 - [ ] Quota record carries `enforcement_mode` from GTS instances under `gts.cf.qe.enforcement.type.v1~` (P1: only
   `hard` is accepted); attempts to create a Quota with an unsupported `enforcement_mode` value are rejected with an
   actionable error; future values are added as new GTS instances per `cpt-cf-quota-enforcement-fr-enforcement-mode`
@@ -3229,8 +3232,8 @@ on behalf of a tenant administrator)
 - [ ] Operations targeting a Quota whose metric is classified `Direct` in `types-registry` are rejected with
   `METRIC_NOT_QUOTA_GATED` for every write/preview entry-point (`debit`, `credit`, `rollback`, `reserve`, `commit`,
   `release`, batch-debit, `evaluate-preview`) — counters are not mutated, no idempotency record / operation log entry /
-  lease row is created; Quota Snapshot reads still succeed. Creating a Quota for a `Direct`-mode metric is permitted but
-  increments the `quota_for_direct_metric_total` telemetry counter
+  lease row is created; Quota Snapshot reads still succeed. Creating a Quota for a `Direct`-mode metric is permitted, and
+  the Quota is counted by the `quota_for_direct_metric_total` gauge while it stays active
 - [ ] Operations against a `QuotaGated` metric for which subject resolution produces zero applicable Quotas are denied
   with `Denied(violated_quota_ids=[], reason="NO_APPLICABLE_QUOTA")` per §3.2 default-deny semantics; counters are not
   mutated, no idempotency record / operation log entry is created. The behavior is uniform across all built-in Engines

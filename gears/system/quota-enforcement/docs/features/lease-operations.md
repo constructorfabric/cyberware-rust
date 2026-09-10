@@ -594,6 +594,14 @@ election TTL plus observation lag. No promise beyond the PRD threshold is added.
   unit tests; atomic multi-Quota acquisition, contention rejection, lazy expiry under a paused sweeper, and replay
   behavior get integration and concurrency tests against the storage plugin; leader failover and the recovery drill
   are the deployment-level checks named in section 6.
+- **Deactivation cascade (tracked here)**: the quota-lifecycle feature implemented the deactivation orchestration and
+  the reference plugin's `deactivate_quota`, which flips the status under the row lock, logs, and enqueues
+  `quota-changed` but resolves no lease yet (`resolved_leases` is empty). This feature fills the lease half inside that
+  transaction — lock the Quota's active leases, mark them resolved-by-deactivation, decrement
+  `lease_capacity_counters`, return held capacity to the acquisition-period counters, and append one
+  `lease-resolved-by-deactivation` event per lease — which closes `cpt-cf-quota-enforcement-flow-quota-deactivate`,
+  `cpt-cf-quota-enforcement-state-quota-lifecycle`, and `cpt-cf-quota-enforcement-dod-deactivation-cascade` of the
+  quota-lifecycle feature. Lock order stays Quota row, then its counter and lease rows (ADR-0002).
 - **Non-applicable review domains**: UX/accessibility is not applicable; there is no user-facing surface. Data
   protection inherits the PRD §6.2 rules; lease rows carry tenant-scoped opaque identifiers and follow the
   operation-log retention boundary with no additional feature-specific requirement.

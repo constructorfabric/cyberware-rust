@@ -747,6 +747,11 @@ retry storm at 10x normal RPS with a 5% retry rate showing zero double-count eve
   state machines get unit tests; replay, payload mismatch, credit/rollback rejection arms, and the trust boundary
   get integration and adversarial tests against the storage plugin; atomicity, the retry storm, the RPO drill, and
   the availability chaos test are the drills named in section 6, not unit tests.
+- **Cap guard consumption arm (tracked here)**: the reference plugin's `update_quota` evaluates the I6 cap guard on the
+  merged row under the Quota's row lock; the allocation arm reads `qe_quota_allocation_counters.in_flight` today, and
+  the consumption arm — the active period's consumed amount from the `quota_consumption_counters` row this feature
+  materialises — lands here through the single seam the plugin leaves for it. Until then a consumption Quota's cap
+  reduction is guarded by the gear's pre-check only.
 - **Non-applicable review domains**: UX/accessibility is not applicable; there is no user-facing surface. Data
   protection inherits the Platform Operational Data rules from PRD §6.2; idempotency records and the operation log
   follow their configured retention windows with no additional feature-specific requirement.
