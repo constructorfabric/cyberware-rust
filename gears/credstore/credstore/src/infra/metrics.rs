@@ -7,47 +7,37 @@
 //! platform's `add_metric_suffixes: false` collector posture.
 
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
+use opentelemetry::metrics::{Counter, Histogram, Meter};
 
 use crate::domain::ports::metrics::{
-    CredStoreMetricsPort, Dep, DepOp, FenceVerify, Outcome, ReadOutcome, SecretCounts,
+    CredStoreMetricsPort, Dep, DepOp, FenceVerify, Outcome, ReadOutcome,
 };
 
 /// Meter / instrumentation scope name.
 pub(crate) const METER_NAME: &str = "credstore";
 
 // ─── Metric names (literal Prometheus form; `add_metric_suffixes: false`) ─────
-const CREDSTORE_SECRETS: &str = "credstore_secrets";
-const CREDSTORE_SECRETS_PROVISIONING: &str = "credstore_secrets_provisioning";
-const CREDSTORE_SECRETS_DEPROVISIONING: &str = "credstore_secrets_deprovisioning";
-const CREDSTORE_TENANTS_WITH_SECRETS: &str = "credstore_tenants_with_secrets";
 const CREDSTORE_READ_OUTCOME: &str = "credstore_read_outcome_total";
 const CREDSTORE_WALKUP_DEPTH: &str = "credstore_walkup_depth";
 const CREDSTORE_DEPENDENCY_QUERY_DURATION: &str = "credstore_dependency_query_duration_seconds";
 const CREDSTORE_DEPENDENCY_HEALTH: &str = "credstore_dependency_health_total";
-const CREDSTORE_PROVISIONING_REAPED: &str = "credstore_provisioning_reaped_total";
-const CREDSTORE_DEPROVISIONING_REAPED: &str = "credstore_deprovisioning_reaped_total";
-const CREDSTORE_PROVISIONING_ROLLBACK: &str = "credstore_provisioning_rollback_total";
 const CREDSTORE_CROSS_TENANT_DENIED: &str = "credstore_cross_tenant_denied_total";
 const CREDSTORE_FENCE_VERIFY: &str = "credstore_fence_verify_total";
-const CREDSTORE_FENCE_BACKFILL: &str = "credstore_fence_backfill_total";
+const CREDSTORE_GC_DELETED: &str = "credstore_gc_deleted_total";
+const CREDSTORE_GC_PENDING_RECLAIMED: &str = "credstore_gc_pending_reclaimed_total";
+const CREDSTORE_EXPIRED_DELETED: &str = "credstore_expired_deleted_total";
 
 /// OpenTelemetry-backed metrics handle for the credstore module.
 pub struct CredStoreMetricsMeter {
-    secrets: Gauge<i64>,
-    secrets_provisioning: Gauge<i64>,
-    secrets_deprovisioning: Gauge<i64>,
-    tenants_with_secrets: Gauge<i64>,
     read_outcome: Counter<u64>,
     walkup_depth: Histogram<u64>,
     dependency_query_duration: Histogram<f64>,
     dependency_health: Counter<u64>,
-    provisioning_reaped: Counter<u64>,
-    deprovisioning_reaped: Counter<u64>,
-    provisioning_rollback: Counter<u64>,
     cross_tenant_denied: Counter<u64>,
     fence_verify: Counter<u64>,
-    fence_backfill: Counter<u64>,
+    gc_deleted: Counter<u64>,
+    gc_pending_reclaimed: Counter<u64>,
+    expired_deleted: Counter<u64>,
 }
 
 impl std::fmt::Debug for CredStoreMetricsMeter {
@@ -62,22 +52,6 @@ impl CredStoreMetricsMeter {
     #[must_use]
     pub fn new(meter: &Meter) -> Self {
         Self {
-            secrets: meter
-                .i64_gauge(CREDSTORE_SECRETS)
-                .with_description("Live count of secrets by sharing scope")
-                .build(),
-            secrets_provisioning: meter
-                .i64_gauge(CREDSTORE_SECRETS_PROVISIONING)
-                .with_description("Live count of secrets in provisioning state")
-                .build(),
-            secrets_deprovisioning: meter
-                .i64_gauge(CREDSTORE_SECRETS_DEPROVISIONING)
-                .with_description("Live count of secrets in deprovisioning state")
-                .build(),
-            tenants_with_secrets: meter
-                .i64_gauge(CREDSTORE_TENANTS_WITH_SECRETS)
-                .with_description("Live count of tenants that own at least one secret")
-                .build(),
             read_outcome: meter
                 .u64_counter(CREDSTORE_READ_OUTCOME)
                 .with_description("Secret read results by outcome")
@@ -97,22 +71,6 @@ impl CredStoreMetricsMeter {
                     "Upstream dependency call outcomes, by dependency + operation + outcome",
                 )
                 .build(),
-            provisioning_reaped: meter
-                .u64_counter(CREDSTORE_PROVISIONING_REAPED)
-                .with_description("Provisioning secrets reaped by the background sweeper")
-                .build(),
-            deprovisioning_reaped: meter
-                .u64_counter(CREDSTORE_DEPROVISIONING_REAPED)
-                .with_description(
-                    "Stuck deprovisioning secrets completed by the background sweeper",
-                )
-                .build(),
-            provisioning_rollback: meter
-                .u64_counter(CREDSTORE_PROVISIONING_ROLLBACK)
-                .with_description(
-                    "Create-saga provisioning-row rollbacks after a backend write failure, by outcome",
-                )
-                .build(),
             cross_tenant_denied: meter
                 .u64_counter(CREDSTORE_CROSS_TENANT_DENIED)
                 .with_description("Cross-tenant secret access attempts that were denied")
@@ -124,11 +82,23 @@ impl CredStoreMetricsMeter {
                      (mismatch = fail-closed 404, the alertable signal)",
                 )
                 .build(),
-            fence_backfill: meter
-                .u64_counter(CREDSTORE_FENCE_BACKFILL)
+            gc_deleted: meter
+                .u64_counter(CREDSTORE_GC_DELETED)
                 .with_description(
-                    "Lazy fingerprint backfills of out-of-band seeded rows, by outcome",
+                    "Maintenance job: backend versions deleted by the gc drain \
+                     (superseded/removed/aborted)",
                 )
+                .build(),
+            gc_pending_reclaimed: meter
+                .u64_counter(CREDSTORE_GC_PENDING_RECLAIMED)
+                .with_description(
+                    "Maintenance job: orphaned pending versions reclaimed (a sustained climb \
+                     means writes are crashing or timing out before commit)",
+                )
+                .build(),
+            expired_deleted: meter
+                .u64_counter(CREDSTORE_EXPIRED_DELETED)
+                .with_description("Maintenance job: expired active rows removed")
                 .build(),
         }
     }
@@ -141,19 +111,6 @@ impl CredStoreMetricsMeter {
 }
 
 impl CredStoreMetricsPort for CredStoreMetricsMeter {
-    fn record_inventory(&self, counts: SecretCounts) {
-        self.secrets
-            .record(counts.private, &[KeyValue::new("sharing", "private")]);
-        self.secrets
-            .record(counts.tenant, &[KeyValue::new("sharing", "tenant")]);
-        self.secrets
-            .record(counts.shared, &[KeyValue::new("sharing", "shared")]);
-        self.secrets_provisioning.record(counts.provisioning, &[]);
-        self.secrets_deprovisioning
-            .record(counts.deprovisioning, &[]);
-        self.tenants_with_secrets.record(counts.tenants, &[]);
-    }
-
     fn read_outcome(&self, outcome: ReadOutcome) {
         self.read_outcome
             .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
@@ -181,19 +138,6 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
         );
     }
 
-    fn provisioning_reaped(&self, n: u64) {
-        self.provisioning_reaped.add(n, &[]);
-    }
-
-    fn deprovisioning_reaped(&self, n: u64) {
-        self.deprovisioning_reaped.add(n, &[]);
-    }
-
-    fn provisioning_rollback(&self, outcome: Outcome) {
-        self.provisioning_rollback
-            .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
-    }
-
     fn cross_tenant_denied(&self) {
         self.cross_tenant_denied.add(1, &[]);
     }
@@ -203,9 +147,16 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
             .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
     }
 
-    fn fence_backfill(&self, outcome: Outcome) {
-        self.fence_backfill
-            .add(1, &[KeyValue::new("outcome", outcome.as_str())]);
+    fn gc_deleted(&self, n: u64) {
+        self.gc_deleted.add(n, &[]);
+    }
+
+    fn gc_pending_reclaimed(&self, n: u64) {
+        self.gc_pending_reclaimed.add(n, &[]);
+    }
+
+    fn expired_deleted(&self, n: u64) {
+        self.expired_deleted.add(n, &[]);
     }
 }
 

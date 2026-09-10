@@ -27,7 +27,7 @@ use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 use crate::error::CredStoreError;
-use crate::models::SharingMode;
+use crate::models::{SharingMode, ValueId};
 
 /// Enforceable traits of a secret type.
 ///
@@ -47,7 +47,8 @@ pub struct SecretTypeDescriptor {
     /// Upper bound on the raw value size; `None` = platform default only.
     pub max_size_bytes: Option<usize>,
     /// Whether secrets of this type may carry `expires_at`; expired secrets
-    /// resolve as not-found and are swept by the reaper.
+    /// resolve as not-found and are swept by the periodic maintenance job
+    /// (ADR-0006 `credstore gc`).
     pub expirable: bool,
     /// Advisory rotation cadence; surfaced via metadata only.
     pub rotation_period_secs: Option<u64>,
@@ -373,6 +374,34 @@ pub fn type_uuid(gts_id: &str) -> Option<Uuid> {
 /// Pinned by `type_uuid_is_deterministic_and_matches_registry_v5` so the
 /// migration default and the computed id can never drift.
 pub const GENERIC_TYPE_UUID_STR: &str = "2a8aac98-cf09-58ed-acd6-f599f35cb5bf";
+
+/// UUID v5 namespace the SDK's deterministic identifiers are derived under.
+///
+/// Mirrors `gts::GtsId::to_uuid`'s private namespace constant
+/// (`Uuid::new_v5(Uuid::NAMESPACE_URL, b"gts")`) — reconstructed here (rather
+/// than named) because that namespace is a private implementation detail of
+/// the upstream `gts-id` crate with no public accessor. Pinned against
+/// [`type_uuid`]'s output (which *does* go through `GtsId::to_uuid`) by
+/// `type_uuid_is_deterministic_and_matches_registry_v5`, and against
+/// [`FENCE_KEY_VALUE_ID`] by `fence_key_value_id_is_pinned_under_the_gts_namespace`.
+/// `FENCE_KEY_VALUE_ID` itself is a hardcoded, pinned literal (`Uuid::new_v5`
+/// is not `const fn`), so this helper exists only to let the pin test
+/// recompute the expected value independently.
+#[cfg(test)]
+fn gts_namespace() -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, b"gts")
+}
+
+/// The fence key's reserved backend entry id (ADR-0006 "Backend key shape"):
+/// the UUID v5 of the name `cfs-internal-fence-key` under [`gts_namespace`] —
+/// the same namespace deterministic secret-type UUIDs are derived under
+/// ([`type_uuid`]). Fixed, never a random v4, so no metadata row's `value_id`
+/// (always minted v4 — [`ValueId::new_v4`]) can ever collide with it. The
+/// fence key lives in the backend under `(TenantId::nil(), FENCE_KEY_VALUE_ID)`;
+/// no metadata row ever points at it, so no API path can resolve, overwrite,
+/// or delete it.
+pub const FENCE_KEY_VALUE_ID: ValueId =
+    ValueId(uuid::uuid!("f7252add-b079-558f-81e1-7a03b14a9cc9"));
 
 impl Default for SecretType {
     fn default() -> Self {

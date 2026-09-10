@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{CredStoreLocalClient, DomainError, Service};
 use crate::domain::ports::metrics::NoopMetrics;
-use crate::domain::secret::service::ReaperSettings;
+use crate::domain::secret::service::GcSettings;
 use crate::domain::secret::test_support::{
     FakeDir, FakePlugin, FakePluginSelector, FakeSecretRepo, catalog_type_resolver, make_ctx,
     mock_enforcer,
@@ -83,10 +83,9 @@ async fn local_client_round_trips_through_service() {
         selector,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        ReaperSettings {
-            tick_secs: 60,
-            provisioning_timeout_secs: 300,
-            deprovisioning_timeout_secs: 300,
+        GcSettings {
+            pending_max_age_secs: 3600,
+            batch_size: 256,
         },
     ));
     let client = CredStoreLocalClient::new(svc);
@@ -134,10 +133,9 @@ async fn create_is_create_only_put_is_update_only() {
         selector,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        ReaperSettings {
-            tick_secs: 60,
-            provisioning_timeout_secs: 300,
-            deprovisioning_timeout_secs: 300,
+        GcSettings {
+            pending_max_age_secs: 3600,
+            batch_size: 256,
         },
     ));
     let client = CredStoreLocalClient::new(svc);
@@ -209,10 +207,9 @@ async fn precondition_guards_in_process_write_and_delete() {
         selector,
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
-        ReaperSettings {
-            tick_secs: 60,
-            provisioning_timeout_secs: 300,
-            deprovisioning_timeout_secs: 300,
+        GcSettings {
+            pending_max_age_secs: 3600,
+            batch_size: 256,
         },
     ));
     let client = CredStoreLocalClient::new(svc);

@@ -1,71 +1,23 @@
 // Created: 2026-04-07 by Constructor Tech
+// Updated: 2026-09-10 by Constructor Tech — value-seeding fields removed (ADR-0006).
 use super::*;
 
 #[test]
 fn config_defaults_are_applied() {
-    let yaml = r#"
-secrets:
-  - tenant_id: "00000000-0000-0000-0000-000000000001"
-    owner_id: "00000000-0000-0000-0000-000000000002"
-    key: "openai_api_key"
-    value: "sk-test-123"
-"#;
-
-    let cfg: StaticCredStorePluginConfig = serde_saphyr::from_str(yaml).unwrap();
-
+    let cfg: StaticCredStorePluginConfig = serde_saphyr::from_str("{}").expect("parse");
     assert_eq!(cfg.vendor, "constructorfabric");
     assert_eq!(cfg.priority, 100);
-    assert_eq!(cfg.secrets.len(), 1);
-    assert!(cfg.secrets[0].sharing.is_none());
-    assert_eq!(cfg.secrets[0].resolve_sharing(), SharingMode::Private);
 }
 
 #[test]
-fn config_allows_omitted_tenant_and_owner() {
+fn config_accepts_explicit_values() {
     let yaml = r#"
-secrets:
-  - key: "global_api_key"
-    value: "sk-global"
+vendor: "acme"
+priority: 5
 "#;
-
-    let cfg: StaticCredStorePluginConfig = serde_saphyr::from_str(yaml).unwrap();
-    assert_eq!(cfg.secrets.len(), 1);
-    assert!(cfg.secrets[0].tenant_id.is_none());
-    assert!(cfg.secrets[0].owner_id.is_none());
-    assert!(cfg.secrets[0].sharing.is_none());
-    assert_eq!(cfg.secrets[0].resolve_sharing(), SharingMode::Shared);
-}
-
-#[test]
-fn config_allows_partial_tenant_only() {
-    let yaml = r#"
-secrets:
-  - tenant_id: "00000000-0000-0000-0000-000000000001"
-    key: "scoped_key"
-    value: "val"
-"#;
-
-    let cfg: StaticCredStorePluginConfig = serde_saphyr::from_str(yaml).unwrap();
-    assert!(cfg.secrets[0].tenant_id.is_some());
-    assert!(cfg.secrets[0].owner_id.is_none());
-    assert!(cfg.secrets[0].sharing.is_none());
-    assert_eq!(cfg.secrets[0].resolve_sharing(), SharingMode::Tenant);
-}
-
-#[test]
-fn config_explicit_sharing_overrides_default() {
-    // tenant_id + no owner_id defaults to Tenant; override to Shared.
-    let yaml = r#"
-secrets:
-  - tenant_id: "00000000-0000-0000-0000-000000000001"
-    key: "key"
-    value: "val"
-    sharing: "shared"
-"#;
-
-    let cfg: StaticCredStorePluginConfig = serde_saphyr::from_str(yaml).unwrap();
-    assert_eq!(cfg.secrets[0].sharing, Some(SharingMode::Shared));
-    assert_eq!(cfg.secrets[0].resolve_sharing(), SharingMode::Shared);
+    let cfg: StaticCredStorePluginConfig = serde_saphyr::from_str(yaml).expect("parse");
+    assert_eq!(cfg.vendor, "acme");
+    assert_eq!(cfg.priority, 5);
 }
 
 #[test]
@@ -75,21 +27,21 @@ vendor: "constructorfabric"
 priority: 100
 unexpected: true
 "#;
-
     let parsed: Result<StaticCredStorePluginConfig, _> = serde_saphyr::from_str(yaml);
     assert!(parsed.is_err());
 }
 
 #[test]
-fn config_allows_empty_secrets() {
-    let parsed: Result<StaticCredStorePluginConfig, _> = serde_saphyr::from_str("{}");
-    assert!(parsed.is_ok());
-
-    let cfg = match parsed {
-        Ok(cfg) => cfg,
-        Err(e) => panic!("failed to parse config: {e}"),
-    };
-    assert!(cfg.secrets.is_empty());
-    assert_eq!(cfg.vendor, "constructorfabric");
-    assert_eq!(cfg.priority, 100);
+fn config_rejects_withdrawn_secrets_field() {
+    // ADR-0006 withdraws out-of-band value seeding; a config carrying the old
+    // `secrets:` block must fail closed (deny_unknown_fields), not silently
+    // ignore seeded values a caller believes are live.
+    let yaml = r#"
+secrets:
+  - tenant_id: "00000000-0000-0000-0000-000000000001"
+    key: "openai_api_key"
+    value: "sk-test-123"
+"#;
+    let parsed: Result<StaticCredStorePluginConfig, _> = serde_saphyr::from_str(yaml);
+    assert!(parsed.is_err());
 }

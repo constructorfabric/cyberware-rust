@@ -13,23 +13,13 @@ use crate::domain::ports::metrics::{
 #[test]
 fn global_meter_records_all_instruments() {
     use super::CredStoreMetricsMeter;
-    use crate::domain::ports::metrics::{
-        CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome, SecretCounts,
-    };
+    use crate::domain::ports::metrics::{CredStoreMetricsPort, Dep, DepOp, Outcome, ReadOutcome};
 
     use crate::domain::ports::metrics::FenceVerify;
 
     let m = CredStoreMetricsMeter::from_global();
     assert!(!format!("{m:?}").is_empty());
 
-    m.record_inventory(SecretCounts {
-        private: 1,
-        tenant: 2,
-        shared: 3,
-        provisioning: 4,
-        deprovisioning: 1,
-        tenants: 2,
-    });
     for outcome in [
         ReadOutcome::HitOwn,
         ReadOutcome::HitInherited,
@@ -40,14 +30,12 @@ fn global_meter_records_all_instruments() {
     m.walkup_depth(2);
     m.dependency(Dep::Plugin, DepOp::PluginGet, Outcome::Success, 0.01);
     m.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Error, 0.02);
-    m.provisioning_reaped(5);
-    m.provisioning_rollback(Outcome::Success);
-    m.provisioning_rollback(Outcome::Error);
     m.cross_tenant_denied();
     m.fence_verify(FenceVerify::Ok);
-    m.fence_verify(FenceVerify::Legacy);
     m.fence_verify(FenceVerify::Mismatch);
-    m.fence_backfill(Outcome::Success);
+    m.gc_deleted(3);
+    m.gc_pending_reclaimed(1);
+    m.expired_deleted(2);
 }
 
 #[test]
@@ -100,14 +88,12 @@ fn dependency_emits_duration_and_health() {
 
 #[test]
 #[cfg(feature = "test-support")]
-fn fence_counters_emit_with_outcome_labels() {
+fn fence_verify_emits_with_outcome_labels() {
     let h = MetricsHarness::new();
     let m = h.metrics();
     m.fence_verify(FenceVerify::Ok);
     m.fence_verify(FenceVerify::Mismatch);
     m.fence_verify(FenceVerify::Mismatch);
-    m.fence_backfill(Outcome::Success);
-    m.fence_backfill(Outcome::NotFound);
     h.force_flush();
     assert_eq!(
         h.counter_value("credstore_fence_verify_total", &[("outcome", "ok")]),
@@ -117,40 +103,22 @@ fn fence_counters_emit_with_outcome_labels() {
         h.counter_value("credstore_fence_verify_total", &[("outcome", "mismatch")]),
         2
     );
-    assert_eq!(
-        h.counter_value("credstore_fence_backfill_total", &[("outcome", "success")]),
-        1
-    );
-    assert_eq!(
-        h.counter_value(
-            "credstore_fence_backfill_total",
-            &[("outcome", "not_found")]
-        ),
-        1
-    );
 }
 
 #[test]
 #[cfg(feature = "test-support")]
-fn provisioning_rollback_emits_with_outcome_label() {
+fn gc_counters_accumulate_independently() {
     let h = MetricsHarness::new();
     let m = h.metrics();
-    m.provisioning_rollback(Outcome::Success);
-    m.provisioning_rollback(Outcome::Error);
-    m.provisioning_rollback(Outcome::Error);
+    m.gc_deleted(3);
+    m.gc_deleted(2);
+    m.gc_pending_reclaimed(1);
+    m.expired_deleted(4);
     h.force_flush();
+    assert_eq!(h.counter_value("credstore_gc_deleted_total", &[]), 5);
     assert_eq!(
-        h.counter_value(
-            "credstore_provisioning_rollback_total",
-            &[("outcome", "success")]
-        ),
+        h.counter_value("credstore_gc_pending_reclaimed_total", &[]),
         1
     );
-    assert_eq!(
-        h.counter_value(
-            "credstore_provisioning_rollback_total",
-            &[("outcome", "error")]
-        ),
-        2
-    );
+    assert_eq!(h.counter_value("credstore_expired_deleted_total", &[]), 4);
 }

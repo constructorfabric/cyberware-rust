@@ -1,4 +1,4 @@
-//! `SeaORM`-backed implementation of [`SecretRepo`].
+//! `SeaORM`-backed implementation of [`SecretRepo`] (ADR-0006).
 
 pub mod helpers;
 mod reads;
@@ -8,7 +8,7 @@ mod writes;
 mod repo_tests;
 
 use async_trait::async_trait;
-use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
+use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId, ValueId};
 use time::OffsetDateTime;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -16,8 +16,7 @@ use uuid::Uuid;
 pub use helpers::{CredstoreDbProvider, SecretRepoImpl};
 
 use crate::domain::error::DomainError;
-use crate::domain::ports::metrics::SecretCounts;
-use crate::domain::secret::model::{SecretRow, SecretStatus};
+use crate::domain::secret::model::{GcEntry, GcReason, NewSecret, SecretRow};
 use crate::domain::secret::repo::SecretRepo;
 
 #[async_trait]
@@ -30,52 +29,6 @@ impl SecretRepo for SecretRepoImpl {
         chain: &[Uuid],
     ) -> Result<Option<SecretRow>, DomainError> {
         reads::resolve_for_get(self, req_tenant, subject, key, chain).await
-    }
-
-    async fn insert_provisioning(
-        &self,
-        scope: &AccessScope,
-        new: &crate::domain::secret::model::NewSecret,
-    ) -> Result<(), DomainError> {
-        writes::insert_provisioning(self, scope, new).await
-    }
-
-    async fn mark_active(&self, scope: &AccessScope, id: Uuid) -> Result<(), DomainError> {
-        writes::mark_active(self, scope, id).await
-    }
-
-    async fn touch(
-        &self,
-        scope: &AccessScope,
-        id: Uuid,
-        sharing: SharingMode,
-        expected_version: Option<i64>,
-        expires_at: Option<OffsetDateTime>,
-        value_fp: Vec<u8>,
-    ) -> Result<Option<SecretRow>, DomainError> {
-        writes::touch(
-            self,
-            scope,
-            id,
-            sharing,
-            expected_version,
-            expires_at,
-            value_fp,
-        )
-        .await
-    }
-
-    async fn backfill_fp(
-        &self,
-        id: Uuid,
-        value_fp: Vec<u8>,
-        fp_key_id: i16,
-    ) -> Result<bool, DomainError> {
-        writes::backfill_fp(self, id, value_fp, fp_key_id).await
-    }
-
-    async fn list_unfenced(&self, limit: u64) -> Result<Vec<SecretRow>, DomainError> {
-        writes::list_unfenced(self, limit).await
     }
 
     async fn find_own(
@@ -99,56 +52,81 @@ impl SecretRepo for SecretRepoImpl {
         reads::find_for_write(self, scope, tenant, subject, key, sharing).await
     }
 
-    async fn delete_by_id(
-        &self,
-        scope: &AccessScope,
-        id: Uuid,
-        expected_version: Option<i64>,
-    ) -> Result<(), DomainError> {
-        writes::delete_by_id(self, scope, id, expected_version).await
-    }
-
-    async fn mark_deprovisioning(
-        &self,
-        scope: &AccessScope,
-        id: Uuid,
-        expected_version: Option<i64>,
-    ) -> Result<bool, DomainError> {
-        writes::mark_deprovisioning(self, scope, id, expected_version).await
-    }
-
-    async fn list_stale_pending(
-        &self,
-        provisioning_older_than_secs: u64,
-        deprovisioning_older_than_secs: u64,
-        limit: u64,
-    ) -> Result<Vec<SecretRow>, DomainError> {
-        writes::list_stale_pending(
-            self,
-            provisioning_older_than_secs,
-            deprovisioning_older_than_secs,
-            limit,
-        )
-        .await
-    }
-
-    async fn reap_by_id(&self, id: Uuid, expected: SecretStatus) -> Result<bool, DomainError> {
-        writes::reap_by_id(self, id, expected).await
-    }
-
-    async fn mark_expired_deprovisioning(&self) -> Result<u64, DomainError> {
-        writes::mark_expired_deprovisioning(self).await
-    }
-
-    async fn inventory(&self) -> Result<SecretCounts, DomainError> {
-        reads::inventory(self).await
-    }
-
     async fn scope_includes_tenant(
         &self,
         scope: &AccessScope,
         tenant: Uuid,
     ) -> Result<bool, DomainError> {
         Ok(reads::scope_includes_tenant(scope, tenant))
+    }
+
+    async fn gc_insert_pending(
+        &self,
+        value_id: ValueId,
+        tenant_id: TenantId,
+    ) -> Result<(), DomainError> {
+        writes::gc_insert_pending(self, value_id, tenant_id).await
+    }
+
+    async fn gc_delete(&self, value_id: ValueId) -> Result<bool, DomainError> {
+        writes::gc_delete(self, value_id).await
+    }
+
+    async fn gc_mark(&self, value_id: ValueId, reason: GcReason) -> Result<bool, DomainError> {
+        writes::gc_mark(self, value_id, reason).await
+    }
+
+    async fn gc_list(&self, limit: u64) -> Result<Vec<GcEntry>, DomainError> {
+        writes::gc_list(self, limit).await
+    }
+
+    async fn is_value_referenced(&self, value_id: ValueId) -> Result<bool, DomainError> {
+        writes::is_value_referenced(self, value_id).await
+    }
+
+    async fn insert_active(&self, scope: &AccessScope, new: &NewSecret) -> Result<(), DomainError> {
+        writes::insert_active(self, scope, new).await
+    }
+
+    async fn switch_value(
+        &self,
+        scope: &AccessScope,
+        id: Uuid,
+        expected_version: Option<i64>,
+        sharing: SharingMode,
+        expires_at: Option<OffsetDateTime>,
+        new_value_id: ValueId,
+        value_fp: Vec<u8>,
+        fp_key_id: i16,
+    ) -> Result<Option<(SecretRow, Option<ValueId>)>, DomainError> {
+        writes::switch_value(
+            self,
+            scope,
+            id,
+            expected_version,
+            sharing,
+            expires_at,
+            new_value_id,
+            value_fp,
+            fp_key_id,
+        )
+        .await
+    }
+
+    async fn delete_by_id(
+        &self,
+        scope: &AccessScope,
+        id: Uuid,
+        expected_version: Option<i64>,
+    ) -> Result<Option<ValueId>, DomainError> {
+        writes::delete_by_id(self, scope, id, expected_version).await
+    }
+
+    async fn list_expired(&self, limit: u64) -> Result<Vec<SecretRow>, DomainError> {
+        reads::list_expired(self, limit).await
+    }
+
+    async fn delete_expired_row(&self, id: Uuid) -> Result<Option<ValueId>, DomainError> {
+        writes::delete_expired_row(self, id).await
     }
 }

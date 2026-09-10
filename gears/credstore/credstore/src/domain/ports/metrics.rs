@@ -1,20 +1,12 @@
 //! Metrics vocabulary and recording port for credential-store operations.
 //!
-//! Defines bounded labels for outcomes, dependencies, lifecycle counts, and
-//! value-fingerprint verification.
+//! Defines bounded labels for outcomes, dependencies, value-fingerprint
+//! verification, and the maintenance job's garbage-collection counters
+//! (ADR-0006). No inventory gauges: the shipped reaper's per-status row-count
+//! and gc-queue-depth gauges were `COUNT … GROUP BY` queries, forbidden by
+//! the platform's no-`COUNT` rule, and are withdrawn rather than reimplemented.
 
 use toolkit_macros::domain_model;
-
-#[domain_model]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SecretCounts {
-    pub private: i64,
-    pub tenant: i64,
-    pub shared: i64,
-    pub provisioning: i64,
-    pub deprovisioning: i64,
-    pub tenants: i64,
-}
 
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,15 +70,14 @@ impl DepOp {
     }
 }
 
-/// Value-fingerprint fence verdict for a read (see
-/// `docs/features/001-value-fingerprint-fence.md`). `Legacy` is an
-/// out-of-band seeded row served on trust (no fingerprint yet); `Mismatch`
-/// is the fail-closed anti-enumeration miss — the alertable signal.
+/// Value-fingerprint fence verdict for a read (ADR-0003, narrowed by
+/// ADR-0006 to an integrity check only — no more out-of-band-seeded
+/// "legacy" case). `Mismatch` is the fail-closed anti-enumeration miss — the
+/// alertable signal.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceVerify {
     Ok,
-    Legacy,
     Mismatch,
 }
 impl FenceVerify {
@@ -94,7 +85,6 @@ impl FenceVerify {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            Self::Legacy => "legacy",
             Self::Mismatch => "mismatch",
         }
     }
@@ -119,42 +109,37 @@ impl Outcome {
 }
 
 pub trait CredStoreMetricsPort: Send + Sync + 'static {
-    fn record_inventory(&self, counts: SecretCounts);
     fn read_outcome(&self, outcome: ReadOutcome);
     fn walkup_depth(&self, depth: u64);
     fn dependency(&self, dep: Dep, op: DepOp, outcome: Outcome, secs: f64);
-    fn provisioning_reaped(&self, n: u64);
-    /// Stuck delete-saga rows completed by the reaper (backend value deleted,
-    /// row removed).
-    fn deprovisioning_reaped(&self, n: u64);
-    /// Records a create-saga provisioning-row rollback after a failed backend
-    /// write. `outcome` is `Error` when the rollback itself failed (the
-    /// reference stays wedged until reaped) — the signal worth alerting on.
-    fn provisioning_rollback(&self, outcome: Outcome);
     fn cross_tenant_denied(&self);
-    /// Records the fence verdict of a read (`ok`/`legacy`/`mismatch`);
-    /// `mismatch` is the fail-closed 404 worth alerting on.
+    /// Records the fence verdict of a read (`ok`/`mismatch`); `mismatch` is
+    /// the fail-closed 404 worth alerting on.
     fn fence_verify(&self, outcome: FenceVerify);
-    /// Records a lazy fingerprint backfill attempt: `Success` = stamped,
-    /// `NotFound` = CAS no-op (a concurrent PUT already stamped), `Error` =
-    /// the best-effort UPDATE failed (retried on a later read/sweep).
-    fn fence_backfill(&self, outcome: Outcome);
+    /// Maintenance job (`credstore gc`): versions deleted by the gc drain
+    /// (`reason != pending`: superseded/removed/aborted).
+    fn gc_deleted(&self, n: u64);
+    /// Maintenance job: orphaned `pending` versions reclaimed (older than
+    /// `gc.pending_max_age_secs` and unreferenced by any row) — a sustained
+    /// climb here means writes are crashing or timing out before commit.
+    fn gc_pending_reclaimed(&self, n: u64);
+    /// Maintenance job: expired `active` rows removed (and their versions
+    /// enqueued for collection).
+    fn expired_deleted(&self, n: u64);
 }
 
 #[domain_model]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopMetrics;
 impl CredStoreMetricsPort for NoopMetrics {
-    fn record_inventory(&self, _: SecretCounts) {}
     fn read_outcome(&self, _: ReadOutcome) {}
     fn walkup_depth(&self, _: u64) {}
     fn dependency(&self, _: Dep, _: DepOp, _: Outcome, _: f64) {}
-    fn provisioning_reaped(&self, _: u64) {}
-    fn deprovisioning_reaped(&self, _: u64) {}
-    fn provisioning_rollback(&self, _: Outcome) {}
     fn cross_tenant_denied(&self) {}
     fn fence_verify(&self, _: FenceVerify) {}
-    fn fence_backfill(&self, _: Outcome) {}
+    fn gc_deleted(&self, _: u64) {}
+    fn gc_pending_reclaimed(&self, _: u64) {}
+    fn expired_deleted(&self, _: u64) {}
 }
 
 #[cfg(test)]
@@ -185,16 +170,20 @@ mod tests {
         );
         assert_eq!(Outcome::Success.as_str(), "success");
         assert_eq!(Outcome::Error.as_str(), "error");
+        assert_eq!(FenceVerify::Ok.as_str(), "ok");
+        assert_eq!(FenceVerify::Mismatch.as_str(), "mismatch");
     }
 
     #[test]
     fn noop_metrics_port_is_inert() {
         let noop = NoopMetrics;
-        noop.record_inventory(SecretCounts::default());
         noop.read_outcome(ReadOutcome::Miss);
         noop.walkup_depth(3);
         noop.dependency(Dep::Pdp, DepOp::Evaluate, Outcome::Success, 0.1);
-        noop.provisioning_reaped(2);
         noop.cross_tenant_denied();
+        noop.fence_verify(FenceVerify::Ok);
+        noop.gc_deleted(2);
+        noop.gc_pending_reclaimed(1);
+        noop.expired_deleted(4);
     }
 }

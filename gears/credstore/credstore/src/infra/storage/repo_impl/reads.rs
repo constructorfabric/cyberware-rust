@@ -1,37 +1,20 @@
-//! Read-only repo methods: `resolve_for_get`, `find_own`, `inventory`,
+//! Read-only repo methods: `resolve_for_get`, `find_own`, `find_for_write`,
 //! `scope_includes_tenant`.
 
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
-use sea_orm::ExprTrait;
-use sea_orm::sea_query::Expr;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect};
 use toolkit_db::secure::{ScopeError, SecureEntityExt};
 use toolkit_security::access_scope::ScopeFilter;
 use toolkit_security::{AccessScope, pep_properties};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::ports::metrics::SecretCounts;
 use crate::domain::secret::model::{SecretRow, SecretStatus};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
 use crate::infra::storage::entity;
 use crate::infra::storage::repo_impl::helpers::{
-    SecretRepoImpl, entity_to_model, map_scope_err, sharing_from_i16, sharing_to_i16,
+    SecretRepoImpl, entity_to_model, map_scope_err, sharing_to_i16,
 };
-
-/// Minimal projection for inventory aggregate rows.
-#[derive(Debug, FromQueryResult)]
-struct InventoryRow {
-    sharing: i16,
-    status: i16,
-    c: i64,
-}
-
-/// Minimal projection for distinct-tenant count.
-#[derive(Debug, FromQueryResult)]
-struct TenantCount {
-    t: i64,
-}
 
 fn scope_err_to_domain(e: ScopeError) -> DomainError {
     match e {
@@ -51,6 +34,8 @@ pub(super) async fn resolve_for_get(
     let req = req_tenant.0;
     // resolve_for_get applies its own chain + sharing predicates;
     // PDP authorization runs upstream. allow_all skips the scope WHERE clamp.
+    // The predicate stays `status = active` in Phase 1 (ADR-0006): a
+    // `declared` row is never a resolution candidate yet.
     let rows = entity::secrets::Entity::find()
         .secure()
         .scope_with(&AccessScope::allow_all())
@@ -60,7 +45,8 @@ pub(super) async fn resolve_for_get(
                 .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
         )
         // Expired secrets resolve as not-found (write paths still see the
-        // row: overwrite refreshes it, delete revokes it, the reaper sweeps it).
+        // row: overwrite refreshes it, delete revokes it, the maintenance
+        // job sweeps it).
         .filter(
             Condition::any()
                 .add(entity::secrets::Column::ExpiresAt.is_null())
@@ -122,8 +108,8 @@ pub(super) async fn find_own(
     key: &SecretRef,
 ) -> Result<Option<SecretRow>, DomainError> {
     let conn = repo.db.conn()?;
-    // Active rows plus deprovisioning ones — a DELETE retry must be able to
-    // resume a stuck delete saga. Provisioning rows stay invisible.
+    // Active rows only — there is no delete saga to resume any more
+    // (ADR-0006): `delete_by_id` is one transaction.
     let rows = entity::secrets::Entity::find()
         .secure()
         .scope_with(scope)
@@ -131,10 +117,7 @@ pub(super) async fn find_own(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.is_in([
-                    SecretStatus::Active.as_smallint(),
-                    SecretStatus::Deprovisioning.as_smallint(),
-                ]))
+                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
                 .add(
                     Condition::any()
                         .add(
@@ -200,72 +183,25 @@ pub(super) async fn find_for_write(
     row.map(entity_to_model).transpose()
 }
 
-#[allow(clippy::cognitive_complexity)]
-pub(super) async fn inventory(repo: &SecretRepoImpl) -> Result<SecretCounts, DomainError> {
+pub(super) async fn list_expired(
+    repo: &SecretRepoImpl,
+    limit: u64,
+) -> Result<Vec<SecretRow>, DomainError> {
     let conn = repo.db.conn()?;
-
-    // Aggregate counts grouped by sharing + status.
-    let rows: Vec<InventoryRow> = entity::secrets::Entity::find()
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .project_all(&conn, |q| {
-            q.select_only()
-                .column(entity::secrets::Column::Sharing)
-                .column(entity::secrets::Column::Status)
-                .column_as(entity::secrets::Column::Id.count(), "c")
-                .group_by(entity::secrets::Column::Sharing)
-                .group_by(entity::secrets::Column::Status)
-                .into_model::<InventoryRow>()
-        })
-        .await
-        .map_err(scope_err_to_domain)?;
-
-    let mut counts = SecretCounts::default();
-    for r in rows {
-        // Decode through the typed enums (not magic numbers) so a future encoding
-        // change can't silently miscount; an unknown encoding is logged, not dropped.
-        match SecretStatus::from_smallint(r.status) {
-            Some(SecretStatus::Provisioning) => counts.provisioning += r.c,
-            Some(SecretStatus::Deprovisioning) => counts.deprovisioning += r.c,
-            Some(SecretStatus::Active) => match sharing_from_i16(r.sharing) {
-                Some(SharingMode::Private) => counts.private += r.c,
-                Some(SharingMode::Tenant) => counts.tenant += r.c,
-                Some(SharingMode::Shared) => counts.shared += r.c,
-                None => tracing::warn!(
-                    sharing = r.sharing,
-                    "inventory: unknown sharing encoding, row not counted"
-                ),
-            },
-            None => tracing::warn!(
-                status = r.status,
-                "inventory: unknown status encoding, row not counted"
-            ),
-        }
-    }
-
-    // Distinct-tenant count for active rows.
-    let tenant_rows: Vec<TenantCount> = entity::secrets::Entity::find()
-        .secure()
-        .scope_with(&AccessScope::allow_all())
+    let rows = entity::secrets::Entity::find()
         .filter(
             Condition::all()
-                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint())),
+                .add(entity::secrets::Column::Status.eq(SecretStatus::Active.as_smallint()))
+                .add(entity::secrets::Column::ExpiresAt.is_not_null())
+                .add(entity::secrets::Column::ExpiresAt.lte(time::OffsetDateTime::now_utc())),
         )
-        .project_all(&conn, |q| {
-            q.select_only()
-                .column_as(
-                    Expr::col(entity::secrets::Column::TenantId).count_distinct(),
-                    "t",
-                )
-                .into_model::<TenantCount>()
-        })
+        .limit(limit)
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(&conn)
         .await
         .map_err(scope_err_to_domain)?;
-
-    if let Some(row) = tenant_rows.into_iter().next() {
-        counts.tenants = row.t;
-    }
-    Ok(counts)
+    rows.into_iter().map(entity_to_model).collect()
 }
 
 pub(super) fn scope_includes_tenant(scope: &AccessScope, tenant: Uuid) -> bool {

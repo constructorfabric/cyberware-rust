@@ -47,9 +47,12 @@ pub trait CredStoreClientV1: Send + Sync {
     ///   that own their references, where the new value is not derived from
     ///   the stored one) pass [`WritePrecondition::Exists`] — an explicit
     ///   last-writer-wins overwrite, `create` + retry when the secret may not
-    ///   exist yet. `Exists` is also the healing path for a fence-poisoned
-    ///   reference (ADR-0003): its `GET` fails closed with `Ok(None)`, so no
-    ///   version validator can be obtained.
+    ///   exist yet. Under immutable value versions (ADR-0006) `Exists` means
+    ///   exactly ordinary last-writer-wins with no other role: recovering a
+    ///   fence-poisoned reference (ADR-0003) is an ordinary new write too
+    ///   (any precondition), since there is no "same key" left to re-`PUT`
+    ///   into — a fenced `GET` still fails closed with `Ok(None)`, but no
+    ///   special healing path exists to obtain a version validator from.
     ///
     /// A `put` never creates: the target must exist, and a missing target
     /// fails the precondition with [`CredStoreError::Conflict`] regardless of

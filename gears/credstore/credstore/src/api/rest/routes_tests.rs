@@ -14,14 +14,13 @@ use uuid::Uuid;
 use crate::domain::ports::metrics::CredStoreMetricsPort;
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
-use crate::domain::secret::model::{SecretRow, SecretStatus};
 use crate::domain::secret::repo::SecretRepo;
-use crate::domain::secret::service::{ReaperSettings, Service};
+use crate::domain::secret::service::{GcSettings, Service};
 use crate::domain::secret::test_support::{
     FakeDir, FakeMetrics, FakePlugin, FakePluginSelector, FakeSecretRepo, catalog_type_resolver,
     make_ctx, mock_enforcer,
 };
-use credstore_sdk::{OwnerId, SecretRef, SecretType, SecretValue, SharingMode, TenantId};
+use credstore_sdk::{SecretRef, SecretType, SecretValue, SharingMode};
 
 use super::register_routes;
 
@@ -42,13 +41,13 @@ fn test_ctx() -> SecurityContext {
 struct TestHarness {
     router: Router,
     repo: Arc<FakeSecretRepo>,
-    plugin: Arc<FakePlugin>,
+    svc: Arc<Service>,
 }
 
 fn build_harness() -> TestHarness {
     let repo = Arc::new(FakeSecretRepo::new());
     let plugin = FakePlugin::new();
-    let selector = Arc::new(FakePluginSelector::new(Arc::clone(&plugin)));
+    let selector = Arc::new(FakePluginSelector::new(plugin));
     let enforcer = mock_enforcer();
     let dir = Arc::new(FakeDir::single(test_tenant()));
     let metrics = FakeMetrics::new();
@@ -59,19 +58,14 @@ fn build_harness() -> TestHarness {
         selector as Arc<dyn PluginSelector>,
         catalog_type_resolver(),
         metrics as Arc<dyn CredStoreMetricsPort>,
-        ReaperSettings {
-            tick_secs: 60,
-            provisioning_timeout_secs: 300,
-            deprovisioning_timeout_secs: 300,
+        GcSettings {
+            pending_max_age_secs: 3600,
+            batch_size: 256,
         },
     ));
     let openapi = OpenApiRegistryImpl::new();
-    let router = register_routes(Router::new(), &openapi, svc);
-    TestHarness {
-        router,
-        repo,
-        plugin,
-    }
+    let router = register_routes(Router::new(), &openapi, Arc::clone(&svc));
+    TestHarness { router, repo, svc }
 }
 
 /// Build a JSON request with the `SecurityContext` injected as an extension.
@@ -101,35 +95,32 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 
 // ── Seed helpers ─────────────────────────────────────────────────────────────
 
-/// Seed an active `Tenant`-shared row directly into the fake repo AND plugin.
-/// Returns the row id — the generation half of the `"<id>.<version>"`
-/// validator the `If-Match` tests build.
+/// Seed an active `Tenant`-shared row through the real write protocol
+/// (`Service::put`) — the value's fingerprint must match the fence key the
+/// service lazily bootstraps, so seeding through the same path the router
+/// uses (rather than fabricating a `SecretRow`/plugin entry by hand) is what
+/// keeps `GET` able to verify it. Returns the row id — the generation half of
+/// the `"<id>.<version>"` validator the `If-Match` tests build.
 async fn seed_secret(harness: &TestHarness, reference: &str, value: &str) -> Uuid {
-    use credstore_sdk::CredStorePluginClientV1;
+    use crate::domain::secret::model::WriteSpec;
     let key = SecretRef::new(reference).expect("valid ref");
-    let tenant = TenantId(test_tenant());
-    let owner = OwnerId(test_subject());
-    let row_id = Uuid::new_v4();
-    harness.repo.seed(SecretRow {
-        id: row_id,
-        tenant_id: tenant,
-        reference: reference.to_owned(),
-        sharing: SharingMode::Tenant,
-        owner_id: owner,
-        status: SecretStatus::Active,
-        version: 1,
-        secret_type_uuid: SecretType::generic().uuid(),
-        expires_at: None,
-        value_fp: None,
-        fp_key_id: None,
-    });
-    // Also prime the plugin store so `svc.get` fetches a real value.
     harness
-        .plugin
-        .put(&test_ctx(), &tenant, &key, SecretValue::from(value), None)
+        .svc
+        .put(
+            &test_ctx(),
+            &key,
+            SecretValue::from(value),
+            WriteSpec::create(SharingMode::Tenant),
+        )
         .await
-        .expect("plugin put");
-    row_id
+        .expect("seed via the real write protocol");
+    harness
+        .repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == reference)
+        .expect("seeded row present")
+        .id
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -1,10 +1,13 @@
 //! `ToolKit` gear declaration, dependency wiring, and managed lifecycle.
 //!
-//! Initialization builds the domain service, registers its SDK client and REST
-//! routes, and the stateful lifecycle runs recovery and fence-backfill sweeps.
+//! Initialization builds the domain service and registers its SDK client and
+//! REST routes. The lifecycle entry runs no resident background loop
+//! (ADR-0006 D7): hygiene (expired-row and garbage-collection sweeps) is the
+//! periodic `credstore gc` maintenance job, invoked by an operator-chosen
+//! scheduler outside this gear's own process lifetime (Phase 3), not a timer
+//! in `serve`.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
@@ -22,7 +25,7 @@ use types_registry_sdk::TypesRegistryClient;
 use crate::client::CredStoreLocalClient;
 use crate::config::CredStoreConfig;
 use crate::domain::ports::metrics::CredStoreMetricsPort;
-use crate::domain::secret::service::{ReaperSettings, Service};
+use crate::domain::secret::service::{GcSettings, Service};
 use crate::infra::metrics::CredStoreMetricsMeter;
 use crate::infra::plugin_select::GtsCredStorePluginSelector;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
@@ -62,32 +65,20 @@ impl CredStoreGear {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
-        let Some(svc) = self.service.get().cloned() else {
+        if self.service.get().is_none() {
             anyhow::bail!("credstore: serve invoked before init");
-        };
-
-        let tick = Duration::from_secs(svc.reaper_tick_secs());
-        let mut interval = tokio::time::interval(tick);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        }
 
         ready.notify();
         info!(
             target: "credstore.lifecycle",
-            reaper_tick_secs = tick.as_secs(),
-            "credstore reaper tick started"
+            "credstore gear serving; no resident background work - hygiene runs via the \
+             `credstore gc` maintenance job on an operator-chosen schedule"
         );
 
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    svc.reap_and_refresh().await;
-                }
-            }
-        }
+        cancel.cancelled().await;
 
-        info!(target: "credstore.lifecycle", "credstore reaper tick cancelled");
+        info!(target: "credstore.lifecycle", "credstore lifecycle cancelled");
         Ok(())
     }
 }
@@ -152,10 +143,9 @@ impl Gear for CredStoreGear {
             plugins,
             types,
             metrics,
-            ReaperSettings {
-                tick_secs: cfg.reaper.tick_secs,
-                provisioning_timeout_secs: cfg.reaper.provisioning_timeout_secs,
-                deprovisioning_timeout_secs: cfg.reaper.deprovisioning_timeout_secs,
+            GcSettings {
+                pending_max_age_secs: cfg.gc.pending_max_age_secs,
+                batch_size: cfg.gc.batch_size,
             },
         ));
 

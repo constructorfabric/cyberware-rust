@@ -94,9 +94,10 @@ impl CredStoreClientV1 for CredStoreLocalClient {
         match self.svc.get(ctx, key).await {
             // The SDK `get` contract is a single 404 surface: `Ok(None)`
             // covers "does not exist" and "inaccessible" alike. The service's
-            // `NotFound` (a resolved row whose value is absent, e.g. mid-saga)
-            // is the same surface, so fold it rather than leak an error the
-            // contract does not admit.
+            // `NotFound` (a resolved row whose backend value is missing even
+            // after the read protocol's one retry against its current
+            // `value_id` — ADR-0006) is the same surface, so fold it rather
+            // than leak an error the contract does not admit.
             Err(DomainError::NotFound) => Ok(None),
             other => other.map_err(Into::into),
         }

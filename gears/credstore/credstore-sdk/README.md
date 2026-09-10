@@ -32,7 +32,7 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
     merge-patch semantics: present fields replace, absent fields are
     untouched; metadata edit, value rotate, or value remove (a `null` value)
     all go through it; never creates
-  - `list` — takes an OData query (`filter`, `select`, `orderby`, `limit`,
+  - `list` — takes an `ODataQuery` (`filter`, `select`, `orderby`, `limit`,
     `cursor`) over credential records; an item's `secret` field is present
     only when `select` names it. Selecting `secret` switches the call into
     **value mode**, matching the REST contract one-for-one: `limit` and

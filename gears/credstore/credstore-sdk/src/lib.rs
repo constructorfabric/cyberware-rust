@@ -14,7 +14,7 @@ pub use error::CredStoreError;
 pub use gts::{CredStorePluginSpecV1, SECRET_RESOURCE_TYPE, SecretTypeTraits, SecretV1};
 pub use models::{
     ExpiryWrite, GetSecretResponse, OwnerId, SecretRef, SecretValue, SharingMode, TenantId,
-    WriteOptions, WritePrecondition,
+    ValueId, WriteOptions, WritePrecondition,
 };
 pub use plugin_api::CredStorePluginClientV1;
-pub use types::{SECRET_TYPE_CATALOG, SecretType, SecretTypeDescriptor};
+pub use types::{FENCE_KEY_VALUE_ID, SECRET_TYPE_CATALOG, SecretType, SecretTypeDescriptor};

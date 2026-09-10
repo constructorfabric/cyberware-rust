@@ -73,6 +73,29 @@ fn type_uuid_is_deterministic_and_matches_registry_v5() {
 }
 
 #[test]
+fn fence_key_value_id_is_pinned_under_the_gts_namespace() {
+    // Recomputed via the crate's own namespace helper (also exercised by
+    // `type_uuid_is_deterministic_and_matches_registry_v5` transitively
+    // through `type_uuid`), so a drift in either the namespace or the fixed
+    // name shows up here.
+    let expected = Uuid::new_v5(&gts_namespace(), b"cfs-internal-fence-key");
+    assert_eq!(FENCE_KEY_VALUE_ID.0, expected);
+    assert_eq!(FENCE_KEY_VALUE_ID.0.get_version_num(), 5);
+    assert_eq!(
+        FENCE_KEY_VALUE_ID.0.to_string(),
+        "f7252add-b079-558f-81e1-7a03b14a9cc9",
+        "FENCE_KEY_VALUE_ID drifted; update the pin"
+    );
+    // Never collides with a catalog type's deterministic UUID.
+    for d in SECRET_TYPE_CATALOG {
+        assert_ne!(
+            FENCE_KEY_VALUE_ID.0,
+            type_uuid(d.gts_id).expect("catalog gts id resolves"),
+        );
+    }
+}
+
+#[test]
 fn resolution_by_name_and_gts_id_round_trips() {
     for d in SECRET_TYPE_CATALOG {
         let by_name = SecretType::from_name(d.name).expect("known name");

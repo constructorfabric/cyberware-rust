@@ -18,10 +18,41 @@ use crate::error::CredStoreError;
 /// Re-export from tenant-resolver-sdk for cross-gear type consistency.
 pub use tenant_resolver_sdk::TenantId;
 
-/// Owner identifier, representing `SecurityContext.subject_id()`.
+/// Owner identifier, representing `SecurityContext.subject_id()`. A row-level
+/// access key only — it plays no part in the backend key shape (ADR-0006):
+/// the plugin never sees it, and a private row's ownership is enforced by
+/// the metadata row alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct OwnerId(pub Uuid);
+
+/// Opaque backend-value identifier (ADR-0006 "immutable value versions").
+///
+/// Every value write mints a fresh `ValueId` (a UUID v4) and writes the bytes
+/// to the backend under `(tenant_id, value_id)` — never `reference` or a
+/// sharing-derived key class. A `credstore_secrets` row's `value_id` column
+/// points at the version it currently serves; `value_id` is unique across the
+/// whole store, so the row alone knows which value belongs to which
+/// reference, and the backend needs neither `reference` nor `owner_id` to do
+/// its job. See [`crate::plugin_api`] and
+/// [`FENCE_KEY_VALUE_ID`](crate::types::FENCE_KEY_VALUE_ID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ValueId(pub Uuid);
+
+impl ValueId {
+    /// Mint a fresh, store-wide-unique value id for a new write.
+    #[must_use]
+    pub fn new_v4() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl fmt::Display for ValueId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
 
 impl OwnerId {
     /// Returns the nil UUID wrapped as an `OwnerId`.
@@ -229,19 +260,25 @@ impl ExpiryWrite {
 /// and send [`Self::Matches`]; a failed precondition surfaces as
 /// [`CredStoreError::Conflict`].
 ///
-/// [`Self::Exists`] is the deliberate, visible-in-code opt-out for the two
-/// flows that cannot hold a version: blind create-or-replace (rotation /
-/// provisioning, where the new value is not derived from the stored one) and
-/// healing a fence-poisoned reference (ADR-0003), whose `GET` fails closed
-/// with 404 so no validator can be obtained.
+/// [`Self::Exists`] is the deliberate, visible-in-code opt-out for blind
+/// create-or-replace flows that cannot hold a version (rotation /
+/// provisioning, where the new value is not derived from the stored one).
+/// It is also what a caller recovering a fence-poisoned reference (ADR-0003)
+/// uses, since a fenced `GET` fails closed with 404 and yields no validator
+/// to hold — but under immutable value versions (ADR-0006) that recovery is
+/// an ordinary new write like any other, not a special healing path;
+/// `Exists` carries no meaning beyond RFC 9110 last-writer-wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePrecondition {
     /// The target secret must already exist (REST `If-Match: *`). This is an
     /// explicit last-writer-wins overwrite: concurrent `Exists` writers to one
-    /// reference race and the later write survives wholesale. Reserve it for
-    /// writers that own their references outright (rotation, provisioning)
-    /// and for healing a fence-poisoned reference; read-modify-write callers
-    /// must use [`Self::Matches`].
+    /// reference race and the later write survives wholesale — each lands
+    /// under its own immutable value version (ADR-0006), so the race
+    /// resolves into two intact versions and one pointer, never a corrupted
+    /// value. Reserve it for writers that own their references outright
+    /// (rotation, provisioning) and for a caller with no version to hold (a
+    /// fenced `GET` fails closed with no validator to read); read-modify-write
+    /// callers must use [`Self::Matches`].
     Exists,
     /// Compare-and-set: the current generation must still be `(id, version)`
     /// (REST `If-Match: "<id>.<version>"`). `id` is the row UUID — fresh per
@@ -356,6 +393,15 @@ mod models_tests {
         assert_eq!(format!("{v:?}"), "[REDACTED]");
         assert_eq!(format!("{v}"), "[REDACTED]");
         assert_eq!(v.as_bytes(), b"supersecret");
+    }
+
+    #[test]
+    fn value_id_new_v4_is_random_and_displays_as_uuid() {
+        let a = ValueId::new_v4();
+        let b = ValueId::new_v4();
+        assert_ne!(a, b, "each mint must be store-wide unique");
+        assert_eq!(a.0.get_version_num(), 4);
+        assert_eq!(a.to_string(), a.0.to_string());
     }
 
     #[test]
