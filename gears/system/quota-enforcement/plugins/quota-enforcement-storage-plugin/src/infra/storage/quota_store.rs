@@ -66,7 +66,7 @@ enum TxError {
 /// logged here and reported as `Unavailable`; scope refusals are the
 /// post-PDP defence (`SubjectOutOfScope`); a caller value that does not fit
 /// its column is `ValueOutOfRange`; everything the schema should have made
-/// impossible is `Corrupt`.
+/// impossible, an unrecognised scope failure included, is `Corrupt`.
 fn lift(operation: &'static str, err: TxError) -> StoreError {
     match err {
         TxError::Store(err) => err,
@@ -75,6 +75,9 @@ fn lift(operation: &'static str, err: TxError) -> StoreError {
         TxError::Scope(
             ScopeError::TenantNotInScope { .. } | ScopeError::Denied(_) | ScopeError::Invalid(_),
         ) => StoreError::SubjectOutOfScope,
+        // `ScopeError` is `#[non_exhaustive]`. A scope the ORM will not
+        // compile is an inconsistency, not a caller's authorization problem.
+        TxError::Scope(other) => corrupt(operation, &other),
         TxError::Map(MappingError::CapOutOfRange { cap }) => StoreError::ValueOutOfRange {
             field: "cap",
             value: cap.to_string(),
