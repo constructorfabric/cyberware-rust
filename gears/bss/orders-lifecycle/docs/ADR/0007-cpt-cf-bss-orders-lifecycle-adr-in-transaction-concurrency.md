@@ -64,9 +64,29 @@ orders carrying identical content.
 Chosen option: **a claim table with a partial unique index**. `orders_inflight_overlap_claim`
 carries one row per resolved line key, with `partial UNIQUE (payer_tenant_id, overlap_scope_key)
 WHERE released_at IS NULL`, inserted inside the transition transaction. A collision maps to the
-registered `order-in-flight-for-key` refusal, audited and settled in that same transaction. The
-gate predicate remains as a **friendly pre-check** that produces a readable refusal in the common
-case; it is explicitly **not** the enforcement.
+registered `order-in-flight-for-key` refusal. The gate predicate remains as a **friendly
+pre-check** that produces a readable refusal in the common case; it is explicitly **not** the
+enforcement.
+
+**How the collision is detected is a correctness requirement, not a detail, and `01 §3.6` now
+states it.** A raw unique violation in PostgreSQL puts the whole transaction into an aborted
+state: no further statement in it can succeed and only a rollback is accepted. But the refusal
+this decision needs is a *committed* outcome under `ADR/0005` — it has to append an audit entry
+and settle its idempotency record and commit, and those writes cannot happen in a transaction the
+violation has already aborted. Two things resolve it, both normative in
+[`../design/01-foundation.md`](../design/01-foundation.md) **§3.6** *Attempt Transition*
+(`DECISIONS.md` D-86). The claim is acquired with `ON CONFLICT … DO NOTHING` and the collision
+detected as a **row shortfall** rather than raised as an error, so the transaction is never
+aborted and stays usable for the audit append and the settle. And acquisition is **step 17**,
+ahead of the version append and every other contribution, so a refusal has nothing durable to
+unwind: had it run later, the refusal would have to discard a committed version row and a moved
+current-version pointer in tables that grant no DELETE. **There is consequently no savepoint
+anywhere in the algorithm** — an earlier version of this ADR pointed at one, and ordering replaced
+it. Three properties the acquisition depends on are stated with it: keys offered distinct, keys
+offered in a total order against deadlock, and READ COMMITTED isolation (under snapshot isolation
+the insert raises a serialisation failure instead of reporting a shortfall). §3.7 declares the
+constraint itself, and carries **no foreign key** to `orders_order_version` for the same ordering
+reason.
 
 A separate table is needed because the constraint's subject is mutable — `released_at` is set on a
 terminal transition — while `orders_order_line`, where the key is resolved, is append-only and
@@ -90,7 +110,7 @@ it would make order submission depend on a second system's write availability.
 ### Consequences
 
 * **The enforcement is a constraint, so it cannot be bypassed by a code path.** This is the property the decision exists for: no slice, migration or admin surface can admit a second in-flight order on a key.
-* **The refusal is not free.** A collision aborts an insert inside the transaction, so it must be mapped deliberately to `order-in-flight-for-key`, audited and settled — an unmapped constraint violation would surface as a 500 rather than one of the four exhaustive outcomes.
+* **The refusal is not free, and it is the sharp edge of this decision.** The collision is detected by the database mid-transaction, so it must be both *mapped* to `order-in-flight-for-key` and *observed without losing the transaction*. Two failures are possible and they are different: an unmapped violation surfaces as a 500 rather than one of the exhaustive outcomes, and a violation allowed to abort the transaction leaves the audit entry and the settled idempotency record unwritten — a silent drop of exactly the kind `ADR/0005` and the audit-completeness NFR forbid. `01 §3.6` *Attempt Transition* step 17 avoids both, by conflict-free insertion and by position.
 * **The gate predicate must exclude the requesting order.** An amendment is issued by an order that already holds its key, so a predicate counting all holders without excluding its own subject refuses every amendment against itself. The transaction avoids the same trap by releasing the prior version's claims *before* inserting the new ones. This is recorded because it has already been introduced once, by D-83's first form.
 * **Claims are never deleted, only released**, so the table grows with submit and amendment traffic and needs an index on `(order_id) WHERE released_at IS NULL` — the release path finds claims by order, and the unique index leads on `payer_tenant_id`.
 * **An order that never reaches a terminal state holds its key forever.** `in_fulfillment` is deliberately expiry-exempt, so a wedged fulfilment blocks that key indefinitely. The design's answer is an operational SLA raised by the sibling gear, which is a process answer to a data problem and is the sharpest residual cost of this decision.
@@ -98,11 +118,29 @@ it would make order submission depend on a second system's write availability.
 
 ### Confirmation
 
-Verified by a concurrency test issuing two identical submits simultaneously and asserting exactly
-one commits and the other returns `order-in-flight-for-key`; by a test asserting an amendment of an
-order that holds its own key is admitted; by asserting the claim is released on every transition
-into the terminal set of `01 §4.3`, including `rejected`; and by a test asserting a partial-unique
-collision surfaces as the registered refusal rather than an unmapped error.
+**This gear has no implementation and no runtime tests**, so the checks below are labelled either
+verifiable today or planned. Every behavioural check this decision needs is in the second group.
+
+**Verifiable today, by reading the design set.** `01 §3.7` declares the partial UNIQUE on
+`(payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL` — a UNIQUE index expresses
+*exactly one*, which is what PRD §6.1(g) fixes — declares the `(order_id) WHERE released_at IS
+NULL` index the release path needs, states that claims are released and never deleted, and names
+the terminal set of `§4.3` on whose transitions the release happens. That the release-before-
+insert ordering is what lets an amendment re-claim its own key is likewise readable there. The
+document-level invariant suite (`scripts/check-design-invariants.py`, run as `make design-check`
+in CI) asserts that every `orders_inflight_overlap_claim.<column>` reference across the set — this
+ADR included — names a real column, and that the index declarations name only that table's
+columns.
+
+**Planned, not yet written.** A concurrency check issuing two identical submits simultaneously
+and asserting exactly one commits while the other returns `order-in-flight-for-key`; a check that
+an amendment of an order holding its own key is admitted; a check that the claim is released on
+every transition into the terminal set of `01 §4.3`, `rejected` included; and — the one this
+decision most needs — a check that a partial-unique collision surfaces as the registered refusal
+*with its audit entry and settled idempotency record committed*, rather than as an unmapped error
+or as an aborted transaction. None of the four is recorded yet as a verification approach in
+`01 §1.2`, which is their home, and the last cannot be written before `01 §3.6` specifies the
+transaction-preserving acquisition.
 
 ## Pros and Cons of the Options
 
@@ -111,7 +149,7 @@ collision surfaces as the registered refusal rather than an unmapped error.
 * Good, because the guarantee is a database constraint, so no code path — slice, migration or admin surface — can admit a second in-flight order on a key.
 * Good, because it is evaluated inside the transition transaction, so two concurrent submits cannot both pass.
 * Good, because the claim's mutable lifecycle (`released_at`) lives on a row that can carry it, which an append-only version-scoped line cannot.
-* Bad, because a constraint violation must be deliberately mapped to a registered refusal, or it surfaces as an unmapped error rather than one of the four exhaustive outcomes.
+* Bad, because a constraint violation must be deliberately mapped to a registered refusal *and* caught without aborting the transaction, or it surfaces as an unmapped error, or it takes the audit append and the settle down with it.
 * Bad, because claims are released rather than deleted, so the table grows with traffic and needs its own index and retention thinking.
 * Bad, because an order that never terminates holds its key indefinitely, and the only answer offered is an operational SLA.
 
@@ -150,7 +188,7 @@ no alternatives, which is precisely the shape a later author removes.
 ## Traceability
 
 - **PRD**: [`../PRD.md`](../PRD.md) — §6.1(f) and §6.1(g) the overlap rules, §16 risks
-- **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §3.7 `orders_inflight_overlap_claim`; [`../design/03-gate-and-pin.md`](../design/03-gate-and-pin.md) §4.2 predicates 7 and 9
+- **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §3.6 the transaction-preserving claim acquisition and release, §3.7 `orders_inflight_overlap_claim`; [`../design/03-gate-and-pin.md`](../design/03-gate-and-pin.md) §4.2 predicates 7 and 9
 
 This decision directly addresses the following requirements or design elements:
 

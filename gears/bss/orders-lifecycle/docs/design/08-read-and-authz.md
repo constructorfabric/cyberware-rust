@@ -192,11 +192,28 @@ client retrying against a failing guard can put thousands of rows on one order. 
 read is therefore a memory-amplification vector for any caller holding the audit-read permission,
 and it is the collection least able to assume a small result.
 
-**Cursor ordering is declared, and its key is immutable.** A page is ordered by
-`(created_at, order_id)` for the order list and by `(sequence, audit_id)` for the audit read;
-`order_id` and `audit_id` are the immutable tiebreakers. `state_entered_at` is deliberately **not**
-a sort key: the engine rewrites it on every state change, so a row could move between pages and be
-returned twice or skipped entirely — silently, with a 200 and a valid-looking cursor.
+**Cursor ordering is declared for every paged collection, and every sort key is immutable.** All
+four collections of the preceding paragraph carry a declared order, because a cursor over an
+undeclared order can duplicate or skip rows at a page boundary:
+
+| Collection | Ordering | Immutable tiebreaker |
+|------------|----------|----------------------|
+| order list | `(created_at, order_id)` | `order_id` |
+| version list | `version`, descending | `version` itself — UNIQUE per order under `orders_order_version`'s `(order_id, version)` primary key, so it needs no second key |
+| per-line read | `(created_at, line_id)` taken from `orders_order_line_identity` | `line_id` |
+| audit read | `(created_at, audit_id)` | `audit_id` |
+
+Both per-order collections are bounded to one aggregate by their own table's primary key, so a
+page never scans across orders ([`01-foundation`](./01-foundation.md) §3.7). The per-line read composes
+the **mutable** fulfillment projection, so its sort key **MUST** come from the append-only line
+identity row rather than from the projection — a line whose fulfillment status advances between
+two pages must not move.
+
+A sort key **MUST NOT** be a mutable column. `state_entered_at` is deliberately **not** one: the
+engine rewrites it on every state change, so a row could move between pages and be returned twice
+or skipped entirely — silently, with a 200 and a valid-looking cursor. The same prohibition rules
+out ordering the version or line collections by anything a later transition rewrites, which is why
+neither takes its order from the aggregate row.
 
 ## 3. Technical Architecture
 
@@ -217,7 +234,7 @@ shared authorization evaluator.
 
 **Relationships**:
 - `Order read view` → `Order root`: one-to-one, resolved from the aggregate row and its current version.
-- `Permission declaration` → every operation in the gear: many-to-many, evaluated before any slice guard on writes and before the store is touched on reads.
+- `Permission declaration` → every operation in the gear: many-to-many, evaluated before any slice guard on writes and before anything is disclosed on reads — which on an order-scoped read is immediately after the aggregate's tenant axes are loaded, because the relationship is evaluated against them (§3.6).
 - `Order read view` → `Line fulfillment projection`: embeds the projection owned by [`06-workflow-seam`](./06-workflow-seam.md), read-only on both sides.
 
 ### 3.2 Component Model
@@ -338,12 +355,12 @@ Input: order_id, security_context
 Output: the composed read view, or a registered refusal
 
 1. [ ] - `p1` - Resolve the caller's actor class and delegated scope - `inst-sr-resolve-actor`
-2. [ ] - `p1` - Load the aggregate row - `inst-sr-load-aggregate`
-3. [ ] - `p1` - **IF** the caller has no relationship to any of the order's axes: - `inst-sr-if-no-relationship`
-   1. [ ] - `p1` - Append the read access-log row: this operation, `outcome` = `refused`, `refusal_reason` = order-not-found, and the delegation proof reference where one was presented - `inst-sr-log-not-found`
+2. [ ] - `p1` - Load the aggregate row, whose tenant axes are the input the relationship check of step 3 is evaluated against. The row loaded here serves the authorization decision **only**: no part of it, and no fact derived from it — not its existence, not its state, not its axes — **MUST** reach a caller who fails step 3 or step 4 - `inst-sr-load-aggregate`
+3. [ ] - `p1` - **IF** no aggregate row exists for order_id **OR** the caller has no relationship to any of the order's axes: - `inst-sr-if-no-relationship`
+   1. [ ] - `p1` - Append the read access-log row: this operation, `outcome` = `refused`, `refusal_reason` = order-not-found, `requested_order_ref` = the requested identifier, `order_id` = that identifier where the row exists and NULL where it does not (§3.7), and the delegation proof reference where one was presented - `inst-sr-log-not-found`
    2. [ ] - `p1` - **RETURN** order-not-found, so existence is not leaked - `inst-sr-return-not-found`
 4. [ ] - `p1` - **IF** the relationship is cross-tenant **AND** no valid delegation proof is present: - `inst-sr-if-no-delegation`
-   1. [ ] - `p1` - Append the read access-log row: `outcome` = `refused`, `refusal_reason` = delegation-proof-required - `inst-sr-log-delegation-required`
+   1. [ ] - `p1` - Append the read access-log row: `outcome` = `refused`, `refusal_reason` = delegation-proof-required, with `order_id` and `requested_order_ref` both carrying the requested identifier — this arm is only reachable where the row exists - `inst-sr-log-delegation-required`
    2. [ ] - `p1` - **RETURN** delegation-proof-required refusal - `inst-sr-return-delegation-required`
 5. [ ] - `p1` - Load the current version's lines with their pins and resolved total - `inst-sr-load-current-version`
 6. [ ] - `p1` - Load the per-line fulfillment projection - `inst-sr-load-projection`
@@ -355,7 +372,19 @@ Output: the composed read view, or a registered refusal
 
 **Description**: Step 3 returns not-found rather than forbidden by design: to a caller with no
 relationship, the difference between "this order is not yours" and "no such order" is itself
-information about another tenant's activity.
+information about another tenant's activity. Its two arms — no row, and a row the caller has no
+relationship to — **MUST** be indistinguishable in the response: same reason, same body, same
+status, and no timing or error-shape difference a caller could read the distinction out of.
+
+**Why the row is loaded before the check, and what that does not permit.** The relationship of
+step 3 is evaluated *against the order's tenant axes*, so those axes have to be read before the
+decision can be taken; there is no ordering in which an order-scoped read authorizes without
+resolving the row it is scoped to. The aggregate row loaded at step 2 is therefore an input to the
+authorization decision and nothing else — it is **never** returned, in whole or in part, to a
+caller who fails step 3 or step 4, and §4.2's exposure rules apply only from step 5 onward. This is
+what §4.3's requirement that the evaluator runs "before any part of the store is disclosed" means
+on this path: nothing is disclosed before authorization, and the pre-decision load is confined to
+the row whose axes the decision is taken against.
 
 #### Paginated list
 
@@ -400,11 +429,20 @@ sequenceDiagram
     participant O as Seller Operator
     participant R as Read projection
     participant A as Audit store
+    participant L as Read access log
     O ->> R: GET audit for order
     R ->> R: resolve relationship and delegation proof
-    R ->> A: read append-only entries by order, ordered by sequence
-    A -->> R: committed and refused transitions, with actor and reason
-    R -->> O: the trail - including denied authorization attempts
+    alt no relationship, or cross-tenant with no valid proof
+        R ->> L: append row - refused, with the reason and any proof reference
+        L -->> R: committed
+        R -->> O: the registered refusal
+    else authorized
+        R ->> A: read append-only entries by order, ordered by sequence
+        A -->> R: committed and refused transitions, with actor and reason
+        R ->> L: append row - served, with the proof reference (cross-tenant only)
+        L -->> R: committed
+        R -->> O: the trail - including denied authorization attempts
+    end
 ```
 
 **Description**: Refused transitions are in the trail alongside committed ones, which is what
@@ -412,33 +450,79 @@ makes a denied authorization attempt or a failed guard visible to a reviewer rat
 invisible. The trail carries actors, reasons, idempotency keys and correlation identifiers, and
 carries no internal diagnostics.
 
+**The audit read writes the access log on the same served-and-refused pattern as the other read
+paths.** A **cross-tenant** audit read **MUST** append its `orders_read_access_log` row —
+`operation` = the audit read, `outcome` = `served`, with the delegation proof reference — and that
+row **MUST** be committed **before** the trail is returned. A refused audit read appends its row on
+exactly the terms of *Read One Order* steps 3.1 and 4.1, including the `requested_order_ref` rule of
+§3.7 for an order that does not exist. An **own-tenant** audit read appends nothing, per §3.7. Of all
+the read surfaces this is the one where the omission mattered most: the audit trail is the widest
+disclosure the gear makes, and an unlogged cross-tenant read of it would leave the §4.4 claim —
+that a review can establish under whose authority an order was read — untrue precisely where it is
+most often asked.
+
+**A failed access-log write blocks a served response and never blocks a refusal.** The write-path
+twin aborts its transaction when the audit append fails, so no state change survives without its
+trail ([`01-foundation`](./01-foundation.md) §3.6 step 21.1). A read has no state change to roll
+back, so the rule is stated on disclosure instead. Where the append fails on a **served**
+cross-tenant read — the audit read or any other — the read **MUST** fail with
+read-store-unavailable and **MUST NOT** return the payload: returning it would produce exactly the
+unlogged cross-tenant access §4.4 asserts cannot happen, and §2.2's fail-closed constraint already
+prefers an unhealthy answer to an untruthful one. Where the append fails on a **refused** read the
+refusal **MUST** still be returned unchanged — a log-write failure **MUST NOT** make a response
+more disclosive than it would otherwise have been — and the failure is raised on the
+read-access-log write-rate signal of §3.8 rather than converted into a different refusal.
+
 ### 3.7 Database Schemas and Tables
 
 This slice introduces **one** table, `orders_read_access_log`, specified at the end of this
 section. The rest of its contract is expressed as index requirements on tables owned by
 [`01-foundation`](./01-foundation.md) §3.7:
 
-- `orders_order` is indexed on `(resource_tenant_id, state, state_entered_at)` and `(seller_tenant_id, state, state_entered_at)`, which serve the two scoped list paths **and** the sweeps, and on `(contract_id)` for the contract filter. The partner path's predicate is an `IN` over `resource_tenant_id`, which is why that axis carries the composite; the previous `payer_tenant_id` composite served no path any slice describes and is removed ([`../DECISIONS.md`](../DECISIONS.md) D-23).
-- The "in this state since" filter reads `orders_order.state_entered_at`, maintained by the engine inside the transition that changes state. It is the same column the expiry sweep reads, so the two slices no longer specify opposite sources for one fact.
+- `orders_order` is indexed on `(resource_tenant_id, state, state_entered_at)` and `(seller_tenant_id, state, state_entered_at)`, which serve the sweeps **and** the "in this state since" filter, and the partner path's predicate is an `IN` over `resource_tenant_id`, which is why that axis carries a composite at all; the previous `payer_tenant_id` composite served no path any slice describes and is removed ([`../DECISIONS.md`](../DECISIONS.md) D-23).
+- **The paged list needs its own indexes, because its cursor does not sort on `state_entered_at`.** §2.2 orders the order list by `(created_at, order_id)` and forbids a mutable sort key, so neither `state_entered_at` composite above can serve a page: they order rows by a column the cursor does not use, which would force a sort of the whole scoped set per page and put the 200 ms budget out of reach. `orders_order` therefore carries a keyset index per declared filter shape, whose trailing columns *are* the cursor keys, so a page is an index range scan from the cursor and no filtered path falls back to a sort. **The index set itself is declared once, in [`01-foundation`](./01-foundation.md) §3.7**, and is not restated here.
+- **The cost of that is stated rather than hidden.** The index count on the gear's hottest write target is real write amplification on every transition, and it is accepted because the alternatives are worse: sorting on `state_entered_at` is forbidden by §2.2 for correctness, not for performance, and sorting the scoped set per page fails the budget. The benchmark of §1.2 **MUST** cover each filter shape at production row counts, since it is what establishes that these indexes are the ones the planner actually chooses.
+- The "in this state since" filter reads `orders_order.state_entered_at`, maintained by the engine inside the transition that changes state. It is the same column the expiry sweep reads, so the two slices no longer specify opposite sources for one fact — and it is a *filter* input only, never a sort key (§2.2).
 - `orders_transition_audit` is read by `(order_id, sequence)`, which its unique constraint already covers.
+- The **version list**'s cursor of §2.2 is served by `orders_order_version`'s `(order_id, version)` primary key with no further index, in either direction. The **per-line read**'s cursor is `(created_at, line_id)` over `orders_order_line_identity`, whose primary key orders by `line_id` instead, so that table **MUST** carry `(order_id, created_at, line_id)`; no line count is bounded anywhere in this design, so the page cannot rely on the set being small enough to sort.
 
 #### Table: orders_read_access_log
 
 **ID**: `cpt-cf-bss-orders-lifecycle-dbtable-read-access-log`
 
-**Schema**: `access_id`, `order_id` (nullable for a list call), `actor`, `actor_class`,
-`operation`, `outcome` (`served` or `refused`), `refusal_reason` (nullable),
-`delegation_proof_ref` (nullable), `accessed_at`.
+**Schema**: `access_id`, `order_id` (nullable — NULL for a list call, and NULL for an order-scoped
+call whose aggregate does not exist, since the FK below cannot be satisfied against a row that is
+not there), `requested_order_ref` (nullable — the identifier the caller asked for, carrying **no**
+foreign key, populated on every order-scoped call whether or not the aggregate exists, and NULL
+only for a list call), `actor`, `actor_class`, `operation`, `outcome` (`served` or `refused`),
+`refusal_reason` (nullable), `delegation_proof_ref` (nullable), `accessed_at`.
 
 **PK**: access_id
 
-**Indexes**: `(accessed_at)` for the 90-day purge; `(order_id, accessed_at)` for the per-order access history a review asks for.
+**Indexes**: `(accessed_at)` for the 90-day purge; `(order_id, accessed_at)` for the per-order access history a review asks for; `(requested_order_ref, accessed_at)`, which is the one that answers "who has been asking for orders that do not exist".
 
-**Constraints**: append-only; FK to `orders_order` where present. Written by the read paths — by
-§3.6 *Read One Order* steps 3.1, 4.1 and 9, *List Orders* step 6, and by the audit read on the
-same pattern — and the reason it exists at all: reads register no transition, so the audit store
+**Constraints**: append-only; FK on `order_id` to `orders_order` where present. Written by the read
+paths — by §3.6 *Read One Order* steps 3.1, 4.1 and 9, *List Orders* step 6, and by the audit read
+of §3.6 *Audit retrieval* on the same served-and-refused pattern — and the reason it exists at all:
+reads register no transition, so the audit store
 cannot record them, and a cross-tenant read with no record would make the delegation-proof audit
 claim untrue ([`../DECISIONS.md`](../DECISIONS.md) D-35).
+
+**Why `order_id` and `requested_order_ref` are both there.** They are not redundant, and the
+not-found refusal is the case that forces the distinction. `order_id` is the foreign-key column: it
+can hold only an identifier that names a real `orders_order` row, so on the missing-aggregate arm of
+*Read One Order* step 3 it **MUST** be NULL — writing the requested identifier there would violate
+the FK and cost the refusal its log row entirely, which is the one row a probe should always leave.
+`requested_order_ref` is a plain value column and therefore records what was asked for without
+asserting that it exists. The resulting representation is exact in all four shapes: a list call has
+both NULL; a served or refused order-scoped call against an existing order has both set to the same
+identifier; a call against an order that does not exist has `requested_order_ref` set and `order_id`
+NULL; and no row anywhere loses the identifier the caller supplied. That last shape — `order_id`
+NULL with `requested_order_ref` set on an order-scoped `operation` — is the signature of a probe
+against a non-existent identifier, so enumeration is countable per `actor` off the
+`(requested_order_ref, accessed_at)` index, which a not-found refusal that recorded nothing would
+have made impossible. Both refusal arms of step 3 still return the identical response (§3.6); the
+distinction is internal to the log.
 
 **Only cross-tenant access is logged, and that is deliberate.** The row is appended when the read
 crosses a tenant boundary, when it is refused for having no relationship to the order, and when it
@@ -528,8 +612,12 @@ engine diagnostic, and no error body **MAY** carry internal diagnostics.
 
 Permissions are declared per actor class and evaluated by the **shared authorization evaluator**
 for every operation in the gear — invoked by the engine pre-guard **before** any slice guard on
-the write path, and invoked directly before the store is touched on the read path, because a read
-registers no transition and so cannot reach the pre-guard. Startup **MUST** fail if an operation
+the write path, and invoked directly on the read path **before any part of the store is
+disclosed**, because a read registers no transition and so cannot reach the pre-guard. On an
+order-scoped read the evaluator runs immediately after the aggregate's tenant axes are loaded and
+before anything is returned, since the relationship it decides is evaluated against those axes and
+cannot be decided without them; the row read to reach the decision **MUST NOT** be disclosed to a
+caller the decision refuses (§3.6). Startup **MUST** fail if an operation
 exists with no declaration. The matrix below is exhaustive over the twenty-five endpoints of
 [`../DESIGN.md`](../DESIGN.md) §3.3 — eleven matrix rows covering twenty-five endpoints, since the
 authoring, read and workflow-only endpoints each share one declaration. An operation absent from

@@ -81,7 +81,7 @@ state machine instead of a posting or a publish.
 | Requirement | Design Response |
 |-------------|------------------|
 | `cpt-cf-bss-orders-lifecycle-fr-order-state-machine` | The state machine is data, not control flow: a transition table of `(from, to, trigger, guard set, actor class, versioning behaviour, event type)` rows (§4.3). An edge that is not a row cannot be taken, and no slice may add one. |
-| `cpt-cf-bss-orders-lifecycle-fr-order-idempotency` | The idempotency registry stores the committed *outcome* keyed by `(operation, idempotency key)` under a unique constraint, written inside the transition transaction, and is resolved **before** admissibility and the version check (§4.2). Duplicate effect is impossible rather than unlikely. |
+| `cpt-cf-bss-orders-lifecycle-fr-order-idempotency` | The idempotency registry stores the committed *outcome* keyed by `(operation, authorized principal, idempotency key)` under a unique constraint — the principal scope is part of the key, so a caller-chosen text value cannot address another caller's record — written inside the transition transaction, and is resolved **before** admissibility and the version check (§4.2). Duplicate effect is impossible rather than unlikely. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-history` | Versions are append-only rows retained in-table with a `supersedes_version` back-reference; nothing rewrites or deletes a prior version, so any version is a direct read. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-amendment` | The engine distinguishes a **versioning** transition (appends a version row) from a **state-only** transition (appends audit only), so an amendment that does not move state still produces a new version and its event. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-events` | The outbox row is written in the transition transaction and drained asynchronously, giving exactly one event per committed transition **that declares an event type**, under at-least-once delivery with consumer de-duplication by event ID (§4.4). |
@@ -97,8 +97,8 @@ state machine instead of a posting or a publish.
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` | Transition commit p95 < 1 s | Transition orchestrator | One transaction, no outbound call inside it: guard inputs are resolved before the transaction opens, and publication is the outbox drain's job, so the commit path is bounded by local writes | Load test at 50 transitions/second (§3.8) on the commit path; drain lag measured separately against the 30 s event-delivery budget |
-| `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions audited, zero silent drops | Audit store | The audit append shares the transition transaction on **every** path, committed and refused alike, so an unaudited transition cannot commit; the store is append-only with a predecessor-hash chain and no update or delete grant | Structural test asserting every table row writes an audit entry on both outcomes; fault-injection test asserting a failed audit append aborts the transition; periodic chain-verification job |
-| `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate orders or duplicate transition effects | Idempotency registry | Unique constraint on `(operation, idempotency_key)`; the marker is inserted if absent and then **re-read**, so a concurrent duplicate resolves to the settled or in-flight case rather than racing it | Parallel same-key concurrency test asserting one durable effect; replay test asserting a stored failure replays as a failure; crash test asserting a lease-expired marker is recoverable |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions audited, zero silent drops | Audit store | The audit append shares the transition transaction on **every** path, committed and refused alike, so an unaudited transition cannot commit; the store is append-only with a predecessor-hash chain, under the single grant-and-retention contract of §3.7 `orders_transition_audit` | Structural test asserting every table row writes an audit entry on both outcomes; fault-injection test asserting a failed audit append aborts the transition; periodic chain-verification job |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate orders or duplicate transition effects, **per principal** — the scope is part of the key, so the guarantee is disclosed at that granularity and `§4.2` states where it stops (create is the one operation a second principal can duplicate) | Idempotency registry | Unique constraint on `(operation, principal_scope, idempotency_key)`; the marker is inserted if absent and then **re-read**, so a concurrent duplicate resolves to the settled or in-flight case rather than racing it | Parallel same-key concurrency test asserting one durable effect; replay test asserting a stored failure replays as a failure; crash test asserting a lease-expired marker is recoverable; cross-principal test asserting one authorized caller presenting another's key neither reads nor overwrites that caller's record |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-recovery` | RPO zero for `submitted`+ orders, RTO ≤ 60 min | Persistence and topology | Version, audit, idempotency and outbox rows are one transaction, committed synchronously to a quorum with a standby in a second failure domain inside the residency boundary; acknowledgement follows durability | DR exercise promoting the standby within the RTO and asserting zero committed-transition loss including undrained outbox rows |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-read-latency` | Order read and list p95 < 200 ms | Read model | The aggregate row carries denormalized current state, `state_entered_at` and a current-version pointer, so a read never walks the version chain | Read benchmarks at production row counts with the page-size bound of [`08-read-and-authz`](./08-read-and-authz.md) §4.5 |
 
@@ -187,7 +187,9 @@ be reported as success: payload mismatch, still-processing, and stale version.
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-principle-append-only-history`
 
 Versions, line identities, lines, resolved totals, acceptance rows and audit entries are
-append-only: they are inserted and never updated or deleted; corrections are new rows. Mutable
+append-only: they are inserted and never updated or deleted; corrections are new rows. The audit
+store's one bounded exception — the purge of time-expired refusal rows — is stated once, on
+`orders_transition_audit` in §3.7, and is not restated here. Mutable
 state is confined to the aggregate, idempotency registry, outbox delivery bookkeeping, draft and
 administrative working content, in-flight overlap claims, fulfillment projection and policy rows,
 each explicitly marked in §3.7. This separation keeps commercial history immutable while allowing
@@ -232,8 +234,10 @@ that bound an order's commercial life.
 The outbox guarantees one row per committed transition that declares an event, and at-least-once
 delivery of that row. It does **not** guarantee exactly-once delivery and does not guarantee
 global ordering; ordering is per `orderId`, which is the ordering key consumers use and the shard
-key of the drain. Consumers de-duplicate by event ID, which is also what makes an operator
-re-drive of a parked row safe.
+key of the drain. Holding that per-`orderId` ordering costs head-of-line blocking on the affected
+order while a row retries or sits parked — the normative statement is §4.4 — so an event backlog
+is per order rather than global. Consumers de-duplicate by event ID, which is also what makes an
+operator re-drive of a parked row safe.
 
 #### Guard inputs from unimplemented gears are ports
 
@@ -300,8 +304,8 @@ predecessor hash forming a per-order chain.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-idempotency-record`
 
-The stored outcome of an operation keyed by `(operation, idempotency key)`: a request fingerprint
-for mismatch detection, a state of in-flight or settled with a lease instant, and the settled
+The stored outcome of an operation keyed by `(operation, authorized principal, idempotency key)`:
+a request fingerprint for mismatch detection binding the record to one target order, a state of in-flight or settled with a lease instant, and the settled
 outcome — success with its result reference, or a refusal with its machine-readable reason.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-outbox-entry`
@@ -432,7 +436,8 @@ answerable.
 
 ##### Responsibility scope
 
-Key resolution ahead of every other check; the insert-if-absent-then-re-read protocol; the
+Key resolution ahead of every other check; the binding of a key to the principal authorized to
+present it and to the target order (§4.2); the insert-if-absent-then-re-read protocol; the
 request fingerprint and mismatch detection; the in-flight marker with its lease; outcome
 settlement including refusals; and the 24-hour retention window with its sweep.
 
@@ -458,8 +463,8 @@ tampering is detectable rather than merely forbidden.
 
 The append-only transition log with actor, timestamp, reason, key, correlation identifier,
 delegation-proof reference and administrative change payload; the per-order predecessor-hash
-chain and its verification job; retrieval by order; and the absence of any update or delete
-grant.
+chain and its verification job; retrieval by order; and the grant-and-retention contract of §3.7
+`orders_transition_audit`, which this component implements and does not restate.
 
 ##### Responsibility boundaries
 
@@ -483,8 +488,9 @@ publisher would cap the whole gear's event throughput regardless of replica coun
 ##### Responsibility scope
 
 The **sharded** drain — leases taken per `order_id` hash range, batched publication within a
-shard — with backoff, per-`orderId` ordering, a bounded attempt count, the dead-letter record
-with its alert, and the operator re-drive operation.
+shard — with backoff, per-`orderId` ordering including the head-of-line suspension that ordering
+implies (§4.4), a bounded attempt count, the dead-letter record with its alert, and the operator
+re-drive operation.
 
 ##### Responsibility boundaries
 
@@ -548,8 +554,9 @@ the version chain; it exposes no guard state and no idempotency content.
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-interface-outbox-redrive`
 
 The operator re-drive of a parked dead-letter row: re-publish under the original event id, so
-consumer de-duplication makes replay safe. Audited, and restricted to the seller-operator actor
-class.
+consumer de-duplication makes replay safe. It republishes in `sequence` order and **MUST NOT** skip
+a parked row, because the drain holds that order's later events behind it (§4.4). Audited, and
+restricted to the seller-operator actor class.
 
 **Error surface**: every refusal carries a registered machine-readable reason and maps to an
 RFC 9457 `application/problem+json` response at the wire edge, with no internal diagnostics in
@@ -597,13 +604,13 @@ concern ([`../DESIGN.md`](../DESIGN.md) §3.5).
 Input: order_id, trigger, security_context, idempotency_key, expected_version, correlation_id, contribution
 Output: committed outcome or registered refusal
 
-1. [ ] - `p1` - Evaluate the authorization pre-guard before probing idempotency: actor class, tenancy relationship, and the delegation proof where the action is cross-tenant; **IF** the actor is not permitted, or a required proof is absent, expired or revoked: open a refusal transaction, append the denied-attempt audit entry with the proof reference where one was presented — **without loading or locking the aggregate row**, since a refused entry takes no sequence and joins no hash chain — commit, and **RETURN** the authorization refusal; **ONLY IF** authorization succeeds, probe the idempotency registry for (operation, idempotency_key) **before resolving any guard input**; **IF** a settled record matches the request fingerprint: **RETURN** its stored outcome - `inst-probe-idempotency`
+1. [ ] - `p1` - Evaluate the authorization pre-guard before probing idempotency: actor class, tenancy relationship, and the delegation proof where the action is cross-tenant; **IF** the actor is not permitted, or a required proof is absent, expired or revoked: open a refusal transaction, append the denied-attempt audit entry with the proof reference where one was presented — **without loading or locking the aggregate row**, since a refused entry takes no sequence and joins no hash chain — commit, and **RETURN** the authorization refusal; **ONLY IF** authorization succeeds, probe the idempotency registry for (operation, principal_scope, idempotency_key) — the principal scope taken from the security context just authorized and **never** from the request body — **before resolving any guard input**; **IF** a settled record matches the request fingerprint: **RETURN** its stored outcome - `inst-probe-idempotency`
 2. [ ] - `p1` - Resolve every guard input the trigger's guard set declares, outside any transaction, under each port's declared deadline - `inst-resolve-guard-inputs`
 3. [ ] - `p1` - **IF** any declared input is unresolvable or its deadline elapses: - `inst-if-input-unresolvable`
    1. [ ] - `p1` - Open a refusal transaction, load the aggregate row taking its row lock, resolve or create the idempotency record, settle it with the guard's registered unevaluable reason, append the refused-attempt audit entry, commit, and **RETURN** that refusal (absence is a refusal) - `inst-return-input-unresolvable`
 4. [ ] - `p1` - Open one transaction for everything that follows - `inst-open-transaction`
 5. [ ] - `p1` - Load the aggregate row for order_id **taking its row lock**, which also serialises audit-sequence allocation - `inst-load-aggregate-locked`
-6. [ ] - `p1` - Resolve the idempotency record for (operation, idempotency_key) - `inst-resolve-idempotency`
+6. [ ] - `p1` - Resolve the idempotency record for (operation, principal_scope, idempotency_key), the scope taken from the authorized security context - `inst-resolve-idempotency`
 7. [ ] - `p1` - **IF** a settled record exists: - `inst-if-idempotency-settled`
    1. [ ] - `p1` - **IF** its request fingerprint differs from this request: - `inst-if-fingerprint-differs`
       1. [ ] - `p1` - Append the audit entry, commit, and **RETURN** idempotency-mismatch refusal - `inst-return-fingerprint-mismatch`
@@ -625,21 +632,26 @@ Output: committed outcome or registered refusal
 14. [ ] - `p1` - Resolve the effective target state: the stored pre-hold state when the trigger is resume, otherwise the row's target - `inst-resolve-effective-target`
 15. [ ] - `p1` - **IF** the trigger is resume **AND** no pre-hold state is stored: settle, audit, commit and **RETURN** a refusal - `inst-if-resume-target-missing`
 16. [ ] - `p1` - Capture the outgoing state before any assignment - `inst-capture-outgoing-state`
-17. [ ] - `p1` - **IF** the row's versioning behaviour is versioning: - `inst-if-versioning-row`
+17. [ ] - `p1` - **IF** the contribution carries resolved overlap keys — submit and amendment do: - `inst-if-overlap-keys`
+    1. [ ] - `p1` - Mark this order's open claims released, then insert one claim row per **distinct** resolved key with `ON CONFLICT (payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL DO NOTHING`, returning the inserted rows - `inst-take-claims`
+    2. [ ] - `p1` - Offer the keys in a **total order** — sorted — so two concurrent multi-key orders acquire in the same sequence and cannot deadlock against each other - `inst-sort-claim-keys`
+    3. [ ] - `p1` - **IF** fewer rows return than distinct keys were offered: settle the idempotency record with `order-in-flight-for-key`, append the refused-attempt audit entry, commit, and **RETURN** that refusal - `inst-if-claim-conflict`
+18. [ ] - `p1` - **IF** the row's versioning behaviour is versioning: - `inst-if-versioning-row`
     1. [ ] - `p1` - Append a new version row from the contribution, with supersedes_version set to the outgoing current version - `inst-append-version`
     2. [ ] - `p1` - Move the aggregate's current-version pointer to the new version - `inst-move-version-pointer`
-18. [ ] - `p1` - Write every other document contribution the row declares — lines, totals, verdict, linkage, projection, acceptance, gate outcome - `inst-write-contributions`
-19. [ ] - `p1` - **IF** the effective target differs from the outgoing state: - `inst-if-state-changes`
+19. [ ] - `p1` - Write every other document contribution the row declares — lines, totals, verdict, linkage, projection, acceptance, gate outcome - `inst-write-contributions`
+20. [ ] - `p1` - **IF** the effective target differs from the outgoing state: - `inst-if-state-changes`
     1. [ ] - `p1` - Set the aggregate's state to the effective target and set state_entered_at - `inst-set-state`
     2. [ ] - `p1` - **IF** the effective target is on_hold: store the outgoing state as the pre-hold state - `inst-store-pre-hold`
     3. [ ] - `p1` - **IF** the effective target is not `on_hold`: clear the pre-hold state - `inst-clear-pre-hold`
-20. [ ] - `p1` - Allocate the next audit sequence from the aggregate's counter and append the audit entry with from-state, to-state, trigger, outcome committed, actor, proof reference, reason, key, correlation_id, version in force and the predecessor hash - `inst-append-audit`
-21. [ ] - `p1` - **IF** the audit append fails: - `inst-if-audit-fails`
+    4. [ ] - `p1` - **IF** the trigger is resume: increment `resume_count`; it is an engine-owned column like `state_entered_at`, no contribution supplies it, and the row 22 guard that reads it ran at step 13 under this same row lock, so the increment cannot race the check ([`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.2) - `inst-increment-resume-count`
+21. [ ] - `p1` - Allocate the next audit sequence from the aggregate's counter and append the audit entry with from-state, to-state, trigger, outcome committed, actor, proof reference, reason, key, correlation_id, version in force and the predecessor hash - `inst-append-audit`
+22. [ ] - `p1` - **IF** the audit append fails: - `inst-if-audit-fails`
     1. [ ] - `p1` - Abort the transaction so no state change survives without its trail - `inst-abort-on-audit-failure`
-22. [ ] - `p1` - **IF** the row declares an event type: enqueue exactly one outbox row for it - `inst-enqueue-outbox`
-23. [ ] - `p1` - Settle the idempotency record with the success outcome and a reference to the audit entry - `inst-settle-success`
-24. [ ] - `p1` - Commit the transaction - `inst-commit-transaction`
-25. [ ] - `p1` - **RETURN** the committed outcome - `inst-return-committed`
+23. [ ] - `p1` - **IF** the row declares an event type: enqueue exactly one outbox row for it - `inst-enqueue-outbox`
+24. [ ] - `p1` - Settle the idempotency record with the success outcome and a reference to the audit entry - `inst-settle-success`
+25. [ ] - `p1` - Commit the transaction - `inst-commit-transaction`
+26. [ ] - `p1` - **RETURN** the committed outcome - `inst-return-committed`
 
 **Description**: The evaluation order is fixed and total. Authorization precedes even the
 advisory idempotency probe, so an unauthorized caller learns nothing about the order's state or a
@@ -649,6 +661,28 @@ necessarily carries a superseded version, and checking the version first would r
 this registry exists to serve. Every refusal path settles its record where one exists, appends its
 audit entry and commits, which is what makes the 100 % audit guarantee true of refusals as well as
 successes.
+
+**The overlap claim is enforced first, because it is a constraint and not a guard.** Step 17 sits
+ahead of the version append at 18 and ahead of every other contribution, and that position is the
+mechanism. Two properties force it. First, the enforcement is a **partial unique index** (`§3.7`
+`orders_inflight_overlap_claim`), and a raw unique violation aborts the whole PostgreSQL
+transaction — the one that step 20's audit append and step 24's settle still have to run in — so
+the claim is taken with `ON CONFLICT … DO NOTHING` and the conflict detected as a **row shortfall**
+rather than raised as an error; `order-in-flight-for-key`, the design's only
+concurrency-correctness refusal, would otherwise be unwritable. Second, a refusal decided at step
+17 has nothing durable to unwind: had the claim been attempted after step 18, the refusal would
+have to discard a committed version row and a moved current-version pointer in tables that grant no
+DELETE, so a phantom version would survive a transition nobody admitted. Deciding before any
+contribution is what makes the refusal path safe without rollback machinery. Two prohibitions
+follow: no step **MAY** take the claim after step 17, and no path **MAY** map the collision to an
+infrastructure error.
+
+Three properties the step depends on, all stated in `§3.7`: keys are offered **distinct** (a
+repeated key inserts one row, and a shortfall count would otherwise read that as the order
+colliding with itself), keys are offered in a **total order** (so two concurrent multi-key orders
+cannot deadlock acquiring in opposite sequences), and the transaction runs at **READ COMMITTED**
+(under snapshot isolation the insert raises a serialisation failure instead of reporting a
+shortfall).
 
 #### Idempotent replay
 
@@ -695,8 +729,8 @@ Input: shard index, undelivered outbox rows in that shard
 Output: delivered or dead-lettered rows
 
 1. [ ] - `p1` - Acquire the lease for this shard; **IF** not acquired, **RETURN** without work - `inst-acquire-shard-lease`
-2. [ ] - `p1` - Select undelivered rows whose shard key falls in this shard, ordered by order_id then sequence, using the partial index on undelivered rows - `inst-select-undelivered`
-3. [ ] - `p1` - Group the selection into batches that preserve per-order_id ordering - `inst-group-batches`
+2. [ ] - `p1` - Select the **candidate `order_id`s** in this shard — those holding at least one row with `delivered_at` NULL — bounded by a per-cycle order count, using the partial index on undelivered rows, which **retains parked rows** so a blocked stream head is visible to this select rather than invisible to it. The bound is on **orders and not on rows**: a row-bounded select would fill its batch with one blocked order's suspended tail and starve every other order in the shard - `inst-select-undelivered`
+3. [ ] - `p1` - **FOR EACH** order_id in the selection, take only the **contiguous prefix** from its lowest undelivered sequence, stopping at the first row that is parked or whose `next_attempt_at` is in the future; group the taken rows into batches that preserve per-order_id ordering - `inst-group-batches`
 4. [ ] - `p1` - **FOR EACH** batch: - `inst-for-each-batch`
    1. [ ] - `p1` - **TRY**: publish to the platform event bus with each event id as its de-duplication token - `inst-try-publish`
       1. [ ] - `p1` - Mark the batch delivered - `inst-mark-delivered`
@@ -706,13 +740,27 @@ Output: delivered or dead-lettered rows
          1. [ ] - `p1` - Park the row as a dead-letter record carrying order_id, version, correlation_id, event id and last error - `inst-park-dead-letter`
          2. [ ] - `p1` - Raise the dead-letter alert to the fulfillment-operator queue - `inst-alert-dead-letter`
          3. [ ] - `p1` - Leave order state untouched — a parked event is not an order state - `inst-preserve-order-state`
-5. [ ] - `p1` - Purge rows delivered longer ago than the outbox retention window - `inst-purge-delivered`
+         4. [ ] - `p1` - Suspend that order's stream: while the parked row is undelivered the drain **MUST NOT** publish any higher sequence for the same order_id, and every other order in the shard continues unaffected - `inst-suspend-order-stream`
+5. [ ] - `p1` - **RETURN** without purging: delivered rows past the outbox retention window are removed by the **retention purge sweep**, not here. Purging inside the drain would have every leaseholder run the same unscoped delete concurrently over the same rows, and the purge predicate carries no shard key - `inst-purge-delivered`
 6. [ ] - `p1` - **RETURN** the delivered, parked and purged counts for the drain-lag metric - `inst-return-drain-counts`
 
 **Description**: Sharding by `order_id` hash lets drain throughput scale with replica count while
 preserving the only ordering the contract promises. Because the order's own state committed with
 the row, a poisoned event cannot corrupt the record it describes — the failure is a delivery
 incident, recoverable by the re-drive of §3.3.
+
+**A failing or parked row blocks its own order's stream, and only its own** (§4.4). Steps 3 and
+4.2.2.4 make that normative, and the choice is deliberate: the alternative — skipping a parked
+sequence and delivering everything after it — breaks the per-order ordering `(order_id, sequence)`
+exists to hold, which no consumer can reconstruct once an event has been delivered out of order,
+and Subscriptions and Billing act on these events. The block is therefore **bounded, not
+unbounded**: it is scoped to one `order_id`, it raises the dead-letter alert of step 4.2.2.2 the
+moment it becomes indefinite, and it is closed by the operator re-drive of §3.3, which republishes
+the parked row **under its original event id and in sequence order**, after which this drain
+resumes that order's suspended stream from the next sequence. The re-drive **MUST NOT** be used to
+skip a parked row — skipping is precisely the out-of-order delivery the block prevents. An order
+whose stream is suspended keeps its committed state and its audit trail; only its event
+*publication* waits.
 
 ### 3.7 Database Schemas and Tables
 
@@ -735,17 +783,26 @@ rows that append no version, and they present the **current version** as their e
 like any other transition, so the optimistic check applies uniformly and no path bypasses it
 ([`../DECISIONS.md`](../DECISIONS.md) D-64).
 
-**Partitioning.** The three traffic-driven append-only stores — the outbox, the read access log
-and Preview gate outcomes — are **range-partitioned by month**, so their retention is a partition
-drop rather than a bulk DELETE, which is the only shape that stays cheap as history grows. The
-transition audit is **not** partitioned for retention: its committed entries carry a 24-month
-archival tier and no DELETE grant, so only its refused rows are purged, in bounded batches through
-the partial index above. Every other table is sized by order count rather than by traffic and needs
+**Partitioning.** Two traffic-driven append-only stores — the read access log and Preview gate
+outcomes — are **range-partitioned by month**, so their retention is a partition drop rather than a
+bulk DELETE, which is the only shape that stays cheap as history grows.
+
+**The outbox is deliberately not partitioned**, and the reason is a constraint, not a preference.
+PostgreSQL requires a unique constraint on a partitioned table to include every partition-key
+column, so a monthly-partitioned outbox could only enforce `(order_id, sequence)` UNIQUE *per
+partition* — and that uniqueness is exactly what per-order ordering and the drain's contiguous
+prefix rest on (`§4.4`). A parked dead-letter row would also pin its month indefinitely, so the
+partition could never be dropped, which removes the only benefit. The outbox therefore keeps
+row-level purging of delivered rows through its own partial index. The
+transition audit is **not** partitioned for retention: its grants and its retention are stated once
+on `orders_transition_audit` below, which is their only normative home, and only its refused rows
+are purged — in bounded batches through that table's partial index. Every other table is sized by order count rather than by traffic and needs
 no partitioning at this phase.
 
 **Immutability** is per table rather than global. Append-only with **no UPDATE or DELETE grant**:
-`orders_order_version`, `orders_order_line`, `orders_resolved_total`, `orders_transition_audit`,
-`orders_acceptance`. Deliberately **mutable**: `orders_order` (denormalized state),
+`orders_order_version`, `orders_order_line`, `orders_resolved_total`, `orders_acceptance`.
+`orders_transition_audit` is append-only as well, but its grants are **split** rather than absent,
+and the split is stated on that table below rather than here. Deliberately **mutable**: `orders_order` (denormalized state),
 `orders_event_outbox` (delivery bookkeeping), `orders_idempotency` (marker settlement),
 `orders_order_admin` and `orders_order_line_admin` (administrative content),
 `orders_draft_content` (pre-submit working set), `orders_line_fulfillment` (projection advance).
@@ -780,6 +837,7 @@ key and the engine's choice between them is undefined (`§4.6`).
 | state_entered_at | timestamptz | When the current state was entered; the dwell input for every sweep and the "in this state since" list filter |
 | current_version | integer, **NOT NULL, `1` from creation** | Pointer into the version chain (deferred FK). Creation appends version 1 carrying the empty draft; submit appends version 2 carrying the gated content |
 | pre_hold_state | enum, nullable | Set by a hold, consumed and cleared by a resume |
+| resume_count | integer, **NOT NULL, `0` from creation** | Resumes taken on this order. Incremented by row 22 and by nothing else; **no transition decrements or resets it**, which is what makes the resume cap of `07 §4.2` a bound rather than a quota. Read by row 22's guard on the already-locked aggregate row, so the cap costs no scan and no index |
 | spawn_signal_at | timestamptz, nullable | Written by the spawn-signal transition; never cleared |
 | authorization_failure_tolerated_at | timestamptz, nullable | The tolerated-authorization risk flag; records a decision taken at an instant and is never cleared |
 | compensation_evidence | jsonb, nullable | Workflow-supplied evidence of drafts voided, activated subscriptions rolled back and at-sale facts emitted; recorded only by failure acknowledgement or workflow-mediated cancellation |
@@ -789,14 +847,34 @@ key and the engine's choice between them is undefined (`§4.6`).
 **PK**: order_id
 
 **Constraints**: `order_number` UNIQUE per `seller_tenant_id`; `pre_hold_state` NULL unless
-`state` is `on_hold`.
+`state` is `on_hold`; `resume_count >= 0`.
 
-This CHECK is why `§3.6` *Attempt Transition* step 19.3 clears `pre_hold_state` on **any** transition whose target is not `on_hold`, not only on resume. Rows 23 (`on_hold → cancelled`) and 24 (`on_hold → expired`) move a held order to a terminal state; clearing only on resume would leave the column populated against a non-`on_hold` state, the UPDATE would fail the constraint, and both transitions — one of them the TTL sweep's main path out of `on_hold` — would be unable to commit at all.
+This CHECK is why `§3.6` *Attempt Transition* step 20.3 clears `pre_hold_state` on **any** transition whose target is not `on_hold`, not only on resume. Rows 23 (`on_hold → cancelled`) and 24 (`on_hold → expired`) move a held order to a terminal state; clearing only on resume would leave the column populated against a non-`on_hold` state, the UPDATE would fail the constraint, and both transitions — one of them the TTL sweep's main path out of `on_hold` — would be unable to commit at all.
 
-**Additional info**: indexed on `(resource_tenant_id, state, state_entered_at)` and
-`(seller_tenant_id, state, state_entered_at)` for the tenancy-scoped list and the sweeps, and on
-`(contract_id)` for the contract filter. The partner path resolves to a set of resource-tenant
-identifiers, which is why that axis carries the composite rather than the payer axis.
+**Additional info** — this list is canonical for `orders_order`; `08 §3.7` and `07 §3.7` state
+*why* each index exists and **MUST NOT** restate the set. Seven indexes:
+
+| Index | Serves |
+|-------|--------|
+| `(resource_tenant_id, state, state_entered_at)` | the per-state expiry sweep and the "in this state since" **filter** |
+| `(seller_tenant_id, state, state_entered_at)` | the same, on the seller axis |
+| `(resource_tenant_id, created_at, order_id)` | the unfiltered scoped page — trailing columns are the list cursor of `08 §2.2` |
+| `(seller_tenant_id, created_at, order_id)` | the same, on the seller axis |
+| `(resource_tenant_id, state, created_at, order_id)` | the state-filtered page |
+| `(seller_tenant_id, state, created_at, order_id)` | the same, on the seller axis |
+| `(contract_id, created_at, order_id)` | the contract-filtered page; replaces a bare `(contract_id)` |
+
+The partner path resolves to a set of resource-tenant identifiers, which is why that axis carries
+the composites rather than the payer axis. **The `state_entered_at` composites cannot serve a
+page**: `08 §2.2` orders the list by `(created_at, order_id)` and forbids a mutable sort key, so a
+cursor cannot sort on a column the engine rewrites — which is a correctness rule, not a
+performance one. An eighth index, `(state, created_at)`, was declared here for an
+absolute-lifetime sweep pass that `07 §4.2` has since withdrawn; it is removed rather than left as
+an unread index on the hottest write path. Seven indexes on the gear's hottest write target is real write amplification on
+every transition, accepted because both alternatives are worse: sorting on `state_entered_at` is
+forbidden, and sorting the scoped set per page misses the 200 ms budget. `08 §1.2`'s benchmark
+**MUST** cover each filter shape at production row counts, since that is what establishes the
+planner chooses these.
 
 #### Table: orders_order_version
 
@@ -895,7 +973,7 @@ without one.
 
 **PK**: claim_id
 
-**Constraints**: FK `(order_id, version)` to `orders_order_version`; **partial UNIQUE** on
+**Constraints**: **partial UNIQUE** on
 `(payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL`. This is the authoritative
 one-in-flight-order constraint, and *exactly one* is what PRD §6.1(g) requires — the in-flight
 order cap is fixed there, unlike the concurrent-**subscription** cardinality of §6.1(f), which
@@ -903,21 +981,40 @@ Catalog or Contract may configure. A UNIQUE index expresses exactly one, so it e
 directly ([`../DECISIONS.md`](../DECISIONS.md) D-83). The table is mutable only to set
 `released_at`; claims are never deleted.
 
-**An index on `order_id` is required, not optional.** The release path below finds a terminal
-order's open claims by `order_id`, and the partial UNIQUE leads on `payer_tenant_id`, which that
-path does not have as a predicate. Without `(order_id) WHERE released_at IS NULL`, every terminal
-transition scans the table inside the transaction holding the aggregate row lock, so commit
-latency degrades with total historical claim volume rather than with live order count.
+**How the collision is taken, normatively.** The claim is acquired at `§3.6` *Attempt
+Transition* **step 17**, which sits **before** the version append of step 18 and before every other
+contribution. That ordering is the whole mechanism: a conflict must be able to refuse without
+leaving anything behind, and a refusal that ran after step 18 would commit a version row and move
+the current-version pointer for a transition nobody admitted — in tables with no DELETE grant, so
+permanently. **This table therefore carries no foreign key to `orders_order_version`.** It records
+`order_id` and the version the claim was taken for as data, and giving it an FK would force the
+version to pre-exist the claim, which is exactly the ordering that produces the phantom version.
+
+Three further properties the mechanism depends on. Keys are offered **distinct** — two lines of one
+order resolving to the same key are one claim, not two, because `ON CONFLICT … DO NOTHING` inserts a
+single row for a repeated key and a shortfall count would otherwise read that as a collision and
+refuse the order against itself. Keys are offered in a **total order**, so two concurrent multi-key
+orders cannot deadlock by acquiring in opposite sequences. And transitions run at **READ
+COMMITTED** — under a snapshot isolation level the insert raises a serialisation failure instead of
+reporting a shortfall, and the refusal decision would be made on state the transaction can no
+longer read.
+
 
 **Additional info**: a submit or amendment transition atomically releases its prior-version claims
 where present and inserts claims for every resolved line key. Releasing the prior version's
 claims **before** inserting the new ones is what lets an amendment re-claim its own key without
-colliding with itself. A partial-unique collision maps to `order-in-flight-for-key`. A transition to `completed`,
-`rejected`, `cancelled`, `expired` or `fulfillment_failed` — that is, any transition into the
-terminal set of `§4.3` — atomically marks all of its open claims released.
-All other in-flight transitions retain the claim. A partial-unique collision is mapped to the
-`order-in-flight-for-key` refusal, settled and audited in the same transaction; it is therefore the
-concurrency enforcement behind the gate's friendly pre-check.
+colliding with itself. **Release on a terminal transition is a step, not an assumption**: a
+transition to `completed`, `rejected`, `cancelled`, `expired` or `fulfillment_failed` — that is,
+any transition into the terminal set of `§4.3` — marks all of that order's open claims released,
+and it does so in `§3.6` step 17 alongside acquisition, in the same transaction as the transition
+itself, so no terminal order can leave a live claim behind.
+All other in-flight transitions retain the claim. A collision refuses with
+`order-in-flight-for-key`, settled and audited in the **same** transaction — the refusal is
+decided at step 17, before anything durable has been contributed, which is why no rollback
+machinery is needed to unwind it; the refusal is a **failed slice guard** in the seven-class taxonomy of `§4.1` — the
+in-transaction enforcement of [`03-gate-and-pin`](./03-gate-and-pin.md) §4.2 predicate 9 — so it
+settles, audits and commits like any other guard refusal and adds no eighth class. It is therefore
+the concurrency enforcement behind the gate's friendly pre-check.
 
 #### Table: orders_draft_content
 
@@ -1022,9 +1119,12 @@ existing at the time of the attempt, not about retaining it forever — and the 
 trail keeps both the chain and the absent DELETE grant that make it tamper-evident.
 
 **Additional info**: refused attempts are recorded as well as committed ones, so a denied
-authorization or a failed guard is visible to an auditor. Refusal rows carry a **90-day
+authorization or a failed guard is visible to an auditor. **This paragraph and the constraints
+above are the canonical audit-retention contract for the set; every other statement defers to it
+and none restates it.** Refusal rows carry a **90-day
 retention** distinct from committed transitions, purged by the retention sweep
-([`../DESIGN.md`](../DESIGN.md) §4.2), and repeated refusals are **rate-limited at a working
+([`../DESIGN.md`](../DESIGN.md) §4.2); committed entries carry the **24-month archival tier** and
+no DELETE grant at all. Repeated refusals are **rate-limited at a working
 baseline of 20 per minute per (caller, order) pair and 200 per minute per caller**, enforced at
 the inbound edge *before* the engine — a limiter refusing inside the engine would write the very
 row it exists to prevent. The values are set here so they can be measured and revised rather than
@@ -1041,7 +1141,11 @@ acquisitions. A refused entry takes no sequence and joins no chain, so the lock 
 not taken; repeated denials are bounded by the rate limit above instead.
 
 **Ordering with nullable sequences.** The audit read returns committed entries ordered by
-`sequence` and interleaves refused entries by `created_at`. `(order_id, sequence)` stays UNIQUE —
+`sequence` and interleaves refused entries by `created_at`. **The audit read's page cursor is
+therefore `(created_at, audit_id)`, not `(sequence, audit_id)`** (`08 §2.2`): a keyset cursor
+cannot sort on a nullable column, and `sequence` is NULL on every refused row, so a
+sequence-keyed page would order refusals unpredictably or drop them. `created_at` is present on
+every row and `audit_id` is immutable, which is what a cursor needs. `(order_id, sequence)` stays UNIQUE —
 repeated NULLs do not collide — so the constraint that makes the committed trail gap-free is
 unaffected.
 
@@ -1054,9 +1158,10 @@ unaffected.
 | Column | Type | Description |
 |--------|------|-------------|
 | operation | text | The operation the key scopes |
-| idempotency_key | text | Caller-supplied key |
-| order_id | uuid, nullable | NULL for create, where no order exists yet |
-| request_fingerprint | text | Detects a same-key different-payload replay |
+| principal_scope | text | The **authorized principal** the key is bound to: the stable subject identifier taken from the security context by the authorization pre-guard (`§3.6` step 1), never from the request body, and never derived from session, token, delegation-proof, replica or transport identity — a scope that varies between a request and its retry makes the retry a different key and defeats the registry (`§4.2`). It partitions the key space so one caller cannot address another's record |
+| idempotency_key | text | Caller-supplied key, unique only **within** `(operation, principal_scope)` |
+| order_id | uuid, nullable | The target order; NULL **only** for create, where no order exists yet. Also covered by `request_fingerprint`, so a same-key replay aimed at another order refuses rather than returning that order's outcome |
+| request_fingerprint | text | Hash over the inputs `§4.2` enumerates; detects a same-key different-request replay |
 | status | enum | `in_flight` or `settled` |
 | lease_expires_at | timestamptz, nullable | Set while `in_flight`; an expired lease is recoverable, which is what makes a crashed request retryable |
 | outcome | enum, nullable | `success` or `refused` once settled |
@@ -1064,10 +1169,19 @@ unaffected.
 | audit_id | uuid, nullable | The transition a settled record produced |
 | created_at, expires_at | timestamptz | The 24-hour retention window |
 
-**PK**: (operation, idempotency_key)
+**PK**: (operation, principal_scope, idempotency_key)
 
-**Constraints**: the primary key is the uniqueness that makes duplicate effect impossible;
-`outcome` NOT NULL when `status` is `settled`. Indexed on `expires_at` for the window sweep.
+**Constraints**: the primary key is the uniqueness that makes duplicate effect impossible, and
+`principal_scope` is **inside** it rather than a column beside it. Keyed on
+`(operation, idempotency_key)` alone the registry is addressable by a caller-chosen text value, so
+one authorized caller can claim a key another caller is using — turning that caller's next retry
+into an idempotency-mismatch, or answering its own request with a stored outcome it never produced.
+`principal_scope` is NOT NULL. `order_id` **MUST** be non-null for every operation other than
+create, and a settled record whose `order_id` differs from the request's resolved target **MUST**
+refuse as `idempotency-mismatch` and **MUST NOT** be overwritten — the binding of one key to one
+aggregate. `outcome` NOT NULL when `status` is `settled`. Indexed on `expires_at` for the window
+sweep. The scoping and the fingerprint contract are stated normatively in `§4.2` *Key scope and the
+request fingerprint*.
 
 #### Table: orders_event_outbox
 
@@ -1078,6 +1192,8 @@ unaffected.
 | Column | Type | Description |
 |--------|------|-------------|
 | event_id | uuid | Consumer de-duplication token, stable across a re-drive |
+| created_at | timestamptz | Enqueue instant; the second key of the type index and the retention input |
+| next_attempt_at | timestamptz, nullable | When this row next becomes eligible for delivery; NULL means immediately. Set by the drain when it reschedules with backoff, so the backoff has somewhere to live |
 | order_id | uuid | Ordering key |
 | shard_key | smallint | `hash(order_id)` modulo **64** — a fixed bucket count that never changes, so drain parallelism can be re-tuned without rewriting stored keys |
 | sequence | bigint | Monotonic per order, allocated from a per-order counter under the aggregate row lock taken at `§3.6` step 5 — the same mechanism as `orders_transition_audit.sequence`, because `(order_id, sequence)` UNIQUE is what per-order ordering rests on and `MAX+1` cannot hold it under concurrency (D-24) |
@@ -1110,8 +1226,11 @@ parallelism reassigns ranges, moves no data, and can never split one order acros
 events/s target implies.
 
 **Additional info**: a **partial index** on `(shard_key, order_id, sequence) WHERE delivered_at IS
-NULL AND dead_lettered_at IS NULL` serves the drain, so its cost is proportional to the backlog
-rather than to every event ever emitted. Delivered rows are **purged** after a 30-day window; the
+NULL` serves the drain, so its cost is proportional to the backlog rather than to every event ever
+emitted. The predicate deliberately stops at `delivered_at`: excluding `dead_lettered_at IS NOT
+NULL` rows would hide exactly the blocked stream heads the drain must see to hold per-order
+ordering (§4.4), and `dead_lettered_at` is therefore a filter on the candidate row rather than a
+predicate on the index. Delivered rows are **purged** after a 30-day window; the
 audit trail, not the outbox, is the durable record.
 
 #### Table: orders_line_fulfillment
@@ -1172,10 +1291,11 @@ was recorded.
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-lifecycle-topology-foundation-runtime`
 
-The engine is a library inside the gear process, not a separate deployable. **Four** background
+The engine is a library inside the gear process, not a separate deployable. **Five** background
 workers run under coordination leases so a multi-replica deployment cannot double-act: the
 **sharded** outbox drain (one lease per shard, so throughput scales with replicas), the per-state
-expiry sweep, the draft auto-void sweep and the idempotency-window sweep. Database privilege is
+expiry sweep, the draft auto-void sweep, the idempotency-window sweep and the retention purge
+sweep. Database privilege is
 runtime-owned; the slice exposes migrations and receives scoped access, and the audit role is
 granted INSERT and SELECT only.
 
@@ -1238,6 +1358,50 @@ distinguishable by the caller:
 | Same key, different fingerprint | Idempotency-mismatch refusal |
 | Same key, in-flight record with a live lease | Still-processing refusal; the caller retries with the same key |
 | No record for the key, and the expected version is superseded | Version-conflict refusal naming the current version |
+| Same key **text**, same fingerprint, **different principal** | **Executed again.** Scoping makes it a different key, so there is no record to replay and the request runs on its merits |
+
+**Key scope and the request fingerprint.** A key is **scoped, never global**. The registry key is
+`(operation, principal_scope, idempotency_key)` (`§3.7` `orders_idempotency`), where
+`principal_scope` is the authorized principal resolved by the authorization pre-guard of `§3.6`
+step 1 and **MUST NOT** be read from the request body. "Same key" in the table above therefore
+means the same **scoped** tuple. Without the scope, one authorized caller could claim a key
+another caller had chosen — converting that caller's next retry into an idempotency-mismatch, or
+having its own request answered by a record it never wrote.
+
+**The scope adds an outcome, and the table's last row is it.** An earlier version of this section
+claimed the four outcomes stayed exhaustive and unchanged under scoping. They do not: two
+principals presenting the same key text for the same request now produce **two executions**, where
+a global key would have de-duplicated them. That is the correct behaviour — neither principal may
+address the other's record — but it is a behaviour change and callers must not read
+de-duplication as a property of the key text. Where two principals legitimately need one effect
+(a retry handed from one service identity to another, a caller migrating credentials), the effect
+must be de-duplicated by something inside the fingerprint's coverage — the target `order_id` and
+`expected_version` do exactly that for every operation except create, where the version conflict
+that would refuse a second submit does not exist. **Create is therefore the one operation where
+cross-principal duplication is possible**, and the design does not prevent it; PRD §12 AC-4's
+"zero duplicate orders" is a guarantee **per principal**, and stating it otherwise would overclaim.
+
+**How `principal_scope` is derived, normatively.** It **MUST** be the **stable subject identifier**
+of the authorized principal — the tenant-and-subject pair the platform asserts, for a human caller,
+or the service-principal identifier for a gear. It **MUST NOT** incorporate any of: session or
+token identity, a token's `jti` or expiry, a delegation-proof identifier, a client instance or
+replica identity, a source address, or a user-agent. The rule is not stylistic. Every one of those
+values can differ between a request and its own retry, and if the scope changes then the retry
+presents a **different key** — so the registry has no record for it, the fifth outcome above
+applies, and the retry **executes a second time**. An idempotency scope derived from anything
+short-lived silently converts the registry from a de-duplicator into a no-op, in exactly the
+crash-and-retry case it exists for. A deployment that cannot supply a stable subject identifier
+**MUST** fail startup rather than substitute a per-connection value.
+
+The **request fingerprint MUST** be a hash over exactly: the operation, the trigger, the resolved
+target `order_id` (or the create sentinel, where no order exists yet), the three tenant axes in
+force, `expected_version`, and the canonicalised document contribution. It **MUST NOT** cover
+`correlation_id`, the request instant, transport headers or any server-assigned value, because a
+legitimate retry varies those and a fingerprint covering them would report every retry as a
+mismatch. It **MUST** cover the target order, which is what binds a settled record to one
+aggregate: a replay of the same scoped key against a different order is an idempotency-mismatch
+refusal, not a return of the first order's outcome. The fingerprint is stored as a hash, never as
+the payload, so the registry holds no commercial content (`§3.2` idempotency registry).
 
 **An authorized replay MUST NOT re-resolve guard inputs.** Authorization is evaluated first; the
 registry is then probed *before* guard-input resolution, and a settled record whose fingerprint
@@ -1314,7 +1478,7 @@ five callers and naming it per caller is the defect the registry exists to preve
 19. [ ] - `p1` - **FROM** `pending_approval` **TO** `submitted` **WHEN** `amendment` (versioning, `OrderAmended`) - `inst-tr-amend-from-pending`
 20. [ ] - `p1` - **FROM** `approved` **TO** `submitted` **WHEN** `amendment` (versioning, `OrderAmended`) - `inst-tr-amend-from-approved`
 21. [ ] - `p1` - **FROM** `submitted`, `pending_approval`, `approved` or `in_fulfillment` **TO** `on_hold` **WHEN** `hold` — storing the outgoing state (state-only, `OrderHeld`) - `inst-tr-hold`
-22. [ ] - `p1` - **FROM** `on_hold` **TO** the stored pre-hold state **WHEN** `resume` (state-only, `OrderResumed`) - `inst-tr-resume`
+22. [ ] - `p1` - **FROM** `on_hold` **TO** the stored pre-hold state **WHEN** `resume` — guarded by the resume cap of [`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.2, and incrementing `resume_count` (state-only, `OrderResumed`) - `inst-tr-resume`
 23. [ ] - `p1` - **FROM** `on_hold` **TO** `cancelled` **WHEN** `cancel` — the pre-hold state's own cancel guard admits it (state-only, `OrderCancelled`) - `inst-tr-hold-cancel`
 24. [ ] - `p1` - **FROM** `submitted`, `pending_approval`, `approved` **TO** `expired`, **OR** **FROM** `on_hold` **TO** `expired` **WHEN** `expire` — the per-state TTL elapses **AND** the pre-hold state is not `in_fulfillment` (actor class system, state-only, `OrderExpired`) - `inst-tr-expire`
 25. [ ] - `p1` - **FROM** any non-terminal state **TO** the same state **WHEN** `record-acceptance` — the customer-acceptance instant is recorded on the partner-placed path (state-only, `OrderAcceptanceRecorded`) - `inst-tr-record-acceptance`
@@ -1393,20 +1557,43 @@ have migrated.
 
 The audit entry **MUST** be appended in the transition transaction on **every** path, committed
 and refused, and a failed append **MUST** abort it — an unaudited transition attempt is not a
-permitted outcome. The store **MUST** have no UPDATE or DELETE grant, **MUST** carry a per-order
-predecessor-hash chain, and **MUST** be verified periodically; that chain plus the absent grant is
-what makes the record tamper-**evident** as the PRD requires. No read **MAY** derive order state
+permitted outcome. The store **MUST NOT** grant UPDATE to any role, **MUST** carry a per-order
+predecessor-hash chain over its committed entries, and **MUST** be verified periodically; that
+chain plus the absent UPDATE grant is what makes the record tamper-**evident** as the PRD requires.
+Its DELETE grant and its retention are exactly those of `§3.7` `orders_transition_audit`, the one
+normative statement of both, which this section defers to rather than repeats. No read **MAY** derive order state
 from it.
 
 #### The outbox
 
 Exactly one outbox row **MUST** be written per committed transition **that declares an event
 type**. Delivery is at-least-once with consumer de-duplication by event ID, and ordering is
-guaranteed per `orderId` only. The drain is **sharded** by `order_id` hash so throughput scales
+guaranteed per `orderId` only — which is a guarantee about *undelivered* rows as much as delivered
+ones: while any row for an order is undelivered, whether in backoff or parked as a dead letter, the
+drain **MUST NOT** publish a higher `sequence` for that `orderId`, and **MUST** continue draining
+every other order in the shard. Head-of-line blocking per order is chosen over skipping, because a
+consumer cannot restore an ordering that has already been broken on the wire. The drain is **sharded** by `order_id` hash so throughput scales
 with replicas. An entry that exhausts its bounded attempt count **MUST** be parked as an
 inspectable dead-letter record with an alert; a parked entry **MUST NOT** be an order state and
 **MUST NOT** alter one, and **MUST** be recoverable by the operator re-drive of §3.3, which
 republishes under the original event id so consumers de-duplicate it.
+
+**The re-drive is a write, not just a publish, and it is order-guarded.** On success it **MUST**
+set `delivered_at` and clear `dead_lettered_at` and `next_attempt_at`, as an engine write like any
+other — without that write the row stays in the drain's selection, the drain keeps stopping on it,
+and the operator's remedy silently does nothing. It **MUST** be refused where any lower `sequence`
+for the same `order_id` is still undelivered, because the ordering rule is enforced by the drain's
+prefix and a per-`eventId` operator call sits outside that path: re-driving sequence 7 while 3 is
+parked would put 7 on the wire first, which is the exact reordering the suspension exists to
+prevent. Once the row is delivered the drain resumes that order's stream from the next sequence.
+
+**What bounds the suspension, honestly.** The blast radius is bounded — one `order_id`, never the
+shard. The **duration is not**: a parked row that nobody re-drives suspends its order's stream
+indefinitely, its rows are never purged because the purge takes only delivered rows, and the
+drain-lag alert fires for that shard until someone acts. The dead-letter alert is a detector, not a
+bound. This is the same shape of residual cost `ADR/0007` records for a wedged order holding its
+overlap key — a process answer to a data problem — and it is stated here rather than implied by an
+alert.
 
 ### 4.5 What this slice deliberately does not own
 

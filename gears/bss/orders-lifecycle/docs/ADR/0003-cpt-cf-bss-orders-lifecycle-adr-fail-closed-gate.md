@@ -79,11 +79,22 @@ provisioning compensation, which is the path the two-phase fulfilment barrier ex
 
 ### Confirmation
 
-Verified by the reason registry containing exactly one unavailable reason for each of the six
-ports — catalog predicates, identity and party, contract resolution, overlap presence, evaluation
-and indicative tax — in `design/03-gate-and-pin.md` §3.3; by the gate algorithm collecting
-unevaluable inputs into the same all-failures report as evaluated failures (§3.6 *Run Gate and Submit* step 8); and by
-a test asserting that an unresolvable port produces a refusal rather than an admission.
+**This gear has no implementation and no runtime tests**, so the checks below are labelled either
+verifiable today or planned.
+
+**Verifiable today, by reading the design set.** The reason registry contains exactly one
+unavailable reason for each of the six ports — catalog predicates, identity and party, contract
+resolution, overlap presence, evaluation and indicative tax — in `design/03-gate-and-pin.md`
+§3.3; the gate algorithm collects unevaluable inputs into the same all-failures report as
+evaluated failures (§3.6 *Run Gate and Submit* step 8); and §4.1 carries the normative
+prohibition on treating unevaluable as passed. The invariant suite's reason-ownership family
+asserts at document level that each of those names has exactly one owning slice, so a second
+slice cannot quietly register a competing spelling of the same condition.
+
+**Planned, not yet written.** A runtime check asserting that an unresolvable port produces a
+refusal rather than an admission is the behavioural half of this decision, and there is nothing
+to run it against. It is not yet recorded as a verification approach in `03 §1.2`, which is its
+home.
 
 ## Pros and Cons of the Options
 

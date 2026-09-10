@@ -83,12 +83,26 @@ pinned, audited order. Phase 2 completes the commercial lifecycle and the siblin
 remediated.** Together with [`../DESIGN.md`](../DESIGN.md), this index, **seven ADRs**, the
 decisions register and the upstream-requirements register, that is **nineteen artifacts**
 covering every design item the PRD's twenty-two functional and seven non-functional requirements
-imply. Five review waves are recorded with the team rather than in this set: the 2026-09-08 wave (`R-01`…`R-74`) and the 2026-09-09/10 waves, whose dispositions include the findings that were **declined** and the reasons why.
+imply. Six review waves are recorded with the team rather than in this set: the 2026-09-08 wave (`R-01`…`R-74`) and the 2026-09-09/10 waves, whose dispositions include the findings that were **declined** and the reasons why.
 
-**No claim is made that the set has converged.** Wave 5 still produced two CRITICALs, and a
-subsequent sweep found seven further instances of one of them that wave 5 had not reached. What
-is asserted is narrower and checkable: `make design-check` holds **559 invariants** over this
-set, and `scripts/test-design-invariants.py` proves each family fires.
+**No claim is made that the set has converged.** Wave 5 produced two CRITICALs, and a subsequent
+sweep found seven further instances of one of them that wave 5 had not reached. Wave 6 reviewed
+wave 5's *own fixes* and found five more CRITICALs, **all five introduced by those fixes** — an
+outbox scheduling column that was indexed but never declared, monthly partitioning incompatible
+with the ordering constraint it sat on, a savepoint that hid a phantom version rather than
+preventing it, an absolute-lifetime backstop rendered inert by a shared idempotency key, and a
+timed validity window no declared interface could carry. That is the honest shape of this set's
+state: each wave has found real defects in the previous wave's remediation, and the rate is not
+yet falling. What is asserted is narrower and checkable: `make design-check` holds **881 invariants** over this
+set, and `scripts/test-design-invariants.py` injects **33 single defects** and requires the checker
+to detect each — one case per assertion family, so no family can pass vacuously.
+
+**What that number does not cover.** The suite asserts derived facts: counts against what they
+count, citations that resolve, reason names that are unique, index declarations that name their own
+table's columns, state sets that match the transition table. It asserts nothing about step
+*ordering*, transaction scope, cardinality coupling, or whether a declared `MUST` has an interface
+behind it — and a 2026-09-10 review found five defects of exactly those kinds while the suite
+reported green. Read it as a guard against drift, not as evidence of correctness.
 
 Phase 0/1 is [`01-foundation.md`](./01-foundation.md), the correctness core: the transition
 contract, the idempotency semantics with their four exhaustive outcomes, the state machine as a

@@ -208,6 +208,47 @@ fallback of admitting the submit and relying on the activation-time re-check is 
 would move the failure past the first line's provisioning, into precisely the expensive
 compensation path the design exists to avoid.
 
+**The activation re-check is a bounding device, not the enforcement point.** The re-read of §3.6
+*Re-check Activation Preconditions* and the activation it guards are two operations over state this
+gear does not own, so state can move between them and nothing this slice writes can close that
+window. The two axes are therefore separated. The **order** axis is closed authoritatively: no
+second order may hold an overlap key, enforced by the partial unique index of
+[`01-foundation`](./01-foundation.md) §3.7 inside the transition transaction. The **subscription**
+axis — `maxConcurrentActive`, §4.2 predicate 7 — can only be closed where the `active` transition
+commits, so Subscriptions **MUST** re-evaluate `overlapScopeKey` and commit `active` under one
+reservation or serialisation boundary; this slice **MUST NOT** present its re-check as that
+boundary, and no implementation **MAY** treat a passing re-check as an admission guarantee. Until
+that upstream enforcement is agreed — the same seam as the `SUB-O5` presence read, and recorded
+against it in [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — **the subscription axis is open, and
+this design does not bound it.** That is the honest statement and it replaces an earlier one.
+
+**Why no timed window is stated.** An earlier version of this section gave the proceed verdict a
+30-second validity window, required the sibling gear to dispatch inside it or re-invoke, and called
+the result "bounded rather than closed". Four things were wrong with it, and each is a reason not
+to restate the bound in some other duration:
+
+* **Nothing carries the deadline.** `§3.6` *Re-check Activation Preconditions* returns "proceed, or a per-line rejection reason" to its caller. A validity origin and a window are not fields of any declared port operation, event payload or endpoint response in this design set, and the transition the caller then drives — `spawn-signal`, [`01-foundation`](./01-foundation.md) §4.3 row 11 — is deliberately event-less. There is therefore no interface through which this gear tells anyone the verdict has expired.
+* **"Invoke the algorithm again" is not an obligation this gear can place.** The re-check is invoked by Subscriptions' caller at its own discretion; this slice publishes no signal that would trigger a re-invocation and observes no failure if none happens. A **MUST** with no observable violation is not a requirement.
+* **One verdict cannot cover N activations.** The design's own sequence puts an entire fulfillment wave between the re-check and the last line's activation — the two-phase barrier of [`06-workflow-seam`](./06-workflow-seam.md) §4.3 explicitly defers lines. A single window measured from one read instant says nothing about the line activated last, and per-line windows would need per-line re-checks the sequence does not contain.
+* **There is no shared clock to measure it against.** The origin instant would be read in this gear and the deadline evaluated in another, with no declared clock source, no skew bound and no way for either side to detect that it disagreed. Both skew directions fail silently: one lets an expired verdict be honoured, the other discards a valid one. The gate's own circuit breaker (§2.2, held open for **10 seconds**) would consume a third of a 30-second window on its own.
+
+**What is actually true, and enforceable.** The order axis is closed, in-transaction, by the index
+named above. On the subscription axis two obligations remain and both are expressible: Subscriptions
+**MUST** close it at the commit that writes `active`, raised as an upstream requirement; and a
+collision that appears at or after activation **MUST** surface as an `overlap-collision` line
+rejection on the failure-acknowledgement path of [`06-workflow-seam`](./06-workflow-seam.md) §4.4,
+with compensation evidence, never as a silent over-provision. The re-check remains valuable as an
+**early abort** — it catches collisions that already exist and saves the provisioning work — and it
+is specified as exactly that, with no admission guarantee attached
+([`../DECISIONS.md`](../DECISIONS.md) D-89).
+
+The alternative that *would* bound the gap from this side is a **server-side relative TTL enforced
+at `spawn-signal`**: the engine records the re-check instant on the order and refuses the spawn
+signal if it is older than a configured age, so the deadline is evaluated on one clock, against
+persisted state, by the party that owns the transition. That is a real mechanism and it is not in
+this design — it needs a column, a guard, a refusal reason and a configured value. It is recorded
+as the closable form of this gap rather than adopted here.
+
 #### The default overlap key collides in the partner path
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-overlap-key-partner-collision`
@@ -498,12 +539,25 @@ Output: proceed, or a per-line rejection reason
 3. [ ] - `p1` - Re-read overlap presence for each line's overlap key - `inst-rc-reread-overlap`
 4. [ ] - `p1` - **IF** a collision appeared since the gate: - `inst-rc-if-overlap-collision`
    1. [ ] - `p1` - **RETURN** overlap-collision rejection for the affected lines - `inst-rc-return-overlap-collision`
-5. [ ] - `p1` - **RETURN** proceed - `inst-rc-return-proceed`
+5. [ ] - `p1` - **RETURN** proceed, which is an **early-abort pass and not an admission guarantee**: the caller **MUST NOT** treat it as one, and **MUST** be able to handle an `overlap-collision` raised later by Subscriptions on the failure-acknowledgement path of [`06-workflow-seam`](./06-workflow-seam.md) §4.4 - `inst-rc-return-proceed`
 
 **Description**: Both predicates read state owned elsewhere that can move between submit and
 activation, which is why passing the gate is necessary but not sufficient. The sibling gear
 invokes this immediately before dispatching the first activation intent and treats either
 rejection as a pre-activation abort rather than a line-execution failure.
+
+**Why this algorithm cannot be made atomic here, and what bounds it instead.** Step 3 is a read and
+the activation it guards is a later call into another gear, so the check and the action it guards
+are separated by construction — two waves passing step 3 concurrently can both proceed and together
+exceed `maxConcurrentActive`. The re-check therefore **MUST NOT** be implemented or relied on as
+the enforcement point. What closes each axis, and what merely bounds it, is stated normatively in
+`§2.2` *The activation re-check is a bounding device, not the enforcement point*: the **order** axis
+is closed in-transaction by `01 §3.7`'s claim index; the **subscription** axis **MUST** be closed by
+Subscriptions inside the transaction that commits `active`; and until it is, **this design does not
+bound the gap** — §2.2 states why no timed validity window is asserted, and what a closable
+server-side form would need. What remains normative here is that a collision surfaces as
+`overlap-collision` through failure acknowledgement rather than as an over-provision nobody
+refused.
 
 ### 3.7 Database Schemas and Tables
 
@@ -612,7 +666,9 @@ catalog version is committed rather than pending. Capture **MUST** occur inside 
 transaction; a line whose pin is not resolvable **MUST** refuse the submit. An amendment **MUST**
 re-pin as part of its own commit.
 
-Known staleness is accepted, and **what bounds it is the per-state TTL**: an order cannot sit in
+Known staleness is accepted, and **what bounds it is the per-state TTL, with the absolute order
+lifetime of `07 §4.2` as the backstop where that TTL is unset** (D-90) — so the bound holds even
+before Q-06 answers, which it previously did not: an order cannot sit in
 `submitted` or `approved` past its TTL, so that is the outer limit on how stale a pin can be when
 fulfilment begins — which also means the bound is only as real as the TTL, currently an unset
 Product-owned value (Q-06). PRD §16 additionally asks for an acceptable staleness window to be

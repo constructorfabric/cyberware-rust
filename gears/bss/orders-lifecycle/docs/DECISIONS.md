@@ -58,6 +58,11 @@
   - [D-83 (H) The in-flight order cap stays at one; route (b) does not resolve Q-05 *(carries `ADR/0007`)*](#d-83-h-the-in-flight-order-cap-stays-at-one-route-b-does-not-resolve-q-05-carries-adr0007)
   - [D-84 (H) One order line produces one subscription — Q-02 answered no](#d-84-h-one-order-line-produces-one-subscription--q-02-answered-no)
   - [D-85 (H) The cross-gear contract surface is GTS-typed *(closes the review's GTS findings)*](#d-85-h-the-cross-gear-contract-surface-is-gts-typed-closes-the-reviews-gts-findings)
+  - [D-86 (H) The overlap collision is taken first, and detected as a row shortfall *(closes a CodeRabbit finding on PR #4775)*](#d-86-h-the-overlap-collision-is-taken-first-and-detected-as-a-row-shortfall-closes-a-coderabbit-finding-on-pr-4775)
+  - [D-87 (H) A parked outbox row blocks its own order's stream and no other](#d-87-h-a-parked-outbox-row-blocks-its-own-orders-stream-and-no-other)
+  - [D-88 (H) The idempotency key is scoped by authorized principal *(closes an IDOR finding)*](#d-88-h-the-idempotency-key-is-scoped-by-authorized-principal-closes-an-idor-finding)
+  - [D-89 (M) The subscription axis of the overlap rule is disclosed as open, not bounded by a timed window](#d-89-m-the-subscription-axis-of-the-overlap-rule-is-disclosed-as-open-not-bounded-by-a-timed-window)
+  - [D-90 (H) Bounded lifetime is a per-state TTL plus a resume cap, and the residual gap is disclosed](#d-90-h-bounded-lifetime-is-a-per-state-ttl-plus-a-resume-cap-and-the-residual-gap-is-disclosed)
 - [Open questions](#open-questions)
 - [Traceability](#traceability)
 
@@ -89,8 +94,10 @@ entry carries the same three fields either way; only the room given to the ratio
 **Status**: opened 2026-09-08. D-01…D-05 record calls taken during original authoring; D-06…D-57
 resolve the 74 findings of the **2026-09-08 review wave** (`R-01`…`R-74`),
 whose finding ids (`R-nn`) are cited per entry; D-58…D-60 come from the verification passes over
-that remediation, which found two decisions asserted but not fully applied. Seventeen items remain
-routed as open questions; Q-14 is closed by a design correction.
+that remediation, which found two decisions asserted but not fully applied; D-61…D-90 come from
+the 2026-09-09 and 2026-09-10 waves and from the review of PR #4775. **Twenty-eight items are
+routed as open questions** (`Q-01`…`Q-28`), of which twenty-five are routed and unanswered — Q-10
+is out of this gear's scope, and Q-02 and Q-14 are closed by design decisions.
 
 ## Status board
 
@@ -104,8 +111,8 @@ routed as open questions; Q-14 is closed by a design correction.
 | F. Ownership and inventory | D-36…D-38 | [H] ×1, [M] ×2 | decided (autonomous) — resolves R-43…R-51, R-74 |
 | G. Non-functional posture | D-39…D-55 | [H] ×10, [M] ×5, [L] ×2 | decided (autonomous, working baselines) — resolves R-52…R-67 |
 | H. PRD fidelity | D-56…D-74 | [H] ×10, [M] ×9 | decided; §15 rows and PRD-wording asks routed to owners |
-| I. Slice-local calls | D-75…D-85 | [H] ×4, [M] ×7 | decided; D-79 is a historical see-D-74 stub; D-82, D-83 and D-84 sit outside the area table |
-| Open questions | Q-01…Q-26 | — | 23 routed and unanswered; Q-10 out of scope for this gear; Q-02 and Q-14 closed by design decisions (D-84, a design correction) |
+| I. Slice-local calls | D-75…D-90 | [H] ×8, [M] ×8 | decided; D-79 is a historical see-D-74 stub; **D-82…D-90 sit outside the area table**, each carrying its own full entry below |
+| Open questions | Q-01…Q-28 | — | 25 routed and unanswered; Q-10 out of scope for this gear; Q-02 and Q-14 closed by design decisions (D-84, a design correction) |
 
 ## A. Foundational shape
 
@@ -432,7 +439,7 @@ column to hold what `§4.4` said must be recorded.
 |----|-----|----------|-----------|-----------|
 | D-36 | [H] | The ordinary cancel operation is assigned to `07-hold-and-expiry`, which already owns the cancel-from-`on_hold` guard, with its algorithm, guard set and registered reasons | No slice owned it: three transition rows and three actor permissions depended on an operation with no algorithm, no guards and no reasons (R-43) | `07 §3.3`, `§3.6`, `§4`; `DESIGN.md §3.3`; `design/README.md` |
 | D-37 | [M] | `DESIGN.md §3.7` becomes the complete gear-table inventory with one ownership rule — **engine owns schema and writes, slice owns content** — and `§3.3` becomes the union of the slice endpoint surfaces | Ownership was assigned twice incompatibly, the inventory omitted the tables slices introduce, and the endpoint inventory omitted eight endpoints while declaring one nobody owned (R-44, R-45) | `DESIGN.md §3.3`, `§3.7`; `01 §3.7` |
-| D-38 | [M] | One reason name per condition: the engine's `version-conflict` replaces `stale-version`, `version-stale` and `verdict-version-stale`; `commercial-field-immutable` replaces the two variants; `expiry-not-permitted-for-state` is deleted in favour of the engine's `not-admissible`. Per-entity IDs are minted, the duplicate sequence ID is removed, the dependency table gains four edges, and all seven count inconsistencies are corrected | Callers key on reason strings, so three names for one condition is a contract defect; and derived facts had drifted across ten documents (R-46…R-51, R-74) | `01 §3.3`; `02 §3.3`; `04 §3.3`; `06 §3.3`; `07 §3.3`; `DESIGN.md §3.1`, `§3.6`; `design/README.md` |
+| D-38 | [M] | One reason name per condition: the engine's `version-conflict` replaces `stale-version`, `version-stale` and `verdict-version-stale`; `commercial-field-immutable` replaces the two variants; `expiry-not-permitted-for-state` is deleted in favour of the engine's `not-admissible`; `administrative-field-in-amendment` is registered by `04 §3.3` for a delta naming an administrative field, distinct from capture's `commercial-field-immutable` and resolved ahead of `tenant-axis-immutable` by `01 §4.1`'s registration order. Per-entity IDs are minted, the duplicate sequence ID is removed, the dependency table gains four edges, and all seven count inconsistencies are corrected | Callers key on reason strings, so three names for one condition is a contract defect; and derived facts had drifted across ten documents (R-46…R-51, R-74) | `01 §3.3`; `02 §3.3`; `04 §3.3`; `06 §3.3`; `07 §3.3`; `DESIGN.md §3.1`, `§3.6`; `design/README.md` |
 
 ## G. Non-functional posture — resolves R-52…R-67
 
@@ -573,8 +580,25 @@ divergence from the PRD's *direct* `approved → pending_approval` edge, routed 
 
 **Decision**: the field classifier gains a **commercial-frozen** class holding
 `resourceTenantId` and `sellerTenantId`. An amendment delta naming either is refused with the new
-`tenant-axis-immutable` reason. `payerTenantId` stays commercial and amendable, paired with a
-seller rebinding where the change crosses seller scope.
+`tenant-axis-immutable` reason. `payerTenantId` stays commercial and amendable **within one
+seller's scope**; a payer change that would cross seller scope is **refused** with
+`payer-rebinding-requires-seller`, not paired with a seller rebinding.
+
+**Corrected 2026-09-10.** This entry originally said `payerTenantId` was "paired with a seller
+rebinding where the change crosses seller scope" — which the same decision makes impossible, since
+freezing `sellerTenantId` means no amendment can carry the paired half. The register entry was
+itself the source of the contradiction `04 §2.2` inherited, so the pairing language is removed
+rather than reworded: there is no post-submit path that rebinds a seller, so the cross-seller payer
+change has no admissible form and is refused.
+
+**This diverges from a PRD MUST, and the divergence is now routed rather than decided here.** The
+pairing language did not originate in this register — PRD §6.1 requires that a cross-seller payer
+change "**MUST** follow the paired payer/seller rebinding semantics", and §12's acceptance
+criterion restates it. Removing the pairing therefore does not resolve the contradiction, it
+relocates it: this design refuses an operation the PRD requires be honoured. The refusal stands as
+specified, because the alternative reachable from here is an unguarded amendment that can rebind
+the selling party. The reconciliation — amend §6.1, specify an ownership-transfer transition that
+moves both axes together, or accept the refusal — is **Q-28**.
 
 **Rationale**: PRD §6.1 fixes all three axes at `submitted` and permits exactly one post-submit
 mutation. `04 §2.2` asserted that payer was the only axis with an amendment path but registered no
@@ -630,7 +654,7 @@ resolved and returns a fingerprint-matching settled outcome immediately; authori
 remains inside the transaction.
 
 **Rationale**: An idempotency outcome is order state. Returning one before authorization let any
-caller holding a matching `(operation, idempotency_key)` and request fingerprint learn a committed
+caller holding a matching scoped key — `(operation, principal_scope, idempotency_key)` since D-88 — and request fingerprint learn a committed
 outcome, contradicting the engine's confidentiality rule. After authorization, PRD §12 AC-4 still
 requires a replay to "return the same result without creating a second order **or re-running the
 sellability gate**". Without the advisory probe, every authorized retry of a committed submit
@@ -936,6 +960,187 @@ would be the outlier rather than the norm.
 **Propagated**: `01 §1.3`, `§3.3`, `§3.4`, `§3.7` (`orders_order.category`,
 `orders_event_outbox.type_uuid`), `§4.7`, `§4.8`, `§4.9`; `DESIGN.md §1.3`, `§3.4`.
 
+### D-86 (H) The overlap collision is taken first, and detected as a row shortfall *(closes a CodeRabbit finding on PR #4775)*
+
+**Decision**: claim acquisition is `01 §3.6` *Attempt Transition* **step 17**, placed **before** the
+version append at step 18 and before every other document contribution. It uses
+`ON CONFLICT … DO NOTHING` and compares returned rows against distinct keys offered; a shortfall
+settles with `order-in-flight-for-key`, audits and commits. Three properties are normative with
+it: keys are offered **distinct** (a repeated key inserts one row, and a shortfall count would
+otherwise read that as the order colliding with itself), keys are offered in a **total order**
+(so two concurrent multi-key orders cannot deadlock), and the transaction runs at **READ
+COMMITTED** (under snapshot isolation the insert raises a serialisation failure instead of
+reporting a shortfall). The refusal is a **failed slice guard** under `§4.1`, so the seven-class
+taxonomy and its four-of-seven settlement split are unchanged and no eighth class appears.
+
+**Rationale**: `§3.7` asserted the collision was "settled and audited in the same transaction". A
+raw unique violation **aborts** the PostgreSQL transaction, and the audit append is step 20 with
+the settle at 24 — so the abort would precede both and the promised refusal could not be produced.
+`ON CONFLICT … DO NOTHING` is what keeps the transaction alive to write it, and an unmapped
+constraint violation surfacing as an infrastructure error is what `§4.2` forbids.
+
+**Ordering, not a savepoint, is the mechanism, and an earlier version of this decision had it
+wrong.** That version wrapped the acquisition in a **SAVEPOINT** and rolled back to it on
+shortfall. Two things were wrong. The savepoint was unnecessary — with `DO NOTHING` there is no
+error to unwind, so it discarded work the refusal path had no reason to discard, including the
+prior-version claim release. And it was placed **after** the version append, which meant a refusal
+had to unwind a committed version row and a moved current-version pointer in tables that grant no
+DELETE; a savepoint rollback would have papered over that, but the phantom version was the real
+defect and the savepoint was hiding it. Moving acquisition to step 17 removes both: nothing durable
+has been contributed when the decision is taken, so there is nothing to roll back and no nested
+transaction boundary anywhere in the algorithm. Consequently
+`orders_inflight_overlap_claim` carries **no foreign key** to `orders_order_version` — an FK would
+force the version to pre-exist the claim, which is exactly the ordering that produced the phantom.
+Enforcement stays where D-26 put it: inside the transaction and inside the index.
+
+**Propagated**: `01 §3.6` *Attempt Transition* step 17 and the renumbered steps 18–26, `§3.7`
+`orders_inflight_overlap_claim`; `ADR/0007`.
+
+### D-87 (H) A parked outbox row blocks its own order's stream and no other
+
+**Decision**: the drain selects on `delivered_at IS NULL` alone, so a parked dead-letter row stays
+visible as a blocked stream head, and it takes only the **contiguous prefix** per `order_id`,
+stopping at the first parked or not-yet-due row. No higher sequence for that order publishes while
+the parked row is undelivered; other orders are unaffected. The operator re-drive **MUST**
+republish the parked row before any later event for that order and **MUST NOT** be used to skip one.
+
+**Rationale**: nothing defined this, and the mechanism was silently working against per-order
+ordering: the drain's partial index was `WHERE delivered_at IS NULL AND dead_lettered_at IS NULL`,
+which **excluded** parked rows, so sequence *n+1* stayed selectable after *n* had parked. A
+consumer would then have received `OrderCompleted` before `OrderSubmitted` — breaking the one
+ordering guarantee `(order_id, sequence)` exists to hold, on the path taken precisely when
+something has already gone wrong. Skipping was rejected: a consumer cannot reconstruct a
+commercial trail from an out-of-order stream, and the alternative cost is bounded — one order's
+stream halts, alerted, and closed by re-drive.
+
+**Three mechanism defects introduced with the first statement of this rule, and corrected.** The
+rule itself is unchanged; what carried it was not implementable. (1) The stop condition named a
+`next_attempt_at` column `orders_event_outbox` did not have, so the backoff had nowhere to live —
+the column is now declared, alongside `created_at`, which the type index also referenced without
+declaring. (2) The row was placed under **monthly partitioning**, which PostgreSQL forbids to
+combine with a unique constraint that omits the partition key — and `(order_id, sequence)` omits
+it; the table is therefore **not partitioned**, and the retention sweep rather than the partition
+drop bounds it. (3) The drain selected a bounded number of **rows**, which can split one order's
+contiguous prefix across two batches; it now selects a bounded number of candidate **`order_id`s**
+and takes each one's prefix whole. Purging moved out of the per-shard drain to the retention sweep
+for the same reason. Re-drive was also under-specified: it **MUST** set `delivered_at` and clear
+`dead_lettered_at` and `next_attempt_at`, and is **refused** while a lower undelivered sequence
+exists for that order, so re-drive cannot itself produce the out-of-order publication this rule
+prevents. The suspension a parked row imposes on its order's stream is **unbounded** in duration
+and disclosed as such.
+
+**Propagated**: `01 §2.2`, `§3.2`, `§3.3`, `§3.6` *Drain Outbox Shard* steps 2, 3 and 4.2.2.4,
+`§3.7` `orders_event_outbox`, `§4.4`; `ADR/0006`.
+
+### D-88 (H) The idempotency key is scoped by authorized principal *(closes an IDOR finding)*
+
+**Decision**: `orders_idempotency` gains `principal_scope`, taken from the security context by the
+pre-guard and **never** from the request body, and its primary key becomes
+`(operation, principal_scope, idempotency_key)`. `order_id` is non-null for every operation except
+create, and a settled record whose `order_id` differs from the resolved target refuses as
+`idempotency-mismatch` rather than being overwritten. The request fingerprint is defined: a hash
+over operation, trigger, resolved target, the three tenant axes, `expected_version` and the
+canonicalised contribution — explicitly **not** `correlation_id`, the request instant, headers or
+any server-assigned value.
+
+**Rationale**: the key was `(operation, idempotency_key)` over a caller-chosen string, with
+`order_id` nullable and outside it, and the fingerprint was defined nowhere in the set. Two
+tenants choosing the same human-readable key — `submit-2026-001`, or a client library's sequence
+number — collided: at best one received `idempotency-mismatch` on a valid request and was frozen
+for the 24-hour window, at worst it resolved another tenant's stored outcome. D-65 solved the
+confidentiality half by refusing before the registry is read; it did not address collision.
+
+**Two consequences of the scoping, both stated in `01 §4.2` rather than glossed.** First, scoping
+**adds a fifth outcome**: the same key text from a different principal is a different key, so the
+request **executes again** where a global key would have de-duplicated it. An earlier statement of
+this decision claimed the four outcomes stayed exhaustive; that was wrong, and it matters because
+"zero duplicate orders" is therefore a guarantee **per principal** — for every operation but
+create the fingerprint's `order_id` and `expected_version` still catch the duplicate, and create
+is the one place cross-principal duplication is possible.
+
+Second, the scope **MUST** be a **stable subject identifier**, and `01 §4.2` prohibits deriving it
+from session, token, `jti`, delegation-proof, replica or transport identity. Any of those can
+differ between a request and its own retry, and a scope that moves makes the retry a different key
+— so the retry re-executes and the registry becomes a no-op in precisely the crash-and-retry case
+it exists for. A deployment that cannot supply a stable identifier **MUST** fail startup.
+
+**Propagated**: `01 §1.2`, `§3.1`, `§3.2`, `§3.6` *Attempt Transition* steps 1 and 6, `§3.7`
+`orders_idempotency`, `§4.2`.
+
+### D-89 (M) The subscription axis of the overlap rule is disclosed as open, not bounded by a timed window
+
+**Decision**: the order axis of the overlap rule is closed in-transaction by
+`01 §3.7`'s index; the **subscription** axis **MUST** be closed by Subscriptions re-evaluating
+`overlapScopeKey` and committing `active` under one reservation boundary, and this gear **MUST
+NOT** present its re-check as that boundary. Until that upstream enforcement exists **the gap is
+open and this design does not bound it.** Two obligations remain, and both are expressible through
+declared interfaces: the re-check is specified as an **early abort** carrying no admission
+guarantee, and a collision appearing at or after activation **MUST** surface as an
+`overlap-collision` line rejection on the failure-acknowledgement path with compensation evidence.
+
+**Rationale**: the re-check was a bare presence read, and the in-flight claim bounds *orders*, not
+active subscriptions — so two activation waves could both pass it and exceed `maxConcurrentActive`.
+Atomicity is unreachable from this gear because the committing transaction belongs to another.
+
+An earlier version of this decision bounded the gap on three terms, the first being a **30-second
+verdict validity window**. It is withdrawn, because the window was not implementable from anything
+this design declares. No port operation, event payload or endpoint response carries a validity
+origin or a deadline, and the transition the caller then drives — `spawn-signal`, `01 §4.3` row 11
+— is event-less, so the expiry could not be communicated. "Re-invoke the re-check" placed a
+**MUST** on a party this gear cannot signal and whose violation it cannot observe. The design's own
+two-phase barrier puts a whole fulfillment wave between the read and the last line's activation, so
+one window could not cover N activations. And the origin would be read on one gear's clock and
+evaluated on another's, with no declared clock source and no skew bound, so both skew directions
+fail silently — while the gate's 10-second breaker hold would consume a third of the window by
+itself. A bound nobody can enforce or detect the breach of is worse than a disclosed gap, because it
+reads as protection.
+
+The closable form is recorded rather than adopted: a **server-side relative TTL enforced at
+`spawn-signal`**, where the engine persists the re-check instant and refuses the spawn signal if it
+is older than a configured age — one clock, persisted state, the party that owns the transition. It
+needs a column, a guard, a refusal reason and a value, none of which this design set has.
+
+**Propagated**: `03 §2.2`, `§3.6` *Re-check Activation Preconditions* steps 3 and 5, `06 §4.3`,
+`UPSTREAM_REQS.md` §2.1 (`SUB-O5` enforcement ask).
+
+### D-90 (H) Bounded lifetime is a per-state TTL plus a resume cap, and the residual gap is disclosed
+
+**Decision**: **Layer 1** is the per-state TTL, measured from `state_entered_at`, which a resume
+restarts — and which holds only where a TTL is configured. An unconfigured TTL **MUST NOT** block
+startup, because the values are Product-owned open questions. **Layer 2** is a **resume cap**:
+`orders_order.resume_count` is incremented by `01 §4.3` row 22 and reset by no transition, and row
+22 carries a registered guard refusing `resume-cap-exhausted` at the cap, baseline **5**. Together
+they bound an order's in-flight life at `(cap + 1) × TTL` **for every state whose TTL is
+configured**. Where a TTL is unset the state is **unbounded**, and that is disclosed in `07 §4.2`
+and alerted in `07 §3.8` rather than covered by a design-owned fallback.
+
+**Rationale**: `state_entered_at` was the sole dwell input and resume rewrites it, so any actor
+holding hold permission could cycle hold/resume and keep an order in `submitted` or `approved`
+indefinitely — defeating the bounded-lifetime MUST, and with it `05 §4.4`'s declined-instrument
+exit, since an order whose payment authorization failed leaves only by expiry. Separately, the
+design asserted every in-flight state has a bounded lifetime while tolerating an unset TTL, so the
+claim was false wherever the value was missing. The cap closes the first problem at the operation
+that creates it. The second is a Product dependency (PRD §15 row 7) and is now stated as one.
+
+**An earlier version of this decision made Layer 2 an absolute order lifetime** measured from
+`created_at`, baseline 90 days, enforced by a second sweep pass. It is withdrawn on four grounds,
+recorded here because the shape of the mistake is reusable:
+
+* Its enforcement pass shared one deterministic idempotency key with the per-state pass, to avoid double-expiring an order both selected. But refusals settle and replay under their key (ADR-0005), and the key was invariant in the order's version — so once a per-state attempt refused as not-admissible, every absolute-pass request for that order and version **replayed the refusal instead of attempting**. The backstop was inert for exactly the orders something had already gone wrong with, and inert invisibly, since a replayed refusal and a fresh one are the same response.
+* It did not close the loop it existed for. The hold that can be cycled indefinitely is the one taken from `in_fulfillment`, which `07 §4.3` exempts from both layers.
+* It pre-empted legitimate orders: one gear-level duration cannot distinguish an abandoned order from an enterprise order awaiting a slow approval, and it expired both.
+* Its value was a commercial policy with no PRD basis (Q-27), taken autonomously.
+
+The count cap was rejected in that earlier version for permitting `n × TTL` and needing a counter,
+a reset rule and a new refusal. That reasoning is inverted here. `(cap + 1) × TTL` is a **bound**,
+which is what was asked for; the counter is written by one transition and reset by none, so there
+is no reset rule to get wrong; and the new refusal is the point — a bound whose breach is a
+refused, audited transition is observable, where a backstop's failure to fire is not.
+
+**Propagated**: `07 §1.1`, `§2.1`, `§2.2`, `§3.1`, `§3.2`, `§3.3`, `§3.6` *Sweep Expired Orders*
+and *Hold Then Resume*, `§3.7`, `§3.8`, `§4.1`, `§4.2`, `§4.3`, `§4.4`, `§4.5`, `§5`;
+`01 §3.7` `orders_order` schema and index list, `§4.3` row 22; `05 §2.2`.
+
 ## Open questions
 
 Not decided here. Each carries a named owner and the design position taken in the meantime.
@@ -968,6 +1173,8 @@ Not decided here. Each carries a named owner and the design position taken in th
 | Q-24 | The **version reason vocabulary** is `{create, submit, amendment}` (D-82) against PRD §6.2's MUST-level eight-value list; the other six name state-only transitions and live on `orders_transition_audit.reason` | Product | The split is implemented and stated in `04 §4.5`; amend §6.2 so its enumeration matches the version/audit split PRD §1.4 already draws, or a conformance run against §6.2 fails on six values |
 | Q-25 | **`OrderAmended`'s PRD trigger no longer holds.** PRD §6.5 emits it "on creation of a new order version", and D-64 makes creation and submit version-appending rows that publish no `OrderAmended` — creation is event-less, submit publishes `OrderSubmitted`. It fires only on the three amendment rows | Product | Implemented and disclosed in `01 §4.4` and `04 §3.3`; amend §6.5 and §9.2 to name amendment as the trigger, or a conformance run against §6.5 fails on two of the five version-appending rows |
 | Q-26 | The **operational limits this design set as working baselines** need ratifying against real capacity: the refusal rate limit (20/min per caller-order, 200/min per caller), the per-port bulkhead (32 in-flight), the breaker ratio (0.5 over 30 s, open 10 s), submit and Preview rate limits (10/min and 60/min per caller), the line cap (200) and the outbox bucket count (64). Each was previously named as a mechanism with no value, so five separate risk mitigations rested on thresholds nobody had set | Architecture | Values are set in `01 §3.7`, `02 §4.5`, `03 §2.2` and measured by the load tests those sections name; they are baselines to revise, not guesses to keep |
+| Q-27 | **An order in a state with no configured TTL never expires.** PRD §6.3 requires bounded lifetime; PRD §15 row 7 leaves the TTL values open; and this design takes no code default, so the requirement is unmet for exactly the states Product has not yet valued — including `draft`, whose auto-void TTL is Q-07. D-90 records why the absolute-lifetime backstop that previously masked this was withdrawn. This is therefore a **requirement blocked on an unanswered question**, not a design gap | Product | Disclosed in `07 §4.2`, `§4.4` and `§4.5`, alerted per `07 §3.8`, and bounded on the one axis this design can close — the resume cap of D-90 stops the dwell being restarted without limit. Answering §15 row 7 and Q-07 closes it; no mechanism changes when they are answered |
+| Q-28 | **D-62 refuses a cross-seller payer rebinding that PRD §6.1 requires be honoured.** The PRD says a payer change crossing seller scope "**MUST** follow the paired payer/seller rebinding semantics (ownership-transfer alignment, manifest §4.11)", and §12's acceptance criterion repeats it — "paired with seller rebinding where the change crosses seller scope". D-62 freezes `sellerTenantId` as commercial-frozen, which makes the paired half unexpressible, and refuses the cross-seller payer change with `payer-rebinding-requires-seller`. The divergence is deliberate and was taken to close a real hole (an unguarded amendment could rebind the selling party), but it narrows a PRD MUST and the register recorded it as a decision rather than routing it | Product + Architecture | The freeze and the refusal are implemented as D-62 states (`04 §2.2`, `§3.3`, `§3.6`); a cross-seller payer change is therefore **not supported** and a caller must cancel and re-place. Closing it needs one of three: amend §6.1 to match, specify an ownership-transfer transition that rebinds both axes together under its own guard and event, or accept the refusal as the answer. Nothing changes in this design until it is answered |
 
 ## Traceability
 

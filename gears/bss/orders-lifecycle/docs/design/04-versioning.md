@@ -161,14 +161,32 @@ acquire it — no such port is declared, and no verdict exists for a version tha
 created. The two-step shape is what makes rows 19 and 20 reachable at all
 ([`../DECISIONS.md`](../DECISIONS.md) D-61, Q-12; §4.3).
 
-#### A payer change may cross seller scope
+#### A payer change must not cross seller scope
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-paired-payer-seller-rebinding`
 
-`payerTenantId` is the only tenant axis with an amendment path. Where the change crosses seller
-scope it **MUST** follow the paired payer/seller rebinding semantics of the platform's
-ownership-transfer alignment: the payer is never silently rebound alone across sellers, because
-that would move billing attribution without moving the selling relationship.
+`payerTenantId` is the only tenant axis with an amendment path, and that path **stops at the
+seller boundary**. A payer change that crosses seller scope **MUST** be refused with
+`payer-rebinding-requires-seller`, because the paired seller rebinding such a move requires
+cannot be performed here at all: `sellerTenantId` is **commercial-frozen** and **MUST NOT** change
+after `submitted` by any path, amendment included
+([`02-capture`](./02-capture.md) §4.3 *Commercial-frozen*; §4.1;
+[`../DECISIONS.md`](../DECISIONS.md) D-62). So the payer is never silently rebound alone across
+sellers — that would move billing attribution without moving the selling relationship — and it is
+never rebound *together with* the seller either, because this slice owns no operation that can
+move the selling party. A genuine cross-seller transfer is a cancel-and-reorder under the new
+seller, or the platform's ownership-transfer flow acting **before** submit; it is not an amendment.
+
+**Seller rebinding is therefore not possible at all after submit**, and this constraint no longer
+claims otherwise. It previously described a paired payer/seller rebinding while §4.1 and
+`02 §4.3` prohibited every post-submit `sellerTenantId` change; no implementation could satisfy
+both, and a reader could conclude either that the documented payer-transfer path must be rejected
+or that an unintended tenant rebinding must be permitted. The prohibition wins, because it is the
+rule PRD §6.1 states — all three axes fixed at submit, exactly one post-submit mutation,
+`payerTenantId` — and because the commercial-frozen guard that enforces it already exists (§3.6
+*Append Amendment* step 1). `payer-rebinding-requires-seller` keeps its registered name and its
+authorization requirements are those of `amend` itself: a cross-seller payer change needs no extra
+authority because it is never admitted.
 
 ## 3. Technical Architecture
 
@@ -280,7 +298,16 @@ six of eight values on the audit row rather than the version row; the split is s
 two are not read as one vocabulary ([`../DECISIONS.md`](../DECISIONS.md) D-82).
 
 **Reasons contributed to the registry**: payer-rebinding-requires-seller,
-tenant-axis-immutable, amendment-empty, version-not-found. An amendment attempted from
+tenant-axis-immutable, **administrative-field-in-amendment**, amendment-empty,
+version-not-found. `administrative-field-in-amendment` is registered **here and only here**: it
+is the amendment path's refusal for a delta naming any administrative field, and it names the
+offending field and directs the caller to `PATCH /orders/{orderId}` (§4.1). It is the mirror of
+capture's `commercial-field-immutable` — that reason refuses commercial content on the
+administrative surface, this one refuses administrative content on the commercial surface — and
+the two are distinct names because they refuse on opposite operations and point the caller in
+opposite directions. `payer-rebinding-requires-seller` refuses a payer change that crosses seller
+scope, which §2.2 and §4.1 establish is never admissible, since `sellerTenantId` cannot be
+rebound to accompany it. An amendment attempted from
 `in_fulfillment` or a terminal state resolves to the engine's own `not-admissible`, which carries
 the current state and trigger — no row exists for those pairs, so a slice-local
 `amendment-not-admitted-in-state` was unreachable from every path and is deleted, matching the
@@ -319,8 +346,8 @@ place.
 Input: order_id, delta, amendment_reason, expected_version, idempotency_key, security_context
 Output: the new version, or a registered refusal
 
-1. [ ] - `p1` - Declare five guards the engine evaluates and audits: admissibility, non-empty delta, **no administrative field in the delta** (refusing with the reason that directs the caller to the administrative edit path), **no commercial-frozen field in the delta** (`tenant-axis-immutable`, naming the field), and **paired payer/seller rebinding** (`payer-rebinding-requires-seller`) - `inst-am-declare-guards`
-2. [ ] - `p1` - Resolve those guards' inputs: classify every delta field through the shared declaration, and determine whether a `payer_tenant_id` change crosses seller scope and whether a paired seller rebinding accompanies it - `inst-am-resolve-guard-inputs`
+1. [ ] - `p1` - Declare five guards the engine evaluates and audits, **in this registration order** (`01 §4.1`), so a delta failing more than one refuses deterministically on the first: admissibility, non-empty delta (`amendment-empty`), **no administrative field in the delta** (`administrative-field-in-amendment`, naming the field and directing the caller to `PATCH /orders/{orderId}`), **no commercial-frozen field in the delta** (`tenant-axis-immutable`, naming the field), and **no cross-seller payer change** (`payer-rebinding-requires-seller`) - `inst-am-declare-guards`
+2. [ ] - `p1` - Resolve those guards' inputs: classify every delta field through the shared declaration, and determine whether a `payer_tenant_id` change crosses seller scope — no paired seller rebinding is looked for, because `sellerTenantId` is commercial-frozen and the guard above it has already refused any delta naming it (§2.2, §4.1) - `inst-am-resolve-guard-inputs`
 3. [ ] - `p1` - Carry forward the current version's commercial content - `inst-am-carry-forward`
 4. [ ] - `p1` - Apply the delta over the carried-forward content - `inst-am-apply-delta`
 5. [ ] - `p1` - Run the full gate over the amended content, re-deriving the order market - `inst-am-rerun-gate`
@@ -424,16 +451,31 @@ and the pre-hold state governs what is permitted, so an amendment resumes first.
 `in_fulfillment` onward only cancel and hold remain.
 
 An amendment **MUST** carry a non-empty delta and an expected version. An amendment whose delta
-touches only administrative fields **MUST** be refused with a reason directing the caller to the
-administrative edit path, rather than silently appending a version that changes no commercial
-content.
+names **any** administrative field **MUST** be refused with `administrative-field-in-amendment`,
+naming the offending field and directing the caller to `PATCH /orders/{orderId}` — rather than
+silently appending a version that changes no commercial content, or writing administrative content
+onto an append-only version row where §3.7 says it never lives.
+
+**The rule is "any", not "only".** A **mixed** delta naming both an administrative field and a
+commercial one is refused on the same reason: the caller is asking for two operations with
+different audit semantics — one appends a version and re-runs the gate, the other does neither —
+and splitting it silently would either bump a version for an administrative correction or apply an
+administrative change with no `PATCH` audit entry. The caller **MUST** send the two separately.
+Where a delta names both an administrative field and a commercial-frozen axis, the refusal is
+`administrative-field-in-amendment`, because slice guards refuse in **registration order**
+(`01 §4.1`) and §3.6 *Append Amendment* step 1 registers the administrative guard ahead of the
+commercial-frozen one — the outcome is therefore deterministic rather than
+implementation-dependent.
 
 **The tenant axes are not uniformly amendable.** `payerTenantId` **MAY** change through an
-amendment, paired with a seller rebinding where the change crosses seller scope.
+amendment **only where the change does not cross seller scope**; a cross-seller payer change
+**MUST** be refused with `payer-rebinding-requires-seller`, because the paired seller rebinding it
+would require is unavailable — see §2.2 *A payer change must not cross seller scope*.
 `resourceTenantId` and `sellerTenantId` **MUST NOT** change through any path once the order is
 `submitted`, and an amendment delta naming either **MUST** be refused with
-`tenant-axis-immutable`. This slice previously asserted that payer was the only axis with an
-amendment path and registered no guard for it, so the assertion was unenforced and a delta
+`tenant-axis-immutable`. **No seller rebinding is possible after submit**, so nothing in this
+slice pairs one with a payer change. This slice previously asserted that payer was the only axis
+with an amendment path and registered no guard for it, so the assertion was unenforced and a delta
 rebinding the resource recipient or the selling party would have committed
 ([`02-capture`](./02-capture.md) §4.3 *Commercial-frozen*;
 [`../DECISIONS.md`](../DECISIONS.md) D-62).

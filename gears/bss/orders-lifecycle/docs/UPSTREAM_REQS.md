@@ -96,6 +96,23 @@ The process **correlation identifier** echoed on confirmations and propagated to
 Engine and OSS. Cited by the sibling Workflow PRD as `SUB-O9`; **not present in the seam map**, so
 unregistered upstream. Without it an end-to-end acquisition trace stops at the seam.
 
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-overlap-activation-atomicity`
+
+**Atomic enforcement of `overlapScopeKey` at the point a subscription commits to `active`.** The
+order axis of the overlap rule is closed inside this gear's transition transaction by
+`01 §3.7`'s partial unique index, but the **subscription** axis cannot be: the committing
+transaction belongs to Subscriptions, so no re-check performed here can be atomic with it. Two
+activation waves can therefore each pass this gear's re-check and jointly exceed
+`maxConcurrentActive`. Subscriptions **MUST** re-evaluate the key and commit `active` under one
+reservation or serialisation boundary. Until it does, **the gap is open and `03 §2.2` does not
+bound it** — that section states why no timed validity window is assertable from this side, since
+nothing this design declares carries a deadline to the party that would have to honour it, and
+`spawn-signal` is event-less. What holds meanwhile is narrower: the re-check is an **early abort**
+with no admission guarantee, and a collision appearing at or after activation surfaces as
+`overlap-collision` on the failure-acknowledgement path with compensation evidence
+(`DECISIONS.md` D-89). This is the same seam as `SUB-O5`, which supplies the *read*; this ask is
+the *enforcement*, and the read alone does not make the rule hold.
+
 ### 2.2 Rating / price evaluation
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-pre-subscription-evaluation`

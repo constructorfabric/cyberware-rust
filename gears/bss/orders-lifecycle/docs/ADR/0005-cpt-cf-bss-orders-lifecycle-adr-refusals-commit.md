@@ -92,14 +92,34 @@ which is what lets a client retry safely without a branch on the previous answer
 
 ### Confirmation
 
-Verified by the transition algorithm carrying the audit-append and commit sequence on every
-refusal branch, and the settle sequence on every refusal reached after authoritative idempotency
-resolution (`design/01-foundation.md` §3.6), by a fault-injection test asserting a failed audit
-append aborts the transition, and by a test asserting a replayed key whose stored outcome is a
-refusal returns that refusal rather than re-attempting. Authorization denial is the deliberate
-pre-probe exception: it is audited and refused without consulting or settling a caller-supplied
-idempotency key, so an unauthorized caller cannot learn a stored outcome or preempt an authorized
-caller’s key.
+**This gear has no implementation and no runtime tests**, so the checks below are labelled either
+verifiable today or planned.
+
+**Verifiable today, by reading `design/01-foundation.md` §3.6 *Attempt Transition*.** Every one
+of the seven refusal branches carries an audit append and a commit — that half is uniform, and it
+is what "zero silent drops" rests on. **Settlement is not uniform, and the branches say which is
+which.** Four branches settle: unresolvable guard input, not-admissible, version conflict and
+failed slice guard. Three do not, and none of the three is an omission:
+
+* **Authorization denial** is the deliberate pre-probe exception. It refuses at the algorithm's first step, before the registry is read, and opens its refusal transaction *without loading or locking the aggregate row* — so it consults and settles no caller-supplied key, and an unauthorized caller can neither learn a stored outcome nor squat a key ahead of the authorized one. This is the carve-out `01 §4.1` cites this section for.
+* **Idempotency-fingerprint mismatch** audits and commits against a settled record carrying a *different* request, and must leave that record's stored outcome intact.
+* **Still-processing** audits and commits against a live in-flight lease owned by another request, and must not steal its marker.
+
+An earlier statement of this section said settlement occurs "on every refusal reached after
+authoritative idempotency resolution". That was wrong in both directions: the unresolvable-input
+branch settles *before* the main transaction's resolution, by resolving or creating the record
+itself, while the mismatch and still-processing branches sit after resolution and settle nothing.
+The four-and-three split above is the contract, stated identically here, in the Decision Outcome
+and in `01 §4.1`; the invariant suite's settlement family asserts at document level that those
+statements do not drift apart.
+
+**Planned, not yet written.** A fault-injection check that a failed audit append aborts the
+transition (recorded as a verification approach under the audit-completeness NFR in `01 §1.2`); a
+replay check that a key whose stored outcome is a refusal returns that refusal rather than
+re-attempting (recorded under the idempotency NFR); and a check that neither the mismatch nor the
+still-processing branch writes to the record it found. The last is recorded nowhere yet and
+`01 §1.2` is its home — it is the check that would catch the overwrite this scoping exists to
+prevent.
 
 ## Pros and Cons of the Options
 
@@ -107,7 +127,7 @@ caller’s key.
 
 * Good, because "100 % audited, zero silent drops" becomes a property of one code path rather than a discipline.
 * Good, because a refused attempt is replayable and diagnosable.
-* Good, because every refusal is audited and committed, so no refusal class can disappear silently.
+* Good, because all seven refusal classes are audited and committed, so no refusal class can disappear silently — settlement is the narrower four-class property, and the two are stated separately rather than as one guarantee.
 * Bad, because the engine writes on the majority of requests, needing a separate retention and a rate limit.
 * Bad, because a transient failure is frozen under its key for 24 hours, which callers must understand.
 
@@ -122,7 +142,7 @@ caller’s key.
 
 * Good, because a transient failure is retryable under the same key.
 * Good, because it still gives complete audit coverage.
-* Bad, because a caller can turn a refusal into a success by retrying, so the stored-outcome contract acquires an exception.
+* Bad, because for the four classes that reach a decision a caller can turn a refusal into a success by retrying, so the stored-outcome contract acquires an exception. The other three have nothing to settle, so this option is no cheaper for them.
 * Bad, because a retry storm against a failing guard writes an audit row per attempt with no de-duplication.
 
 ### Audit only authorization denials

@@ -133,12 +133,20 @@ twelfth state is added. The consequence is real and is not hidden: an order awai
 authorization and a healthy order awaiting the sibling gear's next step are indistinguishable
 from the order document alone, and process visibility is the sibling gear's to provide.
 
-#### A declined instrument has no exit but expiry
+#### A declined instrument exits by expiry, and only where the TTL is set
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-declined-instrument-exit`
 
 Where authorization fails and the seller has not elected tolerate-failure, begin-fulfillment is
-withheld and the order remains `approved` until its TTL elapses. There is no re-authorize
+withheld and the order remains `approved` until its TTL elapses. Two qualifications, and both are
+this constraint's real content rather than footnotes. The `approved` TTL is a **Product-owned open
+question with no code default**, so **while it is unset this order has no automatic exit at all** —
+only a caller-driven cancel retires it ([`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.5). And
+where it *is* set, the **resume cap** of `07 §4.2` is what stops a hold/resume cycle restarting the
+dwell without limit, bounding the exit at `(cap + 1) × TTL` rather than at nothing
+(`../DECISIONS.md` D-90). An earlier version of this constraint claimed an absolute order lifetime
+retired the order in the unset case; that backstop is withdrawn and `07 §4.2` states why, so the
+unset case is disclosed here rather than covered. There is no re-authorize
 operation, no payment failure event and no order-visible outcome, because there is no Payments
 capability to supply one. This is routed as [`../DECISIONS.md`](../DECISIONS.md) Q-08 — the PRD
 carries **no** §15 row for it — and stated as a designed limitation rather

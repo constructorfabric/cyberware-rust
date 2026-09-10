@@ -77,16 +77,44 @@ machine.
 
 ### Confirmation
 
-Verified by the test classes `design/01-foundation.md` §1.2 actually names, cited under the NFR
-each belongs to. From the **audit-completeness** row: a structural test asserting every
-transition-table row writes an audit entry on both outcomes; a fault-injection test asserting a
-failed audit append aborts the transition; and a periodic chain-verification job. From the
-**idempotency** row: a parallel same-key concurrency test asserting exactly one durable effect.
+**This gear has no implementation and no runtime tests.** The checks below are therefore split
+into what is verifiable today by reading the design set, and what is *planned* and not yet
+written. Nothing here cites an existing test of this gear's code.
 
-One assertion this ADR relies on had no test behind it and now does: an **edge-coverage test**
-asserting no transition is admissible outside the twenty-five rows of §4.3. That is the only
-mechanised check behind the normative exclusions this decision makes structural — notably the
-absent `in_fulfillment → expired` row.
+**Verifiable today, and stated at the scope the documents actually support.**
+`design/01-foundation.md` §4.1 makes the four-effects-in-one-transaction rule and the total
+guard-evaluation order normative. §2.2's single-writer constraint names **seven table families** —
+aggregate, version, line, resolved-total, audit, idempotency and outbox — and bars any migration,
+repair script, administrative surface or slice from writing them outside a transition. It is not a
+claim about all nineteen tables in the set, and two are deliberately outside it:
+`orders_draft_content` is declared mutable and is written by capture, and `orders_read_access_log`
+is written by the read surface (`08 §3.7`). Reading it as "every table" would be an overclaim, and
+the seven it does name are the ones the audit guarantee rests on. §3.6 *Attempt Transition* carries
+an audit append and a commit on **every branch that decides an attempt** — all seven refusal
+classes included; the one branch that commits without appending is the **replay** of a settled
+record, which records no new attempt because none occurred. §4.3 holds the state
+machine as data — twenty-five rows over eleven states — which is what makes edge coverage
+enumerable. The document-level invariant suite (`scripts/check-design-invariants.py`, run as
+`make design-check` in CI) mechanises the cross-document part of that: among its families are the
+assertion that no slice algorithm returns a refusal ahead of its engine call, and the assertion
+that no §4.3 row expires from `in_fulfillment` — the normative exclusion this decision makes
+structural. Those families hold over the *documents*; they assert nothing about code.
+
+**Planned, not yet written.** The runtime checks belong to the NFRs they serve and are recorded
+as the Verification Approach column of `01 §1.2`. From the **audit-completeness** row: a
+structural check that every transition-table row writes an audit entry on both outcomes, a
+fault-injection check that a failed audit append aborts the transition, and a periodic
+chain-verification job. From the **idempotency** row: a parallel same-key concurrency check
+asserting exactly one durable effect, a replay check asserting a stored failure replays as a
+failure, and a crash check asserting an expired lease is recoverable.
+
+**Planned, and not yet specified anywhere.** An **edge-coverage check** asserting no transition
+is admissible at runtime outside the twenty-five rows of §4.3 has no home in the design set —
+no document states it and nothing implements it. Until `01 §1.2` records it alongside the other
+verification approaches, the normative exclusions this decision makes structural — notably the
+absent `in_fulfillment → expired` row — rest on the transition table plus the single-writer grant
+at design level, and on the invariant suite's document-level assertion above, not on any
+mechanised runtime check.
 
 ## Pros and Cons of the Options
 

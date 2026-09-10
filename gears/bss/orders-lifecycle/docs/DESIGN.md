@@ -111,7 +111,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` | Transition commit p95 < 1 s. **Two disclosed divergences**: the PRD's threshold reads "durable write **+ event publish**", and the outbox makes publication asynchronous by construction — delivery carries its own **30 s p95** budget (D-41), so the combined figure cannot hold as written; and port resolution adds up to 1.5 s ahead of the commit (1.75 s on Preview), leaving the caller-visible figure unbounded (Q-11). Both routed to Product as Q-16. | Order Transition Engine | Single-round-trip transition: guard evaluation, version/audit append and outbox enqueue in one database transaction; delivery is asynchronous from the outbox so publication never extends the commit path | Load test at production sizing asserting p95 on the commit path; outbox drain measured separately against the event-delivery budget |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-read-latency` | Order read and paginated list p95 < 200 ms | Read-and-authorization slice | Reads are served from a current-version projection carrying the denormalized state, tenant axes and per-line fulfillment status, so no read reconstructs the version chain | Read/list benchmarks at production row counts and page sizes, including the tenancy-scoped filter paths |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions and amendments audited, zero silent drops | Order Transition Engine | The audit append is inside the same transaction as the state change, so an unaudited transition cannot commit; the audit store is append-only and the chain is verifiable | Structural test that every transition-table edge writes an audit row; negative test that a failed audit append aborts the transition |
-| `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate orders or duplicate transition effects | Order Transition Engine | Idempotency records are written in the transition transaction under a unique constraint on the operation key, making duplicate effect impossible rather than unlikely; the in-flight state is explicit | Concurrency test firing the same key in parallel and asserting one durable effect; replay test asserting stored failures replay as failures |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate orders or duplicate transition effects, **per principal** (`design/01-foundation.md` §4.2 discloses the scope's one gap: create) | Order Transition Engine | Idempotency records are written in the transition transaction under a unique constraint on `(operation, principal_scope, idempotency_key)`, making duplicate effect impossible rather than unlikely; the in-flight state is explicit | Concurrency test firing the same key in parallel and asserting one durable effect; replay test asserting stored failures replay as failures; cross-principal test asserting one caller neither reads nor overwrites another's record |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-snapshot-integrity` | 100 % of submitted lines carry a resolvable catalog price pin | Gate-and-pin slice | The pin is captured inside the submit transaction; a line without a resolvable pin fails the gate, so `submitted` and "pinned" are the same commit | Invariant test asserting no `submitted`-or-beyond line exists without a pin; re-pin asserted on every amendment |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-recovery` | RPO zero for `submitted`+ orders, RTO ≤ 60 min, within residency-bound intra-cell failure domains | Persistence and deployment topology | Committed transitions are synchronously durable before acknowledgement; versions, audit rows and outbox entries share the transaction so a recovered database cannot hold a state change without its trail | DR exercise restoring to the declared RTO and asserting zero committed-transition loss including outbox entries |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | Retain all orders and versions per program policy; auto-void abandoned drafts | Persistence and the hold-and-expiry slice | Append-only retention with no destructive path for `submitted`+ orders; the draft auto-void TTL transitions to `expired` rather than deleting, preserving the audit trail | Retention test asserting no delete path reaches a `submitted`+ order; auto-void test asserting the draft remains readable, not removed |
@@ -414,8 +414,9 @@ unbreakable by a new slice.
 
 The order aggregate and its append-only version chain; the declarative state-machine table with
 its guards, terminal set, hold/resume mapping and expiry eligibility; guard evaluation and
-ordering; the idempotency registry and its three non-success outcomes; the optimistic version
-check and stale-version refusal; the append-only transition audit; the event outbox and the
+ordering; the idempotency registry and its non-success outcomes; the optimistic version
+check and its `version-conflict` refusal — the single registered name D-38 consolidated the
+`stale-version` variants into; the append-only transition audit; the event outbox and the
 one-event-per-committed-transition rule; and the registry of machine-readable business reasons.
 
 ##### Responsibility boundaries
@@ -586,9 +587,13 @@ cannot be closed automatically.
 ##### Responsibility scope
 
 Hold and resume with the stored pre-hold state; the per-state TTL policy for `submitted`,
-`pending_approval`, `approved` and `on_hold`; the coordinated expiry scheduler; and the
-transition-table exclusion of `in_fulfillment` and of holds taken from it, together with the
-handoff of those cases to the operational escalation owned by the sibling gear.
+`pending_approval`, `approved` and `on_hold`; the **resume cap** that stops a hold/resume cycle
+restarting the dwell without limit; the coordinated expiry scheduler; and the transition-table
+exclusion of `in_fulfillment` and of holds taken from it, together with the handoff of those cases
+to the operational escalation owned by the sibling gear. It does **not** supply a fallback duration
+for a state whose TTL is unset — such a state is unbounded, disclosed in
+[`design/07-hold-and-expiry.md`](./design/07-hold-and-expiry.md) §4.2 and routed as
+[`DECISIONS.md`](./DECISIONS.md) Q-27.
 
 ##### Responsibility boundaries
 
@@ -682,7 +687,7 @@ identities, delegation-proof references and correlation identifiers, so it joins
 design-introduced surface needing Product's acknowledgement ([`DECISIONS.md`](./DECISIONS.md)
 D-70). The other ten have an FR basis, so §9.1 needs a PRD amendment to remain the
 normative operation set. **One** has no PRD basis at all: the operator outbox re-drive, introduced
-by this design ([`DECISIONS.md`](./DECISIONS.md) D-17) because a parked dead-letter row was
+by this design ([`DECISIONS.md`](./DECISIONS.md) D-17) because a parked dead-letter row **suspends its own order's event stream and no other** until re-drive republishes it in sequence order (D-87) — the re-drive may never be used to skip it — and because a parked row was
 otherwise unrecoverable and the PRD's zero-silent-drops NFR could not be met without it. It is
 recorded as a design-introduced operational surface rather than folded in as though the PRD asked
 for it, and it is the second endpoint whose addition needs Product's acknowledgement rather than
@@ -917,7 +922,7 @@ table** rather than globally, because ten of the nineteen are deliberately mutab
 | `orders_order_admin` | `01 §3.7` | capture | **mutable** — administrative content |
 | `orders_order_line_admin` | `01 §3.7` | capture | **mutable** — administrative content |
 | `orders_resolved_total` | `01 §3.7` | gate-and-pin | append-only |
-| `orders_transition_audit` | `01 §3.7` | engine | append-only, hash-chained, no UPDATE/DELETE grant |
+| `orders_transition_audit` | `01 §3.7` | engine | append-only, hash-chained over committed entries; no UPDATE grant to any role, DELETE only to the retention worker for expired refused rows — `01 §3.7` is the canonical grant and retention contract |
 | `orders_idempotency` | `01 §3.7` | engine | **mutable** — marker settles |
 | `orders_event_outbox` | `01 §3.7` | engine | **mutable** — delivery bookkeeping; delivered rows purged |
 | `orders_line_fulfillment` | `01 §3.7` | workflow-seam | **mutable** — projection advances |
@@ -930,7 +935,7 @@ table** rather than globally, because ten of the nineteen are deliberately mutab
 | `orders_read_access_log` | `08 §3.7` | read-and-authz | append-only |
 
 There is no destructive path for any **order-linked commercial** row: an abandoned draft is
-auto-voided to `expired` and remains readable. Four stores carry bounded retention by design:
+auto-voided to `expired` and remains readable. Four stores carry bounded retention by design, each executed by the retention sweep of §4.2 and each specified in its owning slice rather than here:
 delivered outbox rows (30 days), Preview gate outcomes (7 days), refused-attempt audit rows
 (90 days), and read-access-log rows (90 days).
 
@@ -1047,6 +1052,7 @@ applicable**; it consumes an authorization *outcome* only.
 | Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant on the audit role, plus a per-order predecessor-hash chain verified periodically | A holder of the migration role can drop the grant; detectable via the chain and the grant audit |
 | Preview amplification | Unauthenticated-shaped basket calls fan out to six ports and write outcome rows | Cost and dependency boundary | Preview declares its actor classes, carries a rate limit, and its outcome rows have a bounded retention | A high-volume authorised caller can still consume port capacity, bounded by the per-port bulkhead |
 | Unbounded audit growth | Repeated refused attempts against one order | Availability boundary | Refusal rows carry 90-day retention and repeated refusals are rate-limited | A distributed low-rate refusal campaign remains possible and is a monitoring concern |
+| An order held in-flight indefinitely | An actor with hold permission cycles hold and resume before each TTL elapses, restarting the dwell | Commercial-promise boundary | The resume cap of [`design/07-hold-and-expiry.md`](./design/07-hold-and-expiry.md) §4.2 — a counter only the resume transition increments and no transition resets — bounds total in-flight life at `(cap + 1) × TTL` | Where the state's TTL is **unset** the cap bounds nothing, because the dwell it multiplies is itself unbounded; disclosed as [`DECISIONS.md`](./DECISIONS.md) Q-27 and alerted per `07 §3.8` |
 
 ### 4.3 Data protection, residency and retention
 
@@ -1119,7 +1125,7 @@ Three test classes are conditions of the guarantees this design claims. The stat
 declarative table, so **edge coverage is enumerable**: a structural test asserts every row writes
 an audit row on both outcomes and that no edge exists outside the table. Idempotency and the
 version check are concurrency properties, verified by **parallel same-key execution** asserting
-one durable effect, plus a crash test asserting a lease-expired marker is recoverable. The
+one durable effect. A crash test asserting a lease-expired marker is recoverable is **planned and not yet written** — this gear has no implementation and no runtime tests, so a claim that one exists would be false. The
 unagreed downstream seams are behind ports, so the gate and acknowledgement paths are **testable
 against a contract double** before Subscriptions exists. The sibling gears' precedent of
 jointly-owned golden fixtures before implementation applies to the gate's adopted predicates,
@@ -1133,9 +1139,9 @@ without touching the engine; a state, a transition row, an event type, an envelo
 an engine-owned column requires an engine change, and adding a state or event type is
 additionally a PRD question because both sets are enumerated there.
 
-**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — eighty-five entries plus twenty-six
-routed open questions — with five decisions carrying full alternatives analysis in
-[`ADR/`](./ADR/). **Upstream asks** are declared in [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md),
+**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — ninety entries plus twenty-eight
+routed open questions — with **seven** ADRs in [`ADR/`](./ADR/) carrying full alternatives
+analysis. **Upstream asks** are declared in [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md),
 including `SUB-O10`, which this design raises.
 
 **PRD open questions.** Of the fifteen rows in [`PRD.md`](./PRD.md) §15, twelve are unanswered.

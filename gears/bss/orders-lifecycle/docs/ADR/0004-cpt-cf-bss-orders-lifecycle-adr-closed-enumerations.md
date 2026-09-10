@@ -62,7 +62,7 @@ Chosen option: **keep both sets closed**. Concretely:
 
 ### Consequences
 
-* **The state machine stays at eleven and the event set at eleven**, so none of the four problems needs an engine change or a PRD amendment. Consumer migration was never the cost — `01 §4.6` makes an addition additive — so what this decision buys is avoiding the engine and PRD churn, not avoiding a breaking change.
+* **The state machine stays at eleven and the event set at eleven**, so none of the four problems adds an enumeration value. That is the precise claim, and it is narrower than "no engine change and no PRD amendment": `01 §4.6` is explicit that adding a state or an event type requires **both**, and this decision avoids exactly that cost — but two consequences of it still land outside the slices. **D-15 changes the engine contract**: the in-code transition table gains a **nullable** `event_type` declaration so an event-less row can be expressed, which `01 §4.6` classifies as an engine change in its own right. **D-14 still needs a PRD acknowledgement**: the `draft → expired` auto-void edge (§4.3 row 6) is a transition row the PRD §6.1 normative state diagram does not contain, routed to Product as `DECISIONS.md` **Q-22**, whose answer is either amending that diagram or the twelfth state and event this ADR rejected. What this decision buys is therefore avoiding *enumeration* churn and the consumer forward-compatibility obligation that would ride with it — not avoiding engine propagation or PRD reconciliation altogether.
 * **The outbox cardinality rule stays enforceable.** An earlier draft of this ADR claimed `orders_event_outbox.event_type` is nullable and demoted the rule to a tested invariant on that basis. That was wrong twice: `01 §3.7` declares the column `text` with no nullable marker, and the enqueue is conditional — `01 §3.6` writes a row only *if the transition row declares an event type* — so an event-less transition produces **no** outbox row and no row can ever carry a null type. The rule is therefore "exactly one outbox row per **event-declaring** committed transition", and that remains a checkable cardinality property. The nullability that D-15 introduced is on the in-code transition table's `event_type` declaration, not on the outbox.
 * **The event-less justification depends on an external document.** "The caller caused the transition and already knows" is true because the sibling Orders Workflow PRD's trigger set contains neither `submitted → pending_approval` nor `approved → in_fulfillment`. If that trigger set changes, six rows silently need re-examination — so this ADR is a dependency of that PRD, not merely a reader of it.
 * **A future consumer that is not the caller cannot observe six transition classes at all**: order creation, draft mutation, the administrative edit, `submitted → pending_approval`, `approved → in_fulfillment`, and the spawn signal. Analytics, an operator timeline and a reconciliation job are all plausibly such consumers. Each would need an engine change plus a PRD amendment, which is the cost this decision defers rather than removes.
@@ -71,9 +71,23 @@ Chosen option: **keep both sets closed**. Concretely:
 
 ### Confirmation
 
-Verified by `01 §4.4`'s event catalogue mapping all eleven events to emitting rows and naming the
-six event-less row classes with a justification each; by `01 §4.3` holding twenty-five rows across
-eleven states; and by a test asserting no transition is admissible outside the transition table.
+**This gear has no implementation and no runtime tests**, so the checks below are labelled either
+verifiable today or planned.
+
+**Verifiable today.** `01 §4.4`'s event catalogue maps all eleven events to their emitting rows
+and names the six event-less row classes with a justification each; `01 §4.3` holds twenty-five
+rows across eleven states; and `01 §4.6` states what adding to either set would cost. The
+document-level invariant suite (`scripts/check-design-invariants.py`, run as `make design-check`
+in CI) mechanises the load-bearing part: its state-machine family asserts that §4.4's catalogue
+and §4.3's event-declaring rows are the **same set** in both directions, and that each catalogue
+entry names the event its cited row actually declares — so an event added to one and not the
+other fails the check rather than surviving review.
+
+**Planned, not yet written and not yet specified.** A runtime check asserting no transition is
+admissible outside the transition table has no home in the design set; `01 §1.2` is where it
+belongs, and until it is recorded there the closed edge set is a property of the table plus
+`01 §4.1`'s single-writer rule at design level. The same applies to the event set: nothing yet
+asserts at runtime that a committed transition publishes only the event its row declares.
 
 ## Pros and Cons of the Options
 
@@ -83,7 +97,7 @@ eleven states; and by a test asserting no transition is admissible outside the t
 * Good, because a guard, a reason or a recorded fact is cheaper than a state in every dimension — no TTL, no edges, no event.
 * Good, because it matches `subscriptions/ADR-0001`, so the programme reads one pattern.
 * Bad, because six transition classes are unobservable to any consumer that is not the caller.
-* Bad, because the transition table needs a nullable event-type declaration to express an event-less row, so "does this row emit?" becomes data rather than structure.
+* Bad, because the transition table needs a nullable event-type declaration to express an event-less row, so "does this row emit?" becomes data rather than structure — and that declaration is itself an engine change under `01 §4.6`, which is why the Consequences above claim only that no *enumeration value* is added.
 
 ### Enlarge the sets
 
@@ -117,4 +131,4 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-bss-orders-lifecycle-component-transition-engine` — §4.3's row count and §4.4's event catalogue are the enumerations this decision closes, and §4.6 states what adding to either would cost
 - **PRD**: [`../PRD.md`](../PRD.md) — §6.1 state machine, §6.5 events, §15 rows 5 and 8
 - **DESIGN**: [`../design/01-foundation.md`](../design/01-foundation.md) §4.3, §4.4, §4.6; [`../design/02-capture.md`](../design/02-capture.md) §4.2; [`../design/07-hold-and-expiry.md`](../design/07-hold-and-expiry.md) §4.4
-- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-14, D-15, D-16, D-60
+- **Decisions register**: [`../DECISIONS.md`](../DECISIONS.md) — D-14, D-15, D-16, D-60; open questions Q-01 (the `category` enum stays open), Q-22 (the PRD diagram lacks the `draft → expired` edge this decision keeps)

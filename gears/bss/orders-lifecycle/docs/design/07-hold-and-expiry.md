@@ -39,14 +39,16 @@
 
 ### 1.1 Architectural Vision
 
-This slice owns time. It pauses an order and resumes it to exactly where it was, bounds every
-in-flight state with a time-to-live, sweeps abandoned drafts, and — for the one state it must not
-bound — hands off to an operational escalation owned elsewhere
-([`../PRD.md`](../PRD.md) §6.3).
+This slice owns time. It pauses an order and resumes it to exactly where it was, bounds an
+in-flight state by a per-state time-to-live where one is configured, caps how many times an order
+may be resumed so the dwell cannot be restarted without limit, sweeps abandoned drafts, and — for
+the one state it must not bound — hands off to an operational escalation owned elsewhere
+([`../PRD.md`](../PRD.md) §6.3). Where a TTL is unset the state is unbounded, and §4.2 says so
+rather than asserting a backstop this design cannot enforce.
 
 The reason bounded lifetime matters is commercial rather than hygienic. An order sitting
 indefinitely in `submitted` pins a catalog price, holds an open promise to a customer, and
-accumulates operational debt nobody is watching. So every in-flight state gets a configurable
+accumulates operational debt nobody is watching. So each in-flight state gets a configurable
 TTL and expires to a terminal state with the system as actor.
 
 Every state except one. `in_fulfillment` **must not** be auto-expired, because a subscription
@@ -56,6 +58,17 @@ resources with nothing to compensate them. The same exemption covers a hold take
 deliberately broken, and the exemption lives in the transition table rather than in scheduler
 logic — so a scheduler defect cannot expire such an order, and the bound becomes an operational
 SLA raised by the sibling gear instead of an automatic transition.
+
+The bound has **two layers**, and they answer different questions. The **per-state TTL** is
+Product-owned configuration with no code default, so it is only in force where it has been
+configured. The **resume cap** is a design-owned baseline on the number of times one order may be
+resumed, enforced as a guard on the resume transition itself. It exists because a per-state TTL
+alone bounds nothing an actor can restart: resume rewrites the dwell input, so hold-then-resume
+before each elapse was an unbounded lifetime available to any actor holding hold permission. With
+the cap in force an order's in-flight life is bounded by `(cap + 1) × TTL` wherever a TTL is
+configured. Where one is **not** configured, that state has no bound at all and the cap does not
+supply one — §4.2 states that residual gap rather than papering over it, which is the difference
+between these two layers and the absolute-lifetime backstop an earlier draft claimed.
 
 Hold is narrower than it first appears, and the narrowness is the design. A hold changes **only
 the order**. Already-activated subscriptions keep serving and keep billing, the term does not
@@ -70,7 +83,7 @@ compliance hold silently stop a customer's billing.
 | Requirement | Design Response |
 |-------------|------------------|
 | `cpt-cf-bss-orders-lifecycle-fr-order-hold` | Hold stores the outgoing state on the aggregate; resume reads it as the target. Resume is a lookup, not an inference, so a state added later cannot break resume. |
-| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | Expiry is an ordinary transition row with the system actor class. The `in_fulfillment` exemption and the hold-taken-from-`in_fulfillment` exemption are table rows that do not exist, not scheduler conditions. |
+| `cpt-cf-bss-orders-lifecycle-fr-order-expiry` | Expiry is an ordinary transition row with the system actor class, driven by one sweep pass over a per-state TTL that holds where configured. Restarting a dwell is bounded separately, by a cap on the resume transition rather than by a second sweep. The `in_fulfillment` exemption and the hold-taken-from-`in_fulfillment` exemption are table rows that do not exist, not scheduler conditions. Where a TTL is unset the state is unbounded, disclosed in §4.2 and alerted in §3.8. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-cancel` | Cancel from `on_hold` applies the **pre-hold** state's guards, so a hold cannot be used to widen what cancellation is permitted. |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | The abandoned-draft sweep auto-voids to `expired` rather than deleting, preserving the audit trail. |
 | `cpt-cf-bss-orders-lifecycle-fr-order-events` | Expiry publishes `OrderExpired`; hold and resume publish `OrderHeld` and `OrderResumed`, which is how the sibling gear knows to suspend or resume its process. |
@@ -79,7 +92,7 @@ compliance hold silently stop a customer's billing.
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions audited | Expiry scheduler | An expiry is a normal transition, so it audits with `system` as actor class and the elapsed TTL as reason | Test asserting every expired order carries an audit row with the system actor |
+| `cpt-cf-bss-orders-lifecycle-nfr-order-audit-completeness` | 100 % of transitions audited | Expiry scheduler | An expiry is a normal transition, so it audits with `system` as actor class and the elapsed bound as reason, naming which of the two bounds of §4.2 elapsed | Test asserting every expired order carries an audit row with the system actor |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-idempotency` | Zero duplicate effects | Expiry scheduler | The sweep runs under a singleton lease and each expiry uses a deterministic idempotency key derived from order and version, so a re-run is absorbed | Concurrency test running two sweep instances and asserting one expiry per order |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-retention` | Abandoned drafts auto-voided | Draft sweep | Auto-void is an ordinary transition to `expired`; there is no delete path | Test asserting an auto-voided draft and its audit trail remain readable |
 | `cpt-cf-bss-orders-lifecycle-nfr-order-transition-latency` | Commit p95 < 1 s | Hold and resume | Both resolve no external input; resume reads one stored column | Load test on hold and resume |
@@ -126,6 +139,23 @@ hold and resume.
 scheduler declines to select it. The distinction matters under defect: a scheduler bug can select
 the wrong orders, and the transition table is the thing that refuses them anyway.
 
+#### A resume restarts the state clock, never the order's
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-principle-resume-is-capped`
+
+Resume sets `state_entered_at`, so the **per-state** bound genuinely starts over — that is correct,
+because the order has genuinely re-entered the state and the state's TTL asks how long it may
+dwell there. What must not be unlimited is the **number of restarts**. `state_entered_at` was the
+sole dwell input, and it is writable by an ordinary operation any actor holding `hold` already
+has, so hold-then-resume before each TTL elapses was an unbounded lifetime available to a
+permitted actor — not an attack, just a loop. The loop is closed where it is created: `resume`
+([`01-foundation`](./01-foundation.md) §4.3 row 22) carries a **registered guard** that refuses
+once `orders_order.resume_count` has reached the cap, and every successful resume increments that
+counter. No transition decrements or resets it. The bound is therefore enforced at the operation
+that extends the life, its breach is a refused, audited transition with a named reason rather than
+an absence of something happening, and the arithmetic is closed: at most `cap` restarts of a
+bounded dwell is a bounded total.
+
 #### A park does not stop the clock
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-principle-park-does-not-stop-clock`
@@ -167,6 +197,20 @@ platform versus seller — are all PRD open questions owned by Product. This sli
 **policy model** and leaves the numbers as configuration with no code default, because a code
 default would quietly become the answer.
 
+The **resume cap** is deliberately **not** in that group. It is a design-owned value with a
+working baseline (§4.5), because it closes a hole this design opened — resume rewrites the dwell
+input — and a mitigation whose value is also unchosen would be no mitigation at all. It bounds a
+count rather than a duration, so it cannot pre-empt a per-state TTL Product later chooses,
+whatever that TTL turns out to be.
+
+**What remains unbounded, and it is a Product dependency and not a design gap to close here.**
+Where no TTL is configured for a state, that state has **no bound**: the per-state pass skips it
+(§3.6) and the resume cap bounds restarts of a dwell that is itself unbounded, so `cap` × ∞ is
+still ∞. An earlier draft covered this with an absolute order lifetime measured from `created_at`;
+§4.2 records why that backstop was withdrawn rather than kept. Until PRD §15 row 7 is answered the
+gap is **disclosed** — surfaced as the no-configured-TTL metric and alert of §3.8 — rather than
+claimed closed.
+
 ## 3. Technical Architecture
 
 ### 3.1 Domain Model
@@ -181,12 +225,22 @@ hold is ever in force.
 
 The per-state time-to-live configuration: the state it bounds, its duration, and its
 configuration scope. Resolved at sweep time rather than stored per order, so a policy change
-takes effect on orders already in flight.
+takes effect on orders already in flight. It is **per-state and optional**; where it is unset the
+state is unbounded, and the resume cap below limits restarts rather than supplying a duration.
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-resume-cap`
+
+The restart bound: a single maximum count of resumes per order, compared against a counter on the
+aggregate that only the resume transition increments. It is configuration with a design-owned
+baseline rather than a per-order stored value, and the counter it is compared against is written
+by exactly one transition and reset by none.
 
 **Relationships**:
 - `Order root` → `Hold record`: zero-or-one; the pre-hold column is NULL unless the state is `on_hold`.
 - `State TTL policy` → `Order root`: many-to-many by state, resolved at sweep time.
+- `Resume cap` → `Order root`: one-to-many; one count applies to every order, compared against `orders_order.resume_count`, which only the resume transition increments and which amendment, administrative edit and hold all leave untouched.
 - `Hold record` → `State TTL policy`: an `on_hold` order is bounded by the `on_hold` TTL **unless** its pre-hold state is `in_fulfillment`, in which case it is unbounded and escalated instead.
+- `Hold record` → `Resume cap`: indirect and one-way — a hold does not touch the counter, but the resume that ends the hold does, so the cap bounds how many times one order may re-enter a dwell. It does not bound the dwell itself, and the `in_fulfillment` exemption of §4.3 is outside it entirely.
 
 ### 3.2 Component Model
 
@@ -229,7 +283,8 @@ concurrently would double-expire orders.
 ##### Responsibility scope
 
 The singleton-leased sweep; TTL policy resolution per state; selection of eligible orders;
-deterministic idempotency keys per expiry; and the batch and cadence controls.
+deterministic idempotency keys per expiry; and the batch and cadence controls. It has **one**
+selection pass — the restart bound lives on the resume transition, not here (§4.2).
 
 ##### Responsibility boundaries
 
@@ -253,7 +308,8 @@ what a buyer nearly bought.
 ##### Responsibility scope
 
 The lease-coordinated sweep over `draft` orders past their auto-void TTL, and the auto-void
-transition to `expired` that keeps them readable.
+transition to `expired` that keeps them readable. Where that TTL is unset the sweep does no work
+and `draft` accumulation is unbounded (§4.4).
 
 ##### Responsibility boundaries
 
@@ -281,8 +337,14 @@ as actor class, which is what makes "who expired this order" answerable as `syst
 as whichever caller happened to trigger it.
 
 **Reasons contributed to the registry**: already-on-hold, not-on-hold, resume-target-missing,
-hold-cancel-refused-by-prehold-guard, **cancel-reason-required**,
-**direct-cancel-window-closed** (shared with the seam slice, defined once here). The engine's own
+**resume-cap-exhausted**, hold-cancel-refused-by-prehold-guard, **cancel-reason-required**,
+**direct-cancel-window-closed** (shared with the seam slice, defined once here).
+`resume-cap-exhausted` is registered **here and only here**: it is row 22's guard refusal when
+`orders_order.resume_count` has reached the cap of §4.5, and it names the cap and the count so the
+caller learns the order cannot re-enter its dwell again and must be cancelled or escalated. It is
+deliberately **not** folded into the engine's `not-admissible` — the row *is* admissible and the
+state *does* permit resume; what refuses is a guard on data, which is the distinction `01 §4.1`
+draws between the transition table and the guard set. The engine's own
 `not-admissible` covers an inadmissible hold, resume, cancel or expiry alike, so this slice
 registers no second name for any of it — the earlier `hold-not-admitted-in-state` and
 `cancel-not-admitted-in-state` were exactly such second names and are deleted, matching the
@@ -318,19 +380,29 @@ Input: order_id, holding_actor, reason, security_context, idempotency_key
 Output: on_hold then the restored state, or a registered refusal
 
 1. [ ] - `p1` - Declare hold admissibility as an engine guard: the current state is `submitted`, `pending_approval`, `approved` or `in_fulfillment`; an inadmissible state refuses with the engine's `not-admissible` - `inst-hr-declare-admissibility-guard`
-2. [ ] - `p1` - Supply the current state as the **pre-hold contribution** to the hold transition; the engine writes the column inside the transition transaction (`01 §3.6` *Attempt Transition* step 19.2) - `inst-hr-store-prehold`
+2. [ ] - `p1` - Supply the current state as the **pre-hold contribution** to the hold transition; the engine writes the column inside the transition transaction (`01 §3.6` *Attempt Transition* step 20.2) - `inst-hr-store-prehold`
 3. [ ] - `p1` - Request the hold transition; the engine publishes OrderHeld - `inst-hr-request-hold`
 4. [ ] - `p1` - **RETURN** on_hold - `inst-hr-return-on-hold`
 5. [ ] - `p1` - **WHEN** resume is later requested: - `inst-hr-when-resume`
    1. [ ] - `p1` - **IF** the current state is not `on_hold`: **RETURN** not-on-hold refusal - `inst-hr-if-not-on-hold`
    2. [ ] - `p1` - **IF** no pre-hold state is stored: **RETURN** resume-target-missing refusal - `inst-hr-if-target-missing`
-   3. [ ] - `p1` - Read the stored pre-hold state as the transition target - `inst-hr-read-prehold`
-   4. [ ] - `p1` - Request the resume transition; the engine clears the pre-hold column and publishes OrderResumed (`01 §3.6` *Attempt Transition* step 19.3) - `inst-hr-request-resume`
-   5. [ ] - `p1` - **RETURN** the restored state - `inst-hr-return-restored`
+   3. [ ] - `p1` - **Resume-cap guard**, registered on row 22 and evaluated by the engine against the aggregate row it has already locked: **IF** `orders_order.resume_count` is at or above the cap of §4.5: **RETURN** a `resume-cap-exhausted` refusal naming the cap and the count - `inst-hr-if-resume-cap`
+   4. [ ] - `p1` - Read the stored pre-hold state as the transition target - `inst-hr-read-prehold`
+   5. [ ] - `p1` - Request the resume transition; the engine clears the pre-hold column, increments `resume_count` and publishes OrderResumed, all inside the transition transaction (`01 §3.6` *Attempt Transition* steps 20.3 and 20.4) — the counter is engine-owned and this slice contributes no value for it - `inst-hr-request-resume`
+   6. [ ] - `p1` - **RETURN** the restored state - `inst-hr-return-restored`
 
 **Description**: Nothing about the spawned subscriptions changes at either end. A hold from
 `in_fulfillment` leaves activated subscriptions serving and billing, and leaves wave-1 drafts
 alone — including their own auto-void TTL, which this gear cannot pause.
+
+**Why the cap is read and written inside the transition rather than checked first.** Step 5.3 is a
+**registered guard**, so the engine evaluates it at `01 §3.6` *Attempt Transition* step 13 — under
+the aggregate row lock taken at step 5 — and increments the counter at step 20.4 under that same
+lock, in the same transaction. A pre-check outside the
+transaction would let two concurrent resumes both read a count below the cap and both commit, so
+the cap would be exceeded by exactly the concurrency the engine's single-writer rule exists to
+exclude — and a slice check that refuses ahead of the engine produces no audit row and no settled
+idempotency record, which `01 §2.1` forbids for that reason.
 
 #### The expiry sweep
 
@@ -348,7 +420,7 @@ Output: expired count
 1. [ ] - `p1` - Acquire the singleton sweep lease; **IF** not acquired, **RETURN** without work - `inst-es-acquire-lease`
 2. [ ] - `p1` - **FOR EACH** expirable state — `submitted`, `pending_approval`, `approved`, `on_hold`: - `inst-es-for-each-state`
    1. [ ] - `p1` - Resolve the TTL policy for that state at its configuration scope - `inst-es-resolve-ttl`
-   2. [ ] - `p1` - **IF** no TTL is configured: **SKIP TO** the next state (no code default) - `inst-es-if-no-ttl`
+   2. [ ] - `p1` - **IF** no TTL is configured: increment the no-configured-TTL gauge of `§3.8` and **SKIP TO** the next state (no code default); that state has **no bound at all** this cadence, which §4.2 discloses rather than covers - `inst-es-if-no-ttl`
    3. [ ] - `p1` - **FOR EACH** seller scope with its own policy, and once for the platform fallback: select orders in that state whose `state_entered_at` is older than the TTL, up to the batch size, using the `(seller_tenant_id, state, state_entered_at)` index - `inst-es-select-eligible`
    4. [ ] - `p1` - **FOR EACH** selected order: - `inst-es-for-each-order`
       1. [ ] - `p1` - **IF** the state is `on_hold` **AND** its pre-hold state is `in_fulfillment`: - `inst-es-if-hold-from-fulfillment`
@@ -361,7 +433,24 @@ Output: expired count
 **Description**: Step 2.4.4 is deliberate. The sweep's own exemption check at 2.4.1 is a
 performance optimisation, not the safety mechanism — the safety mechanism is that no
 `in_fulfillment` expiry row exists, so a sweep defect produces a refusal rather than an orphaned
-order.
+order. The sweep therefore has **one pass**, over `state_entered_at`, and it bounds exactly what a
+configured TTL bounds.
+
+**There is deliberately no second pass, and an earlier draft had one.** That draft added an
+absolute-lifetime pass selecting on `orders_order.created_at`, to close the hold/resume loop and to
+cover states whose TTL is unset. It is withdrawn because it could not do either, and §4.2 records
+the reasoning in full. The mechanical half belongs here: the second pass was specified to derive
+the **same** deterministic idempotency key as this pass, from order and version, so that an order
+both selected would expire once. But a refusal **settles** its record and replays under that key
+([`../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md`](../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md)),
+and the key was invariant in the order's version — so a per-state attempt refused as not-admissible
+settled that refusal under the shared key, and every subsequent absolute-pass request for the same
+order and version **replayed the refusal instead of attempting**, for the whole idempotency window.
+The backstop was inert for precisely the orders something had already gone wrong with, and the
+inertness was invisible: a replayed refusal and a genuine refusal are the same response. Deriving
+distinct keys would have fixed the replay and reintroduced the double-expiry the shared key
+existed to prevent. The loop is closed at `resume` instead (§4.2), which needs no second pass and
+therefore no key to share.
 
 #### Overdue escalation handoff
 
@@ -418,20 +507,36 @@ permitting duplicate platform policies ([`../DECISIONS.md`](../DECISIONS.md) D-2
 policy cannot be authored for it.
 
 **Additional info**: seller scope overrides platform scope for the same state. There is **no code
-default** for any TTL; an unconfigured state is not swept, so the absence of a policy is visible
-as orders that never expire rather than as a silently applied constant.
+default** for any per-state TTL; an unconfigured state is not swept, so the absence of a policy is
+visible as the no-configured-TTL gauge and alert of §3.8 rather than as a silently applied
+constant. It is **not** covered by a fallback duration — §4.2 states why the absolute-lifetime
+backstop that would have supplied one was withdrawn.
 
-The **dwell time** an expiry is measured against is `orders_order.state_entered_at`, maintained by
-the engine inside the transition that changes state — not derived from the audit trail, which
-would be an N+1 correlated subquery over the largest table in the gear on every sweep, and which
-would also contradict the rule that no read derives order state from the audit store. A resumed
-order restarts its bound because resume sets the column. The same column serves the "in this state
-since" list filter, so the two slices no longer specify opposite sources for one fact
-([`../DECISIONS.md`](../DECISIONS.md) D-22).
+The **resume cap is not a row in this table.** It is a single gear-level configuration value,
+platform-scoped, and the table's `state` enum admits no value for it — because it bounds a count
+of operations on an order, not a dwell in a state. Its baseline lives in §4.5 and its normative
+rule in §4.2, and the counter it reads is `orders_order.resume_count`
+([`01-foundation`](./01-foundation.md) §3.7).
+
+**One dwell input.** The **per-state** bound is measured against
+`orders_order.state_entered_at`, maintained by the engine inside the transition that changes state
+— not derived from the audit trail, which would be an N+1 correlated subquery over the largest
+table in the gear on every sweep, and which would also contradict the rule that no read derives
+order state from the audit store. A resumed order restarts its **per-state** bound because resume
+sets that column. The same column serves the "in this state since" list filter, so the two slices
+no longer specify opposite sources for one fact ([`../DECISIONS.md`](../DECISIONS.md) D-22).
+
+**The restart bound needs no dwell input and no index.** `orders_order.resume_count`
+([`01-foundation`](./01-foundation.md) §3.7) is read by the resume guard on the aggregate row the
+transition has already loaded and locked, so the cap costs no scan, no second sweep pass and no
+composite index. That is the practical difference from the withdrawn absolute bound, which needed
+a `(state, created_at)` composite the existing `(seller_tenant_id, state, state_entered_at)` and
+`(resource_tenant_id, state, state_entered_at)` indexes do not serve — an index this slice
+requested in `01 §3.7`'s canonical list and no longer needs.
 
 ### 3.8 Deployment Topology
 
-Inherited from [`01-foundation`](./01-foundation.md) §3.8, with two of the gear's four
+Inherited from [`01-foundation`](./01-foundation.md) §3.8, with two of the gear's **five**
 lease-coordinated workers owned here: the **expiry sweep** and the **draft auto-void sweep**. Both
 take a lease, so a multi-replica deployment cannot double-expire. Both are idle-cheap: a sweep
 with no configured TTL does no work at all.
@@ -439,10 +544,16 @@ with no configured TTL does no work at all.
 **Observability owned here**: expiry counts per state per sweep, sweep duration and batch
 saturation, the count of orders **skipped as exempt** (which should be non-zero only for holds
 taken from `in_fulfillment`), the number of states with **no configured TTL** — the signal that a
-Product-owned value is still unset and orders are silently immortal — cancel counts by actor class
-and reason, and hold duration distribution. Alerts fire on a sweep failing to acquire its lease
-for longer than two cadences, on batch saturation persisting (the sweep is falling behind), and on
-any state having no configured TTL in a production environment.
+Product-owned value is still unset and those orders are **unbounded**, which is the residual gap
+§4.2 discloses — cancel counts by actor class and reason, hold duration distribution, the **hold
+cycles per order** distribution, and the count of `resume` transitions **refused as
+`resume-cap-exhausted`**, which is how the restart bound firing becomes visible rather than
+inferred. Alerts fire on a sweep
+failing to acquire its lease for longer than two cadences, on batch saturation persisting (the
+sweep is falling behind), on any state having no configured TTL in a production environment, and
+on any **`resume-cap-exhausted` refusal** at all — because the cap is a backstop, so a non-zero rate
+means either a per-state TTL is missing or an order is being held and resumed in a loop, and both
+are conditions someone should look at rather than metrics to watch drift.
 
 ## 4. Additional Context
 
@@ -462,14 +573,78 @@ A hold **MUST NOT**: pause entitlement or billing on any activated subscription,
 void a wave-1 subscription draft, or be assumed to pause the Subscriptions draft auto-void TTL.
 Already-activated subscriptions keep serving and keep billing for the duration of the hold.
 
+**Hold and resume extend the order's life, and the number of extensions is capped.** Resume
+**MUST** set `state_entered_at`, so the restored state's **per-state** TTL starts over; that is
+intended, since the order has genuinely re-entered the state. What is bounded is the count: resume
+**MUST** increment `orders_order.resume_count` in the same transaction that changes state, and the
+resume transition ([`01-foundation`](./01-foundation.md) §4.3 row 22) **MUST** carry a registered
+guard that refuses with `resume-cap-exhausted` when that counter has already reached the cap of
+§4.5. No transition — hold, resume, cancel, amendment or administrative edit — **MAY** decrement or
+reset the counter. An order at the cap can still be cancelled, and its per-state TTL still
+elapses; what it cannot do is re-enter a dwell again. See §4.2 for why this is the enforcement
+point and why the absolute-lifetime backstop was withdrawn.
+
 ### 4.2 Bounded lifetime (normative)
 
-Every in-flight state **MUST** have a bounded lifetime, delivered as a configurable TTL per
-state for `submitted`, `pending_approval`, `approved` and `on_hold`. On elapse the order **MUST**
-transition to `expired`, publish `OrderExpired`, and audit with actor class `system`.
+Bounded lifetime is delivered in **two layers**, and neither is unconditional. Stating that
+plainly is the point: an earlier text claimed every in-flight state has a bounded lifetime while
+§3.7 and §4.5 permitted a TTL to be unset and merely monitored, and only one of those two could be
+true. A later text closed the contradiction by asserting an absolute backstop that could not
+fire. What follows is the third statement and the first honest one — the two layers together
+bound every order whose states have configured TTLs, and disclose the orders they do not bound.
+
+**Layer 1 — the per-state TTL, which holds only where it is configured.** A configurable TTL
+**MAY** be set per state for `submitted`, `pending_approval`, `approved` and `on_hold`. Where a
+TTL **is** configured for a state, an order dwelling in that state past it **MUST** transition to
+`expired`, publish `OrderExpired`, and audit with actor class `system`. Where a TTL is **not**
+configured, that state has **no per-state bound at all**: there is no code default (§3.7), the
+per-state pass skips the state (§3.6 step 2.2), and the gap is surfaced as the no-configured-TTL
+metric and alert of §3.8. This is a **qualified** guarantee, deliberately, because an unset TTL is
+tolerated rather than fatal — a missing TTL **MUST NOT** block startup, since the numbers are
+Product-owned PRD open questions (§2.2, §4.5) and refusing to start would make an unanswered
+question an outage.
+
+**Layer 2 — the resume cap, which holds unconditionally but bounds a count and not a duration.**
+`orders_order.resume_count` **MUST** be incremented by the resume transition
+([`01-foundation`](./01-foundation.md) §4.3 row 22) in the same transaction that changes state, and
+row 22 **MUST** carry a registered guard refusing with `resume-cap-exhausted` once the counter has
+reached the cap resolved from configuration with the design-owned baseline of §4.5 — therefore
+**never unset**. Guard and increment are both engine-side and both under the aggregate row lock
+(`01 §3.6` *Attempt Transition* steps 13 and 20.4), so two concurrent resumes cannot both observe
+a count below the cap. No transition **MAY** decrement or reset the counter. What this layer guarantees
+is exact and worth stating as arithmetic rather than as a slogan: **an order's total in-flight
+life is at most `(cap + 1) × TTL` for every state whose TTL is configured**, because the only
+operation that restarts a dwell is bounded to `cap` uses. No actor holding any permission this
+gear grants can exceed it.
+
+**What neither layer bounds, disclosed rather than covered.** Where a state's TTL is unset, that
+state has no bound, and the resume cap supplies none — it multiplies a dwell that is itself
+unbounded. Two states are outside both layers entirely by §4.3's exemption: `in_fulfillment`, and
+an `on_hold` order whose pre-hold state is `in_fulfillment`. Those remain bounded by the
+operational SLA and by no transition in this gear. So the unqualified sentence "an in-flight order
+does not live forever" is **not** asserted by this design. What is asserted is the arithmetic
+above, its precondition (a configured TTL), and the visibility of the precondition failing
+(§3.8's no-configured-TTL alert). Closing the residual gap is PRD §15 row 7, a Product decision,
+and this design **MUST NOT** pre-empt it with a code default (§2.2).
+
+**Why the resume cap rather than an absolute order lifetime.** An earlier version of this section
+made Layer 2 an **absolute lifetime measured from `orders_order.created_at`** — attractive because
+it is a property of a column nothing writes after creation, so it needs no counter to maintain
+correctly. It is withdrawn for four reasons, and each is a reason not to restore it in another
+form:
+
+* **It could not fire where it mattered.** Its enforcement was a second sweep pass sharing one deterministic idempotency key with the per-state pass, so that an order both selected would expire once. But refusals settle and replay under their key ([`../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md`](../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md)), and the key was invariant in the order's version — so a per-state attempt refused as not-admissible settled that refusal, and every later absolute-pass request for the same order and version replayed it instead of attempting. The backstop went inert for exactly the orders something had already gone wrong with, and a replayed refusal is indistinguishable from a fresh one. §3.6 records the mechanics.
+* **It did not close the loop it was created for.** The hold an operator can cycle indefinitely is the one taken from `in_fulfillment`, and §4.3 exempts that from both layers. The absolute bound never applied to the case that motivated it.
+* **It pre-empted orders nobody was cycling.** A single gear-level duration cannot distinguish an order abandoned on day one from an enterprise order legitimately awaiting a slow approval; both were expired at the same instant. The cap cannot make that mistake, because an order nobody resumes never approaches it.
+* **Its value had no basis.** 90 days was a design-owned number for a commercial policy, with no PRD requirement behind it, raised as `DECISIONS.md` Q-27. A count of restarts is a mechanical property of the loop being closed, not a commercial policy, so this design can own it.
+
+The cap's own cost, stated plainly: an order that legitimately needs one more resume than the cap
+allows must be cancelled and re-created, or the cap raised. That is a visible, audited refusal
+with a named reason — which is the property the absolute bound lacked.
 
 Expiry **MUST** be scheduler-driven and **MUST NOT** be a public operation. Its idempotency key
 **MUST** be deterministic from order and version so a re-run is absorbed rather than duplicated.
+There is **one** expiry pass, so no two passes can select one order and no key is shared.
 
 A **fail-closed park does not suspend the clock**: where the sibling gear cannot obtain an
 approval-requirement verdict, the order remains `submitted` and the `submitted` TTL continues to
@@ -479,7 +654,9 @@ fires.
 ### 4.3 The `in_fulfillment` exemption (normative)
 
 `in_fulfillment` **MUST NOT** be auto-expired, and neither **MUST** an `on_hold` order whose
-pre-hold state is `in_fulfillment`. This is an explicit exemption from §4.2, taken because a
+pre-hold state is `in_fulfillment`. This is an explicit exemption from **both layers** of §4.2 —
+the per-state TTL and the resume cap alike, and the resume cap does not even engage, since it
+bounds restarts rather than expiring anything — taken because a
 subscription spawn signal may already have been issued and expiry would orphan provisioned
 resources with no compensation path.
 
@@ -508,6 +685,14 @@ be singleton-coordinated and **MUST NOT** touch any order past `draft`.
 Dwell is measured from the order's creation instant for this sweep specifically, since a `draft`
 has had no state transition since creation.
 
+**Where the auto-void TTL is unset, `draft` is unbounded, and there is no fallback.** An earlier
+version had this sweep fall back to the absolute order lifetime of §4.2; that bound is withdrawn
+(§4.2 states why) and nothing replaced it, because the resume cap does not apply — a `draft` is
+never held or resumed. `draft` is therefore the state with the largest exposure to an unanswered
+Product value: baskets accumulate until the auto-void TTL of §4.5 is chosen. This is the same
+disclosure §4.2 makes for the other states, and the same §3.8 alert covers it. It is **not** closed
+by a code default, per §2.2, and closing it is `../DECISIONS.md` Q-07.
+
 ### 4.5 Policy values (open)
 
 Two groups, distinguished because they have different owners. **PRD open questions owned by
@@ -517,10 +702,10 @@ Product**, each cited by its §15 row:
 |-------|-------------|------|
 | `submitted` TTL | row 7 | Must exceed the sibling gear's escalation lead time, since expiry bounds the fail-closed park |
 | `pending_approval` TTL | row 7 | Should relate to the sibling gear's 72-hour default approval escalation window |
-| `approved` TTL | row 7 | The only exit for a declined payment instrument, per [`05-preconditions`](./05-preconditions.md) §4.4 |
+| `approved` TTL | row 7 | The **ordinary** exit for a declined payment instrument, per [`05-preconditions`](./05-preconditions.md) §4.4 — and, while this value is unset, that order's **only** exit is a caller-driven cancel. The resume cap below stops a hold/resume cycle from restarting the TTL without limit, but it supplies no exit where the TTL itself is absent. This is the sharpest consequence of leaving this one value unset, and `05 §4.4` states it from the other side |
 | `on_hold` TTL | row 7 | The PRD names this the worst case, being deliberately open-ended in intent |
 | Override scope | row 7 | Whether seller scope may override platform scope per state |
-| `draft` auto-void TTL | row 5 | Bounds unbounded basket accumulation; the same row carries the program retention period, tracked as [`../DECISIONS.md`](../DECISIONS.md) Q-07 |
+| `draft` auto-void TTL | row 5 | Bounds unbounded basket accumulation; the same row carries the program retention period, tracked as [`../DECISIONS.md`](../DECISIONS.md) Q-07. While unset, the draft sweep does no work and `draft` accumulation is **unbounded** — there is no fallback duration (§4.4) |
 
 Rows 5 and 7 are the two §15 questions this slice waits on. Nothing else here is open: the
 idempotency-key window is **24 hours**, settled in [`01-foundation`](./01-foundation.md) §4.2
@@ -535,10 +720,16 @@ idempotency-key window is **24 hours**, settled in [`01-foundation`](./01-founda
 | Sweep cadence | every 5 minutes per worker | Bounds expiry latency to one cadence past the TTL |
 | Sweep batch size | 500 orders | Keeps a sweep transaction short enough not to hold the aggregate locks it takes |
 | Overdue window | **24 hours** past expected fulfillment time | **Not** an open question: the PRD commits this as a business default; it is recorded here as committed rather than as unchosen |
+| **Resume cap** | **5** resumes per order | Layer 2 of §4.2, enforced as a guard on `01 §4.3` row 22 against `orders_order.resume_count`, which no transition resets. It bounds a **count**, not a duration, so it pre-empts no per-state TTL Product later chooses whatever that value turns out to be — which is why this design can own it while the durations stay open. Five is set from the operational shape the loop has: a compliance or dispute hold that genuinely needs re-taking more than five times on one order is an escalation, not a workflow, and the sixth attempt refuses with `resume-cap-exhausted` and says so on the audit trail. A deployment **MAY** raise or lower it and **MUST NOT** unset it; there is no "unlimited" value |
 
-Leaving the Product-owned values unset means an unconfigured state is **not swept**. That failure
-mode is visible — orders that never expire — which is preferable to a code default silently
-becoming the platform answer.
+Leaving the Product-owned values unset means an unconfigured state is **not swept at all**, and
+orders in it **do not expire**. That is stated without softening: the resume cap bounds restarts
+of a dwell, so where the dwell has no bound the total has none either, and an earlier version of
+this section claimed an absolute lifetime made the bound's *tightness* the only casualty. §4.2
+records why that claim was withdrawn. The failure mode is instead made **visible** — the
+no-configured-TTL gauge and its production alert (§3.8), which fire on the condition itself rather
+than on orders eventually reaching a backstop — which is preferable to a code default silently
+becoming the platform answer, and honest about what is at stake in answering PRD §15 row 7.
 
 ### 4.6 The ordinary cancel operation (normative)
 
@@ -553,7 +744,7 @@ Input: order_id, cancelling_actor, reason, security_context, idempotency_key, ex
 Output: cancelled, or a registered refusal
 
 1. [ ] - `p1` - Declare the guards the engine evaluates: non-terminal state, a **mandatory** cancel reason, and the pre-hold guard where the state is `on_hold` - `inst-co-declare-guards`
-2. [ ] - `p1` - **IF** the current state is `in_fulfillment`: defer to the spawn-signal guard owned by [`06-workflow-seam`](./06-workflow-seam.md) §3.6 *Evaluate Cancel From In-Fulfillment* (with §4.3 for the write-once spawn-signal rule) - `inst-co-defer-spawn-guard`
+2. [ ] - `p1` - **IF** the current state is `in_fulfillment`: defer to the spawn-signal guard owned by [`06-workflow-seam`](./06-workflow-seam.md) §3.6 *Evaluate Cancel From In-Fulfillment (shared guard)* — a guard **shared** with `/workflow-cancel`, not that operation's handler; who may call this `/cancel` is settled by the engine's authorization pre-guard against [`08-read-and-authz`](./08-read-and-authz.md) §4.3 before the guard runs (with `06 §4.3` for the write-once spawn-signal rule) - `inst-co-defer-spawn-guard`
 3. [ ] - `p1` - Request the cancel transition; the engine records the actor and the reason on the audit entry and publishes `OrderCancelled` - `inst-co-request-transition`
 4. [ ] - `p1` - **RETURN** cancelled - `inst-co-return-cancelled`
 
@@ -567,7 +758,7 @@ Billing credit note.
 - **PRD**: [`../PRD.md`](../PRD.md) — §6.3 cancellation, hold and state expiry
 - **Gear design**: [`../DESIGN.md`](../DESIGN.md) — realises `cpt-cf-bss-orders-lifecycle-component-hold-and-expiry`
 - **Engine**: [`01-foundation`](./01-foundation.md) — the hold and expiry transition rows, the pre-hold column, the missing `in_fulfillment` expiry row
-- **Depends on**: [`02-capture`](./02-capture.md) for the draft creation instant; [`06-workflow-seam`](./06-workflow-seam.md) for the spawn signal the hold-cancel guard reads
-- **Consumers**: [`05-preconditions`](./05-preconditions.md) relies on the `approved` TTL as a declined instrument's only exit
+- **Depends on**: [`02-capture`](./02-capture.md) for the draft creation instant, which is the draft sweep's dwell input; [`06-workflow-seam`](./06-workflow-seam.md) for the spawn signal the hold-cancel guard reads
+- **Consumers**: [`05-preconditions`](./05-preconditions.md) relies on the `approved` TTL as a declined instrument's ordinary exit; the resume cap of §4.2 stops that TTL being restarted without limit, and where the TTL is unset there is no automatic exit at all
 - **Sibling gear**: raises the overdue escalation and suspends its process on `OrderHeld`
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition; [`ADR/0004`](../ADR/0004-cpt-cf-bss-orders-lifecycle-adr-closed-enumerations.md) the closed state and event enumerations

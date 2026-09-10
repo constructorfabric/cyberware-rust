@@ -437,7 +437,7 @@ presupposes completed operational compensation, so an acknowledgement that canno
 leaves the order non-terminal under the sibling gear's escalation SLA. The order never waits on a
 Billing credit note — money reverse is a billing-chain concern.
 
-#### Cancel across the spawn boundary
+#### Cancel across the spawn boundary (the shared cancel guard)
 
 **ID**: `cpt-cf-bss-orders-lifecycle-seq-seam-cancel-guard`
 
@@ -445,14 +445,27 @@ Billing credit note — money reverse is a billing-chain concern.
 
 **Actors**: `cpt-cf-bss-orders-lifecycle-actor-orders-seller-operator`, `cpt-cf-bss-orders-lifecycle-actor-orders-workflow`
 
-**Algorithm: Evaluate Cancel From In-Fulfillment**
+**Algorithm: Evaluate Cancel From In-Fulfillment (shared guard)**
 
-Input: order_id, requesting_actor_class, compensation_evidence
+**This is a shared guard, not the `/workflow-cancel` handler.** Both cancel entry points defer to
+it for an order in `in_fulfillment`: the **ordinary** `POST /cancel` owned by
+[`07-hold-and-expiry`](./07-hold-and-expiry.md) §3.6 *Cancel Order* step 2, and the
+**workflow-mediated** `POST /workflow-cancel` declared in §3.3. It therefore **MUST NOT** be read
+as the authorization boundary of either path. Who may call each operation is settled **before**
+this guard runs, by the permission matrix of [`08-read-and-authz`](./08-read-and-authz.md) §4.3
+enforced as the engine's authorization pre-guard ahead of every slice guard
+(`01 §4.1` *Guard evaluation order*, `01 §3.6` *Attempt Transition* step 1) — and that matrix
+restricts `/workflow-cancel` to the Workflow service principal. What `requesting_actor_class`
+decides **here** is only *which cancel window applies* to a caller already authorized for the
+operation they invoked, which is why step 3 reads it after step 2 rather than before.
+
+Input: order_id, requesting_actor_class (of the already-authorized caller, supplied by whichever
+cancel entry point invoked this guard), compensation_evidence
 Output: admit or a registered refusal
 
 1. [ ] - `p1` - Read the recorded spawn signal - `inst-cg-read-spawn-signal`
 2. [ ] - `p1` - **IF** no spawn signal is recorded: - `inst-cg-if-no-spawn`
-   1. [ ] - `p1` - **RETURN** admit; a direct cancel is permitted and wave-1 drafts are compensated by void - `inst-cg-return-direct-admit`
+   1. [ ] - `p1` - **RETURN** admit; the direct-cancel window is still open, so **either** entry point's caller may cancel and wave-1 drafts are compensated by void. This admits on the window, not on the actor: it is not an authorization decision and does not widen who may call `/workflow-cancel` - `inst-cg-return-direct-admit`
 3. [ ] - `p1` - **IF** the requesting actor class is not the Workflow system actor: - `inst-cg-if-not-workflow`
    1. [ ] - `p1` - **RETURN** direct-cancel-window-closed refusal - `inst-cg-return-window-closed`
 4. [ ] - `p1` - **IF** compensation evidence is absent or incomplete: - `inst-cg-if-no-evidence`
@@ -463,6 +476,14 @@ Output: admit or a registered refusal
 closes exactly when the first activation intent is reported and not when `in_fulfillment` is
 entered. After `completed` there is no order-side cancellation window at all — post-purchase
 rights are exercised on the spawned subscriptions.
+
+Because the guard is shared, the step order is deliberate and **MUST NOT** be rewritten as an
+actor check ahead of the window check: hoisting step 3 above step 2 would make the ordinary
+`POST /cancel` of `07 §3.6` refuse every pre-spawn cancellation by a seller operator or partner
+admin — the cancel path PRD §6.3 requires — and it would not add any authorization the engine
+pre-guard does not already enforce. The two callers are distinguished by **permission** at the
+pre-guard and by **window** here, and those are separate concerns
+([`../DECISIONS.md`](../DECISIONS.md) D-33).
 
 ### 3.7 Database Schemas and Tables
 
@@ -585,6 +606,19 @@ existing failure path already expresses this, and routing it explicitly is what 
 The refusing predicate's reason (`market-divergence` or `overlap-collision`) is carried as the
 failure reason so the cause survives on the audit entry.
 
+**The activation re-check verdict is an early abort, and it does not expire.** This gear cannot
+make the check atomic with the transaction that commits a subscription to `active`, and it also
+cannot express a deadline: the re-check returns proceed or a per-line rejection to its caller, and
+the transition Workflow then drives — `spawn-signal`, `01 §4.3` row 11 — is event-less, so no
+declared interface carries a validity origin or a window. `03 §2.2` states this in full and
+withdraws the 30-second window an earlier version asserted. What Workflow **MUST** do is narrower
+and checkable: **MUST NOT** treat a proceed verdict as an admission guarantee, and **MUST** handle
+an `overlap-collision` raised by Subscriptions at any point after the re-check — including after
+lines the two-phase barrier deferred, which is precisely the case one window could never have
+covered. Such a collision arrives on the failure-acknowledgement path of §4.4 with compensation
+evidence, rather than as a silent partial activation
+([`../DECISIONS.md`](../DECISIONS.md) D-89).
+
 **The activation intent carries the start instant.** Each activation intent **MUST** carry the
 **actual activation instant** as the spawned subscription's start, and **MUST NOT** derive that
 start from any date carried on the order. Where the two-phase barrier defers a line past its
@@ -663,7 +697,7 @@ needs amendment; the Lifecycle seam does not assume the missing behavior exists.
 - **Gear design**: [`../DESIGN.md`](../DESIGN.md) — realises `cpt-cf-bss-orders-lifecycle-component-workflow-seam`
 - **Engine**: [`01-foundation`](./01-foundation.md) — transition contract, version check, audit, spawn-signal column
 - **Depends on**: [`05-preconditions`](./05-preconditions.md) for both begin-fulfillment guards; [`03-gate-and-pin`](./03-gate-and-pin.md) for the activation re-check
-- **Consumers**: [`08-read-and-authz`](./08-read-and-authz.md) serves the per-line projection; [`07-hold-and-expiry`](./07-hold-and-expiry.md) reads the spawn signal for the `in_fulfillment` expiry exemption
+- **Consumers**: [`08-read-and-authz`](./08-read-and-authz.md) serves the per-line projection; [`07-hold-and-expiry`](./07-hold-and-expiry.md) reads the spawn signal for the `in_fulfillment` expiry exemption and defers to §3.6 *Evaluate Cancel From In-Fulfillment (shared guard)* from its ordinary `POST /cancel`
 - **Sibling gear**: [`orders-workflow/docs/PRD.md`](../../../orders-workflow/docs/PRD.md)
 - **Upstream asks**: `SUB-O1`, `SUB-O2`, `SUB-O5`, `SUB-O9`, `SUB-O10`, and `…-upreq-workflow-amendment-verdict` — all six, per §4.6
 - **ADRs**: [`ADR/0001`](../ADR/0001-cpt-cf-bss-orders-lifecycle-adr-transition-through-engine.md) transition through the engine; [`ADR/0002`](../ADR/0002-cpt-cf-bss-orders-lifecycle-adr-slice-decomposition.md) the foundation-plus-seven-slices decomposition

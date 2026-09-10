@@ -86,21 +86,36 @@ consumer outside this gear's boundary.
 
 ### Consequences
 
-* **A consumer sees a state change after the commit, not at it.** The delay is bounded by the 30 s delivery budget, not by the transaction. Anything requiring read-your-write consistency must read the order, not wait for the event.
-* **Delivery is at-least-once**, so every consumer needs de-duplication. `(order_id, sequence)` gives them the key to do it.
-* **Per-order ordering is preserved by construction, and only per-order.** `shard_key` is `hash(order_id) % 64` with a *fixed* bucket count and the drain leases contiguous bucket ranges, so re-tuning parallelism can never split one order across two leaseholders. This is why the modulus is fixed rather than tied to the worker count.
+* **A consumer sees a state change after the commit, not at it.** The delay is *targeted* at the 30 s p95 delivery budget rather than bounded by it — a p95 is a target, so an event may exceed it and enter the retry and dead-letter paths below. Anything requiring read-your-write consistency must read the order, not wait for the event.
+* **Delivery is at-least-once**, so every consumer needs de-duplication. **The de-duplication key is `orders_event_outbox.event_id`**, which `01 §3.7` declares as the consumer de-duplication token, *stable across a re-drive* — stability under re-drive is precisely the property de-duplication needs, and §4.4 states the same contract ("consumer de-duplication by event ID"). `(order_id, sequence)` is a different key for a different job: it is the per-order **ordering** key, held by a UNIQUE constraint and allocated under the aggregate row lock, and the drain publishes in that order. A consumer that de-duplicated on it would be keying on ordering rather than identity.
+* **Per-order ordering holds along the delivery path, and only per-order — but the guarantee is conditional.** Sharding makes it *structurally possible*: `shard_key` is `hash(order_id) % 64` with a *fixed* bucket count and the drain leases contiguous bucket ranges, so re-tuning parallelism can never split one order across two leaseholders, and the drain selects and batches in `(order_id, sequence)` order. What sharding alone does **not** give is head-of-line behaviour across a failure: when sequence `n` is retrying with backoff, or has been parked as a dead-letter row and so left the drain's partial index, sequence `n+1` for the same order is still selectable and can publish ahead of it. **`01 §3.6` has since settled it, and per-order ordering now holds across a park as well.** The drain selects on `delivered_at IS NULL` alone — so a parked dead-letter row stays visible as its stream's blocked head — and takes only the **contiguous prefix** per `order_id`, stopping at the first parked or not-yet-due row; no higher sequence for that order publishes while the parked one is undelivered, and no other order is affected (`DECISIONS.md` D-87). `01 §4.4` remains the normative home of the ordering contract, and it carries the two properties that make the rule closed rather than nominal: an operator re-drive **MUST** republish the parked row before any later event for that order and **MUST NOT** be used to skip one, and the suspension is **unbounded in duration** — a blocked order's stream halts until an operator acts. That last point is this ADR's real cost, and it is the deliberate trade: an order's stream stops rather than arriving out of order.
 * **An undeliverable event becomes an operational object.** After a bounded attempt count a row is parked as an inspectable dead-letter record with an alert, and an operator re-drive endpoint exists to republish it. That endpoint has no PRD basis and is disclosed as a design-introduced surface (`Q-19`).
-* **The outbox is a traffic-driven table**, so it carries a 30-day retention on delivered rows, purged by the drain, and is range-partitioned by month.
+* **The outbox is a traffic-driven table**, so it carries a 30-day retention on delivered rows — and it is **not partitioned**, which is a correctness consequence rather than a preference. An earlier version of this consequence had it range-partitioned by month. PostgreSQL requires every unique constraint on a partitioned table to include the partition key, and this table's `(order_id, sequence)` UNIQUE — the constraint per-order ordering rests on — does not include `created_at`. Monthly partitioning and the ordering guarantee are mutually exclusive, and the ordering guarantee wins. Retention is therefore enforced by the sweep that purges delivered rows past the window, not by dropping a partition, and the sweep is a **separate worker** from the per-shard drain (`01 §3.8` counts five) so a purge cannot lengthen a drain batch.
 * **The audit trail and the event stream can disagree transiently.** An audited transition whose outbox row is undelivered is real and invisible; only the order read reflects it. This is acceptable and is why the read is never served from a replica.
 
 ### Confirmation
 
-Verified by the one-outbox-row-per-event-declaring-transition invariant in `01 §3.7`, which names
-its own cross-table cardinality test; by `(order_id, sequence)` UNIQUE with the sequence allocated
-under the aggregate row lock, so ordering cannot be violated by concurrent drains; by a test
-asserting a parked dead-letter row alters no order state; and by the drain-lag metric measured
-against the 30 s budget separately from the commit budget, which is the measurement `Q-16` needs in
-order to be answered.
+**This gear has no implementation and no runtime tests**, so the checks below are labelled either
+verifiable today or planned.
+
+**Verifiable today, by reading `design/01-foundation.md`.** §3.7 declares
+`orders_event_outbox.event_id` as the primary key and the consumer de-duplication token stable
+across a re-drive, `(order_id, sequence)` UNIQUE as what per-order ordering rests on, the
+`sequence` allocated from a per-order counter under the aggregate row lock of §3.6, and one row
+per event-declaring committed transition as an engine-enforced invariant. §4.4 states the
+at-least-once contract, de-duplication by event ID, and that a parked entry is not an order state
+and must not alter one. §3.6 *Attempt Transition* enqueues the row inside the transition
+transaction, which is what makes enqueue-or-nothing atomic with the commit.
+
+**Planned, not yet written.** A cross-table cardinality check for the one-outbox-row-per-
+event-declaring-transition invariant — `01 §3.7` asserts that invariant but does not, as an
+earlier draft of this section claimed, name a test for it; a check that a parked dead-letter row
+alters no order state;
+a check exercising sequence `n` failing before sequence `n+1` for the same order, which is what
+would pin down the ordering dependency named in the Consequences above; and the drain-lag metric
+measured against the 30 s budget separately from the commit budget, which is the measurement
+`Q-16` needs in order to be answered. `01 §1.2`'s Verification Approach column is the home for
+the first three; none is recorded there yet.
 
 ## Pros and Cons of the Options
 

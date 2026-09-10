@@ -87,12 +87,30 @@ makes the reader check two places for every question.
 
 ### Confirmation
 
-Verified by the engine holding the only write grant on the tables of `01 §3.7` — no handler appears
-as a writer anywhere in the set — by every handler's algorithm reaching state through the engine's
-transition operation rather than a direct write, which the invariant suite asserts as its
-no-pre-engine-refusal and single-writer checks, and by startup failing where a handler registers a
-guard against a transition row that does not exist. Drift in the decomposition is therefore a boot
-failure or a failing check, not a review observation.
+**This gear has no implementation and no runtime tests**, so the checks below are labelled either
+verifiable today or planned.
+
+**Verifiable today, with its two exceptions named.** No slice handler writes any of the seven
+table families `01 §2.2`'s single-writer constraint covers — aggregate, version, line,
+resolved-total, audit, idempotency and outbox — a property a reader can confirm by reading that
+constraint against every slice's §3.7; nothing mechanises it, so it stays a review property. The
+broader claim that *no* handler writes *anything* would be false, and the two exceptions are
+deliberate rather than leaks: `orders_draft_content` is declared **mutable** and written by
+capture, because a basket is edited freely and versioning it would make every keystroke a version;
+and `orders_read_access_log` is written by the read surface itself (`08 §3.7`), because the fact it
+records is the read, which no transition causes. Both sit outside §2.2's list for those reasons,
+and neither carries commercial state the audit guarantee depends on. What *is* mechanised at document level is narrower: the invariant suite
+(`scripts/check-design-invariants.py`, run as `make design-check` in CI) asserts that no slice
+algorithm returns a refusal ahead of its engine call, that every table a slice defines appears in
+`DESIGN.md` §3.7's canonical inventory, and that every `orders_<table>.<column>` reference in the
+set — ADRs included — names a real column. Those are the families that catch decomposition drift
+today.
+
+**Planned, not yet written.** Startup registration failing where a handler declares a guard
+against a transition row that does not exist is the runtime half of this decision's enforcement,
+and there is no engine to fail. Until it exists, "a handler's mistake is a boot failure rather
+than a request failure" is a design intent stated in the Consequences above, not an observed
+behaviour.
 
 ## Pros and Cons of the Options
 
