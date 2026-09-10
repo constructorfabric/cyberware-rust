@@ -952,7 +952,7 @@ bench-db-longhaul: bench-pg-longhaul bench-mysql-longhaul bench-mariadb-longhaul
 
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector
+.PHONY: e2e e2e-local e2e-local-smoke e2e-mini-chat e2e-docker e2e-docker-smoke e2e-tr-authz e2e-usage-collector e2e-oop oop-smoke
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -1030,6 +1030,28 @@ e2e-mini-chat:
 e2e-usage-collector:
 	$(call print_target_banner)
 	$(MAKE) e2e-local SUITE=usage-collector
+
+# Out-of-process (loopback) E2E: boots platform-host + OoP gears as local
+# processes (no Kubernetes) and asserts the cross-process seams. Self-managed:
+# its conftest builds the binaries and owns the process lifecycle, so it runs
+# pytest directly (not via run_e2e.py). timeout_func_only keeps the per-test
+# timeout from counting the heavy fixture setup (build + boot + route sync).
+OOP_E2E_DIR ?= testing/e2e/suites/oop
+OOP_E2E_TIMEOUT ?= 60
+## Run the out-of-process (loopback, no-k8s) E2E suite
+e2e-oop: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-platform-host --bin platform-host
+	cargo build -p hello --features oop_module --bin hello-oop
+	cargo build -p cf-api-contracts --features oop_module --bin api-contracts-oop
+	cargo build -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop
+	$(PYTHON) -m pytest $(OOP_E2E_DIR) -c testing/e2e/pytest.ini \
+		-o timeout_func_only=true --timeout=$(OOP_E2E_TIMEOUT) -vv
+
+## Run the scripted Profile-3 (Kubernetes) OoP demo smoke test (see deploy/oop-smoke.sh --help)
+oop-smoke:
+	$(call print_target_banner)
+	deploy/oop-smoke.sh $(OOP_SMOKE_ARGS)
 
 # -------- Code coverage --------
 

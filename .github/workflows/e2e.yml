@@ -123,6 +123,12 @@ jobs:
       - name: Run usage-collector E2E tests (TimescaleDB container)
         run: make e2e-usage-collector
 
+      # Self-managed OoP (loopback, no k8s) suite: builds platform-host + three
+      # oop_module gear binaries and orchestrates them as processes itself, so it
+      # bypasses run_e2e.py and runs via its own target.
+      - name: Run OoP (loopback) E2E tests
+        run: make e2e-oop
+
       - name: Upload E2E logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
