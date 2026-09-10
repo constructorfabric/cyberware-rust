@@ -87,6 +87,10 @@ fn storage_errors_lift_one_to_one_with_the_two_documented_exceptions() {
             StorageError::IdempotencyPayloadMismatch,
             DomainError::IdempotencyPayloadMismatch,
         ),
+        (
+            StorageError::ThresholdsRequireBoundedCap,
+            DomainError::ThresholdsRequireBoundedCap,
+        ),
     ];
     for (storage, expected) in cases {
         assert_eq!(DomainError::from(storage), expected);

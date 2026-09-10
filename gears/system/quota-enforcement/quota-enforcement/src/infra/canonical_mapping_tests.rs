@@ -105,6 +105,26 @@ fn every_variant_family_maps_to_its_documented_status() {
             500,
         ),
         (DomainError::Internal("secret detail".to_owned()), 500),
+        (DomainError::CapMustBeNonNegative { cap: -1 }, 400),
+        (DomainError::ThresholdsRequireBoundedCap, 400),
+        (
+            DomainError::ConstraintContractMismatch {
+                contract: "gts.x~".to_owned(),
+            },
+            400,
+        ),
+        (
+            DomainError::MetricClassificationInvalid {
+                metric: "gts.m".to_owned(),
+            },
+            400,
+        ),
+        (
+            DomainError::NotYetImplemented {
+                feature: "rate quotas",
+            },
+            501,
+        ),
     ];
     for (err, expected) in cases {
         let debug = format!("{err:?}");
@@ -189,4 +209,55 @@ fn unavailability_names_the_dependency_class_but_not_the_cause() {
     .expect("json");
     assert!(rendered.contains("DEPENDENCY_UNAVAILABLE"), "{rendered}");
     assert!(!rendered.contains("10.0.0.7"), "{rendered}");
+}
+
+#[test]
+fn not_yet_implemented_is_unimplemented_with_the_token_leading_the_detail() {
+    let problem = Problem::from(CanonicalError::from(DomainError::NotYetImplemented {
+        feature: "rate quotas",
+    }));
+    assert_eq!(problem.status, Some(501));
+    let detail = problem.detail.clone();
+    assert!(
+        detail.starts_with("NOT_YET_IMPLEMENTED:"),
+        "the token leads the detail: {detail}"
+    );
+    let rendered = serde_json::to_string(&problem).expect("json");
+    assert!(rendered.contains(QUOTA_RESOURCE), "{rendered}");
+}
+
+#[test]
+fn quota_lifecycle_rejections_carry_their_tokens_and_subjects() {
+    let cases = vec![
+        (
+            DomainError::CapMustBeNonNegative { cap: -5 },
+            "CAP_MUST_BE_NON_NEGATIVE",
+            "cap",
+        ),
+        (
+            DomainError::ThresholdsRequireBoundedCap,
+            "THRESHOLDS_REQUIRE_BOUNDED_CAP",
+            "notification_thresholds",
+        ),
+        (
+            DomainError::ConstraintContractMismatch {
+                contract: "gts.cf.core.qe.constraint.v1~x.y.z.w.v1~".to_owned(),
+            },
+            "CONSTRAINT_CONTRACT_MISMATCH",
+            "metadata",
+        ),
+        (
+            DomainError::MetricClassificationInvalid {
+                metric: "gts.cf.qe.metric.type.v1~cf.qe.metric.m.v1".to_owned(),
+            },
+            "METRIC_CLASSIFICATION_INVALID",
+            "gts.cf.qe.metric.type.v1~cf.qe.metric.m.v1",
+        ),
+    ];
+    for (err, token, subject) in cases {
+        let rendered =
+            serde_json::to_string(&Problem::from(CanonicalError::from(err))).expect("json");
+        assert!(rendered.contains(token), "{token}: {rendered}");
+        assert!(rendered.contains(subject), "{subject}: {rendered}");
+    }
 }

@@ -1,9 +1,11 @@
-//! API surface: the REST mount point and the readiness health check.
+//! API surface: the REST routes, the in-process manager client, and the
+//! readiness health check.
 //!
-//! Operational routes land with their features. Every one of them is
-//! registered through [`rest::routes::register_routes`] and admitted through
-//! [`crate::domain::Admission`], so REST and the in-process SDK client share
-//! one authorization boundary.
+//! Every REST operation is registered through
+//! [`rest::routes::register_routes`]; it and the in-process client enter the
+//! domain through the same service, so both transports share one
+//! authorization boundary ([`crate::domain::Admission`]).
 
 pub mod healthcheck;
+pub mod in_process;
 pub mod rest;

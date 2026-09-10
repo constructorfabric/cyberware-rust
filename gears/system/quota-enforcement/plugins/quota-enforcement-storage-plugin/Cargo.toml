@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Quota Enforcement storage plugin on toolkit-db: foundation schema, bootstrap, and configuration tables"
+description = "Quota Enforcement storage plugin on toolkit-db: foundation schema, bootstrap, configuration tables, and the Quota tables"
 repository.workspace = true
 rust-version.workspace = true
 readme = "README.md"
@@ -17,6 +17,11 @@ name = "quota_enforcement_storage_plugin"
 
 [lints]
 workspace = true
+
+[features]
+# Gates the PostgreSQL-backed concurrency suite (`tests/quota_store_integration_pg.rs`,
+# Docker required). Everything else runs on SQLite.
+postgres = ["toolkit-db/pg"]
 
 [dependencies]
 quota-enforcement-sdk = { workspace = true }
@@ -35,15 +40,23 @@ time = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
+gts = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
 
 # Required by the toolkit::gear macro.
 inventory = { workspace = true }
 
 [dev-dependencies]
+quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tokio-util = { workspace = true }
-serde_json = { workspace = true }
-uuid = { workspace = true }
+# Unconditional: dev-dependencies cannot be optional; the suite that needs a
+# container is `#![cfg(feature = "postgres")]`-gated.
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }

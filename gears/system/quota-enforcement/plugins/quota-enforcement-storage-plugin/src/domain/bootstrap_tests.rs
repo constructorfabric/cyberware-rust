@@ -22,6 +22,7 @@ use crate::infra::storage::entity::{
 };
 use crate::infra::storage::repo::config_repo;
 use crate::infra::storage::{Migrator, SqlFoundationStore};
+use crate::test_support::FakeQuotaStore;
 
 async fn test_db() -> Db {
     let opts = ConnectOpts {
@@ -50,7 +51,14 @@ async fn count<E: EntityTrait + toolkit_db::secure::ScopableEntity>(db: &Db) -> 
 }
 
 fn sql_plugin(db: &Db) -> StoragePlugin {
-    StoragePlugin::new(Arc::new(SqlFoundationStore::new(db.clone())))
+    StoragePlugin::new(
+        Arc::new(SqlFoundationStore::new(db.clone())),
+        Arc::new(FakeQuotaStore::default()),
+    )
+}
+
+fn fake_plugin(store: FakeStore) -> StoragePlugin {
+    StoragePlugin::new(Arc::new(store), Arc::new(FakeQuotaStore::default()))
 }
 
 /// Store double for the domain-only paths: no database involved.
@@ -85,12 +93,12 @@ impl FoundationStore for FakeStore {
 
 #[tokio::test]
 async fn a_store_outage_is_reported_as_unavailable_with_the_operation_name() {
-    let plugin = StoragePlugin::new(Arc::new(FakeStore {
+    let plugin = fake_plugin(FakeStore {
         major: None,
         fail: Some(StoreError::Unavailable {
             operation: "read schema major",
         }),
-    }));
+    });
     let err = plugin
         .bootstrap(&BootstrapBundle::foundation())
         .await
@@ -103,10 +111,10 @@ async fn a_store_outage_is_reported_as_unavailable_with_the_operation_name() {
 
 #[tokio::test]
 async fn a_fresh_store_records_the_major_and_reports_the_seed() {
-    let plugin = StoragePlugin::new(Arc::new(FakeStore {
+    let plugin = fake_plugin(FakeStore {
         major: None,
         fail: None,
-    }));
+    });
     let report = plugin
         .bootstrap(&BootstrapBundle::foundation())
         .await

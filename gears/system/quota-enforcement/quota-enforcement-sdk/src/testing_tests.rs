@@ -11,10 +11,11 @@ use super::{
     InMemoryStorage, empty_engine_config, quota_draft, test_metric, test_subject, test_tenant,
 };
 use crate::models::{
-    ApplicableQuotas, BootstrapBundle, CapPatch, ConfigDefaults, Decision, DecisionResult,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState, OperationType,
-    PageRequest, PayloadHash, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersionState,
-    QuotaDebitPlan, QuotaId, QuotaPatch,
+    ApplicableQuotas, BootstrapBundle, CapPatch, ConfigDefaults, Decision, DecisionResult, EventId,
+    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState, NotificationEvent,
+    NotificationEventKind, OperationType, PageRequest, PayloadHash, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersionState, QuotaDebitPlan, QuotaFilter, QuotaId,
+    QuotaPatch, QuotaStatus,
 };
 use crate::storage_plugin::{CONTRACT_MAJOR, QuotaEnforcementStoragePluginV1, StorageError};
 
@@ -698,4 +699,416 @@ async fn active_projection_bindings_are_the_distinct_pairs_of_active_quotas() {
         storage.read_active_projection_bindings().await,
         Err(StorageError::Unavailable(_))
     ));
+}
+
+// --- quota lifecycle reference semantics -----------------------------------
+
+fn quota_changed(quota_id: Option<QuotaId>) -> NotificationEvent {
+    NotificationEvent {
+        event_id: EventId::generate(),
+        kind: NotificationEventKind::QuotaChanged,
+        tenant_id: test_tenant(),
+        quota_id,
+        policy_id: None,
+        subject: None,
+        payload: serde_json::json!({ "change_kind": "created" }),
+        emitted_at: OffsetDateTime::now_utc(),
+    }
+}
+
+#[tokio::test]
+async fn storage_create_fills_the_quota_id_on_events_that_lack_it() {
+    let storage = InMemoryStorage::new();
+    let id = storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            quota_draft(test_subject("u1"), Some(10)),
+            &[quota_changed(None)],
+        )
+        .await
+        .expect("create");
+    let events = storage.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].quota_id, Some(id));
+}
+
+#[tokio::test]
+async fn storage_update_rejects_thresholds_on_an_unbounded_merged_row() {
+    let storage = InMemoryStorage::new();
+    let mut draft = quota_draft(test_subject("u1"), Some(100));
+    draft.notification_thresholds = vec![50];
+    let id = storage
+        .create_quota(&ctx(), &scope(), draft, &[])
+        .await
+        .expect("create");
+
+    let unbound_only = storage
+        .update_quota(
+            &ctx(),
+            &scope(),
+            id,
+            QuotaPatch {
+                cap: Some(CapPatch::Unbounded),
+                ..QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("thresholds stay, cap goes: I14");
+    assert_eq!(unbound_only, StorageError::ThresholdsRequireBoundedCap);
+    assert_eq!(
+        storage.quota(id).expect("row").record_version,
+        1,
+        "a rejected patch writes nothing"
+    );
+
+    let unbound_and_clear = storage
+        .update_quota(
+            &ctx(),
+            &scope(),
+            id,
+            QuotaPatch {
+                cap: Some(CapPatch::Unbounded),
+                notification_thresholds: Some(Vec::new()),
+                ..QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect("both in one patch is consistent");
+    assert_eq!(unbound_and_clear.cap, None);
+    assert!(unbound_and_clear.notification_thresholds.is_empty());
+
+    let thresholds_on_unbounded = storage
+        .update_quota(
+            &ctx(),
+            &scope(),
+            id,
+            QuotaPatch {
+                notification_thresholds: Some(vec![80]),
+                ..QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("thresholds on an unbounded row: I14");
+    assert_eq!(
+        thresholds_on_unbounded,
+        StorageError::ThresholdsRequireBoundedCap
+    );
+}
+
+#[tokio::test]
+async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expired_leases() {
+    let storage = InMemoryStorage::new();
+    storage
+        .bootstrap(&BootstrapBundle::foundation())
+        .await
+        .expect("bootstrap");
+    let id = seeded_quota(&storage, Some(100)).await;
+    let ttl = Duration::from_mins(1);
+
+    let expired = storage
+        .acquire_lease(
+            &ctx(),
+            &scope(),
+            &applicable(),
+            &plan(id, 30),
+            ttl,
+            &idem(OperationType::Reserve, "e", 1),
+        )
+        .await
+        .expect("lease that will expire");
+    storage.expire_leases();
+    let live = storage
+        .acquire_lease(
+            &ctx(),
+            &scope(),
+            &applicable(),
+            &plan(id, 5),
+            ttl,
+            &idem(OperationType::Reserve, "l", 1),
+        )
+        .await
+        .expect("live lease");
+    assert_eq!(storage.consumed(id), 35);
+
+    let outcome = storage
+        .deactivate_quota(&ctx(), &scope(), id, &[])
+        .await
+        .expect("deactivate");
+    assert_eq!(
+        outcome.resolved_leases,
+        vec![live],
+        "expired leases are not resolved (I4)"
+    );
+    assert_eq!(storage.lease_state(expired), Some(LeaseState::Active));
+    assert_eq!(storage.consumed(id), 30, "the live hold was returned");
+    let row = storage.quota(id).expect("row");
+    assert_eq!(row.status, QuotaStatus::Deactivated);
+    assert_eq!(row.record_version, 2);
+
+    let again = storage
+        .deactivate_quota(&ctx(), &scope(), id, &[])
+        .await
+        .expect_err("no second cascade");
+    assert_eq!(again, StorageError::QuotaDeactivated { id });
+    assert_eq!(storage.quota(id).expect("row").record_version, 2);
+
+    let patched = storage
+        .update_quota(
+            &ctx(),
+            &scope(),
+            id,
+            QuotaPatch {
+                fail_open_hint: Some(true),
+                ..QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("a deactivated Quota accepts no patch");
+    assert_eq!(patched, StorageError::QuotaDeactivated { id });
+}
+
+#[tokio::test]
+async fn storage_active_quota_counts_cover_active_quotas_only() {
+    let storage = InMemoryStorage::new();
+    let zero = seeded_quota(&storage, Some(0)).await;
+    seeded_quota(&storage, None).await;
+    seeded_quota(&storage, Some(10)).await;
+    let counts = storage.read_active_quota_counts().await.expect("counts");
+    assert_eq!((counts.cap_zero, counts.cap_unbounded), (1, 1));
+    assert_eq!(counts.by_metric.get(&test_metric()), Some(&3));
+
+    storage
+        .deactivate_quota(&ctx(), &scope(), zero, &[])
+        .await
+        .expect("deactivate");
+    let counts = storage.read_active_quota_counts().await.expect("counts");
+    assert_eq!((counts.cap_zero, counts.cap_unbounded), (0, 1));
+    assert_eq!(counts.by_metric.get(&test_metric()), Some(&2));
+
+    storage.fail_with(StorageError::Unavailable("db down".into()));
+    assert!(matches!(
+        storage.read_active_quota_counts().await,
+        Err(StorageError::Unavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn storage_read_quotas_filters_and_pages_in_creation_order() {
+    let storage = InMemoryStorage::new();
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        ids.push(
+            storage
+                .create_quota(
+                    &ctx(),
+                    &scope(),
+                    quota_draft(test_subject(&format!("u{n}")), Some(n)),
+                    &[],
+                )
+                .await
+                .expect("create"),
+        );
+    }
+    storage
+        .deactivate_quota(&ctx(), &scope(), ids[4], &[])
+        .await
+        .expect("deactivate the last one");
+
+    let first = storage
+        .read_quotas(
+            &ctx(),
+            &scope(),
+            QuotaFilter::default(),
+            PageRequest::first(2),
+        )
+        .await
+        .expect("page 1");
+    assert_eq!(
+        first.items.iter().map(|q| q.id).collect::<Vec<_>>(),
+        ids[..2]
+    );
+    let second = storage
+        .read_quotas(
+            &ctx(),
+            &scope(),
+            QuotaFilter::default(),
+            PageRequest {
+                limit: 2,
+                cursor: first.next_cursor.clone(),
+            },
+        )
+        .await
+        .expect("page 2");
+    assert_eq!(
+        second.items.iter().map(|q| q.id).collect::<Vec<_>>(),
+        ids[2..4]
+    );
+    let third = storage
+        .read_quotas(
+            &ctx(),
+            &scope(),
+            QuotaFilter::default(),
+            PageRequest {
+                limit: 2,
+                cursor: second.next_cursor.clone(),
+            },
+        )
+        .await
+        .expect("page 3");
+    assert_eq!(
+        third.items.iter().map(|q| q.id).collect::<Vec<_>>(),
+        ids[4..]
+    );
+    assert!(third.next_cursor.is_none());
+
+    let active = storage
+        .read_quotas(
+            &ctx(),
+            &scope(),
+            QuotaFilter {
+                status: Some(QuotaStatus::Active),
+                ..QuotaFilter::default()
+            },
+            PageRequest::default(),
+        )
+        .await
+        .expect("active only");
+    assert_eq!(active.items.len(), 4);
+    let by_subject = storage
+        .read_quotas(
+            &ctx(),
+            &scope(),
+            QuotaFilter {
+                subject: Some(test_subject("u3")),
+                ..QuotaFilter::default()
+            },
+            PageRequest::default(),
+        )
+        .await
+        .expect("by subject");
+    assert_eq!(
+        by_subject.items.iter().map(|q| q.id).collect::<Vec<_>>(),
+        vec![ids[3]]
+    );
+    let by_ids = storage
+        .read_quotas(
+            &ctx(),
+            &scope(),
+            QuotaFilter {
+                ids: vec![ids[0], ids[4]],
+                ..QuotaFilter::default()
+            },
+            PageRequest::default(),
+        )
+        .await
+        .expect("by ids");
+    assert_eq!(by_ids.items.len(), 2, "deactivated rows stay readable");
+}
+
+#[tokio::test]
+async fn storage_read_quotas_refuses_a_cursor_it_did_not_issue() {
+    let storage = InMemoryStorage::new();
+    storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            quota_draft(test_subject("u"), Some(1)),
+            &[],
+        )
+        .await
+        .expect("created");
+    for cursor in ["not-a-cursor", "", "-1", "1.5"] {
+        let err = storage
+            .read_quotas(
+                &ctx(),
+                &scope(),
+                QuotaFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    cursor: Some(cursor.to_owned()),
+                },
+            )
+            .await
+            .expect_err(cursor);
+        assert_eq!(err, StorageError::InvalidCursor, "{cursor:?}");
+    }
+}
+
+#[tokio::test]
+async fn storage_update_quota_moves_the_contract_reference_with_the_metadata() {
+    let storage = InMemoryStorage::new();
+    let id = storage
+        .create_quota(
+            &ctx(),
+            &scope(),
+            quota_draft(test_subject("u"), Some(10)),
+            &[],
+        )
+        .await
+        .expect("created");
+    let before = storage.quota(id).expect("stored").constraint_contract;
+    let v2 = crate::models::ContractRef {
+        type_id: gts::GtsTypeId::new(
+            "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v2~",
+        ),
+        version: 2,
+    };
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("weight".to_owned(), serde_json::json!(3));
+
+    let err = storage
+        .update_quota(
+            &ctx(),
+            &scope(),
+            id,
+            QuotaPatch {
+                metadata: Some(metadata.clone()),
+                ..QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("metadata without its contract");
+    assert!(matches!(err, StorageError::Internal(_)), "{err:?}");
+    assert_eq!(storage.quota(id).expect("stored").record_version, 1);
+
+    let updated = storage
+        .update_quota(
+            &ctx(),
+            &scope(),
+            id,
+            QuotaPatch {
+                metadata: Some(metadata),
+                constraint_contract: Some(v2.clone()),
+                ..QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect("metadata with its contract");
+    assert_ne!(before, v2);
+    assert_eq!(updated.constraint_contract, v2);
+    assert_eq!(updated.metadata["weight"], serde_json::json!(3));
+    let unrelated = storage
+        .update_quota(
+            &ctx(),
+            &scope(),
+            id,
+            QuotaPatch {
+                fail_open_hint: Some(true),
+                ..QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect("non-metadata patch");
+    assert_eq!(
+        unrelated.constraint_contract, v2,
+        "other patches leave it alone"
+    );
 }

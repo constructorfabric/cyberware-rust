@@ -13,6 +13,7 @@
 )]
 
 use std::collections::{HashMap, HashSet};
+use std::future::pending;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +33,7 @@ use cluster_sdk::{
 use gts::{GTS_ID_URI_PREFIX, GtsId, GtsInstanceId, GtsStore, GtsTypeId};
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    METRIC_BASE_TYPE, OwnedDefinition, QuotaEnforcementStoragePluginSpecV1,
+    METRIC_BASE_TYPE, MetricId, MetricKind, OwnedDefinition, QuotaEnforcementStoragePluginSpecV1,
     QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, TenantId,
     owned_definitions,
 };
@@ -48,7 +49,9 @@ use types_registry::domain::TypesRegistryService;
 use types_registry::domain::local_client::TypesRegistryLocalClient;
 use types_registry::infra::InMemoryGtsRepository;
 use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
-use types_registry_sdk::{GtsInstance, GtsTypeSchema, RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
+};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -56,8 +59,13 @@ use crate::domain::ports::contracts::{ContractRegistry, DiscoveredType, Register
 use crate::domain::ports::coordination::{
     CoordinatorBinding, LeaderWork, SingletonCoordinator, SingletonScope,
 };
+use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink};
+use crate::domain::ports::metric_registry::{
+    Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry,
+};
 use crate::domain::ports::metrics::{DenialReason, QeMetrics, ValidationReason, ValidationSurface};
 use crate::infra::cluster_coordination::QuotaEnforcementProfile;
+use crate::infra::metric_registry::contract as metric_contract;
 
 /// The tenant every fixture belongs to.
 pub fn tenant() -> TenantId {
@@ -634,6 +642,31 @@ pub fn llm_gateway_documents() -> Vec<Value> {
         .collect()
 }
 
+/// A later publication of the token constraint contract.
+pub const LLM_TOKEN_CONSTRAINT_V2: &str =
+    "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v2~";
+
+/// The `llm_gateway` documents as a later deployment sees them: the token
+/// request contract attaches [`LLM_TOKEN_CONSTRAINT_V2`], published with the
+/// same body under the new id; the v1 contract stays registered.
+pub fn llm_gateway_documents_v2() -> Vec<Value> {
+    let mut documents = llm_gateway_documents();
+    let v1 = documents
+        .iter()
+        .find(|doc| document_id(doc) == LLM_TOKEN_CONSTRAINT)
+        .cloned()
+        .expect("token constraint example");
+    let mut v2 = v1;
+    v2["$id"] = Value::String(format!("{GTS_ID_URI_PREFIX}{LLM_TOKEN_CONSTRAINT_V2}"));
+    documents.push(v2);
+    for doc in &mut documents {
+        if doc["x-gts-traits"]["constraint_contract"] == json!(LLM_TOKEN_CONSTRAINT) {
+            doc["x-gts-traits"]["constraint_contract"] = json!(LLM_TOKEN_CONSTRAINT_V2);
+        }
+    }
+    documents
+}
+
 /// A permissive test-only metric base plus the two `llm_gateway` metrics. The
 /// platform base is registry-owned and defined nowhere in code yet.
 pub fn metric_base_documents() -> Vec<Value> {
@@ -654,8 +687,30 @@ pub fn metric_base_documents() -> Vec<Value> {
     ]
 }
 
-/// A metric instance under the test-only metric base.
+/// A metric instance under the test-only metric base, classified as a
+/// quota-gated counter (the provisional classification contract).
 pub fn metric_instance_document(id: &str) -> Value {
+    classified_metric_document(
+        id,
+        metric_contract::KIND_COUNTER,
+        metric_contract::ENFORCEMENT_QUOTA_GATED,
+    )
+}
+
+/// A metric instance under the test-only metric base with an explicit
+/// classification. `kind` and `enforcement` are written verbatim, so a test can
+/// register an unusable classification.
+pub fn classified_metric_document(id: &str, kind: &str, enforcement: &str) -> Value {
+    json!({
+        "id": id,
+        "type": METRIC_BASE_TYPE,
+        metric_contract::KIND: kind,
+        metric_contract::ENFORCEMENT: enforcement,
+    })
+}
+
+/// A metric instance under the test-only metric base without a classification.
+pub fn unclassified_metric_document(id: &str) -> Value {
     json!({ "id": id, "type": METRIC_BASE_TYPE })
 }
 
@@ -888,8 +943,18 @@ impl FakeContractRegistry {
 
     /// Holds the QE bases, the `llm_gateway` set, and the two metric instances.
     pub fn llm_gateway() -> Self {
+        Self::over(&llm_gateway_documents())
+    }
+
+    /// [`Self::llm_gateway`] after the token constraint moved to
+    /// [`LLM_TOKEN_CONSTRAINT_V2`].
+    pub fn llm_gateway_v2() -> Self {
+        Self::over(&llm_gateway_documents_v2())
+    }
+
+    fn over(documents: &[Value]) -> Self {
         let fake = Self::empty();
-        for registered in resolve_documents(&llm_gateway_documents()) {
+        for registered in resolve_documents(documents) {
             fake.add_type(registered);
         }
         for metric in [METRIC_TOKENS, METRIC_REQUESTS] {
@@ -1048,4 +1113,316 @@ pub fn type_ids(documents: &[Value]) -> HashSet<String> {
         .map(document_id)
         .filter(|id| id.ends_with('~'))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Metric registry and gauge doubles (quota-lifecycle)
+// ---------------------------------------------------------------------------
+
+/// The classifications of `METRIC_TOKENS` and `METRIC_REQUESTS` in every
+/// fixture: quota-gated counters.
+pub fn gated_counter() -> MetricDescriptor {
+    MetricDescriptor {
+        kind: MetricKind::Counter,
+        mode: MetricMode::QuotaGated,
+    }
+}
+
+/// An in-memory `MetricRegistry`: explicit classifications, staleness, removal,
+/// unavailability, and a hang, plus a call counter.
+#[derive(Default)]
+pub struct FakeMetricRegistry {
+    metrics: Mutex<HashMap<String, Classified>>,
+    calls: AtomicUsize,
+    fail_all: AtomicBool,
+    hang: AtomicBool,
+}
+
+impl FakeMetricRegistry {
+    /// Knows no metric.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Knows the two `llm_gateway` metrics as fresh, quota-gated counters.
+    pub fn classified() -> Self {
+        let fake = Self::empty();
+        for metric in [METRIC_TOKENS, METRIC_REQUESTS] {
+            fake.add(metric, gated_counter());
+        }
+        fake
+    }
+
+    pub fn add(&self, id: &str, descriptor: MetricDescriptor) {
+        self.metrics.lock().expect("lock").insert(
+            id.to_owned(),
+            Classified {
+                descriptor,
+                freshness: Freshness::Fresh,
+            },
+        );
+    }
+
+    /// Reclassify `id`'s enforcement mode.
+    pub fn set_mode(&self, id: &str, mode: MetricMode) {
+        if let Some(entry) = self.metrics.lock().expect("lock").get_mut(id) {
+            entry.descriptor.mode = mode;
+        }
+    }
+
+    /// Mark `id`'s answer as served from a stale cache.
+    pub fn set_stale(&self, id: &str) {
+        if let Some(entry) = self.metrics.lock().expect("lock").get_mut(id) {
+            entry.freshness = Freshness::Stale;
+        }
+    }
+
+    /// Forget `id`: the registry no longer knows the metric.
+    pub fn remove(&self, id: &str) {
+        self.metrics.lock().expect("lock").remove(id);
+    }
+
+    /// Every later `describe` fails as unavailable.
+    pub fn fail_all(&self) {
+        self.fail_all.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer again.
+    pub fn recover(&self) {
+        self.fail_all.store(false, Ordering::SeqCst);
+        self.hang.store(false, Ordering::SeqCst);
+    }
+
+    /// Every later `describe` never resolves.
+    pub fn hang(&self) {
+        self.hang.store(true, Ordering::SeqCst);
+    }
+
+    /// Number of `describe` calls, failures included.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl MetricRegistry for FakeMetricRegistry {
+    async fn describe(&self, metric: &MetricId) -> Result<Option<Classified>, DomainError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.hang.load(Ordering::SeqCst) {
+            pending::<()>().await;
+        }
+        if self.fail_all.load(Ordering::SeqCst) {
+            return Err(DomainError::TypesRegistryUnavailable(
+                "fake metric registry unavailable".to_owned(),
+            ));
+        }
+        Ok(self
+            .metrics
+            .lock()
+            .expect("lock")
+            .get(metric.as_str())
+            .copied())
+    }
+}
+
+/// Records every publication in order, withdrawals included.
+#[derive(Default)]
+pub struct RecordingGaugeSink {
+    publications: Mutex<Vec<Option<LifecycleCounts>>>,
+}
+
+impl RecordingGaugeSink {
+    pub fn publications(&self) -> Vec<Option<LifecycleCounts>> {
+        self.publications.lock().expect("lock").clone()
+    }
+
+    /// The most recent publication, if any happened: `Some(None)` is a
+    /// withdrawal, `None` means nothing was published yet.
+    #[allow(
+        clippy::option_option,
+        reason = "a withdrawal is a publication of nothing"
+    )]
+    pub fn last(&self) -> Option<Option<LifecycleCounts>> {
+        self.publications.lock().expect("lock").last().copied()
+    }
+}
+
+impl LifecycleGaugeSink for RecordingGaugeSink {
+    fn publish(&self, counts: Option<LifecycleCounts>) {
+        self.publications.lock().expect("lock").push(counts);
+    }
+}
+
+/// A `TypesRegistryClient` over a mock whose `get_instance` can be made to
+/// fail, for the cached adapter's unavailability paths. Every other method
+/// delegates.
+pub struct FailingInstanceRegistry {
+    inner: MockTypesRegistryClient,
+    fail_instances: AtomicBool,
+    instance_calls: AtomicUsize,
+}
+
+impl FailingInstanceRegistry {
+    pub fn new(inner: MockTypesRegistryClient) -> Self {
+        Self {
+            inner,
+            fail_instances: AtomicBool::new(false),
+            instance_calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Every later `get_instance` fails as unavailable.
+    pub fn fail_instances(&self) {
+        self.fail_instances.store(true, Ordering::SeqCst);
+    }
+
+    /// `get_instance` answers again.
+    pub fn recover(&self) {
+        self.fail_instances.store(false, Ordering::SeqCst);
+    }
+
+    /// Number of `get_instance` calls, failures included.
+    pub fn instance_calls(&self) -> usize {
+        self.instance_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl TypesRegistryClient for FailingInstanceRegistry {
+    async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
+        self.inner.register(entities).await
+    }
+
+    async fn register_type_schemas(
+        &self,
+        type_schemas: Vec<Value>,
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
+        self.inner.register_type_schemas(type_schemas).await
+    }
+
+    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
+        self.inner.get_type_schema(type_id).await
+    }
+
+    async fn get_type_schema_by_uuid(
+        &self,
+        type_uuid: Uuid,
+    ) -> Result<GtsTypeSchema, CanonicalError> {
+        self.inner.get_type_schema_by_uuid(type_uuid).await
+    }
+
+    async fn get_type_schemas(
+        &self,
+        type_ids: Vec<String>,
+    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
+        self.inner.get_type_schemas(type_ids).await
+    }
+
+    async fn get_type_schemas_by_uuid(
+        &self,
+        type_uuids: Vec<Uuid>,
+    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
+        self.inner.get_type_schemas_by_uuid(type_uuids).await
+    }
+
+    async fn list_type_schemas(
+        &self,
+        query: TypeSchemaQuery,
+    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
+        self.inner.list_type_schemas(query).await
+    }
+
+    async fn register_instances(
+        &self,
+        instances: Vec<Value>,
+    ) -> Result<Vec<RegisterResult>, CanonicalError> {
+        self.inner.register_instances(instances).await
+    }
+
+    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
+        self.instance_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_instances.load(Ordering::SeqCst) {
+            return Err(CanonicalError::service_unavailable()
+                .with_detail("registry down")
+                .create());
+        }
+        self.inner.get_instance(id).await
+    }
+
+    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
+        self.inner.get_instance_by_uuid(uuid).await
+    }
+
+    async fn get_instances(
+        &self,
+        ids: Vec<String>,
+    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
+        self.inner.get_instances(ids).await
+    }
+
+    async fn get_instances_by_uuid(
+        &self,
+        uuids: Vec<Uuid>,
+    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
+        self.inner.get_instances_by_uuid(uuids).await
+    }
+
+    async fn list_instances(
+        &self,
+        query: InstanceQuery,
+    ) -> Result<Vec<GtsInstance>, CanonicalError> {
+        self.inner.list_instances(query).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A bound service for the transport tests (REST, in-process)
+// ---------------------------------------------------------------------------
+
+/// The lifecycle bounds every transport test runs with.
+pub fn test_limits() -> crate::domain::quotas::QuotaLimits {
+    crate::domain::quotas::QuotaLimits {
+        metadata_max_bytes: 4096,
+        list_max_limit: 500,
+        list_max_ids: 100,
+    }
+}
+
+/// A service whose dependencies are not bound: every lifecycle call is
+/// `NotReady`.
+pub fn unbound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Service> {
+    let metrics = Arc::new(RecordingMetrics::default());
+    Arc::new(crate::domain::Service::new(
+        crate::domain::Admission::new(authz_resolver_sdk::PolicyEnforcer::new(pdp), metrics),
+        Arc::new(crate::domain::Readiness::new()),
+        test_limits(),
+    ))
+}
+
+/// A service bound to the in-memory storage, the `llm_gateway` catalogue with
+/// both subject projections, and classified metrics.
+pub async fn bound_service(pdp: Arc<dyn AuthZResolverApi>) -> Arc<crate::domain::Service> {
+    let service = unbound_service(pdp);
+    let registry = Arc::new(FakeContractRegistry::llm_gateway());
+    let metrics = RecordingMetrics::default();
+    let catalog = crate::domain::catalog::CatalogBuilder::new(registry.as_ref(), &metrics)
+        .build(&crate::domain::catalog::CatalogConfig {
+            subject_projections: vec![
+                GtsTypeId::new(LLM_USER_PROJECTION),
+                GtsTypeId::new(LLM_TENANT_PROJECTION),
+            ],
+            resource_projections: Vec::new(),
+        })
+        .await
+        .expect("catalogue");
+    service
+        .bind(crate::domain::Bound {
+            storage: Arc::new(InMemoryStorage::new()),
+            coordinator: Arc::new(NoopCoordinator),
+            catalog: Arc::new(catalog),
+            registry,
+            metric_registry: Arc::new(FakeMetricRegistry::classified()),
+        })
+        .expect("bind");
+    service
 }

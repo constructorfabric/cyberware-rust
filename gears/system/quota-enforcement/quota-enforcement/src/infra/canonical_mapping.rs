@@ -30,11 +30,20 @@ pub mod reason {
     pub const NOT_READY: &str = "NOT_READY";
     /// A dependency is unreachable.
     pub const DEPENDENCY_UNAVAILABLE: &str = "DEPENDENCY_UNAVAILABLE";
+    /// A reserved capability (`rate` Quotas in P1).
+    pub const NOT_YET_IMPLEMENTED: &str = "NOT_YET_IMPLEMENTED";
 }
 
 impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
         match err {
+            // --- quota lifecycle, decided before storage (400 / 501) ---
+            DomainError::CapMustBeNonNegative { .. }
+            | DomainError::ThresholdsRequireBoundedCap
+            | DomainError::ConstraintContractMismatch { .. }
+            | DomainError::MetricClassificationInvalid { .. }
+            | DomainError::NotYetImplemented { .. } => quota_lifecycle(err),
+
             // --- 400 InvalidArgument ---
             DomainError::InvalidArgument { field, reason } => QuotaResource::invalid_argument()
                 .with_field_violation(field, format!("invalid argument {field}: {reason}"), reason)
@@ -243,3 +252,51 @@ impl From<DomainError> for CanonicalError {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "canonical_mapping_tests.rs"]
 mod canonical_mapping_tests;
+
+/// The lifts of the quota-lifecycle rejections decided before storage.
+fn quota_lifecycle(err: DomainError) -> CanonicalError {
+    match err {
+        // --- 400 InvalidArgument ---
+        DomainError::CapMustBeNonNegative { cap } => QuotaResource::invalid_argument()
+            .with_field_violation(
+                "cap",
+                format!("cap {cap} is negative; caps live in 0..=i64::MAX"),
+                "CAP_MUST_BE_NON_NEGATIVE",
+            )
+            .create(),
+        // --- 400 FailedPrecondition ---
+        DomainError::ThresholdsRequireBoundedCap => QuotaResource::failed_precondition()
+            .with_precondition_violation(
+                "notification_thresholds",
+                "notification thresholds require a bounded cap",
+                "THRESHOLDS_REQUIRE_BOUNDED_CAP",
+            )
+            .create(),
+        DomainError::ConstraintContractMismatch { contract } => {
+            QuotaResource::failed_precondition()
+                .with_precondition_violation(
+                    "metadata",
+                    format!("metadata violates constraint contract {contract}"),
+                    "CONSTRAINT_CONTRACT_MISMATCH",
+                )
+                .with_resource(contract)
+                .create()
+        }
+        DomainError::MetricClassificationInvalid { metric } => QuotaResource::failed_precondition()
+            .with_precondition_violation(
+                metric.clone(),
+                format!("metric {metric} carries no usable classification"),
+                "METRIC_CLASSIFICATION_INVALID",
+            )
+            .create(),
+        // --- 501 Unimplemented ---
+        // The builder has no reason slot; the token leads the detail, as the
+        // 503 lifts do.
+        DomainError::NotYetImplemented { feature } => QuotaResource::unimplemented(format!(
+            "{}: {feature} is not yet implemented",
+            reason::NOT_YET_IMPLEMENTED
+        ))
+        .create(),
+        other => CanonicalError::from(other),
+    }
+}

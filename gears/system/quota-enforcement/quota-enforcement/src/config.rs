@@ -6,6 +6,7 @@ use gts::GtsTypeId;
 use serde::Deserialize;
 
 use crate::domain::catalog::CatalogConfig;
+use crate::domain::quotas::{GaugeTiming, QuotaLimits};
 
 /// Gear configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -23,6 +24,10 @@ pub struct QuotaEnforcementConfig {
     pub metrics: MetricsConfig,
     /// The owner projections configured for evaluation.
     pub catalog: CatalogSection,
+    /// Bounds of the Quota lifecycle surface.
+    pub quotas: QuotasSection,
+    /// Timing of the lifecycle-gauge refresh.
+    pub gauges: GaugesSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -33,6 +38,8 @@ impl Default for QuotaEnforcementConfig {
             sweeper_stop_timeout_secs: 10,
             metrics: MetricsConfig::default(),
             catalog: CatalogSection::default(),
+            quotas: QuotasSection::default(),
+            gauges: GaugesSection::default(),
         }
     }
 }
@@ -55,7 +62,9 @@ impl QuotaEnforcementConfig {
             anyhow::bail!("[quota-enforcement].sweeper_stop_timeout_secs must be at least 1");
         }
         self.metrics.validate()?;
-        self.catalog.validate()
+        self.catalog.validate()?;
+        self.quotas.validate()?;
+        self.gauges.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -220,6 +229,165 @@ impl CatalogSection {
             subject_projections: parse(&self.subject_projections)?,
             resource_projections: parse(&self.resource_projections)?,
         })
+    }
+}
+
+/// Bounds of the Quota lifecycle surface (`[quota-enforcement.quotas]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuotasSection {
+    /// Largest canonical-JSON size of a Quota's `metadata` object, in bytes
+    /// (PRD section 5.2, default 4 KiB).
+    pub metadata_max_bytes: usize,
+    /// Entries the metric classification cache holds before evicting the
+    /// least recently used one.
+    pub metric_cache_entries: usize,
+    /// Age after which a cached classification is refreshed from the
+    /// registry, in seconds.
+    pub metric_cache_ttl_secs: u64,
+    /// Additional age during which a cached classification may still be
+    /// served to a write when the registry does not answer, in seconds.
+    /// Beyond `ttl + grace` nothing is served; the write fails closed.
+    pub metric_cache_stale_grace_secs: u64,
+    /// Largest page a list request may ask for.
+    pub list_max_limit: u32,
+    /// Largest number of explicit ids one list request may name.
+    pub list_max_ids: usize,
+}
+
+impl Default for QuotasSection {
+    fn default() -> Self {
+        Self {
+            metadata_max_bytes: 4096,
+            metric_cache_entries: 256,
+            metric_cache_ttl_secs: 60,
+            metric_cache_stale_grace_secs: 300,
+            list_max_limit: 500,
+            list_max_ids: 100,
+        }
+    }
+}
+
+impl QuotasSection {
+    /// Smallest metadata size limit: an empty object serialized.
+    pub const MIN_METADATA_BYTES: usize = 2;
+    /// Largest metadata size limit.
+    pub const MAX_METADATA_BYTES: usize = 1_048_576;
+
+    /// Reject bounds the gear cannot serve with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(Self::MIN_METADATA_BYTES..=Self::MAX_METADATA_BYTES).contains(&self.metadata_max_bytes)
+        {
+            anyhow::bail!(
+                "[quota-enforcement.quotas].metadata_max_bytes must be within {}..={}",
+                Self::MIN_METADATA_BYTES,
+                Self::MAX_METADATA_BYTES
+            );
+        }
+        if self.metric_cache_entries == 0 {
+            anyhow::bail!("[quota-enforcement.quotas].metric_cache_entries must be at least 1");
+        }
+        if self.metric_cache_ttl_secs == 0 {
+            anyhow::bail!("[quota-enforcement.quotas].metric_cache_ttl_secs must be at least 1");
+        }
+        if self.list_max_limit == 0 {
+            anyhow::bail!("[quota-enforcement.quotas].list_max_limit must be at least 1");
+        }
+        if self.list_max_ids == 0 {
+            anyhow::bail!("[quota-enforcement.quotas].list_max_ids must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// The domain view of the request bounds.
+    #[must_use]
+    pub const fn to_limits(&self) -> QuotaLimits {
+        QuotaLimits {
+            metadata_max_bytes: self.metadata_max_bytes,
+            list_max_limit: self.list_max_limit,
+            list_max_ids: self.list_max_ids,
+        }
+    }
+
+    /// Age after which a cached classification is refreshed.
+    #[must_use]
+    pub const fn metric_cache_ttl(&self) -> Duration {
+        Duration::from_secs(self.metric_cache_ttl_secs)
+    }
+
+    /// Additional age during which a stale classification may serve a write.
+    #[must_use]
+    pub const fn metric_cache_stale_grace(&self) -> Duration {
+        Duration::from_secs(self.metric_cache_stale_grace_secs)
+    }
+}
+
+/// Timing of the lifecycle-gauge refresh (`[quota-enforcement.gauges]`). The
+/// elected replica reads the active-Quota counts every `refresh_secs`, bounds
+/// each read by `refresh_deadline_secs`, and withdraws the published sample
+/// once no refresh succeeded for `stale_after_secs`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "configuration keys carry their unit, as `sweeper_stop_timeout_secs` does"
+)]
+pub struct GaugesSection {
+    /// Seconds between two refreshes.
+    pub refresh_secs: u64,
+    /// Seconds one refresh may take before it counts as failed.
+    pub refresh_deadline_secs: u64,
+    /// Seconds without a successful refresh before the sample is withdrawn.
+    pub stale_after_secs: u64,
+}
+
+impl Default for GaugesSection {
+    fn default() -> Self {
+        Self {
+            refresh_secs: 30,
+            refresh_deadline_secs: 10,
+            stale_after_secs: 180,
+        }
+    }
+}
+
+impl GaugesSection {
+    /// Reject timings under which the refresh cannot keep a sample fresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a value is zero, the deadline exceeds the
+    /// interval, or the staleness bound does not exceed the interval.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.refresh_secs == 0 {
+            anyhow::bail!("[quota-enforcement.gauges].refresh_secs must be at least 1");
+        }
+        if self.refresh_deadline_secs == 0 || self.refresh_deadline_secs > self.refresh_secs {
+            anyhow::bail!(
+                "[quota-enforcement.gauges].refresh_deadline_secs must be within 1..=refresh_secs"
+            );
+        }
+        if self.stale_after_secs <= self.refresh_secs {
+            anyhow::bail!(
+                "[quota-enforcement.gauges].stale_after_secs must exceed refresh_secs, else the \
+                 sample is withdrawn before the next refresh"
+            );
+        }
+        Ok(())
+    }
+
+    /// The domain view of the timing.
+    #[must_use]
+    pub const fn to_timing(&self) -> GaugeTiming {
+        GaugeTiming {
+            refresh: Duration::from_secs(self.refresh_secs),
+            refresh_deadline: Duration::from_secs(self.refresh_deadline_secs),
+            stale_after: Duration::from_secs(self.stale_after_secs),
+        }
     }
 }
 

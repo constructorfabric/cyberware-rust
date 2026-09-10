@@ -1,10 +1,11 @@
 //! Gear declaration of quota-enforcement.
 //!
-//! `init` wires the PEP boundary, the domain service, and the cluster
-//! coordination binding. The lifecycle entry runs the fail-closed bootstrap
-//! before the ready signal. The REST surface mounts into the platform
-//! `api-gateway`; the readiness check reports the bootstrap state and the
-//! cluster requirements verdict.
+//! `init` wires the PEP boundary, the domain service, the in-process manager
+//! client, and the cluster coordination binding. The lifecycle entry runs the
+//! fail-closed bootstrap before the ready signal, then hosts the leader-only
+//! lifecycle-gauge refresh under a child token. The REST surface mounts into
+//! the platform `api-gateway`; the readiness check reports the bootstrap state
+//! and the cluster requirements verdict.
 //!
 //! The gear declares no `deps = [cluster]` edge (cluster DESIGN section
 //! 3.17.7): a deployed consumer links no cluster gear. Start ordering comes
@@ -12,10 +13,12 @@
 //! SDK-submitted consumer registration.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use quota_enforcement_sdk::QuotaManagerClientV1;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
@@ -26,11 +29,17 @@ use tracing::info;
 use types_registry_sdk::TypesRegistryClient;
 
 use crate::api::healthcheck::ReadinessCheck;
+use crate::api::in_process::InProcessQuotaManager;
 use crate::api::rest::routes;
 use crate::config::QuotaEnforcementConfig;
-use crate::domain::ports::QeMetrics;
-use crate::domain::{Admission, Bootstrap, CatalogBinding, PluginBinding, Readiness, Service};
+use crate::domain::ports::{LifecycleGaugeSink, MetricRegistry, QeMetrics};
+use crate::domain::{
+    Admission, Bootstrap, Bound, CatalogBinding, GaugeTiming, LifecycleGaugeRefresher,
+    PluginBinding, Readiness, Service, SingletonScope,
+};
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
+use crate::infra::lifecycle_gauges::LifecycleGaugeCell;
+use crate::infra::metric_registry::CachedMetricRegistry;
 use crate::infra::metrics;
 use crate::infra::pdp_probe::PdpReachability;
 use crate::infra::types_registry::TypesRegistryContracts;
@@ -53,6 +62,14 @@ pub struct QuotaEnforcementGear {
     service: OnceLock<Arc<Service>>,
     bootstrap: OnceLock<Bootstrap>,
     hub: OnceLock<Arc<ClientHub>>,
+    gauges: OnceLock<GaugeWiring>,
+}
+
+/// What the lifecycle entry needs to host the gauge refresh.
+struct GaugeWiring {
+    cell: Arc<LifecycleGaugeCell>,
+    timing: GaugeTiming,
+    stop_timeout: Duration,
 }
 
 impl Default for QuotaEnforcementGear {
@@ -61,6 +78,7 @@ impl Default for QuotaEnforcementGear {
             service: OnceLock::new(),
             bootstrap: OnceLock::new(),
             hub: OnceLock::new(),
+            gauges: OnceLock::new(),
         }
     }
 }
@@ -72,11 +90,20 @@ impl QuotaEnforcementGear {
         self.service.get().cloned()
     }
 
-    /// Lifecycle entry: bootstrap, signal ready, then idle until shutdown.
+    /// The lifecycle gauge sample cell, once `init` ran. Holds a sample only
+    /// while this replica leads and its last refresh succeeded.
+    #[must_use]
+    pub fn lifecycle_gauges(&self) -> Option<Arc<LifecycleGaugeCell>> {
+        self.gauges.get().map(|wiring| wiring.cell.clone())
+    }
+
+    /// Lifecycle entry: bootstrap, signal ready, host the leader-only gauge
+    /// refresh, then stop on shutdown.
     ///
     /// Bootstrap resolves the cluster leader election here, in `start`, after
-    /// the cluster gear started. Later features spawn their sweepers here under
-    /// child tokens of `cancel`, after the ready signal.
+    /// the cluster gear started. The gauge refresh runs under a child token of
+    /// `cancel` after the ready signal; later features spawn their sweepers the
+    /// same way.
     ///
     /// # Errors
     ///
@@ -88,23 +115,15 @@ impl QuotaEnforcementGear {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
-        let service = self
-            .service
-            .get()
-            .cloned()
-            .context("quota-enforcement: serve invoked before init")?;
-        let bootstrap = self
-            .bootstrap
-            .get()
-            .context("quota-enforcement: serve invoked before init")?;
-
-        let bound = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                anyhow::bail!("quota-enforcement: shutdown requested during bootstrap");
-            }
-            outcome = bootstrap.run() => outcome.context("quota-enforcement bootstrap failed")?,
-        };
+        let (service, bootstrap, gauges) = self.initialised()?;
+        let bound = bootstrap_or_shutdown(bootstrap, &cancel).await?;
+        let refresher = LifecycleGaugeRefresher::new(
+            bound.storage.clone(),
+            bound.metric_registry.clone(),
+            gauges.cell.clone() as Arc<dyn LifecycleGaugeSink>,
+            gauges.timing,
+        );
+        let coordinator = bound.coordinator.clone();
         service
             .bind(bound)
             .context("quota-enforcement: publish bootstrapped dependencies")?;
@@ -112,10 +131,72 @@ impl QuotaEnforcementGear {
         ready.notify();
         info!(target: LOG_TARGET, "quota-enforcement is ready");
 
+        let gauge_task = spawn_gauge_refresh(coordinator, refresher, cancel.child_token());
         cancel.cancelled().await;
         info!(target: LOG_TARGET, "quota-enforcement is stopping");
+        join_gauge_refresh(gauge_task, gauges.stop_timeout).await;
         Ok(())
     }
+}
+
+impl QuotaEnforcementGear {
+    /// The init-time cells, all filled or none.
+    fn initialised(&self) -> anyhow::Result<(Arc<Service>, &Bootstrap, &GaugeWiring)> {
+        const BEFORE_INIT: &str = "quota-enforcement: serve invoked before init";
+        let service = self.service.get().cloned().context(BEFORE_INIT)?;
+        let bootstrap = self.bootstrap.get().context(BEFORE_INIT)?;
+        let gauges = self.gauges.get().context(BEFORE_INIT)?;
+        Ok((service, bootstrap, gauges))
+    }
+}
+
+/// Bootstrap raced against shutdown: a shutdown during bootstrap is an error
+/// of the lifecycle entry, so the ready signal is never sent.
+async fn bootstrap_or_shutdown(
+    bootstrap: &Bootstrap,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Bound> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => {
+            anyhow::bail!("quota-enforcement: shutdown requested during bootstrap");
+        }
+        outcome = bootstrap.run() => outcome.context("quota-enforcement bootstrap failed"),
+    }
+}
+
+/// Leader-only: the elected replica refreshes and publishes the gauge sample;
+/// every other replica publishes nothing. Leadership loss cancels the child
+/// token and the refresher withdraws its sample.
+fn spawn_gauge_refresh(
+    coordinator: Arc<dyn crate::domain::SingletonCoordinator>,
+    refresher: Arc<LifecycleGaugeRefresher>,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<Result<(), crate::domain::DomainError>> {
+    tokio::spawn(async move {
+        coordinator
+            .run_while_leader(
+                SingletonScope::LifecycleGauges,
+                shutdown,
+                refresher.leader_work(),
+            )
+            .await
+    })
+}
+
+/// Wait for the gauge task to stop within `budget`; a slow or failed stop is
+/// logged, never an error of the lifecycle entry.
+async fn join_gauge_refresh(
+    task: tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>,
+    budget: Duration,
+) {
+    let failure = match tokio::time::timeout(budget, task).await {
+        Ok(Ok(Ok(()))) => return,
+        Ok(Ok(Err(err))) => format!("lifecycle gauge election ended with an error: {err}"),
+        Ok(Err(join)) => format!("lifecycle gauge task did not finish cleanly: {join}"),
+        Err(_elapsed) => format!("lifecycle gauge task did not stop within {budget:?}"),
+    };
+    tracing::warn!(target: LOG_TARGET, "{failure}");
 }
 
 #[async_trait]
@@ -140,22 +221,39 @@ impl Gear for QuotaEnforcementGear {
         let enforcer = PolicyEnforcer::new(authz);
 
         // The projection contract catalogue is built from the types registry at
-        // bootstrap; without the client there is no catalogue to publish.
+        // bootstrap; without the client there is no catalogue to publish. The
+        // same client answers metric identity and classification for writes.
         let registry: Arc<dyn TypesRegistryClient> = hub
             .get::<dyn TypesRegistryClient>()
             .with_context(|| format!("{} requires a types-registry client", Self::MODULE_NAME))?;
         let catalog = CatalogBinding {
-            registry: Arc::new(TypesRegistryContracts::new(registry)),
+            registry: Arc::new(TypesRegistryContracts::new(registry.clone())),
             config: cfg
                 .catalog
                 .to_domain()
                 .context("[quota-enforcement.catalog] is not a valid catalogue")?,
         };
+        let metric_registry: Arc<dyn MetricRegistry> = Arc::new(CachedMetricRegistry::new(
+            registry,
+            cfg.quotas.metric_cache_entries,
+            cfg.quotas.metric_cache_ttl(),
+            cfg.quotas.metric_cache_stale_grace(),
+        ));
 
-        let metrics: Arc<dyn QeMetrics> = metrics::build_default_adapter(&cfg.metrics);
+        let gauge_cell = Arc::new(LifecycleGaugeCell::default());
+        let metrics: Arc<dyn QeMetrics> =
+            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone());
         let readiness = Arc::new(Readiness::new());
         let admission = Admission::new(enforcer, metrics.clone());
-        let service = Arc::new(Service::new(admission, readiness.clone()));
+        let service = Arc::new(Service::new(
+            admission,
+            readiness.clone(),
+            cfg.quotas.to_limits(),
+        ));
+        // The in-process manager client enters the domain where REST does.
+        hub.register::<dyn QuotaManagerClientV1>(Arc::new(InProcessQuotaManager::new(
+            service.clone(),
+        )));
 
         let timing = ElectionTiming::new(
             cfg.election.ttl(),
@@ -164,23 +262,40 @@ impl Gear for QuotaEnforcementGear {
         )
         .context("[quota-enforcement.election] is not a valid election timing")?;
         let coordinator = Arc::new(ClusterCoordinationBinding::new(hub.clone(), timing));
-        let binding = PluginBinding::new(hub.clone(), cfg.storage_vendor);
-        let bootstrap =
-            Bootstrap::new(binding, coordinator, pdp_probe, catalog, metrics, readiness);
+        let binding = PluginBinding::new(hub.clone(), cfg.storage_vendor.clone());
+        let bootstrap = Bootstrap::new(
+            binding,
+            coordinator,
+            pdp_probe,
+            catalog,
+            metric_registry,
+            metrics,
+            readiness,
+        );
 
-        self.hub
-            .set(hub)
-            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-        self.bootstrap
-            .set(bootstrap)
-            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-        self.service
-            .set(service)
-            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        let gauges = GaugeWiring {
+            cell: gauge_cell,
+            timing: cfg.gauges.to_timing(),
+            stop_timeout: cfg.sweeper_stop_timeout(),
+        };
+        set_once(&self.gauges, gauges)?;
+        set_once(&self.hub, hub)?;
+        set_once(&self.bootstrap, bootstrap)?;
+        set_once(&self.service, service)?;
 
         info!(target: LOG_TARGET, "quota-enforcement initialised; bootstrap runs in the lifecycle entry");
         Ok(())
     }
+}
+
+/// Fill one of the gear's init-time cells exactly once.
+fn set_once<T>(cell: &OnceLock<T>, value: T) -> anyhow::Result<()> {
+    cell.set(value).map_err(|_| {
+        anyhow::anyhow!(
+            "{} gear already initialized",
+            QuotaEnforcementGear::MODULE_NAME
+        )
+    })
 }
 
 impl RestApiCapability for QuotaEnforcementGear {

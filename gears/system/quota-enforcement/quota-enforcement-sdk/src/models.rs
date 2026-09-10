@@ -12,7 +12,7 @@
 //!   reject unknown fields.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
@@ -510,6 +510,35 @@ pub enum NotificationEventKind {
     PolicyChanged,
 }
 
+impl NotificationEventKind {
+    /// Stable `kebab-case` name, equal to the serialized form; the outbox
+    /// stores it as the payload type.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ThresholdCrossed => "threshold-crossed",
+            Self::PeriodRollover => "period-rollover",
+            Self::LeaseAutoReleased => "lease-auto-released",
+            Self::LeaseResolvedByDeactivation => "lease-resolved-by-deactivation",
+            Self::QuotaChanged => "quota-changed",
+            Self::QuotaCounterAdjusted => "quota-counter-adjusted",
+            Self::QuotaRollbackApplied => "quota-rollback-applied",
+            Self::PolicyChanged => "policy-changed",
+        }
+    }
+}
+
+/// Registry-reported kind of a metric (PRD section 3.2). Closed; the gear
+/// reads it from the metric instance and never defaults it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricKind {
+    /// Cumulative within a period; pairs naturally with consumption Quotas.
+    Counter,
+    /// A level; pairs naturally with allocation Quotas.
+    Gauge,
+}
+
 // ---------------------------------------------------------------------------
 // Subjects and contracts
 // ---------------------------------------------------------------------------
@@ -767,6 +796,21 @@ pub struct ProjectionBinding {
     pub projection_type: GtsTypeId,
 }
 
+/// Active-Quota counts behind the lifecycle gauges (PRD section 5.16):
+/// `quota_cap_zero_total`, `quota_cap_unbounded_total`, and, joined with the
+/// current metric classification by the gear, `quota_for_direct_metric_total`.
+/// Platform-plane and caller-less, like [`ProjectionBinding`]; only Quotas with
+/// lifecycle status `active` count, whatever their validity window.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ActiveQuotaCounts {
+    /// Active Quotas with `cap = 0`.
+    pub cap_zero: u64,
+    /// Active Quotas with an unbounded cap.
+    pub cap_unbounded: u64,
+    /// Active Quotas per metric.
+    pub by_metric: HashMap<MetricId, u64>,
+}
+
 /// Optional validity bounds of a Quota. Both ends are inclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -812,7 +856,8 @@ pub struct Quota {
     pub period: Option<PeriodType>,
     /// Behaviour at the cap boundary.
     pub enforcement_mode: EnforcementMode,
-    /// Cap in metric units. `None` means unbounded.
+    /// Cap in metric units, within `0..=`[`Quota::MAX_CAP`]. `None` means
+    /// unbounded.
     pub cap: Option<u64>,
     /// Notification thresholds as percentages of cap, ascending.
     pub notification_thresholds: Vec<u8>,
@@ -826,9 +871,10 @@ pub struct Quota {
     pub source: QuotaSource,
     /// Lifecycle state.
     pub status: QuotaStatus,
-    /// Contract the metadata was validated against.
+    /// Contract the metadata was validated against: snapshotted at creation and
+    /// moved with every accepted metadata update.
     pub constraint_contract: ContractRef,
-    /// Optimistic-concurrency record version.
+    /// Record version. Increments once per accepted mutation.
     pub record_version: u32,
     /// Creation time.
     #[serde(with = "rfc3339")]
@@ -836,6 +882,90 @@ pub struct Quota {
     /// Last mutation time.
     #[serde(with = "rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+impl Quota {
+    /// Largest cap any surface accepts. Caps live in `0..=i64::MAX` so every
+    /// storage backend holds them in a signed 64-bit column: the REST surface
+    /// takes a signed integer and rejects negatives, the SDK checks `u64`
+    /// values against this bound (`CAP_OUT_OF_RANGE`), SQL carries a check
+    /// constraint.
+    pub const MAX_CAP: u64 = i64::MAX.unsigned_abs();
+}
+
+/// The public read shape of a Quota: the stored record plus what the gear
+/// computes at read time. Every Quota read and list returns it, over REST and
+/// in process alike (quota-lifecycle feature). Storage never produces it; its
+/// `read_quotas` returns the bare [`Quota`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaView {
+    /// The stored record.
+    #[serde(flatten)]
+    pub quota: Quota,
+    /// Server-computed: the response's clock reading lies within
+    /// `validity_window`, an absent bound being unbounded on its side. One
+    /// clock reading per response.
+    pub currently_within_window: bool,
+    /// Registry-reported kind of the metric at read time. `None` only when
+    /// the registry no longer knows the metric; the record stays readable and
+    /// the removal is logged.
+    #[serde(default)]
+    pub metric_kind: Option<MetricKind>,
+}
+
+impl QuotaView {
+    /// Pure computation of the view for the clock reading `now`.
+    #[must_use]
+    pub fn compute(quota: Quota, metric_kind: Option<MetricKind>, now: OffsetDateTime) -> Self {
+        let currently_within_window = quota.validity_window.is_none_or(|w| w.contains(now));
+        Self {
+            quota,
+            currently_within_window,
+            metric_kind,
+        }
+    }
+}
+
+/// Public create input of a Quota (`QuotaManagerClientV1::create_quota`): a
+/// [`QuotaDraft`] without the constraint contract, which the gear resolves from
+/// the catalogue and snapshots itself. The gear validates every field before
+/// storage sees a draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaSpec {
+    /// PDP-authorized target tenant.
+    pub tenant_id: TenantId,
+    /// Subject the Quota binds to: `(projection_type, subject_id)`.
+    pub subject: SubjectRef,
+    /// Registered metric.
+    pub metric: MetricId,
+    /// Accounting model. `rate` is reserved and rejected.
+    pub quota_type: QuotaType,
+    /// Period specification. Required for consumption Quotas, rejected for
+    /// allocation Quotas.
+    #[serde(default)]
+    pub period: Option<PeriodType>,
+    /// Behaviour at the cap boundary.
+    pub enforcement_mode: EnforcementMode,
+    /// Cap in metric units, within `0..=`[`Quota::MAX_CAP`]. `None` means
+    /// unbounded.
+    #[serde(default)]
+    pub cap: Option<u64>,
+    /// Notification thresholds as percentages of cap, ascending. Require a
+    /// bounded cap.
+    #[serde(default)]
+    pub notification_thresholds: Vec<u8>,
+    /// Optional validity bounds.
+    #[serde(default)]
+    pub validity_window: Option<ValidityWindow>,
+    /// Informational fail-open hint. Defaults to fail-closed.
+    #[serde(default)]
+    pub fail_open_hint: bool,
+    /// Metadata validated against the metric owner's constraint contract.
+    #[serde(default)]
+    pub metadata: Map<String, Value>,
+    /// Who imposes the Quota.
+    pub source: QuotaSource,
 }
 
 /// Create input for a Quota. The gear validates it before storage sees it.
@@ -855,7 +985,8 @@ pub struct QuotaDraft {
     pub period: Option<PeriodType>,
     /// Behaviour at the cap boundary.
     pub enforcement_mode: EnforcementMode,
-    /// Cap in metric units. `None` means unbounded.
+    /// Cap in metric units, within `0..=`[`Quota::MAX_CAP`]. `None` means
+    /// unbounded.
     #[serde(default)]
     pub cap: Option<u64>,
     /// Notification thresholds as percentages of cap.
@@ -872,8 +1003,32 @@ pub struct QuotaDraft {
     pub metadata: Map<String, Value>,
     /// Who imposes the Quota.
     pub source: QuotaSource,
-    /// Contract the metadata was validated against.
+    /// Contract the metadata was validated against. Set by the gear from the
+    /// catalogue, never caller-supplied: the public create shape is
+    /// [`QuotaSpec`], which has no such field.
     pub constraint_contract: ContractRef,
+}
+
+impl QuotaDraft {
+    /// The storage draft of a validated `spec` with the resolved contract.
+    #[must_use]
+    pub fn from_spec(spec: QuotaSpec, constraint_contract: ContractRef) -> Self {
+        Self {
+            tenant_id: spec.tenant_id,
+            subject: spec.subject,
+            metric: spec.metric,
+            quota_type: spec.quota_type,
+            period: spec.period,
+            enforcement_mode: spec.enforcement_mode,
+            cap: spec.cap,
+            notification_thresholds: spec.notification_thresholds,
+            validity_window: spec.validity_window,
+            fail_open_hint: spec.fail_open_hint,
+            metadata: spec.metadata,
+            source: spec.source,
+            constraint_contract,
+        }
+    }
 }
 
 /// Patch of a Quota's `cap`.
@@ -909,6 +1064,12 @@ pub struct QuotaPatch {
     pub validity_window: Option<ValidityWindowPatch>,
     /// New metadata object, replacing the previous one.
     pub metadata: Option<Map<String, Value>>,
+    /// The contract the new `metadata` was validated against, stored with it in
+    /// the same write so the reference never lags the object. Set by the gear
+    /// whenever `metadata` is present, never caller-supplied: the gear rejects a
+    /// present value from a client. Storage rejects a `metadata` patch without
+    /// it as `Internal`.
+    pub constraint_contract: Option<ContractRef>,
     /// New enforcement mode.
     pub enforcement_mode: Option<EnforcementMode>,
     /// New fail-open hint.

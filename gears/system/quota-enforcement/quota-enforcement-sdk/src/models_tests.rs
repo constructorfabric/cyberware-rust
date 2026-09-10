@@ -6,11 +6,12 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    CapPatch, ContractRef, Decision, DecisionResult, EnforcementMode, EvaluationAttribution,
-    IdempotencySubjectKey, LeaseState, MetricId, NotificationEventKind, OperationType, PageRequest,
-    PageResult, PeriodType, PolicyId, PolicyScope, ProjectionBinding, QuotaDebitPlan, QuotaId,
-    QuotaPatch, QuotaSource, QuotaType, ResourceProjection, ScopeError, SubjectRef, SubjectScope,
-    UnknownValue, ValidityWindow,
+    ActiveQuotaCounts, CapPatch, ContractRef, Decision, DecisionResult, EnforcementMode,
+    EvaluationAttribution, IdempotencySubjectKey, LeaseState, MetricId, MetricKind,
+    NotificationEventKind, OperationType, PageRequest, PageResult, PeriodType, PolicyId,
+    PolicyScope, ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch,
+    QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, ScopeError,
+    SubjectRef, SubjectScope, TenantId, UnknownValue, ValidityWindow,
 };
 use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 
@@ -513,4 +514,161 @@ fn projection_bindings_are_distinct_by_pair() {
     .into_iter()
     .collect();
     assert_eq!(set.len(), 2);
+}
+
+// --- quota-lifecycle read and create shapes ---------------------------------
+
+fn spec() -> QuotaSpec {
+    QuotaSpec {
+        tenant_id: TenantId::new(Uuid::from_u128(7)),
+        subject: SubjectRef {
+            projection_type: GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"),
+            subject_id: "u1".to_owned(),
+        },
+        metric: MetricId::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1")
+            .expect("metric"),
+        quota_type: QuotaType::Consumption,
+        period: Some(PeriodType::Month),
+        enforcement_mode: EnforcementMode::Hard,
+        cap: Some(10),
+        notification_thresholds: vec![50, 90],
+        validity_window: None,
+        fail_open_hint: false,
+        metadata: serde_json::Map::new(),
+        source: QuotaSource::Operator,
+    }
+}
+
+fn contract() -> ContractRef {
+    ContractRef {
+        type_id: GtsTypeId::new(
+            "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~",
+        ),
+        version: 1,
+    }
+}
+
+fn stored(spec: QuotaSpec, window: Option<ValidityWindow>) -> Quota {
+    let draft = QuotaDraft::from_spec(spec, contract());
+    Quota {
+        id: QuotaId::new(Uuid::from_u128(1)),
+        tenant_id: draft.tenant_id,
+        subject: draft.subject,
+        metric: draft.metric,
+        quota_type: draft.quota_type,
+        period: draft.period,
+        enforcement_mode: draft.enforcement_mode,
+        cap: draft.cap,
+        notification_thresholds: draft.notification_thresholds,
+        validity_window: window,
+        fail_open_hint: draft.fail_open_hint,
+        metadata: draft.metadata,
+        source: draft.source,
+        status: QuotaStatus::Active,
+        constraint_contract: draft.constraint_contract,
+        record_version: 1,
+        created_at: ts(0),
+        updated_at: ts(0),
+    }
+}
+
+#[test]
+fn quota_view_is_computed_for_one_instant_and_flattens_the_record() {
+    let window = ValidityWindow {
+        start: Some(ts(100)),
+        end: Some(ts(200)),
+    };
+    let quota = stored(spec(), Some(window));
+    let inside = QuotaView::compute(quota.clone(), Some(MetricKind::Counter), ts(150));
+    assert!(inside.currently_within_window);
+    assert_eq!(inside.metric_kind, Some(MetricKind::Counter));
+    let after = QuotaView::compute(quota.clone(), None, ts(201));
+    assert!(
+        !after.currently_within_window,
+        "past the end, status untouched"
+    );
+    assert_eq!(after.quota.status, QuotaStatus::Active);
+    let unbounded = QuotaView::compute(stored(spec(), None), Some(MetricKind::Gauge), ts(0));
+    assert!(unbounded.currently_within_window);
+
+    let value = serde_json::to_value(&inside).expect("serialize");
+    assert_eq!(
+        value["id"],
+        json!(quota.id.to_string()),
+        "record fields are flattened"
+    );
+    assert_eq!(value["currently_within_window"], json!(true));
+    assert_eq!(value["metric_kind"], json!("counter"));
+    let back: QuotaView = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back, inside);
+}
+
+#[test]
+fn metric_kind_is_closed_and_snake_case() {
+    assert_eq!(
+        serde_json::to_value(MetricKind::Gauge).expect("serialize"),
+        json!("gauge")
+    );
+    assert_eq!(
+        serde_json::from_value::<MetricKind>(json!("counter")).expect("counter"),
+        MetricKind::Counter
+    );
+    assert!(serde_json::from_value::<MetricKind>(json!("histogram")).is_err());
+}
+
+#[test]
+fn quota_spec_has_no_contract_field_and_becomes_a_draft_with_one() {
+    let spec = spec();
+    let value = serde_json::to_value(&spec).expect("serialize");
+    assert!(value.get("constraint_contract").is_none());
+    let mut with_contract = value;
+    with_contract["constraint_contract"] = json!({ "type_id": "x", "version": 1 });
+    assert!(
+        serde_json::from_value::<QuotaSpec>(with_contract).is_err(),
+        "a caller cannot smuggle the contract in"
+    );
+    let draft = QuotaDraft::from_spec(spec.clone(), contract());
+    assert_eq!(draft.constraint_contract, contract());
+    assert_eq!(draft.metric, spec.metric);
+    assert_eq!(draft.notification_thresholds, vec![50, 90]);
+}
+
+#[test]
+fn max_cap_is_the_largest_signed_64_bit_value() {
+    assert_eq!(Quota::MAX_CAP, 9_223_372_036_854_775_807);
+    assert_eq!(i64::try_from(Quota::MAX_CAP), Ok(i64::MAX));
+}
+
+#[test]
+fn active_quota_counts_default_to_zero_and_round_trip() {
+    let mut counts = ActiveQuotaCounts::default();
+    assert_eq!((counts.cap_zero, counts.cap_unbounded), (0, 0));
+    counts.cap_zero = 2;
+    counts.by_metric.insert(
+        MetricId::parse("gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1")
+            .expect("metric"),
+        3,
+    );
+    let value = serde_json::to_value(&counts).expect("serialize");
+    let back: ActiveQuotaCounts = serde_json::from_value(value).expect("round trip");
+    assert_eq!(back, counts);
+}
+
+#[test]
+fn notification_event_kind_names_equal_their_serialized_form() {
+    for kind in [
+        NotificationEventKind::ThresholdCrossed,
+        NotificationEventKind::PeriodRollover,
+        NotificationEventKind::LeaseAutoReleased,
+        NotificationEventKind::LeaseResolvedByDeactivation,
+        NotificationEventKind::QuotaChanged,
+        NotificationEventKind::QuotaCounterAdjusted,
+        NotificationEventKind::QuotaRollbackApplied,
+        NotificationEventKind::PolicyChanged,
+    ] {
+        assert_eq!(
+            serde_json::to_value(kind).expect("serialize"),
+            json!(kind.as_str())
+        );
+    }
 }

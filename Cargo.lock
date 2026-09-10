@@ -2970,6 +2970,7 @@ name = "cf-gears-quota-enforcement"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "cf-gears-authz-resolver",
@@ -2980,6 +2981,7 @@ dependencies = [
  "cf-gears-standalone-cluster-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
@@ -2992,9 +2994,12 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 
@@ -3003,6 +3008,7 @@ name = "cf-gears-quota-enforcement-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-security",
  "gts",
@@ -3023,17 +3029,22 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "cf-gears-quota-enforcement-sdk",
+ "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-db-macros",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
+ "gts",
  "inventory",
  "sea-orm",
  "sea-orm-migration",
  "serde",
  "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.18",
  "time",
  "tokio",

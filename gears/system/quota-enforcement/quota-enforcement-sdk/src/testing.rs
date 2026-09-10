@@ -28,13 +28,13 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::models::{
-    ApplicableQuotas, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults, ContractRef,
-    DeactivateOutcome, DebitPlan, EnforcementMode, EventId, ExpiredLease, IdempotencyRecord,
-    IdempotencyScope, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId,
-    MutationResult, NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope,
-    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, ProjectionBinding, Quota,
-    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus,
-    QuotaType, SubjectRef, TenantId, ValidityWindowPatch,
+    ActiveQuotaCounts, ApplicableQuotas, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults,
+    ContractRef, DeactivateOutcome, DebitPlan, EnforcementMode, EventId, ExpiredLease,
+    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken,
+    MetricId, MutationResult, NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState,
+    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
+    QuotaSource, QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindowPatch,
 };
 use crate::storage_plugin::{CONTRACT_MAJOR, QuotaEnforcementStoragePluginV1, StorageError};
 
@@ -280,19 +280,20 @@ impl InMemoryStorage {
         Ok(quota)
     }
 
-    fn paginate<T: Clone>(items: &[T], page: &PageRequest) -> PageResult<T> {
-        let start: usize = page
-            .cursor
-            .as_deref()
-            .and_then(|c| c.parse().ok())
-            .unwrap_or(0);
+    /// Offset pagination; the cursor is the decimal offset. A cursor that is
+    /// not one is refused, as a real backend refuses a foreign cursor.
+    fn paginate<T: Clone>(items: &[T], page: &PageRequest) -> Result<PageResult<T>, StorageError> {
+        let start: usize = match page.cursor.as_deref() {
+            None => 0,
+            Some(cursor) => cursor.parse().map_err(|_| StorageError::InvalidCursor)?,
+        };
         let limit = page.limit.max(1) as usize;
         let end = start.saturating_add(limit).min(items.len());
         let next_cursor = (end < items.len()).then(|| end.to_string());
-        PageResult {
+        Ok(PageResult {
             items: items.get(start..end).unwrap_or_default().to_vec(),
             next_cursor,
-        }
+        })
     }
 
     fn snapshot(st: &StorageState, quota: &Quota) -> QuotaSnapshot {
@@ -370,6 +371,25 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             .collect())
     }
 
+    async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StorageError> {
+        let st = self.state.lock();
+        Self::check(&st)?;
+        let mut counts = ActiveQuotaCounts::default();
+        for quota in st
+            .quotas
+            .values()
+            .filter(|quota| quota.status == QuotaStatus::Active)
+        {
+            match quota.cap {
+                Some(0) => counts.cap_zero += 1,
+                None => counts.cap_unbounded += 1,
+                Some(_) => {}
+            }
+            *counts.by_metric.entry(quota.metric.clone()).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
+
     async fn create_quota(
         &self,
         _ctx: &SecurityContext,
@@ -404,7 +424,17 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 updated_at: now,
             },
         );
-        Self::push_events(&mut st, events);
+        let events: Vec<NotificationEvent> = events
+            .iter()
+            .cloned()
+            .map(|mut event| {
+                if event.quota_id.is_none() {
+                    event.quota_id = Some(id);
+                }
+                event
+            })
+            .collect();
+        Self::push_events(&mut st, &events);
         Ok(id)
     }
 
@@ -418,19 +448,33 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<Quota, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
+        Self::active_quota(&st, quota_id)?;
         let consumed = st.consumed.get(&quota_id).copied().unwrap_or(0);
         let quota = st
             .quotas
             .get_mut(&quota_id)
             .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
-        if let Some(cap) = patch.cap {
-            match cap {
-                CapPatch::Bounded(new_cap) if new_cap < consumed => {
-                    return Err(StorageError::CapBelowConsumed { new_cap, consumed });
-                }
-                CapPatch::Bounded(new_cap) => quota.cap = Some(new_cap),
-                CapPatch::Unbounded => quota.cap = None,
-            }
+        // I6 and I14 are decided on the merged row before anything changes.
+        let merged_cap = match patch.cap {
+            Some(CapPatch::Bounded(new_cap)) => Some(new_cap),
+            Some(CapPatch::Unbounded) => None,
+            None => quota.cap,
+        };
+        if let Some(new_cap) = merged_cap
+            && patch.cap.is_some()
+            && new_cap < consumed
+        {
+            return Err(StorageError::CapBelowConsumed { new_cap, consumed });
+        }
+        let merged_thresholds_present = patch
+            .notification_thresholds
+            .as_ref()
+            .map_or(!quota.notification_thresholds.is_empty(), |t| !t.is_empty());
+        if merged_cap.is_none() && merged_thresholds_present {
+            return Err(StorageError::ThresholdsRequireBoundedCap);
+        }
+        if patch.cap.is_some() {
+            quota.cap = merged_cap;
         }
         if let Some(thresholds) = patch.notification_thresholds {
             quota.notification_thresholds = thresholds;
@@ -442,7 +486,13 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             };
         }
         if let Some(metadata) = patch.metadata {
+            let contract = patch.constraint_contract.ok_or_else(|| {
+                StorageError::Internal(
+                    "metadata patch without the contract it was validated against".to_owned(),
+                )
+            })?;
             quota.metadata = metadata;
+            quota.constraint_contract = contract;
         }
         if let Some(mode) = patch.enforcement_mode {
             quota.enforcement_mode = mode;
@@ -466,20 +516,32 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<DeactivateOutcome, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
+        Self::active_quota(&st, quota_id)?;
+        let now = OffsetDateTime::now_utc();
         let quota = st
             .quotas
             .get_mut(&quota_id)
             .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
         quota.status = QuotaStatus::Deactivated;
         quota.record_version += 1;
+        quota.updated_at = now;
+        // The cascade: every live lease holding this Quota is resolved and its
+        // held capacity returned. Expired leases are already released (I4).
         let mut resolved = Vec::new();
+        let mut returned: Vec<LeaseHold> = Vec::new();
         for (token, lease) in &mut st.leases {
             if lease.state == LeaseState::Active
+                && lease.expires_at > now
                 && lease.holds.iter().any(|h| h.quota_id == quota_id)
             {
                 lease.state = LeaseState::ResolvedByDeactivation;
                 resolved.push(*token);
+                returned.extend(lease.holds.iter().cloned());
             }
+        }
+        for hold in &returned {
+            let counter = st.consumed.entry(hold.quota_id).or_insert(0);
+            *counter = counter.saturating_sub(hold.held_amount);
         }
         Self::push_events(&mut st, events);
         Ok(DeactivateOutcome {
@@ -506,7 +568,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             .filter(|q| filter.ids.is_empty() || filter.ids.contains(&q.id))
             .cloned()
             .collect();
-        Ok(Self::paginate(&items, &page))
+        Self::paginate(&items, &page)
     }
 
     async fn apply_debit_plan(
@@ -815,7 +877,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             .filter(|q| pairs.iter().any(|a| Self::matches(q, a)))
             .map(|q| Self::snapshot(&st, q))
             .collect();
-        Ok(Self::paginate(&items, &page))
+        Self::paginate(&items, &page)
     }
 
     async fn create_policy(
@@ -1014,7 +1076,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Self::paginate(&items, &page))
+        Self::paginate(&items, &page)
     }
 
     async fn lookup_idempotency(

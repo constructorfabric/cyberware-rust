@@ -40,6 +40,8 @@ inventory = { workspace = true }
 
 # `AccessScope` and `SecurityContext` on the plugin contract signatures.
 toolkit-security = { workspace = true }
+# `QuotaEnforcementError` is the platform canonical error (DESIGN section 3.3).
+toolkit-canonical-errors = { workspace = true }
 
 parking_lot = { workspace = true, optional = true }
 

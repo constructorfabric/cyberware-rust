@@ -19,16 +19,17 @@ use crate::domain::error::{Dependency, DomainError};
 use crate::domain::plugins::PluginBinding;
 use crate::domain::ports::contracts::ContractRegistry;
 use crate::domain::ports::coordination::SingletonScope;
+use crate::domain::ports::metric_registry::MetricRegistry;
 use crate::domain::ports::metrics::{ValidationReason, ValidationSurface};
 use crate::domain::readiness::{Readiness, ReadinessState};
 use crate::infra::pdp_probe::PdpReachability;
 use crate::infra::types_registry::TypesRegistryContracts;
 use crate::test_support::{
-    DenyAllPdp, FailingPdp, FakeContractRegistry, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION,
-    LLM_TOKEN_CONSTRAINT, LLM_TOKEN_REQUEST, LLM_USER_PROJECTION, METRIC_OTHER, METRIC_TOKENS,
-    PermitTenantsPdp, RecordingMetrics, StaticCoordinatorBinding, ctx, hub_with, idle_work,
-    in_process_registry, llm_gateway_documents, metric_base_documents, register_storage,
-    storage_instance, tenant,
+    DenyAllPdp, FailingPdp, FakeContractRegistry, FakeMetricRegistry, LLM_MODEL_RESOURCE,
+    LLM_TENANT_PROJECTION, LLM_TOKEN_CONSTRAINT, LLM_TOKEN_REQUEST, LLM_USER_PROJECTION,
+    METRIC_OTHER, METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, StaticCoordinatorBinding, ctx,
+    hub_with, idle_work, in_process_registry, llm_gateway_documents, metric_base_documents,
+    register_storage, storage_instance, tenant,
 };
 
 fn type_id(raw: &str) -> GtsTypeId {
@@ -48,6 +49,7 @@ struct Harness {
     coordinator: Arc<StaticCoordinatorBinding>,
     pdp: Arc<dyn AuthZResolverApi>,
     registry: Arc<dyn ContractRegistry>,
+    metric_registry: Arc<FakeMetricRegistry>,
     config: CatalogConfig,
     metrics: Arc<RecordingMetrics>,
     readiness: Arc<Readiness>,
@@ -88,6 +90,7 @@ fn harness_with_registry(
         coordinator: StaticCoordinatorBinding::ok(),
         pdp,
         registry,
+        metric_registry: Arc::new(FakeMetricRegistry::classified()),
         config: llm_config(),
         metrics: Arc::new(RecordingMetrics::default()),
         readiness: Arc::new(Readiness::new()),
@@ -103,6 +106,7 @@ fn bootstrap(h: &Harness) -> Bootstrap {
             registry: h.registry.clone(),
             config: h.config.clone(),
         },
+        h.metric_registry.clone() as Arc<dyn MetricRegistry>,
         h.metrics.clone(),
         h.readiness.clone(),
     )
@@ -404,6 +408,65 @@ async fn a_compatible_active_quota_passes_the_compatibility_check() {
         .await
         .expect("the catalogue admits the binding");
     assert!(h.readiness.is_ready());
+}
+
+#[tokio::test]
+async fn an_active_quota_on_a_removed_metric_is_flagged_and_bootstrap_completes() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let mut stranded = quota_draft(
+        SubjectRef {
+            projection_type: type_id(LLM_USER_PROJECTION),
+            subject_id: "u-1".to_owned(),
+        },
+        Some(5),
+    );
+    stranded.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
+    storage
+        .create_quota(&ctx(), &AccessScope::allow_all(), stranded, &[])
+        .await
+        .expect("seeded");
+    let h = harness(storage, true, permitting_pdp());
+    h.metric_registry.remove(METRIC_TOKENS);
+    bootstrap(&h)
+        .run()
+        .await
+        .expect("a removed metric is flagged, never fatal");
+    assert!(h.readiness.is_ready());
+    assert_eq!(
+        h.metric_registry.calls(),
+        1,
+        "each distinct bound metric is looked up once"
+    );
+}
+
+#[tokio::test]
+async fn a_registry_that_does_not_answer_the_metric_scan_fails_on_the_registry_dependency() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let mut bound_quota = quota_draft(
+        SubjectRef {
+            projection_type: type_id(LLM_USER_PROJECTION),
+            subject_id: "u-1".to_owned(),
+        },
+        Some(5),
+    );
+    bound_quota.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
+    storage
+        .create_quota(&ctx(), &AccessScope::allow_all(), bound_quota, &[])
+        .await
+        .expect("seeded");
+    let h = harness(storage, true, permitting_pdp());
+    h.metric_registry.fail_all();
+    let err = bootstrap(&h).run().await.err().expect("registry outage");
+    assert!(
+        matches!(err, DomainError::TypesRegistryUnavailable(_)),
+        "{err:?}"
+    );
+    failed_on(&h, Dependency::TypesRegistry);
+    assert_eq!(
+        h.coordinator.calls(),
+        0,
+        "the cluster resolve never ran after the failed scan"
+    );
 }
 
 /// The mandatory real-registry test: registration, discovery, resolution,

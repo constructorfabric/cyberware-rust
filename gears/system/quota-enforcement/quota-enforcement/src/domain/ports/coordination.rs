@@ -1,9 +1,9 @@
 //! Output port for singleton coordination (DESIGN section 3.3, "Cluster
 //! Coordination").
 //!
-//! The two sweepers run as cluster-wide singletons. The platform `cluster`
-//! gear elects the replica that runs each of them; this port is the domain's
-//! view of that election. Its only implementation is the `CoordinationAdapter`
+//! The two sweepers and the lifecycle-gauge refresh run as cluster-wide
+//! singletons. The platform `cluster` gear elects the replica that runs each
+//! of them; this port is the domain's view of that election. Its only implementation is the `CoordinationAdapter`
 //! in `infra::cluster_coordination` (ADR-0006). The port exists for the
 //! domain-layer dependency rule; it is not a plugin extension point.
 
@@ -27,11 +27,18 @@ pub enum SingletonScope {
     LeaseSweeper,
     /// Idempotency-record and operation-log retention.
     RetentionSweeper,
+    /// Storage-backed refresh of the lifecycle gauges (quota-lifecycle
+    /// feature). Leader-only, so identical global counts are never summed.
+    LifecycleGauges,
 }
 
 impl SingletonScope {
     /// Every scope.
-    pub const ALL: [Self; 2] = [Self::LeaseSweeper, Self::RetentionSweeper];
+    pub const ALL: [Self; 3] = [
+        Self::LeaseSweeper,
+        Self::RetentionSweeper,
+        Self::LifecycleGauges,
+    ];
 
     /// The election name of the scope, under the gear's scope prefix.
     #[must_use]
@@ -39,6 +46,7 @@ impl SingletonScope {
         match self {
             Self::LeaseSweeper => "lease-sweeper",
             Self::RetentionSweeper => "retention-sweeper",
+            Self::LifecycleGauges => "lifecycle-gauges",
         }
     }
 }

@@ -6,14 +6,25 @@ use opentelemetry::metrics::MeterProvider;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
 
+use std::sync::Arc;
+
 use super::{
     ADMITTED_METRIC_VIOLATIONS_TOTAL, CONTRACT_VALIDATION_FAILURES_TOTAL, DENIAL_TOTAL,
     QeMetricsMeter, build_default_adapter,
 };
 use crate::config::MetricsConfig;
+use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink};
 use crate::domain::ports::metrics::{
     DenialReason, QeMetrics, REASON_LABEL, SURFACE_LABEL, ValidationReason, ValidationSurface,
 };
+use crate::infra::lifecycle_gauges::{
+    LifecycleGaugeCell, QUOTA_CAP_UNBOUNDED_TOTAL, QUOTA_CAP_ZERO_TOTAL,
+    QUOTA_FOR_DIRECT_METRIC_TOTAL,
+};
+
+fn cell() -> Arc<LifecycleGaugeCell> {
+    Arc::new(LifecycleGaugeCell::default())
+}
 
 fn local_provider() -> (SdkMeterProvider, InMemoryMetricExporter) {
     let exporter = InMemoryMetricExporter::default();
@@ -63,6 +74,7 @@ fn denial_total_is_rendered_under_the_catalogue_name_with_the_reason_label() {
     let meter = QeMetricsMeter::new(
         &provider.meter("quota-enforcement"),
         &MetricsConfig::default(),
+        cell(),
     );
 
     meter.record_denial(DenialReason::PermissionDenied);
@@ -100,7 +112,7 @@ fn a_configured_prefix_namespaces_the_instrument() {
     let config = MetricsConfig {
         prefix: "qe".to_owned(),
     };
-    let meter = QeMetricsMeter::new(&provider.meter("quota-enforcement"), &config);
+    let meter = QeMetricsMeter::new(&provider.meter("quota-enforcement"), &config, cell());
     meter.record_denial(DenialReason::InvalidArgument);
     provider.force_flush().expect("flush");
     assert_eq!(counter_sum(&exporter, "qe_denial_total", None), Some(1));
@@ -117,6 +129,7 @@ fn contract_validation_counters_render_with_their_closed_labels() {
     let meter = QeMetricsMeter::new(
         &provider.meter("quota-enforcement"),
         &MetricsConfig::default(),
+        cell(),
     );
 
     meter.record_contract_validation_failure(
@@ -204,6 +217,92 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
 
 #[test]
 fn the_default_adapter_builds_on_the_global_provider_without_panicking() {
-    let adapter = build_default_adapter(&MetricsConfig::default());
+    let adapter = build_default_adapter(&MetricsConfig::default(), cell());
     adapter.record_denial(DenialReason::NotReady);
+}
+
+/// Last value of the `u64` gauge named `name` in the most recent export, if
+/// it carries a data point.
+fn gauge_last_u64(exporter: &InMemoryMetricExporter, name: &str) -> Option<u64> {
+    let metrics = exporter.get_finished_metrics().expect("finished metrics");
+    let mut last = None;
+    for rm in &metrics {
+        for sm in rm.scope_metrics() {
+            for metric in sm.metrics() {
+                if metric.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Gauge(gauge)) = metric.data()
+                {
+                    last = gauge
+                        .data_points()
+                        .next()
+                        .map(opentelemetry_sdk::metrics::data::GaugeDataPoint::value);
+                }
+            }
+        }
+    }
+    last
+}
+
+#[test]
+fn lifecycle_gauges_observe_the_published_sample_and_nothing_when_withdrawn() {
+    let (provider, exporter) = local_provider();
+    let cell = cell();
+    let _meter = QeMetricsMeter::new(
+        &provider.meter("quota-enforcement"),
+        &MetricsConfig::default(),
+        cell.clone(),
+    );
+
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        gauge_last_u64(&exporter, QUOTA_CAP_ZERO_TOTAL),
+        None,
+        "no sample, no data point"
+    );
+
+    cell.publish(Some(LifecycleCounts {
+        cap_zero: 2,
+        cap_unbounded: 5,
+        for_direct_metric: 1,
+    }));
+    provider.force_flush().expect("flush");
+    assert_eq!(gauge_last_u64(&exporter, QUOTA_CAP_ZERO_TOTAL), Some(2));
+    assert_eq!(
+        gauge_last_u64(&exporter, QUOTA_CAP_UNBOUNDED_TOTAL),
+        Some(5)
+    );
+    assert_eq!(
+        gauge_last_u64(&exporter, QUOTA_FOR_DIRECT_METRIC_TOTAL),
+        Some(1)
+    );
+
+    cell.publish(None);
+    exporter.reset();
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        gauge_last_u64(&exporter, QUOTA_CAP_ZERO_TOTAL),
+        None,
+        "a withdrawn sample is absent, never zero"
+    );
+}
+
+#[test]
+fn lifecycle_gauges_honour_the_configured_prefix() {
+    let (provider, exporter) = local_provider();
+    let cell = cell();
+    let config = MetricsConfig {
+        prefix: "qe".to_owned(),
+    };
+    let _meter = QeMetricsMeter::new(&provider.meter("quota-enforcement"), &config, cell.clone());
+    cell.publish(Some(LifecycleCounts {
+        cap_zero: 1,
+        cap_unbounded: 0,
+        for_direct_metric: 0,
+    }));
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        gauge_last_u64(&exporter, "qe_quota_cap_zero_total"),
+        Some(1)
+    );
+    assert_eq!(gauge_last_u64(&exporter, QUOTA_CAP_ZERO_TOTAL), None);
 }

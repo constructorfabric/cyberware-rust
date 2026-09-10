@@ -12,6 +12,7 @@ use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
 
 use super::ports::metrics::ValidationReason;
+use super::tokens;
 
 /// Which plugin family a binding error is about.
 ///
@@ -279,6 +280,37 @@ pub enum DomainError {
         projection: String,
     },
 
+    // --- quota lifecycle, decided before storage ---
+    /// A reserved capability: the `rate` quota type in P1.
+    #[error("{feature} is not yet implemented")]
+    NotYetImplemented {
+        /// The reserved capability.
+        feature: &'static str,
+    },
+    /// A negative cap. Caps live in `0..=i64::MAX`; `0` and unbounded are valid.
+    #[error("cap {cap} is negative")]
+    CapMustBeNonNegative {
+        /// The requested cap.
+        cap: i64,
+    },
+    /// Notification thresholds on an unbounded cap: percentages of nothing.
+    /// Raised by the gear's pre-check and by storage on the merged row (I14).
+    #[error("notification thresholds require a bounded cap")]
+    ThresholdsRequireBoundedCap,
+    /// Quota metadata violates the metric owner's constraint contract.
+    #[error("metadata violates constraint contract {contract}")]
+    ConstraintContractMismatch {
+        /// The constraint contract type.
+        contract: String,
+    },
+    /// The metric is registered but its instance carries no usable
+    /// classification (kind and enforcement mode). Never defaulted.
+    #[error("metric {metric} carries no usable classification")]
+    MetricClassificationInvalid {
+        /// The metric.
+        metric: String,
+    },
+
     /// Last-resort opaque failure. Never carries caller-facing detail.
     #[error("internal error: {0}")]
     Internal(String),
@@ -354,6 +386,7 @@ impl From<StorageError> for DomainError {
             StorageError::CapBelowConsumed { new_cap, consumed } => {
                 Self::CapBelowConsumed { new_cap, consumed }
             }
+            StorageError::ThresholdsRequireBoundedCap => Self::ThresholdsRequireBoundedCap,
             StorageError::QuotaNotFound { id } => Self::NotFound {
                 kind: ResourceKind::Quota,
                 id: id.to_string(),
@@ -368,6 +401,10 @@ impl From<StorageError> for DomainError {
             // Storage-layer defense in depth caught what the PDP should have.
             StorageError::SubjectOutOfScope => Self::PdpDenied {
                 reason: Some(Self::SUBJECT_OUT_OF_SCOPE.to_owned()),
+            },
+            StorageError::InvalidCursor => Self::InvalidArgument {
+                field: "cursor",
+                reason: tokens::CURSOR_INVALID,
             },
             StorageError::Unavailable(detail) => Self::BackendUnavailable(detail),
             // Detected at bootstrap and fatal there. A runtime occurrence is a

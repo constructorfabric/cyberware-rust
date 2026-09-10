@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use super::StoragePluginGear;
 use crate::infra::storage::Migrator;
+use crate::test_support::{draft, tenant};
 
 struct StaticConfigProvider {
     root: serde_json::Value,
@@ -64,6 +65,42 @@ async fn init_binds_the_plugin_to_the_database_and_bootstrap_works_through_it() 
         .await
         .expect("bootstrap through the bound plugin");
     assert_eq!(report.inserted, 3);
+
+    // The Quota store is wired over the gear's late-bound outbox: until the
+    // dispatcher binds it, a mutation rolls back as unavailable and nothing
+    // is written, while reads answer.
+    assert!(!gear.notification_outbox().is_bound());
+    let err = plugin
+        .create_quota(
+            &security_ctx(),
+            &toolkit_security::AccessScope::for_tenant(tenant().as_uuid()),
+            draft(tenant(), "u1", Some(1)),
+            &[],
+        )
+        .await
+        .expect_err("outbox unbound");
+    assert!(
+        matches!(err, quota_enforcement_sdk::StorageError::Unavailable(_)),
+        "{err:?}"
+    );
+    let page = plugin
+        .read_quotas(
+            &security_ctx(),
+            &toolkit_security::AccessScope::allow_all(),
+            quota_enforcement_sdk::QuotaFilter::default(),
+            quota_enforcement_sdk::PageRequest::default(),
+        )
+        .await
+        .expect("reads need no outbox");
+    assert!(page.items.is_empty());
+}
+
+fn security_ctx() -> toolkit_security::SecurityContext {
+    toolkit_security::SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0x5eed))
+        .subject_tenant_id(tenant().as_uuid())
+        .build()
+        .expect("security context")
 }
 
 #[tokio::test]

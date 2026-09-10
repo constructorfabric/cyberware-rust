@@ -6,8 +6,10 @@
 //! names it, and returns an error so the runtime never marks the gear ready.
 //! The projection-contracts feature adds the QE-owned GTS registration, the
 //! catalogue consistency set, and the compatibility check against active
-//! Quotas (`features/projection-contracts.md`). Later features extend
-//! [`Bootstrap::run`] with their own steps.
+//! Quotas (`features/projection-contracts.md`). The quota-lifecycle feature
+//! adds the removed-metric scan over the bound metrics and binds the registries
+//! the write path needs. Later features extend [`Bootstrap::run`] with their
+//! own steps.
 
 use std::sync::Arc;
 
@@ -21,6 +23,7 @@ use super::error::{Dependency, DomainError};
 use super::plugins::PluginBinding;
 use super::ports::contracts::ContractRegistry;
 use super::ports::coordination::{CoordinatorBinding, SingletonCoordinator};
+use super::ports::metric_registry::MetricRegistry;
 use super::ports::metrics::QeMetrics;
 use super::ports::pdp::PdpProbe;
 use super::readiness::Readiness;
@@ -37,6 +40,10 @@ pub struct Bound {
     pub coordinator: Arc<dyn SingletonCoordinator>,
     /// The published projection contract catalogue. Immutable for the process.
     pub catalog: Arc<ProjectionContractCatalog>,
+    /// The contract registry the write path snapshots projections from.
+    pub registry: Arc<dyn ContractRegistry>,
+    /// The metric identity and classification registry.
+    pub metric_registry: Arc<dyn MetricRegistry>,
 }
 
 /// The registry the catalogue is built from and the projections to build it
@@ -56,6 +63,7 @@ pub struct Bootstrap {
     coordinator: Arc<dyn CoordinatorBinding>,
     pdp: Arc<dyn PdpProbe>,
     catalog: CatalogBinding,
+    metric_registry: Arc<dyn MetricRegistry>,
     metrics: Arc<dyn QeMetrics>,
     readiness: Arc<Readiness>,
 }
@@ -68,6 +76,7 @@ impl Bootstrap {
         coordinator: Arc<dyn CoordinatorBinding>,
         pdp: Arc<dyn PdpProbe>,
         catalog: CatalogBinding,
+        metric_registry: Arc<dyn MetricRegistry>,
         metrics: Arc<dyn QeMetrics>,
         readiness: Arc<Readiness>,
     ) -> Self {
@@ -76,6 +85,7 @@ impl Bootstrap {
             coordinator,
             pdp,
             catalog,
+            metric_registry,
             metrics,
             readiness,
         }
@@ -165,6 +175,28 @@ impl Bootstrap {
             .map_err(|e| (Dependency::Catalog, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
 
+        // A persisted Quota whose metric was later removed from the registry is
+        // flagged, never deactivated: every distinct bound metric is looked up
+        // once, a registry that does not answer fails readiness.
+        let mut seen = std::collections::HashSet::new();
+        for metric in bindings.iter().map(|b| &b.metric) {
+            if !seen.insert(metric.clone()) {
+                continue;
+            }
+            let described = self
+                .metric_registry
+                .describe(metric)
+                .await
+                .map_err(|e| (Dependency::TypesRegistry, e))?;
+            if described.is_none() {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    metric = %metric,
+                    "active Quotas reference a metric the types registry no longer knows"
+                );
+            }
+        }
+
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
         // The cluster resolver validates the operator's binding of the
         // `quota-enforcement` profile: an unbound profile or a backend without a
@@ -187,6 +219,8 @@ impl Bootstrap {
             storage,
             coordinator,
             catalog: Arc::new(catalog),
+            registry: self.catalog.registry.clone(),
+            metric_registry: self.metric_registry.clone(),
         })
     }
 }

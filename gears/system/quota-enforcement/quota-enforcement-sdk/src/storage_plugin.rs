@@ -39,6 +39,12 @@
 //!   [`StorageError::SchemaVersionMismatch`].
 //! - **I13 Threshold-marker reset.** A newly materialized period row has a
 //!   `NULL` highest-crossed-threshold marker.
+//! - **I14 Thresholds need a bounded cap.** `update_quota` returns
+//!   [`StorageError::ThresholdsRequireBoundedCap`] when the merged row would
+//!   carry notification thresholds with an unbounded cap, checked in the
+//!   transaction under the same row lock as I6. The gear pre-validates the
+//!   rule against the row it read, but two concurrent patches can each pass
+//!   that check; storage is authoritative.
 //!
 //! Every tenant-scoped call receives the caller's [`AccessScope`] unmodified
 //! and binds it through `SecureConn`. No scoped operation runs without it.
@@ -51,11 +57,11 @@ use time::OffsetDateTime;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::models::{
-    ApplicableQuotas, BatchDebitItem, BootstrapBundle, ConfigDefaults, DeactivateOutcome,
-    DebitPlan, ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken,
-    MutationResult, NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope,
-    PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft,
-    QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
+    ActiveQuotaCounts, ApplicableQuotas, BatchDebitItem, BootstrapBundle, ConfigDefaults,
+    DeactivateOutcome, DebitPlan, ExpiredLease, IdempotencyRecord, IdempotencyScope,
+    IdempotencyWrite, LeaseToken, MutationResult, NotificationEvent, PageRequest, PageResult,
+    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
+    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
 };
 
 /// Major version of this contract. Coupled to the gear's major version. A
@@ -156,6 +162,10 @@ pub enum StorageError {
         /// The identifier.
         id: QuotaId,
     },
+    /// The merged row would carry notification thresholds with an unbounded
+    /// cap (I14).
+    #[error("notification thresholds require a bounded cap")]
+    ThresholdsRequireBoundedCap,
     /// The target period is closed.
     #[error("the target period is closed")]
     PeriodClosed,
@@ -184,6 +194,12 @@ pub enum StorageError {
     /// A subject outside the authorized scope reached storage.
     #[error("subject is outside the authorized scope")]
     SubjectOutOfScope,
+
+    // --- caller input ---
+    /// The continuation cursor of a page request does not decode. Cursors are
+    /// opaque to callers, so this is caller input, not a backend failure.
+    #[error("malformed continuation cursor")]
+    InvalidCursor,
 
     // --- operational ---
     /// Transport or backend reachability failure.
@@ -239,9 +255,32 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         &self,
     ) -> Result<HashSet<ProjectionBinding>, StorageError>;
 
+    /// Counts of active Quotas behind the lifecycle gauges: `cap = 0`,
+    /// unbounded cap, and per metric (quota-lifecycle feature).
+    ///
+    /// Platform-plane and caller-less like
+    /// [`Self::read_active_projection_bindings`], read periodically by the
+    /// elected replica's gauge refresh and never on a request path. Only
+    /// lifecycle status `active` counts, whatever the validity window.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StorageError>;
+
     // --- quota CRUD ---
 
-    /// Persist a new Quota and enqueue `events` in the same transaction.
+    /// Persist a new Quota and enqueue `events` in the same transaction (I1,
+    /// I11). The row starts `active` with `record_version = 1`. An event
+    /// whose `quota_id` is `None` receives the assigned id, since the caller
+    /// cannot know it before the call. The draft's `tenant_id` must lie inside
+    /// `scope`.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::SubjectOutOfScope`] when the draft's tenant is outside
+    ///   `scope`.
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn create_quota(
         &self,
         ctx: &SecurityContext,
@@ -250,7 +289,23 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         events: &[NotificationEvent],
     ) -> Result<QuotaId, StorageError>;
 
-    /// Apply `patch` under a row lock. Enforces I6.
+    /// Apply `patch` under a row lock and return the committed row (I1, I6,
+    /// I11, I14). Every accepted patch increments `record_version` once and
+    /// sets `updated_at`. A `metadata` patch carries the contract it was
+    /// validated against in `constraint_contract`; both are written together.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::Internal`] for a `metadata` patch without its
+    ///   `constraint_contract`.
+    /// - [`StorageError::QuotaNotFound`] when no row with this id lies inside
+    ///   `scope`.
+    /// - [`StorageError::QuotaDeactivated`] when the row is deactivated;
+    ///   nothing is written.
+    /// - [`StorageError::CapBelowConsumed`] (I6) and
+    ///   [`StorageError::ThresholdsRequireBoundedCap`] (I14), both evaluated on
+    ///   the merged row inside the transaction.
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn update_quota(
         &self,
         ctx: &SecurityContext,
@@ -260,7 +315,19 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         events: &[NotificationEvent],
     ) -> Result<Quota, StorageError>;
 
-    /// Deactivate a Quota and resolve its active leases atomically.
+    /// Deactivate a Quota and resolve its active leases atomically (I1, I11).
+    /// The plugin constructs and enqueues one `lease-resolved-by-deactivation`
+    /// event per resolved lease itself; callers pass only the `quota-changed`
+    /// event, since only the transaction knows the leases. Leases past their
+    /// expiry are already released (I4) and are not resolved again.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::QuotaNotFound`] when no row with this id lies inside
+    ///   `scope`.
+    /// - [`StorageError::QuotaDeactivated`] when the row is already
+    ///   deactivated; no second cascade runs and nothing is written.
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn deactivate_quota(
         &self,
         ctx: &SecurityContext,
@@ -269,7 +336,17 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         events: &[NotificationEvent],
     ) -> Result<DeactivateOutcome, StorageError>;
 
-    /// Read Quotas within the caller's scope.
+    /// Read Quotas within the caller's scope, ordered by `quota_id` ascending
+    /// (`UUIDv7`, creation order). The cursor is opaque and carries position
+    /// only: tenant and PDP scope are re-applied on every page, so a cursor
+    /// never grants access. `page.limit` may be clamped to the plugin's
+    /// maximum. Deactivated Quotas remain readable.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::InvalidCursor`] for a malformed `page.cursor`.
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    /// - [`StorageError::Internal`] for an over-long `filter.ids`.
     async fn read_quotas(
         &self,
         ctx: &SecurityContext,

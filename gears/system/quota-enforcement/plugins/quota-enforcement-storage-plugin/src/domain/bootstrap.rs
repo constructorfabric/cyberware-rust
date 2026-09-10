@@ -8,29 +8,31 @@
 //!
 //! The `QuotaEnforcementStoragePluginV1` implementation is wired only once
 //! every primitive the trait names exists. Until then this type is reached by
-//! the plugin gear and by tests only.
+//! the plugin gear and by tests only. The Quota primitives it forwards live in
+//! `domain::quotas`.
 
 use std::sync::Arc;
 
 use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, StorageError};
 use toolkit_macros::domain_model;
 
-use super::ports::{FoundationStore, SeedReport, StoreError};
+use super::ports::{FoundationStore, QuotaStore, SeedReport, StoreError};
 
 const LOG_TARGET: &str = "qe.storage";
 
-/// Storage plugin over its foundation store.
+/// Storage plugin over its foundation and Quota stores.
 #[domain_model]
 #[derive(Clone)]
 pub struct StoragePlugin {
     store: Arc<dyn FoundationStore>,
+    pub(super) quotas: Arc<dyn QuotaStore>,
 }
 
 impl StoragePlugin {
-    /// Bind the plugin to a store.
+    /// Bind the plugin to its stores.
     #[must_use]
-    pub fn new(store: Arc<dyn FoundationStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<dyn FoundationStore>, quotas: Arc<dyn QuotaStore>) -> Self {
+        Self { store, quotas }
     }
 
     /// Verify the schema major and seed the default configuration rows.
@@ -139,16 +141,32 @@ impl StoragePlugin {
     }
 }
 
-/// Lift of the store port errors onto the contract error.
-trait FromStore {
+/// Lift of the store port errors onto the contract error. The four
+/// quota-lifecycle variants, `SubjectOutOfScope`, and `InvalidCursor` map one
+/// to one; caller input the contract has no variant for (filter bounds), a
+/// patch the gear cannot produce, and every inconsistency are `Internal`, as
+/// the contract documents.
+pub(super) trait FromStore {
     fn from_store(err: StoreError) -> Self;
 }
 
 impl FromStore for StorageError {
     fn from_store(err: StoreError) -> Self {
         match err {
-            StoreError::DefaultOutOfRange { .. } => Self::Internal(err.to_string()),
             StoreError::Unavailable { .. } => Self::Unavailable(err.to_string()),
+            StoreError::QuotaNotFound { id } => Self::QuotaNotFound { id },
+            StoreError::QuotaDeactivated { id } => Self::QuotaDeactivated { id },
+            StoreError::CapBelowConsumed { new_cap, consumed } => {
+                Self::CapBelowConsumed { new_cap, consumed }
+            }
+            StoreError::ThresholdsRequireBoundedCap => Self::ThresholdsRequireBoundedCap,
+            StoreError::SubjectOutOfScope => Self::SubjectOutOfScope,
+            StoreError::InvalidCursor => Self::InvalidCursor,
+            StoreError::DefaultOutOfRange { .. }
+            | StoreError::InvalidPatch { .. }
+            | StoreError::InvalidFilter { .. }
+            | StoreError::ValueOutOfRange { .. }
+            | StoreError::Corrupt { .. } => Self::Internal(err.to_string()),
         }
     }
 }

@@ -1,9 +1,12 @@
 //! Infrastructure adapters: the cluster coordination adapter, the PDP
-//! reachability probe, the projection contract registry, the canonical-error
-//! lift, and the metrics meter.
+//! reachability probe, the projection contract registry, the cached metric
+//! classification registry, the canonical-error lift, the lifecycle-gauge
+//! sample cell, and the metrics meter.
 
 pub mod canonical_mapping;
 pub mod cluster_coordination;
+pub mod lifecycle_gauges;
+pub mod metric_registry;
 pub mod metrics;
 pub mod pdp_probe;
 pub mod types_registry;
@@ -12,6 +15,11 @@ pub use cluster_coordination::{
     ClusterCoordination, ClusterCoordinationBinding, ElectionTiming, QuotaEnforcementProfile,
     SCOPE_PREFIX,
 };
+pub use lifecycle_gauges::{
+    LifecycleGaugeCell, QUOTA_CAP_UNBOUNDED_TOTAL, QUOTA_CAP_ZERO_TOTAL,
+    QUOTA_FOR_DIRECT_METRIC_TOTAL,
+};
+pub use metric_registry::CachedMetricRegistry;
 pub use metrics::{
     ADMITTED_METRIC_VIOLATIONS_TOTAL, CONTRACT_VALIDATION_FAILURES_TOTAL, DENIAL_TOTAL,
     QeMetricsMeter, build_default_adapter,
