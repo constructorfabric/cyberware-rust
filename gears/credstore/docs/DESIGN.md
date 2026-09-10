@@ -326,7 +326,7 @@ graph TB
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-gear`
 
-`credstore` — the stateful gear. Layers: `api/rest` (Axum routes, DTOs with redacted `Debug`, `If-Match` parsing), `domain` (service with get/put/delete sagas — **superseded by ADR-0006, planned**: the value write protocol and delete-and-gc of §6.2/§6.3 — authz scope evaluation, resolver port, metrics port, plugin selector port), `infra` (SecureORM repo, migrations, tenant-resolver adapter with TTL+LRU ancestor cache, GTS plugin selector, OTel metrics, canonical error mapping). Declares `deps = [authz-resolver, tenant-resolver, types-registry]` and capabilities `system, db, rest, stateful`; its lifecycle entry runs the reaper loop (§6.4). **Withdrawn by ADR-0006 (planned)**: no resident reaper loop — the gear's lifecycle entry starts no background timer; the equivalent maintenance work becomes an admin entrypoint of the gear binary (`credstore gc`), invoked by an operator-chosen schedule outside the gear's own lifecycle (§6.4).
+`credstore` — the stateful gear. Layers: `api/rest` (Axum routes, DTOs with redacted `Debug`, `If-Match` parsing), `domain` (service with get/put/delete sagas — **superseded by ADR-0006, planned**: the value write protocol and delete-and-gc of §6.2/§6.3 — authz scope evaluation, resolver port, metrics port, plugin selector port), `infra` (SecureORM repo, migrations, tenant-resolver adapter with TTL+LRU ancestor cache, GTS plugin selector, OTel metrics, canonical error mapping). Declares `deps = [authz-resolver, tenant-resolver, types-registry]` and capabilities `system, db, rest, stateful`; its lifecycle entry runs the reaper loop (§6.4). **Withdrawn by ADR-0006 (planned)**: no resident reaper loop — the gear's lifecycle entry starts no background timer; the equivalent maintenance work becomes an in-process entry point, the SDK trait `CredStoreMaintenanceV1::run_gc` (no REST), invoked by the host on an operator-chosen schedule outside the gear's own lifecycle (§6.4).
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-component-static-plugin`
 
@@ -1018,7 +1018,7 @@ Status-driven saga symmetric to provisioning (statuses ship in `m0001_initial_sc
 
 ### 6.4 Maintenance Job (planned, ADR-0006; shipped reaper below)
 
-**Planned (ADR-0006).** The reaper is withdrawn outright: the gear's lifecycle entry runs no resident loop, no `tick_secs`, no background timer of any kind. Its remaining duties move to a **periodic maintenance job** — an admin entrypoint of the gear binary (e.g. `credstore gc`), invoked by the platform scheduler or a Kubernetes CronJob on an operator-chosen schedule, daily by default, weekly acceptable — outside the request path and outside the gear's own lifecycle. The host that invokes it (cron, platform scheduler) is out of scope for this design; the job's logic is not.
+**Planned (ADR-0006).** The reaper is withdrawn outright: the gear's lifecycle entry runs no resident loop, no `tick_secs`, no background timer of any kind. Its remaining duties move to a **periodic maintenance job** whose entry point is in-process, not REST: the SDK trait `CredStoreMaintenanceV1::run_gc`, registered in `ClientHub` next to `CredStoreClientV1` and resolved by the host — a `gc` subcommand of the application binary run by a Kubernetes CronJob, or a scheduler gear — on an operator-chosen schedule, daily by default, weekly acceptable; outside the request path and outside the gear's own lifecycle. The host that invokes it is out of scope for this design; the job's logic and its contract are not.
 
 The job is idempotent and concurrency-safe (safe to run from multiple replicas, safe to re-run after a partial failure), and processes work in bounded batches (`gc.batch_size`, default 256) until nothing is left:
 
@@ -1039,7 +1039,7 @@ The job is idempotent and concurrency-safe (safe to run from multiple replicas, 
 
 **Retired**: the stuck-`provisioning` sweep, completing a stuck `deprovisioning` saga, and fence backfill for out-of-band seeded rows are no longer duties of anything resident in the gear — none of the states they swept for can exist any more (§6.2, §6.3, §4.10, all shipped/superseded), and the job that takes over the reaper's remaining duties runs outside the gear's lifecycle entirely.
 
-**Config**: the whole `reaper` block is removed (§10), replaced by a `gc` block read by the `credstore gc` entrypoint, not by the gear's own `serve` lifecycle: `gc.pending_max_age_secs` (default 3600 s) and `gc.batch_size` (default 256). **Metrics**: `provisioning_rollback`, `provisioning_reaped`, `deprovisioning_reaped` are removed with the reaper — `provisioning_rollback` has no successor (there is no compensating rollback step left to count); `provisioning_reaped`/`deprovisioning_reaped` are retired along with the statuses they counted, with `gc_pending_reclaimed`/`gc_deleted`/`expired_deleted` above as their nearest counterparts.
+**Config**: the whole `reaper` block is removed (§10), replaced by a `gc` block read by `run_gc` (the `CredStoreMaintenanceV1` entry point), not by the gear's own `serve` lifecycle: `gc.pending_max_age_secs` (default 3600 s) and `gc.batch_size` (default 256). **Metrics**: `provisioning_rollback`, `provisioning_reaped`, `deprovisioning_reaped` are removed with the reaper — `provisioning_rollback` has no successor (there is no compensating rollback step left to count); `provisioning_reaped`/`deprovisioning_reaped` are retired along with the statuses they counted, with `gc_pending_reclaimed`/`gc_deleted`/`expired_deleted` above as their nearest counterparts.
 
 #### Shipped today (withdrawn by ADR-0006)
 
@@ -1197,7 +1197,7 @@ gears:
 
 Config is validated at init (`deny_unknown_fields`; non-empty vendor; all periods > 0); an invalid config fails gear startup.
 
-**Planned (ADR-0006).** The whole `reaper` block above is removed — there is no resident loop left in the gear to configure. It is replaced by a `gc` block read by the maintenance-job entrypoint (`credstore gc`), not by the gear's own `serve` lifecycle:
+**Planned (ADR-0006).** The whole `reaper` block above is removed — there is no resident loop left in the gear to configure. It is replaced by a `gc` block read by the maintenance job's entry point (`CredStoreMaintenanceV1::run_gc`, in-process via `ClientHub`), not by the gear's own `serve` lifecycle:
 
 ```yaml
       gc:
@@ -1208,7 +1208,7 @@ Config is validated at init (`deny_unknown_fields`; non-empty vendor; all period
         # writer's own best-effort cleanup), no deprovisioning status to time out
 ```
 
-The job's own run schedule (daily by default, weekly acceptable) is operator-configured outside the gear — a Kubernetes CronJob or the platform scheduler invoking `credstore gc` — not a `gears.credstore.config` key.
+The job's own run schedule (daily by default, weekly acceptable) is operator-configured outside the gear — a Kubernetes CronJob running the application binary's `gc` subcommand, or a scheduler gear, either of which calls `CredStoreMaintenanceV1::run_gc` — not a `gears.credstore.config` key and not a REST endpoint.
 
 ### Error Mapping
 
