@@ -61,7 +61,7 @@ and its value together; a merge-`PATCH` on the same address edits metadata
 or rotates/removes the value without touching the rest of the record; and
 the value has its own read address, distinct from the record, plus the
 collection's value mode for reading several at once. [ADR-0006](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)
-(`proposed`) replaces in-place overwrite with immutable value versions: every
+(`proposed`) replaces in-place overwrite with immutable value versions — the model of Vault KV v2 and the cloud secret managers, shadow paging with a `git gc`-style collector — so the saga and its reaper go away: every
 write mints a fresh version id, switches the row's pointer to it in one
 transaction, and deletes the version it replaced right after — with a
 periodic maintenance job, run on an operator-chosen schedule outside the

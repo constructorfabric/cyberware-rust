@@ -21,6 +21,7 @@ Updated:  2026-09-10 by Constructor Tech
   - [Preconditions: one ordering](#preconditions-one-ordering)
   - [Name retention is no longer needed](#name-retention-is-no-longer-needed)
   - [Backend key shape](#backend-key-shape)
+  - [The pattern, and why the reaper goes with the saga](#the-pattern-and-why-the-reaper-goes-with-the-saga)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Backward Compatibility by Mode](#backward-compatibility-by-mode)
@@ -164,6 +165,19 @@ The fence key's own reserved backend entry ([What the fence still does](#what-th
 One consequence of dropping `reference` and key-class from the backend key is worth stating on its own: private and tenant/shared credentials that share one reference no longer need distinct key classes to keep from colliding in the backend, because distinct `value_id`s already do that. The coexistence rule itself — the partial unique indexes on `credstore_secrets` that let a private row and a tenant/shared row share a reference — is unchanged; only the backend's need to encode the class is gone.
 
 Plugins need no list capability under this scheme and gain none: reconciling a version nobody's row points to any more is answered entirely by `credstore_value_gc`, on the credstore side, which is what keeps the plugin contract at exactly three methods (D5).
+
+### The pattern, and why the reaper goes with the saga
+
+None of this is novel, and naming the pattern is what justifies removing the reaper rather than shrinking it. The design is **immutable versions with an atomic pointer switch**, assembled from four well-known pieces:
+
+- **Immutable versioned secrets.** Every managed secret store of note models a secret as an ordered set of immutable versions plus a pointer to the current one: HashiCorp Vault KV v2 keeps numbered versions and never overwrites in place; Google Cloud Secret Manager's `SecretVersion` payloads are immutable and the secret resource points at `latest`; AWS Secrets Manager attaches staging labels (`AWSCURRENT`, `AWSPREVIOUS`) to immutable version ids; Azure Key Vault addresses every secret version by its own identifier. credstore's `value_id` is the same idea, with the version pointer living in the metadata row rather than inside the backend — which is what lets any dumb kv store (D5) participate.
+- **Copy-on-write, a.k.a. shadow paging.** Writing the new bytes beside the old ones and publishing them with a single atomic pointer move is shadow paging (Lorie, 1977) — the mechanism that gives copy-on-write engines such as ZFS and LMDB crash consistency without a redo log: the only mutable thing is the pointer, and the pointer changes in one atomic step, so no reader can observe a half-written page. Here the "page" is a backend entry and the "root pointer" is `credstore_secrets.value_id`, moved inside one database transaction.
+- **A content store with reachability-based garbage collection — Git's model.** Git objects are immutable and addressed by id; refs point at them; an object no ref reaches is garbage that `git gc --prune` removes whenever it runs, and nothing about the repository's correctness depends on when that is. `credstore_value_gc` plus the maintenance job is exactly this: an unreferenced version is garbage, and collecting it is hygiene, not repair.
+- **An intent record instead of a saga.** The `pending` row written before the backend call is the transactional-outbox idea — a durable record of intent kept in the same database as the state it concerns — reduced to a single row, because the only thing that ever needs replaying is the deletion of bytes nobody points at.
+
+Why this *removes* the reaper instead of reshaping it: a saga — the shipped model — has intermediate states (`provisioning`, `deprovisioning`, a torn overwrite) that are **wrong until repaired**, and the reaper was the component whose job was to notice and repair them on a timer, so correctness depended on it running. Under immutable versions there is no intermediate state: a row either points at fully written bytes or at nothing, there is nothing to repair, and no component's lateness can leave a reference wedged or a read closed. What remains is unreachable garbage, and garbage collection is the textbook case for a lazy, periodic, correctness-free job — the `git gc` shape — not for a resident loop inside the service.
+
+References: [Vault KV secrets engine v2](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2) · [Google Cloud Secret Manager overview (secret versions)](https://cloud.google.com/secret-manager/docs/overview) · [AWS Secrets Manager: what's in a secret (versions and staging labels)](https://docs.aws.amazon.com/secretsmanager/latest/userguide/whats-in-a-secret.html) · [Azure Key Vault: keys, secrets and certificates (object identifiers, versions)](https://learn.microsoft.com/en-us/azure/key-vault/general/about-keys-secrets-certificates) · [Shadow paging](https://en.wikipedia.org/wiki/Shadow_paging) — R. A. Lorie, *Physical integrity in a large segmented database*, ACM TODS 2(1), 1977 · [Copy-on-write](https://en.wikipedia.org/wiki/Copy-on-write) · [Git Internals — Git Objects](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects) · [`git gc`](https://git-scm.com/docs/git-gc) · [Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) · [Saga](https://microservices.io/patterns/data/saga.html).
 
 ### Consequences
 
