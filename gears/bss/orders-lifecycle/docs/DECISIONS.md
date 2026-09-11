@@ -962,16 +962,19 @@ would be the outlier rather than the norm.
 
 ### D-86 (H) The overlap collision is taken first, and detected as a row shortfall *(closes a CodeRabbit finding on PR #4775)*
 
-**Decision**: claim acquisition is `01 §3.6` *Attempt Transition* **step 17**, placed **before** the
-version append at step 18 and before every other document contribution. It uses
-`ON CONFLICT … DO NOTHING` and compares returned rows against distinct keys offered; a shortfall
-settles with `order-in-flight-for-key`, audits and commits. Three properties are normative with
-it: keys are offered **distinct** (a repeated key inserts one row, and a shortfall count would
-otherwise read that as the order colliding with itself), keys are offered in a **total order**
-(so two concurrent multi-key orders cannot deadlock), and the transaction runs at **READ
-COMMITTED** (under snapshot isolation the insert raises a serialisation failure instead of
-reporting a shortfall). The refusal is a **failed slice guard** under `§4.1`, so the seven-class
-taxonomy and its four-of-seven settlement split are unchanged and no eighth class appears.
+**Decision**: claim maintenance is `01 §3.6` *Attempt Transition* **step 17**, placed **before** the
+version append at step 18 and before every other document contribution, and it runs on **every**
+row. Sub-step 17.1 releases every claim on a terminal target; 17.2 skips the rows that neither
+acquire nor release; 17.3–17.6 are the acquiring path and are **check-then-mutate** — partition the
+resolved keys into those the order already holds and those it does not, acquire only the second
+group with `ON CONFLICT … DO NOTHING`, refuse on a row shortfall **before releasing anything**, and
+release superseded claims only after acquisition succeeds. Four properties are normative with it:
+that ordering; keys offered **distinct** (a repeated key inserts one row, and a shortfall count
+would otherwise read that as the order colliding with itself); keys offered in a **total order** (so
+two concurrent multi-key orders cannot deadlock); and **READ COMMITTED** (under snapshot isolation
+the insert raises a serialisation failure instead of reporting a shortfall). The refusal is a
+**failed slice guard** under `§4.1`, so the seven-class taxonomy and its four-of-seven settlement
+split are unchanged and no eighth class appears.
 
 **Rationale**: `§3.7` asserted the collision was "settled and audited in the same transaction". A
 raw unique violation **aborts** the PostgreSQL transaction, and the audit append is step 20 with
@@ -993,8 +996,24 @@ transaction boundary anywhere in the algorithm. Consequently
 force the version to pre-exist the claim, which is exactly the ordering that produced the phantom.
 Enforcement stays where D-26 put it: inside the transaction and inside the index.
 
-**Propagated**: `01 §3.6` *Attempt Transition* step 17 and the renumbered steps 18–26, `§3.7`
-`orders_inflight_overlap_claim`; `ADR/0007`.
+**Two further defects came out of the first statement of this decision, and both are corrected
+here** *(2026-09-11, CodeRabbit Major on PR #4775 plus one found alongside it)*. The first: that
+version released the order's existing claims **before** inserting the replacements. A refusal
+commits under `ADR/0005`, so the release committed with it — a refused amendment left its order
+non-terminal and **no longer holding its own overlap key**, free for another order to take. The
+savepoint this decision removed had been covering exactly that, and the removal turned a hidden
+dependency into a live defect; "nothing durable to unwind" was true of the version row and false of
+the release. Partitioning fixes it and also removes the self-collision **structurally**, since a key
+the order already holds is never re-offered.
+
+The second: claim release on a terminal transition was written as part of the acquisition branch,
+whose condition is that the contribution carries resolved overlap keys. **No terminal row carries
+any**, so the release never executed and every `completed` order would have held its overlap key
+permanently — a leak on the happy path, externally indistinguishable from the deliberate
+`in_fulfillment` exemption. It is now sub-step **17.1**, ahead of that branch.
+
+**Propagated**: `01 §3.6` *Attempt Transition* step 17 (sub-steps 17.1–17.6) and steps 18–26,
+`§3.7` `orders_inflight_overlap_claim`; `ADR/0007`.
 
 ### D-87 (H) A parked outbox row blocks its own order's stream and no other
 

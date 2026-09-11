@@ -632,10 +632,13 @@ Output: committed outcome or registered refusal
 14. [ ] - `p1` - Resolve the effective target state: the stored pre-hold state when the trigger is resume, otherwise the row's target - `inst-resolve-effective-target`
 15. [ ] - `p1` - **IF** the trigger is resume **AND** no pre-hold state is stored: settle, audit, commit and **RETURN** a refusal - `inst-if-resume-target-missing`
 16. [ ] - `p1` - Capture the outgoing state before any assignment - `inst-capture-outgoing-state`
-17. [ ] - `p1` - **IF** the contribution carries resolved overlap keys — submit and amendment do: - `inst-if-overlap-keys`
-    1. [ ] - `p1` - Mark this order's open claims released, then insert one claim row per **distinct** resolved key with `ON CONFLICT (payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL DO NOTHING`, returning the inserted rows - `inst-take-claims`
-    2. [ ] - `p1` - Offer the keys in a **total order** — sorted — so two concurrent multi-key orders acquire in the same sequence and cannot deadlock against each other - `inst-sort-claim-keys`
-    3. [ ] - `p1` - **IF** fewer rows return than distinct keys were offered: settle the idempotency record with `order-in-flight-for-key`, append the refused-attempt audit entry, commit, and **RETURN** that refusal - `inst-if-claim-conflict`
+17. [ ] - `p1` - Maintain this order's overlap claims; this is where the one-in-flight-order rule of `§3.7` is enforced, and it runs on **every** row rather than only on the acquiring ones: - `inst-maintain-claims`
+    1. [ ] - `p1` - **IF** the effective target is in the terminal set of `§4.3`: release every unreleased claim this order holds and **SKIP TO** step 18 — a terminal transition acquires nothing, and releasing here is what keeps a completed order from holding its key forever - `inst-release-on-terminal`
+    2. [ ] - `p1` - **IF** the contribution carries no resolved overlap keys — every non-terminal row but submit and amendment: **SKIP TO** step 18, leaving the claim set untouched - `inst-skip-claims`
+    3. [ ] - `p1` - Compute the **distinct** resolved key set and partition it into keys this order **already holds** an unreleased claim on and keys it does not - `inst-partition-claim-keys`
+    4. [ ] - `p1` - Insert one claim row per key in the **second** partition only, offered in a **total order** — sorted — so two concurrent multi-key orders acquire in the same sequence and cannot deadlock, with `ON CONFLICT (payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL DO NOTHING`, returning the inserted rows - `inst-take-claims`
+    5. [ ] - `p1` - **IF** fewer rows return than keys were offered: settle the idempotency record with `order-in-flight-for-key`, append the refused-attempt audit entry, commit, and **RETURN** that refusal — **nothing has been released, so the order still holds every claim it held on entry** - `inst-if-claim-conflict`
+    6. [ ] - `p1` - Release this order's unreleased claims on keys **not** in the resolved set; acquisition has already succeeded, so no refusal can reach this step - `inst-release-superseded-claims`
 18. [ ] - `p1` - **IF** the row's versioning behaviour is versioning: - `inst-if-versioning-row`
     1. [ ] - `p1` - Append a new version row from the contribution, with supersedes_version set to the outgoing current version - `inst-append-version`
     2. [ ] - `p1` - Move the aggregate's current-version pointer to the new version - `inst-move-version-pointer`
@@ -676,6 +679,26 @@ DELETE, so a phantom version would survive a transition nobody admitted. Decidin
 contribution is what makes the refusal path safe without rollback machinery. Two prohibitions
 follow: no step **MAY** take the claim after step 17, and no path **MAY** map the collision to an
 infrastructure error.
+
+**"Nothing to unwind" is a property of the sub-step order, not a given, and an earlier version of
+this algorithm did not have it.** That version released the order's existing claims *first* and
+then inserted the replacements. The refusal at 17.5 **commits** (`ADR/0005`), so the release
+committed with it: a refused amendment left its order non-terminal and **no longer holding its own
+overlap key**, free for another order to claim. The savepoint the design carried before step 17
+existed was covering exactly that, and removing the savepoint without reordering the sub-steps
+turned a hidden dependency into a live defect. Sub-steps 17.3 to 17.6 are therefore
+**check-then-mutate**: partition the resolved keys, acquire only the ones not already held, refuse
+before touching anything, and release the superseded claims only once acquisition has succeeded.
+Partitioning also removes the amendment's self-collision **structurally** rather than by ordering —
+a key the order already holds is never re-offered, so it cannot conflict with itself — which is why
+the release no longer has to come first for any reason.
+
+**Step 17 runs on every row, not only the acquiring ones.** Its first sub-step is the terminal
+release. That placement is load-bearing: the acquisition branch is reached only when the
+contribution carries resolved keys, which no terminal row does, so a terminal release written as
+part of that branch would never execute and every completed order would hold its overlap key
+permanently — a leak on the **happy path**, and one indistinguishable from the deliberate
+`in_fulfillment` exemption from the outside.
 
 Three properties the step depends on, all stated in `§3.7`: keys are offered **distinct** (a
 repeated key inserts one row, and a shortfall count would otherwise read that as the order
@@ -1000,8 +1023,12 @@ permanently. **This table therefore carries no foreign key to `orders_order_vers
 `order_id` and the version the claim was taken for as data, and giving it an FK would force the
 version to pre-exist the claim, which is exactly the ordering that produces the phantom version.
 
-Three further properties the mechanism depends on. Keys are offered **distinct** — two lines of one
-order resolving to the same key are one claim, not two, because `ON CONFLICT … DO NOTHING` inserts a
+Four further properties the mechanism depends on. Acquisition is **check-then-mutate**: step 17
+partitions the resolved keys, acquires only those the order does not already hold, refuses before
+releasing anything, and releases superseded claims only after acquisition succeeds. Releasing first
+was the earlier shape and it was wrong — the refusal commits, so the release committed with it and a
+refused amendment surrendered its own key. Keys are offered **distinct** — two lines of one order
+resolving to the same key are one claim, not two, because `ON CONFLICT … DO NOTHING` inserts a
 single row for a repeated key and a shortfall count would otherwise read that as a collision and
 refuse the order against itself. Keys are offered in a **total order**, so two concurrent multi-key
 orders cannot deadlock by acquiring in opposite sequences. And transitions run at **READ
@@ -1010,18 +1037,21 @@ reporting a shortfall, and the refusal decision would be made on state the trans
 longer read.
 
 
-**Additional info**: a submit or amendment transition atomically releases its prior-version claims
-where present and inserts claims for every resolved line key. Releasing the prior version's
-claims **before** inserting the new ones is what lets an amendment re-claim its own key without
-colliding with itself. **Release on a terminal transition is a step, not an assumption**: a
-transition to `completed`, `rejected`, `cancelled`, `expired` or `fulfillment_failed` — that is,
-any transition into the terminal set of `§4.3` — marks all of that order's open claims released,
-and it does so in `§3.6` step 17 alongside acquisition, in the same transaction as the transition
-itself, so no terminal order can leave a live claim behind.
+**Additional info**: a submit or amendment transition acquires claims for the resolved line keys it
+does not already hold, and releases only those it holds on keys no longer in the set — in that
+order. An amendment re-claiming its own key does not collide with itself because that key is
+**never re-offered**, which is a structural property of the partition rather than a consequence of
+release ordering. **Release on a terminal transition is its own sub-step, 17.1, and runs before the
+acquisition branch is even reached**: a transition to `completed`, `rejected`, `cancelled`,
+`expired` or `fulfillment_failed` — any transition into the terminal set of `§4.3` — marks all of
+that order's open claims released, in the same transaction as the transition itself, so no terminal
+order can leave a live claim behind. That sub-step position is deliberate: a terminal row carries no
+resolved keys, so a release written inside the acquisition branch would never execute and every
+completed order would hold its key permanently.
 All other in-flight transitions retain the claim. A collision refuses with
 `order-in-flight-for-key`, settled and audited in the **same** transaction — the refusal is
-decided at step 17, before anything durable has been contributed, which is why no rollback
-machinery is needed to unwind it; the refusal is a **failed slice guard** in the seven-class taxonomy of `§4.1` — the
+decided at 17.5, before anything durable has been contributed **and before any claim has been
+released**, which is why no rollback machinery is needed to unwind it; the refusal is a **failed slice guard** in the seven-class taxonomy of `§4.1` — the
 in-transaction enforcement of [`03-gate-and-pin`](./03-gate-and-pin.md) §4.2 predicate 9 — so it
 settles, audits and commits like any other guard refusal and adds no eighth class. It is therefore
 the concurrency enforcement behind the gate's friendly pre-check.
