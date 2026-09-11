@@ -684,18 +684,13 @@ contribution is what makes the refusal path safe without rollback machinery. Two
 follow: no step **MAY** take the claim after step 17, and no path **MAY** map the collision to an
 infrastructure error.
 
-**"Nothing to unwind" is a property of the sub-step order, not a given, and an earlier version of
-this algorithm did not have it.** That version released the order's existing claims *first* and
-then inserted the replacements. The refusal at 17.5 **commits** (`ADR/0005`), so the release
-committed with it: a refused amendment left its order non-terminal and **no longer holding its own
-overlap key**, free for another order to claim. The savepoint the design carried before step 17
-existed was covering exactly that, and removing the savepoint without reordering the sub-steps
-turned a hidden dependency into a live defect. Sub-steps 17.3 to 17.6 are therefore
-**check-then-mutate**: partition the resolved keys, acquire only the ones not already held, refuse
-before touching anything, and release the superseded claims only once acquisition has succeeded.
-Partitioning also removes the amendment's self-collision **structurally** rather than by ordering —
-a key the order already holds is never re-offered, so it cannot conflict with itself — which is why
-the release no longer has to come first for any reason.
+**"Nothing to unwind" is a property of the sub-step order, not a given.** Sub-steps 17.3 to 17.6
+are **check-then-mutate**: partition the resolved keys, acquire only the ones not already held,
+refuse before touching anything, release superseded claims only after acquisition succeeds. Release
+first — the earlier shape — committed the release along with the refusal, so a refused amendment
+surrendered its own key ([`../DECISIONS.md`](../DECISIONS.md) **D-86**). Partitioning also removes
+the amendment's self-collision **structurally**: a key the order already holds is never re-offered,
+so it cannot conflict with itself, and the release no longer has to come first for any reason.
 
 **Step 17 runs on every row, not only the acquiring ones.** Its first sub-step is the terminal
 release. That placement is load-bearing: the acquisition branch is reached only when the
@@ -810,15 +805,12 @@ rows that append no version, and they present the **current version** as their e
 like any other transition, so the optimistic check applies uniformly and no path bypasses it
 ([`../DECISIONS.md`](../DECISIONS.md) D-64).
 
-**Partitioning: no table in this gear is partitioned, and that is a decision rather than an
-omission.** An earlier version of this paragraph range-partitioned the two traffic-driven
-append-only stores — the read access log and Preview gate outcomes — by month, so that retention
-would be a partition drop rather than a bulk DELETE. It is withdrawn for three reasons, each
-independently sufficient.
-
-* **It contradicted both owning slices.** `orders_gate_outcome` declares its purge against an index on `(evaluated_at) WHERE order_id IS NULL` ([`03-gate-and-pin`](./03-gate-and-pin.md) §3.7) and `orders_read_access_log` against `(accessed_at)` ([`08-read-and-authz`](./08-read-and-authz.md) §3.7). Both are row-level DELETEs. This paragraph was the only statement claiming otherwise, and the tables' owners are authoritative over their own retention mechanism.
-* **A monthly partition cannot express a 7-day retention.** Preview outcomes are kept **7 days**. There is no month to drop that contains only rows older than a week, so partition-drop retention is not merely inferior there — it is arithmetically unable to implement the declared window.
-* **Nothing creates the partitions.** `§3.8` names the gear's lease-coordinated workers — the outbox drain, the per-state expiry sweep, the draft auto-void sweep, the idempotency-window sweep, the retention purge sweep and the audit-chain verifier. None creates or drops a partition, and a range-partitioned table with no partition covering the current month **rejects every insert**. For the read access log that failure is not degraded service: the audit read's access-log write is **fail-closed** (`08 §4.2`), so every audit read would begin failing at midnight on the first of the month. Adding a sixth worker to manage partitions would be the alternative, and it buys nothing the two index-driven purges do not already deliver.
+**Partitioning: no table in this gear is partitioned**, and that is a decision rather than an
+omission. One of its three grounds is worth carrying here because it is the one a future reader
+would otherwise re-introduce: **a monthly partition cannot express a 7-day retention.** Preview
+outcomes are kept 7 days, and no month contains only rows older than a week, so partition-drop
+retention is not merely coarser there — it cannot implement the declared window. The other two
+grounds, and the withdrawal itself, are [`../DECISIONS.md`](../DECISIONS.md) **D-91**.
 
 Both purges are therefore owned by the existing **retention purge sweep**, run in bounded batches
 through the partial indexes their tables declare, which is the same shape the refused-audit purge
@@ -1030,9 +1022,8 @@ version to pre-exist the claim, which is exactly the ordering that produces the 
 
 Four further properties the mechanism depends on. Acquisition is **check-then-mutate**: step 17
 partitions the resolved keys, acquires only those the order does not already hold, refuses before
-releasing anything, and releases superseded claims only after acquisition succeeds. Releasing first
-was the earlier shape and it was wrong — the refusal commits, so the release committed with it and a
-refused amendment surrendered its own key. Keys are offered **distinct** — two lines of one order
+releasing anything, and releases superseded claims only after acquisition succeeds (D-86 records
+why releasing first was wrong). Keys are offered **distinct** — two lines of one order
 resolving to the same key are one claim, not two, because `ON CONFLICT … DO NOTHING` inserts a
 single row for a repeated key and a shortfall count would otherwise read that as a collision and
 refuse the order against itself. Keys are offered in a **total order**, so two concurrent multi-key
@@ -1045,14 +1036,11 @@ longer read.
 **Additional info**: a submit or amendment transition acquires claims for the resolved line keys it
 does not already hold, and releases only those it holds on keys no longer in the set — in that
 order. An amendment re-claiming its own key does not collide with itself because that key is
-**never re-offered**, which is a structural property of the partition rather than a consequence of
-release ordering. **Release on a terminal transition is its own sub-step, 17.1, and runs before the
-acquisition branch is even reached**: a transition to `completed`, `rejected`, `cancelled`,
-`expired` or `fulfillment_failed` — any transition into the terminal set of `§4.3` — marks all of
-that order's open claims released, in the same transaction as the transition itself, so no terminal
-order can leave a live claim behind. That sub-step position is deliberate: a terminal row carries no
-resolved keys, so a release written inside the acquisition branch would never execute and every
-completed order would hold its key permanently.
+**never re-offered** — a structural property of the partition. **Release on a terminal transition
+is its own sub-step, 17.1, ahead of the acquisition branch**: a transition into the terminal set of
+`§4.3` marks all of that order's open claims released, in the same transaction as the transition
+itself, so no terminal order leaves a live claim behind. The position is deliberate — a terminal row
+carries no resolved keys, so a release inside the acquisition branch would never execute (D-86).
 All other in-flight transitions retain the claim. A collision refuses with
 `order-in-flight-for-key`, settled and audited in the **same** transaction — the refusal is
 decided at 17.5, before anything durable has been contributed **and before any claim has been
@@ -1147,9 +1135,8 @@ storable: a nullable column cannot participate in a primary key.
 **PK**: audit_id
 
 **Constraints**: append-only; `(order_id, sequence)` UNIQUE, which serves the hash chain and the
-per-order **committed** lookup. Three indexes, and the first is the one an earlier version of this
-table omitted: **`(order_id, created_at, audit_id)`** serves the paged audit read, whose cursor is
-`(created_at, audit_id)` — see *Ordering with nullable sequences* below. `(order_id, sequence)`
+per-order **committed** lookup. Three indexes. **`(order_id, created_at, audit_id)`** serves the paged audit
+read, whose cursor is `(created_at, audit_id)` — see *Ordering with nullable sequences* below. `(order_id, sequence)`
 **cannot** serve that page, because a refused entry carries a NULL `sequence` and so appears in no
 `sequence` ordering; paging a `created_at`-ordered result through a `sequence` cursor repeats and
 skips rows at page boundaries, silently. A **partial index** on
@@ -1169,11 +1156,9 @@ declared and could never run — and ADR-0005 cites that window as the reason wr
 refusal is a bounded cost rather than an unbounded one. Deleting a chained row would also sever
 the predecessor-hash chain at that point and make routine retention indistinguishable from
 tampering, which is why the chain now links **committed** entries only and a refused-attempt row
-carries a NULL `prev_hash`. The third split is the **erasure role's time-boxed UPDATE**: a
-standing "no UPDATE to any role" made the pseudonymisation `../DESIGN.md` §4.3 requires for an
-erasure obligation unexecutable, so that rule is stated as **no *standing* grant** and the
-exception is bounded to one recorded run rather than left as a contradiction between two documents.
-Refusals remain fully audited — the 100 % guarantee is about the entry
+carries a NULL `prev_hash`. The third split is the **erasure role's time-boxed UPDATE**, bounded to
+one recorded run, because a standing "no UPDATE to any role" made the pseudonymisation
+`../DESIGN.md` §4.3 requires unexecutable. Refusals remain fully audited — the 100 % guarantee is about the entry
 existing at the time of the attempt, not about retaining it forever — and the committed commercial
 trail keeps both the chain and the absent DELETE grant that make it tamper-evident.
 
@@ -1442,18 +1427,16 @@ means the same **scoped** tuple. Without the scope, one authorized caller could 
 another caller had chosen — converting that caller's next retry into an idempotency-mismatch, or
 having its own request answered by a record it never wrote.
 
-**The scope adds an outcome, and the table's last row is it.** An earlier version of this section
-claimed the four outcomes stayed exhaustive and unchanged under scoping. They do not: two
-principals presenting the same key text for the same request now produce **two executions**, where
-a global key would have de-duplicated them. That is the correct behaviour — neither principal may
-address the other's record — but it is a behaviour change and callers must not read
-de-duplication as a property of the key text. Where two principals legitimately need one effect
-(a retry handed from one service identity to another, a caller migrating credentials), the effect
-must be de-duplicated by something inside the fingerprint's coverage — the target `order_id` and
-`expected_version` do exactly that for every operation except create, where the version conflict
-that would refuse a second submit does not exist. **Create is therefore the one operation where
-cross-principal duplication is possible**, and the design does not prevent it; PRD §12 AC-4's
-"zero duplicate orders" is a guarantee **per principal**, and stating it otherwise would overclaim.
+**The scope adds an outcome, and the table's last row is it.** Two principals presenting the same
+key text for the same request produce **two executions**, where a global key would have
+de-duplicated them. That is correct — neither principal may address the other's record — but it is
+a behaviour change, and callers **MUST NOT** read de-duplication as a property of the key text.
+Where two principals legitimately need one effect, it must be de-duplicated by something inside the
+fingerprint's coverage; the target `order_id` and `expected_version` do that for every operation
+except **create**, where the version conflict that would refuse a second submit does not exist.
+**Create is therefore the one operation where cross-principal duplication is possible**, this
+design does not prevent it, and PRD §12 AC-4's "zero duplicate orders" is accordingly a guarantee
+**per principal** ([`../DECISIONS.md`](../DECISIONS.md) **D-88**).
 
 **How `principal_scope` is derived, normatively.** It **MUST** be the **stable subject identifier**
 of the authorized principal — the tenant-and-subject pair the platform asserts, for a human caller,
