@@ -1139,7 +1139,7 @@ without touching the engine; a state, a transition row, an event type, an envelo
 an engine-owned column requires an engine change, and adding a state or event type is
 additionally a PRD question because both sets are enumerated there.
 
-**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — ninety entries plus twenty-eight
+**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — ninety entries plus **thirty**
 routed open questions — with **seven** ADRs in [`ADR/`](./ADR/) carrying full alternatives
 analysis. **Upstream asks** are declared in [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md),
 including `SUB-O10`, which this design raises.
@@ -1161,6 +1161,18 @@ the `change` order category — **modeled and refused this phase**, with the enu
 third value pending Q-01 — add-on selection on the line, commercial bounds on a usage-bearing
 line, partial fulfillment with per-line terminals, deal and quote provenance references, and any
 CPQ or quote artifact.
+
+**What that deferral means commercially, stated so the phase is not over-read.** `new_sale` means
+**every line spawns a new subscription**, so this gear covers **net-new acquisition only**. An
+existing customer adding seats, upgrading a plan, or changing term is a *commercially initiated
+change* — `category = change` — and is refused at creation
+([`design/02-capture.md`](./design/02-capture.md) §2.2). Those motions continue down the
+pre-existing direct-subscription path, which means that for the whole of this phase the expansion
+half of a subscription business has **no order document, no sellability gate at the point of
+change, no price pin, no approval arc and none of the audit trail this gear exists to provide**.
+The gap is the PRD's declared phasing and not a design defect; it is recorded here because "Orders
+is live" and "commercial changes are governed by Orders" are different claims, and only the first
+becomes true at the end of this phase.
 
 **Sibling-gear evidence base.** The engine-shaped core, the append-only history with in-table
 supersession, the transactional outbox, the integer-minor-unit money convention, the

@@ -95,8 +95,8 @@ entry carries the same three fields either way; only the room given to the ratio
 resolve the 74 findings of the **2026-09-08 review wave** (`R-01`…`R-74`),
 whose finding ids (`R-nn`) are cited per entry; D-58…D-60 come from the verification passes over
 that remediation, which found two decisions asserted but not fully applied; D-61…D-90 come from
-the 2026-09-09 and 2026-09-10 waves and from the review of PR #4775. **Twenty-eight items are
-routed as open questions** (`Q-01`…`Q-28`), of which twenty-five are routed and unanswered — Q-10
+the 2026-09-09 and 2026-09-10 waves and from the review of PR #4775. **Thirty items are
+routed as open questions** (`Q-01`…`Q-30`), of which twenty-seven are routed and unanswered — Q-10
 is out of this gear's scope, and Q-02 and Q-14 are closed by design decisions.
 
 ## Status board
@@ -112,7 +112,7 @@ is out of this gear's scope, and Q-02 and Q-14 are closed by design decisions.
 | G. Non-functional posture | D-39…D-55 | [H] ×10, [M] ×5, [L] ×2 | decided (autonomous, working baselines) — resolves R-52…R-67 |
 | H. PRD fidelity | D-56…D-74 | [H] ×10, [M] ×9 | decided; §15 rows and PRD-wording asks routed to owners |
 | I. Slice-local calls | D-75…D-90 | [H] ×8, [M] ×8 | decided; D-79 is a historical see-D-74 stub; **D-82…D-90 sit outside the area table**, each carrying its own full entry below |
-| Open questions | Q-01…Q-28 | — | 25 routed and unanswered; Q-10 out of scope for this gear; Q-02 and Q-14 closed by design decisions (D-84, a design correction) |
+| Open questions | Q-01…Q-30 | — | 27 routed and unanswered; Q-10 out of scope for this gear; Q-02 and Q-14 closed by design decisions (D-84, a design correction) |
 
 ## A. Foundational shape
 
@@ -249,7 +249,7 @@ engine call and written inside its transaction.
 **Rationale**: writing then transitioning leaves an orphaned row on refusal, defeating "no partial
 commit to reconcile" and contradicting the single-writer constraint.
 
-**Propagated**: `03 §3.6` *Run Gate and Submit* step 10.1; `05 §3.6` *Record Acceptance* step 5;
+**Propagated**: `03 §3.6` *Run Gate and Submit* step 11.1; `05 §3.6` *Record Acceptance* step 5;
 `06 §3.6` *Acknowledge Fulfillment* steps 2.1.2, 2.2.2, 3, 4;
 `07 §3.6` *Hold Then Resume* step 2.
 
@@ -874,7 +874,7 @@ and bind a resource dimension into the key, accept serialised ordering under rou
 as written the column can only ever hold `0`, so it is schema surface with no expressible state,
 and the review that produced this reversal criticised exactly that shape.
 
-**Propagated**: `01 §3.7` `orders_inflight_overlap_claim`; `03 §3.6` *Run Gate and Submit* step 14,
+**Propagated**: `01 §3.7` `orders_inflight_overlap_claim`; `03 §3.6` *Run Gate and Submit* step 15,
 `§4.2` predicates 7 and 9.
 
 ### D-84 (H) One order line produces one subscription — Q-02 answered no
@@ -1175,6 +1175,8 @@ Not decided here. Each carries a named owner and the design position taken in th
 | Q-26 | The **operational limits this design set as working baselines** need ratifying against real capacity: the refusal rate limit (20/min per caller-order, 200/min per caller), the per-port bulkhead (32 in-flight), the breaker ratio (0.5 over 30 s, open 10 s), submit and Preview rate limits (10/min and 60/min per caller), the line cap (200) and the outbox bucket count (64). Each was previously named as a mechanism with no value, so five separate risk mitigations rested on thresholds nobody had set | Architecture | Values are set in `01 §3.7`, `02 §4.5`, `03 §2.2` and measured by the load tests those sections name; they are baselines to revise, not guesses to keep |
 | Q-27 | **An order in a state with no configured TTL never expires.** PRD §6.3 requires bounded lifetime; PRD §15 row 7 leaves the TTL values open; and this design takes no code default, so the requirement is unmet for exactly the states Product has not yet valued — including `draft`, whose auto-void TTL is Q-07. D-90 records why the absolute-lifetime backstop that previously masked this was withdrawn. This is therefore a **requirement blocked on an unanswered question**, not a design gap | Product | Disclosed in `07 §4.2`, `§4.4` and `§4.5`, alerted per `07 §3.8`, and bounded on the one axis this design can close — the resume cap of D-90 stops the dwell being restarted without limit. Answering §15 row 7 and Q-07 closes it; no mechanism changes when they are answered |
 | Q-28 | **D-62 refuses a cross-seller payer rebinding that PRD §6.1 requires be honoured.** The PRD says a payer change crossing seller scope "**MUST** follow the paired payer/seller rebinding semantics (ownership-transfer alignment, manifest §4.11)", and §12's acceptance criterion repeats it — "paired with seller rebinding where the change crosses seller scope". D-62 freezes `sellerTenantId` as commercial-frozen, which makes the paired half unexpressible, and refuses the cross-seller payer change with `payer-rebinding-requires-seller`. The divergence is deliberate and was taken to close a real hole (an unguarded amendment could rebind the selling party), but it narrows a PRD MUST and the register recorded it as a decision rather than routing it | Product + Architecture | The freeze and the refusal are implemented as D-62 states (`04 §2.2`, `§3.3`, `§3.6`); a cross-seller payer change is therefore **not supported** and a caller must cancel and re-place. Closing it needs one of three: amend §6.1 to match, specify an ownership-transfer transition that rebinds both axes together under its own guard and event, or accept the refusal as the answer. Nothing changes in this design until it is answered |
+| Q-29 | **PRD §1.1 claims the order does "double duty as quote and order" with "validity/expiry [as] the per-state TTL", and no state in this design is a quote.** A commercial quote is a *priced, non-binding, time-bounded offer*. A `draft` carries no price (`02 §3.2`); submit is where the price appears and on the self-service path submit **is** the commitment (`05 §4.2`); Preview prices a basket but persists only its per-predicate verdicts, so the figure it quoted is unrecoverable and bound for no period (`03 §4.6`). A partner-led sale needing "valid for thirty days" must hold that price outside this SoR with its validity unenforced — the outcome §1.1 gives as the reason no separate quote artifact is needed | Product + Architecture | Disclosed in `03 §4.6`. This design **MUST NOT** close it locally by storing Preview's total and calling it an offer: an offer needs a validity rule, an expiry actor, a re-price rule and a binding-on-acceptance rule, none of which any document in this set carries. Closing it means amending §1.1 to stop claiming quote coverage, or specifying a priced offer artifact — a scope decision, not a design one |
+| Q-30 | **The partner path cannot complete without a `resourceTenantId` principal who can reach an acceptance surface.** `05 §4.2` bars the placing and selling parties from recording acceptance — the only technical control against manufactured consent, and kept. But where the end customer has no platform credential at the point of sale, nobody may record it: begin-fulfillment refuses, the order rests in `approved`, and with the TTL unset (Q-06, Q-27) it never leaves. A partner-placed order can be commercially agreed offline and still be unfulfillable | Product + whoever owns partner onboarding | Disclosed in `05 §4.2`. The platform **MUST** be able to present an acceptance action to a `resourceTenantId` principal for any order the partner path produces — a capability this gear does not own. No delegated or operator-attested route is offered, deliberately, since an attested route is the authority artifact D-31 found unspecified. The available mitigation is a seller electing acceptance **not** required (`05 §4.1`) — a decision about evidence, to be made knowingly |
 
 ## Traceability
 

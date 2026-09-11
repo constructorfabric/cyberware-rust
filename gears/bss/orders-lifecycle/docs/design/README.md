@@ -63,10 +63,19 @@ pinned snapshot and the market binding `03` captures. `07` needs `02` for the dr
 auto-void sweep collects and `06` for the spawn signal its cancel guard reads. `08` needs `04`
 for the historical version reads and `06` for the per-line fulfillment projection it embeds.
 
-**Phase 1 has no working submit path until two upstream items land.** The gate fails closed on an
+**Phase 1 has no working submit path until four upstream lanes land.** The gate fails closed on an
 unevaluable input ([`../ADR/0003`](../ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md)),
 and three of the six adopted pricing predicates cannot be evaluated from the built read model
-while the overlap-presence read (`SUB-O5`) does not exist. Capture and the engine are buildable and
+while the overlap-presence read (`SUB-O5`) does not exist. The three are named here rather than
+counted, because each has a different owner and they will not land together — the pricing gear's
+own foundation design records that a version produced today answers predicates (2), (3) and (4)
+and **cannot answer (1), (5) or (6)**: **(1)** the active `PriceWindow` and its coverage horizon,
+which waits on that gear's window-linkage slice; **(5)** the per-market GA gate and the
+prepaid-execution gate; and **(6)** the registry `sellable` flag, which is **not a pricing fact at
+all** — it is owned by the `products` gear, which carries a PRD and no implementation. A reader
+sequencing this work should therefore treat `products` as a submit-path dependency of equal
+standing to pricing, which the dependency tables in [`../DESIGN.md`](../DESIGN.md) §3.5 and
+[`../PRD.md`](../PRD.md) §13 do not make obvious. Capture and the engine are buildable and
 testable; a submit that *passes* is not, until those lanes exist. That is designed behaviour, not
 a defect, and it is stated here so the phase map is not read as a delivery promise it cannot keep.
 The operator-visible half is routed as [`../DECISIONS.md`](../DECISIONS.md) Q-15.

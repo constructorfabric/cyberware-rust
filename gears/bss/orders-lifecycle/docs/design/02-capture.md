@@ -277,7 +277,7 @@ commercial change — that is [`04-versioning`](./04-versioning.md).
 **Reasons contributed to the registry**: category-not-admitted, currency-mismatch,
 payer-mismatch, line-not-in-draft, commercial-field-immutable, field-unclassified,
 line-cap-exceeded, date-cascade-invalid (defined once here with the cascade it governs, and
-raised by the gate — [`03-gate-and-pin`](./03-gate-and-pin.md) §3.6 *Run Gate and Submit* step 9 —
+raised by the gate — [`03-gate-and-pin`](./03-gate-and-pin.md) §3.6 *Run Gate and Submit* step 10 —
 since submit is where the cascade resolves).
 
 **Order number**: assigned at creation, unique per `sellerTenantId`, and treated as a display

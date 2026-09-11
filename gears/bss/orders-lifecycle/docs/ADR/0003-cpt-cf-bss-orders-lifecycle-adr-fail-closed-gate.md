@@ -86,7 +86,7 @@ verifiable today or planned.
 unavailable reason for each of the six ports — catalog predicates, identity and party, contract
 resolution, overlap presence, evaluation and indicative tax — in `design/03-gate-and-pin.md`
 §3.3; the gate algorithm collects unevaluable inputs into the same all-failures report as
-evaluated failures (§3.6 *Run Gate and Submit* step 8); and §4.1 carries the normative
+evaluated failures (§3.6 *Run Gate and Submit* step 9); and §4.1 carries the normative
 prohibition on treating unevaluable as passed. The invariant suite's reason-ownership family
 asserts at document level that each of those names has exactly one owning slice, so a second
 slice cannot quietly register a competing spelling of the same condition.

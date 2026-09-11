@@ -164,6 +164,17 @@ carries a **deadline**. Five of the six sit on the submit path; the indicative-t
 | **Submit budget** (five ports; tax not invoked) | **1.5 s** |
 | **Preview budget** (all six) | **1.75 s** |
 
+**Every deadline above is per port per run, not per line, and that is a requirement on the call
+shape rather than an observation.** A port whose input scales with the basket — catalog
+predicates, price evaluation, overlap presence and pin composition all do — **MUST** be invoked
+**once per run with the whole line set**, and **MUST NOT** be invoked once per line. The line cap
+of **200** ([`02-capture`](./02-capture.md) §3.7) is set on the assumption that a capped basket
+resolves inside the 250 ms catalog deadline, and that assumption is only true of a batched call:
+per-line invocation would need 1.25 ms round trips to hold, which no network port achieves. Stating
+the cap without stating the call shape left the two consistent only by accident, and an
+implementation that fans out per line would miss the budget at a fraction of the cap while
+satisfying every other rule in this slice.
+
 This budget covers **port resolution only**, which completes before the transaction opens. The
 PRD's `p95 < 1 s` is scoped to the commit — the durable write and event publish — so the two are
 compliant side by side, but nothing bounds what the caller experiences end to end. That gap is
@@ -252,6 +263,17 @@ as the closable form of this gap rather than adopted here.
 #### The default overlap key collides in the partner path
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-constraint-overlap-key-partner-collision`
+
+**The commercial rule, before the partner case:** at most **one in-flight order per overlap key**
+(`01 §3.7`, predicate 9 above). A buyer who has submitted an order for a product and not yet seen
+it reach a terminal state **cannot submit a second order for that product** — they are refused
+with `order-in-flight-for-key` until the first completes, is cancelled, or expires. That is the
+intended rule and PRD §6.1(g) fixes it at one, but it is a constraint on the sales motion and not
+only a concurrency control: a buyer correcting a mistake must amend the in-flight order rather than
+place another, and a wedged order blocks the key until an operator clears it (ADR-0007 records the
+`in_fulfillment` case, which no expiry row can reach). Any buyer surface **MUST** present the
+refusal as "an order for this is already in progress" with a route to that order, rather than as a
+generic validation failure.
 
 The default `overlapScopeKey` is `(payerTenantId, catalogSubscriptionProductKey)` at cardinality
 one, adopted from the subscriptions gear. Read literally it refuses a partner admin buying the
@@ -466,31 +488,32 @@ Output: submitted order with pin and total, or a refusal listing every failure
 
 1. [ ] - `p1` - Declare the at-least-one-line guard so the engine evaluates it and audits its refusal - `inst-gs-declare-lines-guard`
 2. [ ] - `p1` - Derive the order market from the payer's commercial profile - `inst-gs-derive-market`
-3. [ ] - `p1` - **PARALLEL** resolve the independent port inputs: - `inst-gs-parallel-resolve`
-   - [ ] - `p1` - adopted catalog predicates over every line's scope key - `inst-gs-resolve-catalog`
+3. [ ] - `p1` - Read the catalog **pin-eligibility frontier** once and fix the run's `catalog_version`; every catalog-facing resolution below — predicates, evaluation and pin — **MUST** be taken at that one version, and a later advance of the frontier **MUST NOT** be picked up mid-run - `inst-gs-fix-catalog-version`
+4. [ ] - `p1` - **PARALLEL** resolve the independent port inputs, each **batched into one call per port** for the whole basket: - `inst-gs-parallel-resolve`
+   - [ ] - `p1` - adopted catalog predicates over every line's scope key, at the fixed version - `inst-gs-resolve-catalog`
    - [ ] - `p1` - tenant-axis validity and party eligibility - `inst-gs-resolve-identity`
    - [ ] - `p1` - contract status, only where a contract reference is present - `inst-gs-resolve-contract`
    - [ ] - `p1` - overlap presence for each line's overlap key - `inst-gs-resolve-overlap`
-   - [ ] - `p1` - the resolved total from the evaluation contract - `inst-gs-resolve-total`
-4. [ ] - `p1` - Read each line's tenant policy switch and resolve the date cascade per [`02-capture`](./02-capture.md) §4.2, using the submit instant where the contract-effective date is unauthored - `inst-gs-resolve-cascade`
-5. [ ] - `p1` - Initialize an empty failure list - `inst-gs-init-failures`
-6. [ ] - `p1` - **FOR EACH** adopted predicate result that failed: add it with its reason unchanged - `inst-gs-collect-adopted`
-7. [ ] - `p1` - **FOR EACH** of the nine delta predicates: evaluate and add any failure - `inst-gs-collect-delta`
-8. [ ] - `p1` - **IF** any port was unresolvable: add its unevaluable reason (absence is a refusal) - `inst-gs-collect-unevaluable`
-9. [ ] - `p1` - **FOR EACH** line whose policy-required calendar field cannot be resolved: add date-cascade-invalid - `inst-gs-collect-cascade-invalid`
-10. [ ] - `p1` - **IF** the failure list is non-empty: - `inst-gs-if-failures`
+   - [ ] - `p1` - the resolved total from the evaluation contract, **at the fixed version** - `inst-gs-resolve-total`
+5. [ ] - `p1` - Read each line's tenant policy switch and resolve the date cascade per [`02-capture`](./02-capture.md) §4.2, using the submit instant where the contract-effective date is unauthored - `inst-gs-resolve-cascade`
+6. [ ] - `p1` - Initialize an empty failure list - `inst-gs-init-failures`
+7. [ ] - `p1` - **FOR EACH** adopted predicate result that failed: add it with its reason unchanged - `inst-gs-collect-adopted`
+8. [ ] - `p1` - **FOR EACH** of the nine delta predicates: evaluate and add any failure - `inst-gs-collect-delta`
+9. [ ] - `p1` - **IF** any port was unresolvable: add its unevaluable reason (absence is a refusal) - `inst-gs-collect-unevaluable`
+10. [ ] - `p1` - **FOR EACH** line whose policy-required calendar field cannot be resolved: add date-cascade-invalid - `inst-gs-collect-cascade-invalid`
+11. [ ] - `p1` - **IF** the failure list is non-empty: - `inst-gs-if-failures`
     1. [ ] - `p1` - Pass the failure set as the contribution so the engine persists the gate outcome, audits the refusal and settles the idempotency record in one transaction - `inst-gs-contribute-refusal-outcome`
     2. [ ] - `p1` - **RETURN** every failure in one response; the order stays in `draft` - `inst-gs-return-all-failures`
-11. [ ] - `p1` - Compose the catalog price pin for each line and verify it is resolvable - `inst-gs-compose-pin`
-12. [ ] - `p1` - **IF** any pin is unresolvable: - `inst-gs-if-pin-unresolvable`
+12. [ ] - `p1` - Compose the catalog price pin for each line **at the version fixed in step 3**, in one batched call, and verify it is resolvable - `inst-gs-compose-pin`
+13. [ ] - `p1` - **IF** any pin is unresolvable: - `inst-gs-if-pin-unresolvable`
     1. [ ] - `p1` - Pass pin-unresolvable as the contribution so the engine audits the refusal and settles the idempotency record, exactly as step 10.1 does - `inst-gs-contribute-pin-refusal`
     2. [ ] - `p1` - **RETURN** the pin-unresolvable refusal; the order stays in `draft` - `inst-gs-return-pin-unresolvable`
-13. [ ] - `p1` - Assemble the resolved total rows and the TCV figure per §4.4 - `inst-gs-assemble-total`
-14. [ ] - `p1` - Request the submit transition, contributing pin, total, market, the resolved line dates and policy-switch state, gate outcome and the **submitting principal as the initiating actor** - `inst-gs-request-transition`
-15. [ ] - `p1` - **RETURN** the submitted order - `inst-gs-return-submitted`
+14. [ ] - `p1` - Assemble the resolved total rows and the TCV figure per §4.4 - `inst-gs-assemble-total`
+15. [ ] - `p1` - Request the submit transition, contributing pin, total, market, the resolved line dates and policy-switch state, gate outcome and the **submitting principal as the initiating actor** - `inst-gs-request-transition`
+16. [ ] - `p1` - **RETURN** the submitted order - `inst-gs-return-submitted`
 
-**Description**: Steps 5 through 10 are the all-failures contract. Every input is resolved before
-*Run Gate and Submit* step 14, so the transaction that commits `submitted` performs no network call and the pin lands
+**Description**: Steps 6 through 11 are the all-failures contract. Every input is resolved before
+*Run Gate and Submit* step 15, so the transaction that commits `submitted` performs no network call and the pin lands
 in the same commit as the state.
 
 #### Preview a basket
@@ -666,6 +689,18 @@ catalog version is committed rather than pending. Capture **MUST** occur inside 
 transaction; a line whose pin is not resolvable **MUST** refuse the submit. An amendment **MUST**
 re-pin as part of its own commit.
 
+**One catalog version governs a whole submit.** The pin-eligibility frontier is read **once**, at
+`§3.6` *Run Gate and Submit* step 3, and the resulting `catalog_version` **MUST** govern every
+catalog-facing resolution in that run — the adopted predicates, the price evaluation that produces
+the resolved total, and the pin itself. No step **MAY** re-read the frontier, and an advance of the
+frontier mid-run **MUST NOT** be picked up. Without this rule the algorithm resolves the total at
+step 4 and composes the pin at step 12, and the frontier can advance between them well inside the
+1.5 s budget — the pricing gear publishes the frontier with an advance instant precisely because it
+moves. The order would then commit a total evaluated at one version and a pin frozen at another,
+with nothing on the document saying so. That is not a money defect, because the total is
+non-authoritative either way; it is a defect in the commercial record, which is the artifact this
+gear exists to be. The same rule binds an amendment's re-pin and re-evaluation to one version.
+
 Known staleness is accepted, and **what bounds it is the per-state TTL and nothing else**. Where a
 TTL is configured, an order cannot sit in `submitted` or `approved` past it, so `(cap + 1) × TTL`
 — the resume cap of `07 §4.2` bounding how often the dwell restarts — is the outer limit on how
@@ -711,6 +746,22 @@ total, and the exclusion **MUST** be stated on the read and Preview responses ra
 implicit. The named case is **brand**, whose per-sale identifier is owned by Subscriptions and
 does not exist before a subscription does.
 
+**Tax is the second exclusion, and it is the one a buyer notices.** The order-time total is
+**pre-tax**. Tax is read from the billing-chain owner on **Preview only**, is **indicative**, and
+**MUST NOT** be stored on any order (§4.6) — so a submitted order carries no tax figure at all,
+not even an indicative one.
+
+**Therefore: the stored resolved total MUST NOT be presented as the amount the customer will be
+invoiced**, and any surface that renders it **MUST** render the declared exclusions with it. That
+obligation is normative on this gear's own read surface
+([`08-read-and-authz`](./08-read-and-authz.md) §4.2) and is an **explicit expectation on any
+consumer surface** — a buyer portal, a partner console, an order confirmation email — none of which
+this gear owns. The total is evidence of what was quoted against the catalog at submit; the
+invoiceable amount is composed downstream, after Subscriptions seals the pricing snapshot and the
+billing chain applies tax. Two numbers that differ and are both correct is a dispute generator
+unless the difference is disclosed at the point of display, which is why the obligation is stated
+as a requirement rather than left to whoever builds the surface.
+
 This resolves **PRD §15 row 6** in the only way available without a new upstream
 operation: rather than reporting a total that silently omits an overlay, the response declares
 what it omitted. Should a pre-subscription evaluation operation later accept order-level scope
@@ -738,6 +789,25 @@ Three prohibitions are absolute. The indicative tax **MUST NOT** be stored on an
 **MUST NOT** return an approval-requirement verdict. And Preview **MUST NOT** return a TCV figure
 when a basket line omits term duration or billing cycle — the figure is undefined without them,
 and returning one computed from an assumed term would be a worse answer than none.
+
+**Preview is not a quote, and this gear has no quote.** The distinction is worth stating plainly,
+because PRD §1.1 says the order "does double duty as **quote and order**" with "validity/expiry
+[as] the per-state TTL", and no state in this design delivers what a quote is commercially — a
+**priced, non-binding, time-bounded offer**. Three facts make that so, and each is a rule stated
+elsewhere in this set rather than an oversight here:
+
+* A `draft` carries **no price**. It "resolves no catalog reference, captures no pin, computes no total" ([`02-capture`](./02-capture.md) §3.2), so the pre-commitment state is unpriced.
+* Submit is where the price appears — and on the self-service path **submit *is* the commitment** ([`05-preconditions`](./05-preconditions.md) §4.2), so the priced state is not an offer.
+* Preview prices a basket but **persists only its per-predicate verdicts** to `orders_gate_outcome` (§3.7). The resolved total, the TCV and the indicative tax are returned and **not stored**, so the number Preview quoted is not recoverable afterwards, is bound for no period, and no order references it.
+
+The consequence is operational rather than theoretical: a partner-led sale that needs "here is your
+price, valid for thirty days" must hold that figure **outside** this system of record, with its
+validity unenforced — which is the outcome PRD §1.1 gives as the reason a separate quote artifact
+is unnecessary. This slice **MUST NOT** close the gap locally by storing Preview's total and
+calling it an offer: an offer needs a validity rule, an expiry actor, a re-price rule on expiry and
+a binding-on-acceptance rule, none of which any document in this set carries. The reconciliation —
+amend §1.1 to stop claiming quote coverage, or specify a priced offer artifact with a validity
+bound — is routed as [`../DECISIONS.md`](../DECISIONS.md) **Q-29**.
 
 ## 5. Traceability
 

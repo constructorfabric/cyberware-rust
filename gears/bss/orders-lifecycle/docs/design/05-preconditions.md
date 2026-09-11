@@ -461,6 +461,27 @@ selling party supplying the customer's consent without a specified, verifiable a
 [`08-read-and-authz`](./08-read-and-authz.md) §4.3 carries the rule; this slice carries the guard
 that enforces it.
 
+**The bar creates a platform precondition, and it is this slice's to state.** The rule above is
+the only technical control against a partner manufacturing customer consent, and it is kept — but
+it means the partner path **cannot complete without a `resourceTenantId` principal who can reach
+an acceptance surface**. In partner-led selling the end customer frequently has no platform
+credential at the point of sale, and where that is so nobody is permitted to record acceptance:
+begin-fulfillment refuses with `acceptance-required-not-recorded` (§3.6), the order rests in
+`approved`, and it leaves only by its TTL — or, where that TTL is unset, **not at all**
+([`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.2, `../DECISIONS.md` Q-27). A partner-placed
+order can therefore be commercially agreed offline and still be unfulfillable.
+
+Two things follow. The platform **MUST** be able to present an acceptance action to a
+`resourceTenantId` principal for any order the partner path produces — an onboarding or
+invitation capability this gear does not own and cannot supply. And where consent is genuinely
+captured out of band (a signed document, an email confirmation), recording it **still requires**
+a `resourceTenantId` principal to act; this design offers **no** delegated or operator-attested
+route, deliberately, because an attested route is exactly the authority artifact D-31 found
+unspecified. Whether the acceptance-required election is even set for the partner path is a
+seller policy (§4.1), so the simplest available mitigation is a seller electing acceptance **not**
+required — which is a commercial decision about evidence, not a workaround, and should be made
+knowingly. The reconciliation is routed as [`../DECISIONS.md`](../DECISIONS.md) **Q-30**.
+
 The line-level **acceptance due date is a calendar field** and **MUST NOT** satisfy the instant
 under any circumstance. The cascade in [`02-capture`](./02-capture.md) §4.2 that fills it from
 the contract-effective date **MUST NOT** be read as defaulting the instant. This is stated twice
@@ -506,10 +527,17 @@ instrument, and refund-as-reversal have no owning capability.
 
 Two consequences follow and are recorded rather than discovered. A **declined instrument** leaves
 the order `approved` with no payment event, no re-authorize operation and expiry as its only
-exit, indistinguishable from a healthy order awaiting its next process step. And a **reversal
-after capture** would be a refund through a payment provider rather than a Billing credit note,
-which is a different artifact with a different system of record than the compensation path
-assumes.
+automatic exit, indistinguishable from a healthy order awaiting its next process step.
+**Compounded with the unset TTL of `../DECISIONS.md` Q-27 it has no automatic exit at all**, and
+only a caller-driven cancel retires it — so the two open questions interact, and Q-08 should not be
+read as "the order expires eventually" while Q-06 is unanswered. Stated at full strength: today a
+customer whose card declines gets an order that is silently stuck, carries no explanation on the
+document, emits no event a surface could react to, and persists until somebody cancels it by hand.
+That is a launch-relevant customer-experience defect, not a deferred nicety, and the only reason it
+is recorded rather than fixed is that no Payments capability exists to fix it against. And a
+**reversal after capture** would be a refund through a payment provider rather than a Billing
+credit note, which is a different artifact with a different system of record than the compensation
+path assumes.
 
 Neither is a PRD open question: PRD §15's fifteen rows carry nothing about payment ordering, a
 declined instrument's exit, or refund-as-reversal. Both are routed in this gear's own register as
