@@ -666,12 +666,14 @@ catalog version is committed rather than pending. Capture **MUST** occur inside 
 transaction; a line whose pin is not resolvable **MUST** refuse the submit. An amendment **MUST**
 re-pin as part of its own commit.
 
-Known staleness is accepted, and **what bounds it is the per-state TTL, with the absolute order
-lifetime of `07 §4.2` as the backstop where that TTL is unset** (D-90) — so the bound holds even
-before Q-06 answers, which it previously did not: an order cannot sit in
-`submitted` or `approved` past its TTL, so that is the outer limit on how stale a pin can be when
-fulfilment begins — which also means the bound is only as real as the TTL, currently an unset
-Product-owned value (Q-06). PRD §16 additionally asks for an acceptable staleness window to be
+Known staleness is accepted, and **what bounds it is the per-state TTL and nothing else**. Where a
+TTL is configured, an order cannot sit in `submitted` or `approved` past it, so `(cap + 1) × TTL`
+— the resume cap of `07 §4.2` bounding how often the dwell restarts — is the outer limit on how
+stale a pin can be when fulfilment begins. **Where the TTL is unset, that limit does not exist and
+a pin can be arbitrarily stale**, which is this slice's share of the gap `07 §4.2` discloses and
+`DECISIONS.md` Q-27 routes. An earlier version of this paragraph named an absolute order lifetime
+as the backstop covering the unset case; that bound is withdrawn (D-90), and nothing replaced it,
+so the staleness question returns to Q-06 unanswered rather than bounded by a design-owned value. PRD §16 additionally asks for an acceptable staleness window to be
 documented in the NFR workshop; that is routed as Q-17 rather than dropped. If the catalog
 publishes a change after submit, the
 pinned rows are stale relative to the newest version and the customer binds to the pinned rows.
