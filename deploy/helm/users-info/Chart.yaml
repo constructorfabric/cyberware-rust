@@ -1,0 +1,15 @@
+apiVersion: v2
+name: users-info
+description: >-
+  users-info - an authenticated, database-backed REST OoP demo gear. Deploys as
+  its own pod, authenticates tenant-plane requests locally (embedded authn
+  stack), resolves the central authz-resolver over REST via the platform host's
+  DirectoryService for every PEP check, and persists to its own PostgreSQL
+  database. Reverse-proxied by the api-gateway edge (Profile 3).
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: toolkit-common
+    version: 0.1.0
+    repository: "file://../toolkit-common"

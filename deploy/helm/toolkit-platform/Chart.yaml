@@ -1,0 +1,34 @@
+apiVersion: v2
+name: toolkit-platform
+description: >-
+  CF/Gears ToolKit platform umbrella chart. Deploys the platform-host (edge +
+  DirectoryService + trust-coupled core + system gears) together with a set of
+  out-of-process gears. Target: Profile 3 (Kubernetes).
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: platform-host
+    version: 0.1.0
+    repository: "file://../platform-host"
+    condition: platform-host.enabled
+  - name: postgres
+    version: 0.1.0
+    repository: "file://../postgres"
+    condition: postgres.enabled
+  - name: hello
+    version: 0.1.0
+    repository: "file://../hello"
+    condition: hello.enabled
+  - name: users-info
+    version: 0.1.0
+    repository: "file://../users-info"
+    condition: users-info.enabled
+  - name: api-contracts
+    version: 0.1.0
+    repository: "file://../api-contracts"
+    condition: api-contracts.enabled
+  - name: api-contracts-consumer
+    version: 0.1.0
+    repository: "file://../api-contracts-consumer"
+    condition: api-contracts-consumer.enabled

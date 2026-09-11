@@ -1,0 +1,48 @@
+# Local multi-process platform-host: api-contracts-consumer OoP gear.
+#
+# Run (after the host + the api-contracts provider are up):
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+#     cargo run -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop \
+#       -- --config config/oop-api-contracts-consumer.yaml
+#
+# Then (bearer required — any non-empty token is accepted by static-authn
+# accept_all and mapped to the platform-root tenant):
+#   curl -X POST -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
+#     -d '{"amount_cents":1000,"currency":"USD","description":"test"}' \
+#     http://127.0.0.1:9098/api-contracts-consumer/v1/charge
+#
+# The consumer resolves the PaymentApi contract from the SEPARATE api-contracts
+# provider pod over REST (via the DirectoryService) and forwards the charge —
+# the OoP gear-to-gear REST path.
+
+server:
+  home_dir: "~/.cf-gears-api-contracts-consumer"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-api-contracts-consumer.log"
+    file_level: info
+
+oop_http:
+  listen_addr: "127.0.0.1:9098"
+  advertise_uri: "http://127.0.0.1:9098"
+  allow_loopback_advertise: true
+
+gears:
+  api-contracts-consumer:
+    config: {}
+
+  # Embedded tenant-plane authn stack (in-memory; no DB).
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: accept_all
+
+  types-registry:
+    config: {}

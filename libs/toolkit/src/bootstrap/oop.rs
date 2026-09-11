@@ -204,7 +204,7 @@ fn build_oop_config_and_db(
 
 /// Merges logging configurations: master as base, local as override (by key).
 ///
-/// Each key in the logging `HashMap` (e.g., "default", "calculator", "sqlx")
+/// Each key in the logging `HashMap` (e.g., "default", "hello", "sqlx")
 /// is overridden by local if present.
 fn merge_logging_configs(master: Option<&LoggingConfig>, local: &LoggingConfig) -> LoggingConfig {
     master

@@ -39,6 +39,7 @@ pub fn register_routes(
         )
         .tag(API_TAG)
         .authenticated()
+        .exposed()
         .no_license_required()
         .json_request::<ChargeRequest>(openapi, "")
         .handler({

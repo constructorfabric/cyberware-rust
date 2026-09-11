@@ -1,0 +1,10 @@
+apiVersion: v2
+name: postgres
+description: >-
+  Shared, single-instance PostgreSQL for the CF/Gears demo. One Postgres
+  Deployment/Service serving a database-per-gear: each OoP gear owns its own
+  logical database on this shared server (never shared tables). For anything
+  beyond a demo, replace with a managed/HA PostgreSQL.
+type: application
+version: 0.1.0
+appVersion: "17"

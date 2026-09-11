@@ -1,5 +1,16 @@
 # Out-of-Process Gears and gRPC SDK Pattern
 
+> **Transport note.** **REST is the default transport for out-of-process (OoP) gears** (see
+> [ADR-0003](../adrs/toolkit/0003-toolkit-universal-lazy-layer.md)); gRPC as documented here is
+> the **opt-in** transport. For the current REST-based model — independent pods that
+> self-register with the DirectoryService and are reached through the api-gateway edge — see the
+> how-to *Run a gear out-of-process* (`docs/web-docs/build-with-gears/out-of-process.md`) and the
+> runnable examples `examples/toolkit/hello/` and `examples/toolkit/api-contracts/`. Gear-to-gear
+> calls use `#[toolkit::consumes]` / `#[toolkit::provides]`, not the manual wiring shown below.
+>
+> This document remains the reference for the **shared OoP runtime** (`OopRunOptions`, lifecycle,
+> shutdown) and the **gRPC SDK pattern** when gRPC is explicitly chosen.
+
 ToolKit supports running gears as separate processes with gRPC-based inter-process communication. This enables process isolation, language flexibility, and independent scaling.
 
 ## Core invariants
@@ -23,32 +34,25 @@ pub enum RuntimeKind {
 }
 ```
 
-## OoP Gear Configuration
+## Configuring an OoP process
 
-### YAML configuration
+An OoP gear runs as its own process and connects back to the platform host's DirectoryService.
+Point it at that endpoint with the `TOOLKIT_DIRECTORY_ENDPOINT` environment variable, and drive
+its local HTTP surface (REST + probes) with an `oop_http` block:
 
 ```yaml
+oop_http:
+  listen_addr: "127.0.0.1:9091"
+  advertise_uri: "http://127.0.0.1:9091"
+
 gears:
-  calculator:
-    runtime:
-      type: oop
-      execution:
-        executable_path: "~/.cf-gears/bin/calculator-oop.exe"
-        args: [ ]
-        working_directory: null
-        environment:
-          RUST_LOG: "info"
-    config:
-      some_setting: "value"
+  my_gear:
+    config: {}
 ```
 
-### Configuration fields
-
-- `type: oop` — marks the gear as out-of-process
-- `executable_path` — path to the gear binary (supports `~` expansion)
-- `args` — command-line arguments passed to the executable
-- `working_directory` — optional working directory for the process
-- `environment` — environment variables to set for the process
+> **Removed:** the legacy `runtime.type: oop` + `execution.executable_path` config — in which
+> the host spawned the gear as a child process — is no longer used anywhere in the repo. OoP
+> gears are deployed as independent processes/pods (see `deploy/helm/` and `deploy/docker/`).
 
 ## OoP Bootstrap Library
 
@@ -82,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
 | `instance_id` | Instance ID (defaults to random UUID) |
 | `directory_endpoint` | DirectoryService gRPC endpoint |
 | `config_path` | Path to configuration file |
-| `verbose` | Log verbosity (0=default, 1=info, 2=debug, 3=trace) |
+| `verbose` | Log verbosity (0=default, 1=debug, 2=trace) |
 | `print_config` | Print effective config and exit |
 | `heartbeat_interval_secs` | Heartbeat interval (default: 5) |
 | `version` | Gear version used for `DirectoryService` registration and the generated `OpenAPI` spec version; `None` means no explicit version |

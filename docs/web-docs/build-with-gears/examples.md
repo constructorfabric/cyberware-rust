@@ -12,14 +12,14 @@ Every pattern in this section maps to runnable code in the framework repository.
 
 - **`examples/toolkit/users-info/`** — the complete gear followed by [Build your first gear](../your-first-gear/) and [Gear anatomy](../gear-anatomy/): an SDK, a domain service with authorization, secure multi-tenant persistence, a REST surface with OData, and runtime wiring.
 
-## Out-of-process gears (gRPC)
+## Out-of-process gears (Profile 3)
 
-- **`examples/oop-gears/calculator/`** — a gear that runs in-process or out-of-process behind the same SDK trait, selected by config. See [Run a gear out-of-process](../out-of-process/).
-- **`examples/oop-gears/calculator-gateway/`** — a gateway in front of the out-of-process calculator.
+- **`examples/toolkit/hello/`** — a minimal REST gear that runs as its own pod, self-registers with the DirectoryService, and is reverse-proxied by the api-gateway edge. See [Run a gear out-of-process](../out-of-process/).
+- **`examples/toolkit/api-contracts/`** — a `PaymentApi` provider gear plus a separate consumer gear that resolves the contract over REST from another pod (out-of-process gear-to-gear via `#[toolkit::consumes]`).
 
 ## Object-oriented / composition patterns
 
-- **`examples/oop-gears/`** — composition patterns showing gears calling gears through `ClientHub`. See [SDK contracts and ClientHub](../../concepts/sdk-and-clienthub/).
+- **`examples/toolkit/api-contracts/`** — composition showing one gear calling another through `ClientHub` / `#[toolkit::consumes]`, identical in-process or across pods. See [SDK contracts and ClientHub](../../concepts/sdk-and-clienthub/).
 
 ## Toolkit feature examples
 

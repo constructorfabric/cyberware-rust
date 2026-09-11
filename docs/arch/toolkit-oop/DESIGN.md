@@ -280,7 +280,9 @@ handles:
 - Configuration loading and merging (master-rendered config via `TOOLKIT_MODULE_CONFIG` env var, merged with local config
   field-by-field for DB, key-by-key for logging).
 - Logging initialization with OpenTelemetry support (tracing config from master).
-- gRPC connection to DirectoryService (via `DirectoryGrpcClient::connect`).
+- Lazy gRPC client to the DirectoryService (via `DirectoryGrpcClient::connect_lazy`): the channel connects on first
+  use, so a cold DirectoryService does not block or crash bootstrap. The background presence loop's backoff retry
+  absorbs the startup window (`cpt-cf-adr-eventual-readiness`).
 - Heartbeat loop using a child `CancellationToken`.
 - Gear lifecycle execution via `run(RunOptions { ... })`.
 - Graceful shutdown driven by a root `CancellationToken` hooked to OS signals.

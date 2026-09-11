@@ -1,0 +1,14 @@
+apiVersion: v2
+name: api-contracts-consumer
+description: >-
+  api-contracts-consumer - an OoP gear that resolves the PaymentApi contract from
+  the SEPARATE api-contracts provider pod over REST (via the DirectoryService)
+  and forwards charges. Demonstrates the Profile 3 out-of-process gear-to-gear
+  REST path.
+type: application
+version: 0.1.0
+appVersion: "dev"
+dependencies:
+  - name: toolkit-common
+    version: 0.1.0
+    repository: "file://../toolkit-common"

@@ -1,0 +1,117 @@
+[package]
+name = "cf-gears-platform-host"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CF/Gears Platform Host - trust-coupled core + system gears (Profile 3 platform-host image)"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "platform-host"
+path = "src/main.rs"
+
+[features]
+# Plugin availability is a build-time choice (which plugin crates are linked);
+# the active vendor is selected at runtime via GTS `vendor` config. Two presets
+# are provided:
+#   * `dev-plugins`  - static/config-driven plugins; zero external dependencies,
+#                      boots out of the box (mirrors config/e2e-features.txt).
+#                      Intended for CI, demos, and single-user on-prem.
+#   * `prod-plugins` - OIDC authn + tenant-resolver-backed authz + resource-group
+#                      -backed tenant resolution. The real Profile 3 stack.
+# Build the production platform-host image with `--features prod-plugins`
+# (optionally `--no-default-features` to exclude the static plugins entirely).
+default = ["dev-plugins"]
+
+dev-plugins = [
+    "static-authn",
+    "static-authz",
+    "static-tenants",
+    "static-credstore",
+    "static-idp",
+]
+
+# NOTE: credstore and account-management currently ship only `static-*` backend
+# plugins in-tree, so they are included in both presets until real backends land.
+prod-plugins = [
+    "oidc-authn",
+    "tr-authz",
+    "tenant-resolver-rg",
+    "static-credstore",
+    "static-idp",
+]
+
+# authn-resolver backends
+static-authn = ["dep:static-authn-plugin"]
+oidc-authn = ["dep:oidc-authn-plugin"]
+# authz-resolver backends
+static-authz = ["dep:static-authz-plugin"]
+tr-authz = ["dep:tr-authz-plugin"]
+# tenant-resolver backends
+static-tenants = ["dep:static-tr-plugin"]
+single-tenant = ["dep:single-tenant-tr-plugin"]
+tenant-resolver-rg = ["dep:rg-tr-plugin"]
+# credstore backends
+static-credstore = ["dep:static-credstore-plugin"]
+# account-management identity-provider backends
+static-idp = ["dep:static-idp-plugin"]
+
+# FIPS-140-3: use the AWS-LC FIPS-validated crypto module for all crypto ops.
+fips = ["toolkit/fips"]
+# Kubernetes platform-plane auth (SA-token TokenReview validation). Enables the
+# toolkit k8s-auth path, the grpc-hub inbound TokenReview validator (the hub
+# serves the DirectoryService whose RPCs are enforced on the platform plane),
+# and the api-gateway inbound TokenReview validator (it is the REST host for
+# co-hosted platform-plane routes such as authz-resolver/evaluate).
+k8s = ["toolkit/k8s-auth", "grpc_hub/k8s-auth", "api_gateway/k8s-auth"]
+# OpenTelemetry tracing/metrics export.
+otel = ["toolkit/otel"]
+
+[dependencies]
+mimalloc = { workspace = true }
+
+# ToolKit bootstrap (host mode)
+toolkit = { workspace = true, features = ["bootstrap"] }
+
+# Trust-coupled core (must remain co-located, see DESIGN "Platform Host Composition")
+authz-resolver = { package = "cf-gears-authz-resolver", path = "../../gears/system/authz-resolver/authz-resolver" }
+tenant-resolver = { package = "cf-gears-tenant-resolver", path = "../../gears/system/tenant-resolver/tenant-resolver" }
+resource_group = { package = "cf-gears-resource-group", path = "../../gears/system/resource-group/resource-group" }
+account_management = { package = "cf-gears-account-management", path = "../../gears/system/account-management/account-management" }
+
+# System gears
+gear_orchestrator = { package = "cf-gears-gear-orchestrator", path = "../../gears/system/gear-orchestrator" }
+types_registry = { package = "cf-gears-types-registry", path = "../../gears/system/types-registry/types-registry" }
+credstore = { package = "cf-gears-credstore", path = "../../gears/credstore/credstore" }
+api_gateway = { package = "cf-gears-api-gateway", path = "../../gears/system/api-gateway" }
+grpc_hub = { package = "cf-gears-grpc-hub", path = "../../gears/system/grpc-hub" }
+authn-resolver = { package = "cf-gears-authn-resolver", path = "../../gears/system/authn-resolver/authn-resolver" }
+
+# Optional tenant resolver plugins
+static-tr-plugin = { package = "cf-gears-static-tr-plugin", path = "../../gears/system/tenant-resolver/plugins/static-tr-plugin", optional = true }
+single-tenant-tr-plugin = { package = "cf-gears-single-tenant-tr-plugin", path = "../../gears/system/tenant-resolver/plugins/single-tenant-tr-plugin", optional = true }
+rg-tr-plugin = { package = "cf-gears-rg-tr-plugin", path = "../../gears/system/tenant-resolver/plugins/rg-tr-plugin", optional = true }
+
+# Optional authn/authz plugins
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+oidc-authn-plugin = { package = "cf-gears-oidc-authn-plugin", path = "../../gears/system/authn-resolver/plugins/oidc-authn-plugin", optional = true }
+static-authz-plugin = { package = "cf-gears-static-authz-plugin", path = "../../gears/system/authz-resolver/plugins/static-authz-plugin", optional = true }
+tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", path = "../../gears/system/authz-resolver/plugins/tr-authz-plugin", optional = true }
+
+# Optional credstore plugins
+static-credstore-plugin = { package = "cf-gears-static-credstore-plugin", path = "../../gears/credstore/plugins/static-credstore-plugin", optional = true }
+
+# Optional account-management identity-provider plugins
+static-idp-plugin = { package = "cf-gears-static-idp-plugin", path = "../../gears/system/account-management/plugins/static-idp-plugin", optional = true }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

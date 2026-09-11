@@ -11,17 +11,31 @@ publish = false
 
 [features]
 default = []
-# OpenTelemetry in the resolved REST client: W3C traceparent propagation + RED
-# metrics (forwards `api-contracts-sdk/otel`).
+# OpenTelemetry in the resolved REST client.
 otel = ["api-contracts-sdk/otel"]
+# OoP binary (api-contracts-consumer-oop): bootstrap + embedded authn stack.
+oop_module = [
+    "dep:tokio",
+    "dep:clap",
+    "dep:mimalloc",
+    "toolkit/bootstrap",
+    "dep:authn-resolver",
+    "dep:static-authn-plugin",
+    "dep:types-registry",
+]
+# Kubernetes TokenReview platform-plane auth.
+k8s-auth = ["toolkit/k8s-auth"]
 
 [lints]
 workspace = true
 
+[[bin]]
+name = "api-contracts-consumer-oop"
+path = "src/main.rs"
+required-features = ["oop_module"]
+
 [dependencies]
-# `rest-client` is not optional: `#[toolkit::consumes]` in `gear.rs` names
-# `PaymentApiRestResolvingClient` unconditionally, so the SDK must always
-# generate it.
+# rest-client for the resolving client `#[toolkit::consumes]` names.
 api-contracts-sdk = { workspace = true, features = ["rest-client"] }
 toolkit.workspace = true
 toolkit-canonical-errors.workspace = true
@@ -30,6 +44,14 @@ async-trait.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 tracing.workspace = true
+
+# OoP-only, gated behind `oop_module`.
+tokio = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+authn-resolver = { package = "cf-gears-authn-resolver", path = "../../../../gears/system/authn-resolver/authn-resolver", optional = true }
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+types-registry = { package = "cf-gears-types-registry", path = "../../../../gears/system/types-registry/types-registry", optional = true }
 
 [dev-dependencies]
 # The real provider gear, booted alongside this consumer in the composition test.

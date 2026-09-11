@@ -73,7 +73,7 @@ pub enum ShutdownOptions {
 /// Configuration for a single `OoP` gear to be spawned.
 #[derive(Clone)]
 pub struct OopGearSpawnConfig {
-    /// Name of the gear (e.g., "calculator").
+    /// Name of the gear (e.g., "hello").
     pub gear_name: String,
     /// Path to the gear executable.
     pub binary: PathBuf,

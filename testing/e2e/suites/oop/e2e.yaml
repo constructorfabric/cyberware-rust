@@ -1,0 +1,20 @@
+# Out-of-process (loopback) E2E suite — self-managed.
+#
+# This suite verifies the Profile-3 OoP wiring WITHOUT Kubernetes: it boots the
+# platform-host (edge + DirectoryService) and three OoP gear processes on
+# loopback (the same software path as the cluster demo, minus k8s), then asserts
+# the cross-process seams that no unit test or in-process E2E can reach:
+#   - anonymous cross-process reverse-proxy through the edge (hello)
+#   - tenant-plane 401 gating at the edge
+#   - OoP -> OoP contract call over REST (api-contracts-consumer -> api-contracts),
+#     discovered via the DirectoryService
+#
+# It owns its own lifecycle (multiple distinct binaries), so it is NOT run by the
+# shared `make e2e-local`. Run it directly:
+#
+#   make e2e-oop
+#
+# The suite's conftest.py builds the required binaries and manages the processes;
+# it does not use run_e2e.py's single-binary launcher.
+suite: oop
+launcher: pytest

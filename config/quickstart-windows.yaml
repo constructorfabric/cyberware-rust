@@ -80,13 +80,6 @@ logging:
     max_age_days: 28
     max_backups: 3
     max_size_mb: 100
-  calculator:
-    console_level: debug
-    file: "logs/calculator-oop.log"
-    file_level: debug
-    max_age_days: 28
-    max_backups: 3
-    max_size_mb: 100
 
 
 # Per-gear configurations using new structure
@@ -115,24 +108,6 @@ gears:
     config:
       # Use ephemeral port; OoP gears receive the actual bound address from master host
       listen_addr: "127.0.0.1:0"
-
-  calculator:
-    runtime:
-      type: oop
-      execution:
-        executable_path: "calculator-oop.exe"
-        # CLI arguments passed to OoP gear. Use --config to pass gear's own config file:
-        # args: ["--config", "config/oop-example.yaml"]
-        # The local config file is used to:
-        #   - Configure system gears for OoP process (e.g., grpc_hub.listen_addr)
-        #   - Override settings from master (TOOLKIT_MODULE_CONFIG)
-        #   - Run in standalone mode (without master host)
-        args: [ "--config", "./config/oop-example.yaml" ]
-        working_directory: "."
-        environment: { }
-    config:
-      some_setting: "value"
-
 
   users-info:
     # Gear-specific database configuration

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: toolkit-common
+description: >-
+  CF/Gears ToolKit Helm library chart. Provides reusable named templates
+  (Deployment, Service, ConfigMap, ServiceAccount, helpers) shared by the
+  platform-host and per-gear (OoP) charts. Supports Profile 3 (Kubernetes),
+  including SA-token projection for platform-plane authentication.
+type: library
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - cf-gears
+  - toolkit
+  - oop
+  - platform
+maintainers:
+  - name: Constructor Fabric

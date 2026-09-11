@@ -1,0 +1,120 @@
+# Default values for the api-contracts (PaymentApi PROVIDER OoP gear) chart.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/constructorfabric/api-contracts
+  tag: "dev"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  automount: true
+  annotations: {}
+
+command: ["/app/gear"]
+args: ["--config", "/app/config/gear.yaml"]
+
+service:
+  type: ClusterIP
+  # OoP REST + probes port (matches oop_http.listen_addr).
+  port: 9097
+
+grpc:
+  enabled: false
+  port: 50051
+
+# DirectoryService (platform host grpc-hub) this gear registers with. Injected
+# as TOOLKIT_DIRECTORY_ENDPOINT. Overridden by the umbrella chart to match the
+# platform-host Service name.
+directoryEndpoint: "http://platform-host:50051"
+
+# SA-token projection for platform-plane auth. The projected token (audience
+# `toolkit-internal`) is attached to this gear's DirectoryService calls so the
+# enforced grpc-hub accepts its register/resolve RPCs.
+saToken:
+  enabled: true
+  audience: toolkit-internal
+  mountPath: /var/run/secrets/tokens/toolkit-internal
+  fileName: token
+  expirationSeconds: 3600
+
+probes:
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 3
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    failureThreshold: 6
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+podLabels: {}
+podAnnotations: {}
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop: ["ALL"]
+nodeSelector: {}
+affinity: {}
+tolerations: []
+
+# Gear config mounted at /app/config/gear.yaml. advertise_uri uses this gear's
+# in-cluster Service DNS so consumer pods can resolve and call it over REST.
+config:
+  mountPath: /app/config/gear.yaml
+  fileName: gear.yaml
+  content: |
+    server:
+      home_dir: "/app/data"
+
+    logging:
+      default:
+        console_format: "json"
+        console_level: info
+
+    oop_http:
+      listen_addr: "0.0.0.0:9097"
+      advertise_uri: "http://{{ include "toolkit-common.fullname" . }}:9097"
+      internal_auth:
+        provider: kube
+        audiences: ["toolkit-internal"]
+        token_path: /var/run/secrets/tokens/toolkit-internal/token
+
+    gears:
+      api-contracts:
+        config: {}
+
+      authn-resolver:
+        config:
+          vendor: "constructorfabric"
+
+      static-authn-plugin:
+        config:
+          vendor: "constructorfabric"
+          priority: 100
+          mode: accept_all
+
+      types-registry:
+        config: {}

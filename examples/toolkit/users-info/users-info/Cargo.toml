@@ -13,14 +13,31 @@ workspace = true
 default = ["odata"]
 odata = []          # enable streaming API with typed queries
 integration = []    # gate integration tests
+# OoP binary (users-info-oop): bootstrap + embedded authn stack.
+oop_module = [
+    "dep:clap",
+    "dep:mimalloc",
+    "toolkit/bootstrap",
+    "dep:authn-resolver",
+    "dep:static-authn-plugin",
+    "dep:types-registry",
+]
+# Kubernetes TokenReview platform-plane auth.
+k8s-auth = ["toolkit/k8s-auth"]
+
+[[bin]]
+name = "users-info-oop"
+path = "src/main.rs"
+required-features = ["oop_module"]
 
 [dependencies]
 # SDK - public API, models, and errors
 users-info-sdk = { path = "../users-info-sdk", features = ["odata"] }
 
-# AuthZ resolver for authorization (PEP flow)
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", path = "../../../../gears/system/authz-resolver/authz-resolver-sdk" }
-authz-resolver = { workspace = true }
+# Consumed via `#[toolkit::consumes]`; rest-client for the resolving client.
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", path = "../../../../gears/system/authz-resolver/authz-resolver-sdk", features = [
+    "rest-client",
+] }
 
 # Core dependencies
 anyhow = { workspace = true }
@@ -69,7 +86,16 @@ toolkit-sdk = { workspace = true }
 toolkit-macros = { workspace = true }
 opentelemetry = { workspace = true }
 
+# OoP-only, gated behind `oop_module`.
+clap = { workspace = true, optional = true }
+mimalloc = { workspace = true, optional = true }
+authn-resolver = { package = "cf-gears-authn-resolver", path = "../../../../gears/system/authn-resolver/authn-resolver", optional = true }
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../../../gears/system/authn-resolver/plugins/static-authn-plugin", optional = true }
+types-registry = { package = "cf-gears-types-registry", path = "../../../../gears/system/types-registry/types-registry", optional = true }
+
 [dev-dependencies]
+# The real provider gear, linked only for in-process composition/PEP tests.
+authz-resolver = { workspace = true }
 tokio-util = { workspace = true }
 serde_json = { workspace = true }
 

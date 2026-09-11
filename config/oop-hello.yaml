@@ -1,0 +1,29 @@
+# Local multi-process platform-host: hello OoP gear.
+#
+# Run (after the host is up):
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+#     cargo run -p hello --features oop_module --bin hello-oop -- --config config/oop-hello.yaml
+#
+# Then:
+#   curl http://127.0.0.1:8087/hello/v1/ping   # proxied through the edge
+#   curl http://127.0.0.1:9091/hello/v1/ping   # direct to the OoP pod
+
+server:
+  home_dir: "~/.cf-gears-hello"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-hello.log"
+    file_level: info
+
+# OoP HTTP serving lifecycle: bind a local REST server + register its endpoint
+# with the DirectoryService so the edge can proxy to it.
+oop_http:
+  listen_addr: "127.0.0.1:9091"
+  advertise_uri: "http://127.0.0.1:9091"
+  allow_loopback_advertise: true
+
+gears:
+  hello:
+    config: {}

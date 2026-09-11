@@ -14,8 +14,10 @@ use url::Url;
 #[allow(unused_imports)]
 use users_info_sdk::UsersInfoClientV1;
 
-// Import AuthZ resolver for authorization (PEP flow)
-use authz_resolver_sdk::AuthZResolverApi;
+// Import AuthZ resolver for authorization (PEP flow). The client is consumed
+// via `#[toolkit::consumes]` (below) and resolved lazily by the PolicyEnforcer,
+// so this gear works identically in-process and out-of-process.
+use authz_resolver_sdk::PolicyEnforcer;
 
 use crate::api::rest::dto::UserEvent;
 use crate::api::rest::routes;
@@ -38,9 +40,9 @@ pub(crate) type ConcreteAppServices =
 /// Main gear struct with DDD-light layout and proper `ClientHub` integration
 #[toolkit::gear(
     name = "users-info",
-    deps = [authz_resolver],
     capabilities = [db, rest]
 )]
+#[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 pub struct UsersInfo {
     // Keep the domain service behind OnceLock for set-once access.
     // AppServices contains the db_handle and provides db() for per-request Db instances.
@@ -91,11 +93,11 @@ impl Gear for UsersInfo {
         let audit_adapter: Arc<dyn AuditPort> =
             Arc::new(HttpAuditClient::new(http_client, audit_base, notify_base));
 
-        // Fetch AuthZ resolver from ClientHub
-        let authz = ctx
-            .client_hub()
-            .get::<dyn AuthZResolverApi>()
-            .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
+        // AuthZ resolver is consumed via `#[toolkit::consumes]`; the resolving
+        // client is wired by the runtime's proxy-wiring phase (after `init`), so
+        // the enforcer resolves it lazily from the ClientHub at request time.
+        // This is the single code path for both in-process and OoP deployments.
+        let enforcer = PolicyEnforcer::from_hub(ctx.client_hub());
 
         let service_config = ServiceConfig {
             max_display_name_length: 100,
@@ -124,7 +126,7 @@ impl Gear for UsersInfo {
             db,
             publisher,
             audit_adapter,
-            authz,
+            enforcer,
             service_config,
             metrics,
         ));

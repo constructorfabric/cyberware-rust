@@ -51,6 +51,7 @@ debug = true
 [workspace]
 members = [
     "apps/cf-gears-example-server",
+    "apps/platform-host",
     "tools/gts-analyze",
     "tools/xtask",
     "libs/toolkit",
@@ -114,10 +115,7 @@ members = [
     "examples/toolkit/users-info/users-info-sdk",
     "examples/toolkit/users-info/users-info",
     "examples/toolkit/users-info/users-info-server",
-    "examples/oop-gears/calculator-gateway/calculator-gateway-sdk",
-    "examples/oop-gears/calculator-gateway/calculator-gateway",
-    "examples/oop-gears/calculator/calculator-sdk",
-    "examples/oop-gears/calculator/calculator",
+    "examples/toolkit/hello/hello",
     "examples/cf-gears-fips-probe",
     "gears/system/types-registry/types-registry-sdk",
     "gears/system/types-registry/types-registry",
@@ -543,6 +541,9 @@ proptest = "1"
 
 # CLI support
 clap = { version = "4.5", features = ["derive"] }
+
+# Allocator
+mimalloc = { version = "0.1" }
 
 # Database utilities
 #

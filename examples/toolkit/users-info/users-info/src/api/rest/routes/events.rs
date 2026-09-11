@@ -19,6 +19,7 @@ where
     let router = OperationBuilder::get("/users-info/v1/users/events")
         .operation_id("users_info.events")
         .authenticated()
+        .exposed()
         .require_license_features::<License>([])
         .summary("User events stream (SSE)")
         .description("Real-time stream of user events as Server-Sent Events")

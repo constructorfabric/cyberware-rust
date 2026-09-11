@@ -1,0 +1,19 @@
+# Minimal preset: platform-host only (no OoP gears).
+#
+#   helm install platform deploy/helm/toolkit-platform -f deploy/helm/toolkit-platform/values-minimal.yaml
+
+platform-host:
+  enabled: true
+  fullnameOverride: platform-host
+
+hello:
+  enabled: false
+
+users-info:
+  enabled: false
+
+api-contracts:
+  enabled: false
+
+api-contracts-consumer:
+  enabled: false
