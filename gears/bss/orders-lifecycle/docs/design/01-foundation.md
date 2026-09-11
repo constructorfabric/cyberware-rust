@@ -570,7 +570,7 @@ No slice may register a second name for any of these four. Every reason is a **G
 |-------------------|----------------|----------|
 | `toolkit-db` | Runtime-scoped database access | The one transaction per transition, and the append-only stores |
 | `types-registry` | SDK client | Resolving and registering the GTS event, error and category types of §4.7; a type that fails to register fails the boot |
-| Coordination lease library | SDK client | Singleton coordination for the sharded outbox drain, the per-state expiry sweep, the draft auto-void sweep, the idempotency-window sweep and the retention purge sweep — five workers |
+| Coordination lease library | SDK client | Singleton coordination for the sharded outbox drain, the per-state expiry sweep, the draft auto-void sweep, the idempotency-window sweep, the retention purge sweep and the audit-chain verifier — six workers |
 
 **Dependency Rules** (per project conventions):
 - No circular dependencies
@@ -783,9 +783,19 @@ rows that append no version, and they present the **current version** as their e
 like any other transition, so the optimistic check applies uniformly and no path bypasses it
 ([`../DECISIONS.md`](../DECISIONS.md) D-64).
 
-**Partitioning.** Two traffic-driven append-only stores — the read access log and Preview gate
-outcomes — are **range-partitioned by month**, so their retention is a partition drop rather than a
-bulk DELETE, which is the only shape that stays cheap as history grows.
+**Partitioning: no table in this gear is partitioned, and that is a decision rather than an
+omission.** An earlier version of this paragraph range-partitioned the two traffic-driven
+append-only stores — the read access log and Preview gate outcomes — by month, so that retention
+would be a partition drop rather than a bulk DELETE. It is withdrawn for three reasons, each
+independently sufficient.
+
+* **It contradicted both owning slices.** `orders_gate_outcome` declares its purge against an index on `(evaluated_at) WHERE order_id IS NULL` ([`03-gate-and-pin`](./03-gate-and-pin.md) §3.7) and `orders_read_access_log` against `(accessed_at)` ([`08-read-and-authz`](./08-read-and-authz.md) §3.7). Both are row-level DELETEs. This paragraph was the only statement claiming otherwise, and the tables' owners are authoritative over their own retention mechanism.
+* **A monthly partition cannot express a 7-day retention.** Preview outcomes are kept **7 days**. There is no month to drop that contains only rows older than a week, so partition-drop retention is not merely inferior there — it is arithmetically unable to implement the declared window.
+* **Nothing creates the partitions.** `§3.8` names the gear's lease-coordinated workers — the outbox drain, the per-state expiry sweep, the draft auto-void sweep, the idempotency-window sweep, the retention purge sweep and the audit-chain verifier. None creates or drops a partition, and a range-partitioned table with no partition covering the current month **rejects every insert**. For the read access log that failure is not degraded service: the audit read's access-log write is **fail-closed** (`08 §4.2`), so every audit read would begin failing at midnight on the first of the month. Adding a sixth worker to manage partitions would be the alternative, and it buys nothing the two index-driven purges do not already deliver.
+
+Both purges are therefore owned by the existing **retention purge sweep**, run in bounded batches
+through the partial indexes their tables declare, which is the same shape the refused-audit purge
+already uses.
 
 **The outbox is deliberately not partitioned**, and the reason is a constraint, not a preference.
 PostgreSQL requires a unique constraint on a partitioned table to include every partition-key
@@ -1291,11 +1301,25 @@ was recorded.
 
 - [ ] `p3` - **ID**: `cpt-cf-bss-orders-lifecycle-topology-foundation-runtime`
 
-The engine is a library inside the gear process, not a separate deployable. **Five** background
+The engine is a library inside the gear process, not a separate deployable. **Six** background
 workers run under coordination leases so a multi-replica deployment cannot double-act: the
 **sharded** outbox drain (one lease per shard, so throughput scales with replicas), the per-state
-expiry sweep, the draft auto-void sweep, the idempotency-window sweep and the retention purge
-sweep. Database privilege is
+expiry sweep, the draft auto-void sweep, the idempotency-window sweep, the retention purge sweep
+and the **audit-chain verifier**.
+
+**The audit-chain verifier is the sixth worker, and it was previously a job nothing declared.**
+`§3.7` requires the predecessor-hash chain to be verified periodically, and this section's
+observability list carries "audit-chain verification results" as a metric and alerts on "any
+chain-verification mismatch" — so the design monitored an executor it never named. That is not a
+documentation gap: `../DESIGN.md` §4.2's threat model answers audit tampering with *the chain plus
+the absent UPDATE grant*, and a chain nobody checks detects nothing, so the mitigation was resting
+on work that had no owner. The worker is therefore declared here with the three properties it needs:
+
+* **Scope is per order, walked in a rolling pass.** The chain is per-order (`§3.7`), so a run verifies one order's committed entries end to end and moves on. Verifying the whole trail in one pass does not scale — at the D-41 capacity baseline the committed trail reaches the order of billions of rows inside the 24-month tier — and a per-order unit is both the natural boundary and independently restartable.
+* **Cadence is a full pass within a design-owned window, baseline 30 days**, so the worst-case detection latency for tampering is bounded and stateable rather than emergent. An order under dispute **MAY** additionally be verified on demand; that path is a read, not a mutation.
+* **A mismatch alerts and MUST NOT repair.** The verifier holds no UPDATE or DELETE grant — it uses the audit role's SELECT — so it cannot silently rewrite a chain it finds broken, which is the only posture consistent with the trail being evidence. It **MUST** skip refused rows: those carry a NULL `sequence` and join no chain (`§3.7`), so including them would report a mismatch on every order that has ever refused an attempt.
+
+Database privilege is
 runtime-owned; the slice exposes migrations and receives scoped access, and the audit role is
 granted INSERT and SELECT only.
 

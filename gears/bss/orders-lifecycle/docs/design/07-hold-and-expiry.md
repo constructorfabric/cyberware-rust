@@ -536,7 +536,7 @@ requested in `01 §3.7`'s canonical list and no longer needs.
 
 ### 3.8 Deployment Topology
 
-Inherited from [`01-foundation`](./01-foundation.md) §3.8, with two of the gear's **five**
+Inherited from [`01-foundation`](./01-foundation.md) §3.8, with two of the gear's **six**
 lease-coordinated workers owned here: the **expiry sweep** and the **draft auto-void sweep**. Both
 take a lease, so a multi-replica deployment cannot double-expire. Both are idle-cheap: a sweep
 with no configured TTL does no work at all.

@@ -954,11 +954,13 @@ The gear runs as a stateless transition and read service over a shared `toolkit-
 with database privilege runtime-owned and the gear exposing migrations only. The audit role is
 granted INSERT and SELECT only, which is half of what makes the trail tamper-evident.
 
-**Five background workers** are lease-coordinated so a multi-replica deployment cannot double-act:
+**Six background workers** are lease-coordinated so a multi-replica deployment cannot double-act:
 the **sharded outbox drain** — one lease per `order_id` hash shard, so event throughput scales
 with replicas while per-order ordering holds — the per-state TTL expiry sweep, the draft auto-void
-sweep, the idempotency-window sweep, and the **retention purge sweep**. The outbox is the only
-asynchronous egress.
+sweep, the idempotency-window sweep, the **retention purge sweep**, and the **audit-chain
+verifier**, which walks orders in a rolling pass and is what makes §4.2's tamper-evidence claim
+rest on an executor rather than on the chain alone (`design/01-foundation.md` §3.8). The outbox is
+the only asynchronous egress.
 
 The retention purge sweep exists because three of the four declared retention windows previously
 had no executor: only delivered outbox rows were purged, by the drain. It runs singleton-leased on
@@ -1018,7 +1020,7 @@ blank because a threshold nobody set is a threshold nobody can verify against
 Cost is dominated by the shared `toolkit-db` backend and scales with retained order history. The
 gear is sized by transition rate rather than data volume: an order is a handful of small rows and
 the version chain grows only on amendment, which is rare relative to submit. Read load is absorbed
-by the aggregate row rather than the write path. The five background workers are lease-coordinated
+by the aggregate row rather than the write path. The six background workers are lease-coordinated
 and idle-cheap.
 
 ### 4.2 Security posture
