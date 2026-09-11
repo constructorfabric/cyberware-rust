@@ -42,6 +42,7 @@ Updated:  2026-09-10 by Constructor Tech
   - [O2: immutable versions, pointer, gc table (CHOSEN)](#o2-immutable-versions-pointer-gc-table-chosen)
   - [O3: backend-native versioning](#o3-backend-native-versioning)
   - [O4: two-phase commit, outbox](#o4-two-phase-commit-outbox)
+- [More Information](#more-information)
 - [Traceability](#traceability)
 
 <!-- /toc -->
@@ -177,7 +178,6 @@ None of this is novel, and naming the pattern is what justifies removing the rea
 
 Why this *removes* the reaper instead of reshaping it: a saga — the shipped model — has intermediate states (`provisioning`, `deprovisioning`, a torn overwrite) that are **wrong until repaired**, and the reaper was the component whose job was to notice and repair them on a timer, so correctness depended on it running. Under immutable versions there is no intermediate state: a row either points at fully written bytes or at nothing, there is nothing to repair, and no component's lateness can leave a reference wedged or a read closed. What remains is unreachable garbage, and garbage collection is the textbook case for a lazy, periodic, correctness-free job — the `git gc` shape — not for a resident loop inside the service.
 
-References: [Vault KV secrets engine v2](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2) · [Google Cloud Secret Manager overview (secret versions)](https://cloud.google.com/secret-manager/docs/overview) · [AWS Secrets Manager: what's in a secret (versions and staging labels)](https://docs.aws.amazon.com/secretsmanager/latest/userguide/whats-in-a-secret.html) · [Azure Key Vault: keys, secrets and certificates (object identifiers, versions)](https://learn.microsoft.com/en-us/azure/key-vault/general/about-keys-secrets-certificates) · [Shadow paging](https://en.wikipedia.org/wiki/Shadow_paging) — R. A. Lorie, *Physical integrity in a large segmented database*, ACM TODS 2(1), 1977 · [Copy-on-write](https://en.wikipedia.org/wiki/Copy-on-write) · [Git Internals — Git Objects](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects) · [`git gc`](https://git-scm.com/docs/git-gc) · [Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) · [Saga](https://microservices.io/patterns/data/saga.html).
 
 ### Consequences
 
@@ -330,6 +330,12 @@ Compatibility is recorded here, not optimized for.
 - Bad: heavier than the guarantee needs. The intent row this ADR uses already gives a crash a single, cheap, indexed place to be discovered and reconciled; a full 2PC coordinator or an outbox-with-dispatcher adds a component, a failure mode of its own (a stuck coordinator, a lagging consumer), and an operational surface the platform's cluster primitives explicitly steer away from for external side effects (ADR-0003's citation of cluster ADR-002: no remote I/O inside a coordinated critical section).
 - Rejected: the intent-row/gc-table pair is the outbox pattern's essential idea — a durable record of intent, drained asynchronously — at the minimum weight this problem needs, with no second coordination protocol layered on top.
 
+## More Information
+
+Precedents and background for the pattern named in [The pattern, and why the reaper goes with the saga](#the-pattern-and-why-the-reaper-goes-with-the-saga): [Vault KV secrets engine v2](https://developer.hashicorp.com/vault/docs/secrets/kv/kv-v2) · [Google Cloud Secret Manager overview (secret versions)](https://cloud.google.com/secret-manager/docs/overview) · [AWS Secrets Manager: what's in a secret (versions and staging labels)](https://docs.aws.amazon.com/secretsmanager/latest/userguide/whats-in-a-secret.html) · [Azure Key Vault: keys, secrets and certificates (object identifiers, versions)](https://learn.microsoft.com/en-us/azure/key-vault/general/about-keys-secrets-certificates) · [Shadow paging](https://en.wikipedia.org/wiki/Shadow_paging) — R. A. Lorie, *Physical integrity in a large segmented database*, ACM TODS 2(1), 1977 · [Copy-on-write](https://en.wikipedia.org/wiki/Copy-on-write) · [Git Internals — Git Objects](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects) · [`git gc`](https://git-scm.com/docs/git-gc) · [Transactional outbox](https://microservices.io/patterns/data/transactional-outbox.html) · [Saga](https://microservices.io/patterns/data/saga.html).
+
+The write protocol is walked step by step, with its failure map, in DESIGN §6.2–§6.4; the scenario walkthrough kept alongside this project (one `smtp-default` reference across a three-tenant chain) shows every state of the row, the gc table and the backend after each request.
+
 ## Traceability
 
 - Builds on [ADR-0001](0001-cpt-cf-credstore-adr-stateful-gear.md): the metadata table and the pointer it now carries live in the store that ADR established; the stateful-gear decision is what makes a pointer possible at all.
@@ -337,5 +343,15 @@ Compatibility is recorded here, not optimized for.
 - Amends [ADR-0003](0003-cpt-cf-credstore-adr-value-fingerprint-fence.md): the fence mechanism is unchanged; its saga-healing role is withdrawn along with out-of-band seeding.
 - Defines the write protocol [ADR-0004](0004-cpt-cf-credstore-adr-secret-value-exposure.md) builds its surface on, including the crash-safety of `PATCH {"value": null}`.
 - Leaves [ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md) untouched: the collection read resolves through the same row and the same `value_id` pointer, with no change to its authorization or reduction logic.
-- Requirements: `cpt-cf-credstore-fr-put-secret`, `cpt-cf-credstore-fr-delete-secret`, `cpt-cf-credstore-fr-deprovisioning`, `cpt-cf-credstore-fr-optimistic-concurrency`, `cpt-cf-credstore-fr-write-secret`, `cpt-cf-credstore-fr-write-credential-record`, `cpt-cf-credstore-nfr-confidentiality`.
-- New requirement: `cpt-cf-credstore-fr-immutable-value-versions`, added to the PRD §5.8 alongside this project's other proposed requirements.
+- **PRD**: [PRD.md](../PRD.md) · **DESIGN**: [DESIGN.md](../DESIGN.md) (§4.7 schema, §6.1–§6.4 lifecycle)
+
+This decision directly addresses the following requirements or design elements:
+
+* `cpt-cf-credstore-fr-immutable-value-versions` — the requirement this ADR introduces: a new immutable backend entry per value write, one-transaction pointer switch, garbage never truth.
+* `cpt-cf-credstore-fr-put-secret` — the write is a protocol over a fresh `value_id`, not a saga over a shared key.
+* `cpt-cf-credstore-fr-write-secret`, `cpt-cf-credstore-fr-write-credential-record` — `PUT` and a value-bearing `PATCH` run the same protocol; a metadata-only `PATCH` is one row update.
+* `cpt-cf-credstore-fr-delete-secret` — delete is one transaction (row + gc row); the reference is free to reuse at once.
+* `cpt-cf-credstore-fr-deprovisioning` — superseded: no `deprovisioning` status and no name retention remain.
+* `cpt-cf-credstore-fr-optimistic-concurrency` — one write ordering for every precondition; the CAS is the row transaction.
+* `cpt-cf-credstore-nfr-confidentiality` — a row never points at bytes it does not describe; a corrupted entry fails closed and is recovered by a new version.
+* `cpt-cf-credstore-seq-write-saga` — the sequence in DESIGN §4.6 now describes this protocol.

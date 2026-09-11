@@ -18,55 +18,57 @@ The `cf-gears-credstore` module provides:
 
 - **Local metadata** — a gear-owned `credstore_secrets` table (`SecureORM` /
   sea-orm, migration `m0001`) holding sharing, owner, status, `version`, and
-  the value-fingerprint fence (planned, ADR-0006: gains `value_id`, the
-  pointer to the row's current immutable backend version)
-- **PDP authorization** — `AccessScope` enforced in SQL via `SecureORM` clamps;
-  out-of-scope access is fail-closed (canonical 404, anti-enumeration)
+  (ADR-0006) `value_id`, the pointer to the row's current immutable backend
+  version, plus a `credstore_value_gc` table tracking versions pending
+  reclaim
+- **Credential record / secret value split** (ADR-0004): the record
+  (`reference`, `type`, `sharing`, `fallback`, `status`, `inheritance`,
+  `version`, `owner_id`) and its value are two representations, each with
+  its own read address — `GET /credentials/{ref}` never carries the value,
+  only `GET /credentials/{ref}/secret` does — and one write address: `PUT`
+  creates or replaces both together, `PATCH` (RFC 7396 JSON Merge Patch)
+  edits the record, rotates the value, or removes it (`{"value": null}`)
+  without recreating anything
+- **PDP authorization** — six actions on the resolved concrete type
+  (`list`/`read`/`write`/`delete` on the record, `read_secret`/
+  `write_secret` on the value; `crate::gts::permissions`), `AccessScope`
+  enforced in SQL via `SecureORM` clamps; out-of-scope access is fail-closed
+  (canonical 404, anti-enumeration)
 - **Hierarchical resolution** — a single indexed query over the ancestor chain
   (TTL+LRU cached, barriers ignored — `shared` inherits through them); the backend is read once for the winner's value
+- **Upward-rooted collection read** (ADR-0005): `GET /credentials` lists one
+  reduced record per reference, rooted at the caller's tenant and its
+  ancestor chain only, filterable/orderable on an indexed allowlist and
+  keyset-paginated; selecting `secret` in `$select` switches the same
+  collection into a capped, non-paginated **value mode** that returns the
+  decrypted value alongside each item the caller may read
 - **Value-fingerprint fence** — every read verifies the backend value against a
   per-row `HMAC-SHA256` (key auto-stored in the backend, never on the wire), so
   a metadata/value desync from a concurrent write fails closed instead of
   disclosing a value under a foreign sharing label (DESIGN §4.10, ADR-0003)
-  (integrity check; no healing path under ADR-0006)
+  (integrity check; no healing path, since ADR-0006 recreates the value
+  outright when something looks wrong)
 - **Versioning** — strong generation-bound `ETag` (`"<id>.<version>"`) on `GET`,
-  mandatory `If-Match` on `PUT`/`DELETE` (a validator, or `*` for explicit
-  last-writer-wins; no ABA across recreation)
-- **Crash-safe writes** — each value is a new immutable version under a fresh
-  id; the row's pointer switches in one transaction after the bytes are
-  written; old versions are deleted by the writer right after the switch —
-  that is the cleanup path; leftovers (a failed writer-side delete, or a
-  crash) and expired records are removed by a periodic maintenance job, not
-  an in-process reaper (planned, ADR-0006; the shipped saga —
-  provisioning→backend→active with rollback and a reaper — until then)
+  mandatory `If-Match` on `PATCH`/`DELETE` (and, for `PUT`, exactly one of
+  `If-None-Match: *` create-only or `If-Match`); a validator, or `*` for
+  explicit last-writer-wins; no ABA across recreation
+- **Immutable value versions** (ADR-0006) — every write mints a fresh
+  version under a new id; the row's pointer switches to it in one
+  transaction only after the bytes are durably written; the version it
+  replaced is deleted by the writer right after the switch — that is the
+  cleanup path; leftovers (a failed writer-side delete, or a crash) and
+  expired records are removed by a periodic maintenance job, not an
+  in-process reaper: there is no resident timer in the gear at all
+- **`CredStoreMaintenanceV1`** — the maintenance job's only entry point:
+  `run_gc` is an in-process `ClientHub` trait, not a REST route, invoked by
+  the host (a `gc` subcommand under a Kubernetes `CronJob`, or a scheduler
+  gear) on an operator-chosen schedule
 - **Backend plugin** — value-only store discovered via the types registry (vendor)
-- **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/secrets`
+- **`ClientHub` + REST** — registers `CredStoreClientV1`; exposes `/credstore/v1/credentials`
 
 This module depends on `types-registry`, `tenant-resolver`, and `authz-resolver`,
 and **requires a database**. The secret value is stored in a plugin (e.g.
 `cf-gears-static-credstore-plugin`, or an OpenBao-backed plugin).
-
-**Planned direction (not yet implemented).** [ADR-0004](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md)
-and [ADR-0005](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0005-cpt-cf-credstore-adr-upward-collection-read.md)
-(both `proposed`) split the credential record and its secret value into two
-addressable resources and add a metadata listing, upward-rooted through the
-tenant hierarchy, that never carries a value unless the caller's `$select`
-names `secret` — which switches that same collection read into a capped,
-non-paginated bulk value read — and rename the PDP resource type to
-`gts.cf.core.credstore.credential.v1~` and replace the three shipped actions
-with six on it (`list`, `read`, `write`, `delete` on the record;
-`read_secret`, `write_secret` on the value). Under that model a credential is
-created in one request — a `PUT` on the record address carries the record
-and its value together; a merge-`PATCH` on the same address edits metadata
-or rotates/removes the value without touching the rest of the record; and
-the value has its own read address, distinct from the record, plus the
-collection's value mode for reading several at once. [ADR-0006](https://github.com/constructorfabric/gears-rust/blob/main/gears/credstore/docs/ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)
-(`proposed`) replaces in-place overwrite with immutable value versions — the model of Vault KV v2 and the cloud secret managers, shadow paging with a `git gc`-style collector — so the saga and its reaper go away: every
-write mints a fresh version id, switches the row's pointer to it in one
-transaction, and deletes the version it replaced right after — with a
-periodic maintenance job, run on an operator-chosen schedule outside the
-gear (no resident reaper), collecting whatever that best-effort delete
-missed.
 
 ## Usage
 
@@ -109,6 +111,9 @@ credstore:
     gc:                          # settings of the maintenance job (ADR-0006); no resident reaper
       pending_max_age_secs: 3600 # a pending write intent older than this is reclaimed by the job
       batch_size: 256            # rows per batch in the job's expiry and gc passes
+    list:                        # GET /credentials (ADR-0005/ADR-0004)
+      max_limit: 200             # metadata-mode page-size cap; a caller `limit` above this is 400 INVALID_LIMIT
+      value_mode_cap: 25         # match-set cap for a value-mode ($select=…,secret) request; over this is 400 TOO_MANY_MATCHES
 ```
 
 ## License
