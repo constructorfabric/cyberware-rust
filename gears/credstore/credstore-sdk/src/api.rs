@@ -6,18 +6,20 @@
 //! see [`crate::models::Credential`] and [`crate::models::Secret`].
 
 use async_trait::async_trait;
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
 use crate::error::CredStoreError;
 use crate::models::{
-    Credential, CredentialPatch, CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef,
-    Validator, WritePrecondition,
+    Credential, CredentialListItem, CredentialPatch, CredentialWrite, PutOutcome, PutPrecondition,
+    Secret, SecretRef, Validator, WritePrecondition,
 };
 
-/// Consumer-facing API trait for credential storage operations. Six methods,
-/// none named `create` or `read_secrets`: `put` under
-/// [`PutPrecondition::CreateOnly`] **is** create, and the collection read
-/// (`list`, with `$select=secret` for bulk value reads) is Phase 3.
+/// Consumer-facing API trait for credential storage operations. Seven
+/// methods, none named `create` or `read_secrets`: `put` under
+/// [`PutPrecondition::CreateOnly`] **is** create, and [`Self::list`] is the
+/// collection read (metadata by default; `$select` containing `secret`
+/// switches it to bulk value mode, ADR-0005/ADR-0004).
 #[async_trait]
 pub trait CredStoreClientV1: Send + Sync {
     /// Retrieves the credential **record** by reference, applying
@@ -126,4 +128,52 @@ pub trait CredStoreClientV1: Send + Sync {
         key: &SecretRef,
         precondition: WritePrecondition,
     ) -> Result<(), CredStoreError>;
+
+    /// Lists the credentials visible to the caller's tenant, rooted at that
+    /// tenant and walking upward through its ancestor chain only — never
+    /// downward (ADR-0005, "Upward-rooted collection read"). One item per
+    /// reference: the same reduction a point read (`Self::get`) of that
+    /// reference would apply, so the catalogue and the point read never
+    /// disagree.
+    ///
+    /// `query.filter()` accepts `reference` and `type` (SQL-clamped;
+    /// `eq`/`in` only) plus `sharing`, `fallback` and `expires_at` (applied
+    /// after reduction, since they vary across a reference's chain);
+    /// `inheritance`, `owner_tenant_id` and `updated_at` are never
+    /// filterable or orderable. `query.order` accepts only `reference`
+    /// (ascending by default). `query.selected_fields()` accepts the
+    /// `Credential` field names plus `secret`.
+    ///
+    /// Selecting `secret` switches the request to **value mode**: `limit`
+    /// and `query.cursor` are rejected, `query.order` must be empty, the
+    /// selector in `query.filter()` must be exactly `reference` or `type`
+    /// (`eq`/`in`), the match set is capped, and each returned item's
+    /// [`CredentialListItem::secret`] carries the decrypted value for the
+    /// items the caller may read — a refused, missing, or
+    /// fingerprint-mismatched item is omitted rather than reported.
+    /// `Page::page_info.next_cursor` is always `None` in this mode; there is
+    /// no pagination over a value-mode match set.
+    ///
+    /// A caller whose scope does not admit its own tenant gets an empty page,
+    /// never [`CredStoreError::AccessDenied`] (ADR-0005: the PDP resource is
+    /// the resolved concrete type, so there is nothing to evaluate — and
+    /// therefore nothing to deny — until rows exist).
+    ///
+    /// Requires the `list` action per distinct type present among candidates
+    /// (metadata mode) or `read_secret` (value mode); a type the caller may
+    /// not read is dropped from the page rather than failing the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredStoreError::InvalidRequest`] if `query` names an
+    /// unsupported filter/order field, an out-of-range `limit`, a malformed
+    /// cursor, a cursor minted under a different filter/order, or a
+    /// value-mode request that also carries pagination — or, in value mode,
+    /// if the selector is not `reference`/`type` `eq`/`in`, or the selector
+    /// matches more than the configured cap.
+    async fn list(
+        &self,
+        ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError>;
 }

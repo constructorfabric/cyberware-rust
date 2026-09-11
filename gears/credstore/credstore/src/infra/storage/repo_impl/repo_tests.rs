@@ -65,13 +65,35 @@ fn new_secret(
     sharing: SharingMode,
     value_id: ValueId,
 ) -> NewSecret {
+    new_secret_typed(
+        tenant,
+        owner,
+        key,
+        sharing,
+        value_id,
+        SecretType::generic().uuid(),
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "test fixture builder mirroring NewSecret's own field list plus an explicit type"
+)]
+fn new_secret_typed(
+    tenant: Uuid,
+    owner: Uuid,
+    key: &str,
+    sharing: SharingMode,
+    value_id: ValueId,
+    secret_type_uuid: Uuid,
+) -> NewSecret {
     NewSecret {
         id: Uuid::new_v4(),
         tenant_id: TenantId(tenant),
         reference: sref(key),
         sharing,
         owner_id: OwnerId(owner),
-        secret_type_uuid: SecretType::generic().uuid(),
+        secret_type_uuid,
         expires_at: None,
         value_id,
         value_fp: vec![7u8; 32],
@@ -96,6 +118,28 @@ async fn seed_active(
     // (`insert_active`): `insert_active_tx` now requires its own gc-pending
     // delete to affect exactly one row (it rolls back otherwise), matching
     // `switch_value_tx`'s intent-claim check.
+    repo.gc_insert_pending(value_id, TenantId(tenant))
+        .await
+        .expect("gc_insert_pending");
+    repo.insert_active(&AccessScope::for_tenant(tenant), &new)
+        .await
+        .expect("insert_active");
+    (id, value_id)
+}
+
+/// Like [`seed_active`], with an explicit `secret_type_uuid` — for tests
+/// that need more than one distinct type present.
+async fn seed_active_typed(
+    repo: &SecretRepoImpl,
+    tenant: Uuid,
+    owner: Uuid,
+    key: &str,
+    sharing: SharingMode,
+    secret_type_uuid: Uuid,
+) -> (Uuid, ValueId) {
+    let value_id = ValueId::new_v4();
+    let new = new_secret_typed(tenant, owner, key, sharing, value_id, secret_type_uuid);
+    let id = new.id;
     repo.gc_insert_pending(value_id, TenantId(tenant))
         .await
         .expect("gc_insert_pending");
@@ -1489,5 +1533,259 @@ async fn resolve_candidates_excludes_ancestor_declared_inherit_row() {
     assert!(
         candidates.is_empty(),
         "an ancestor's declared/inherit row must not be a candidate at all"
+    );
+}
+
+// ── collection read: list_candidate_references / list_candidate_types /
+//    list_candidates_for_references (ADR-0005) ─────────────────────────────
+
+#[tokio::test]
+async fn list_candidate_references_is_distinct_and_keyset_paginated() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+
+    for name in ["a", "b", "c", "d"] {
+        seed_active(&repo, tenant, owner, name, SharingMode::Tenant).await;
+    }
+
+    let first_page = repo
+        .list_candidate_references(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            None,
+            None,
+            None,
+            false,
+            3,
+        )
+        .await
+        .expect("page 1");
+    assert_eq!(
+        first_page,
+        vec!["a", "b", "c"],
+        "limit+1-sized fetch, ascending"
+    );
+
+    let second_page = repo
+        .list_candidate_references(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            None,
+            None,
+            Some("c"),
+            false,
+            3,
+        )
+        .await
+        .expect("page 2");
+    assert_eq!(
+        second_page,
+        vec!["d"],
+        "cursor is exclusive; only the reference after it is returned"
+    );
+
+    let descending = repo
+        .list_candidate_references(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            None,
+            None,
+            None,
+            true,
+            10,
+        )
+        .await
+        .expect("descending");
+    assert_eq!(descending, vec!["d", "c", "b", "a"]);
+}
+
+#[tokio::test]
+async fn list_candidate_references_clamps_by_reference_and_type() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let api_key_uuid = SecretType::from_name("api-key").expect("known").uuid();
+
+    seed_active(&repo, tenant, owner, "generic-one", SharingMode::Tenant).await;
+    seed_active(&repo, tenant, owner, "generic-two", SharingMode::Tenant).await;
+    seed_active_typed(
+        &repo,
+        tenant,
+        owner,
+        "api-key-one",
+        SharingMode::Tenant,
+        api_key_uuid,
+    )
+    .await;
+
+    let by_reference = repo
+        .list_candidate_references(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            Some(&["generic-one".to_owned(), "api-key-one".to_owned()]),
+            None,
+            None,
+            false,
+            10,
+        )
+        .await
+        .expect("reference clamp");
+    assert_eq!(by_reference, vec!["api-key-one", "generic-one"]);
+
+    let by_type = repo
+        .list_candidate_references(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            None,
+            Some(&[api_key_uuid]),
+            None,
+            false,
+            10,
+        )
+        .await
+        .expect("type clamp");
+    assert_eq!(by_type, vec!["api-key-one"]);
+}
+
+#[tokio::test]
+async fn list_candidate_references_spans_the_ancestor_chain_shared_only() {
+    let repo = setup().await;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+
+    seed_active(&repo, parent, owner, "parent-shared", SharingMode::Shared).await;
+    seed_active(&repo, parent, owner, "parent-tenant", SharingMode::Tenant).await;
+    seed_active(&repo, child, owner, "child-own", SharingMode::Tenant).await;
+
+    let refs = repo
+        .list_candidate_references(
+            TenantId(child),
+            OwnerId(owner),
+            &[child, parent],
+            None,
+            None,
+            None,
+            false,
+            10,
+        )
+        .await
+        .expect("list");
+    assert_eq!(
+        refs,
+        vec!["child-own", "parent-shared"],
+        "the parent's tenant-only row must not be visible to the child"
+    );
+}
+
+#[tokio::test]
+async fn list_candidate_types_is_clamped_like_step_1_and_restricted_to_the_given_references() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let generic_uuid = SecretType::generic().uuid();
+    let api_key_uuid = SecretType::from_name("api-key").expect("known").uuid();
+
+    seed_active(&repo, tenant, owner, "r1", SharingMode::Tenant).await;
+    seed_active_typed(
+        &repo,
+        tenant,
+        owner,
+        "r2",
+        SharingMode::Tenant,
+        api_key_uuid,
+    )
+    .await;
+    // r3 exists but is excluded from the `references` slice below.
+    seed_active_typed(
+        &repo,
+        tenant,
+        owner,
+        "r3",
+        SharingMode::Tenant,
+        api_key_uuid,
+    )
+    .await;
+
+    let types = repo
+        .list_candidate_types(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            &["r1".to_owned(), "r2".to_owned()],
+            None,
+        )
+        .await
+        .expect("types");
+    let mut types = types;
+    types.sort();
+    let mut expected = vec![generic_uuid, api_key_uuid];
+    expected.sort();
+    assert_eq!(types, expected, "r3 must not contribute its type");
+
+    let clamped = repo
+        .list_candidate_types(
+            TenantId(tenant),
+            OwnerId(owner),
+            &[tenant],
+            &["r1".to_owned(), "r2".to_owned()],
+            Some(&[api_key_uuid]),
+        )
+        .await
+        .expect("type-clamped types");
+    assert_eq!(
+        clamped,
+        vec![api_key_uuid],
+        "clamped to the same type_uuid_in step 1 would have applied"
+    );
+}
+
+#[tokio::test]
+async fn list_candidates_for_references_fetches_whole_rows_unclamped_by_type() {
+    let repo = setup().await;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let owner = Uuid::new_v4();
+    let api_key_uuid = SecretType::from_name("api-key").expect("known").uuid();
+
+    seed_active(&repo, parent, owner, "shadowed", SharingMode::Shared).await;
+    seed_active_typed(
+        &repo,
+        child,
+        owner,
+        "shadowed",
+        SharingMode::Tenant,
+        api_key_uuid,
+    )
+    .await;
+
+    let rows = repo
+        .list_candidates_for_references(
+            TenantId(child),
+            OwnerId(owner),
+            &[child, parent],
+            &["shadowed".to_owned()],
+        )
+        .await
+        .expect("whole rows");
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "both the own and the ancestor row, regardless of type"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.tenant_id == TenantId(child) && r.secret_type_uuid == api_key_uuid)
+    );
+    assert!(
+        rows.iter().any(|r| r.tenant_id == TenantId(parent)
+            && r.secret_type_uuid == SecretType::generic().uuid())
     );
 }

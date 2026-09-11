@@ -25,6 +25,7 @@ toolkit-macros = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-db = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 tenant-resolver-sdk = { workspace = true }

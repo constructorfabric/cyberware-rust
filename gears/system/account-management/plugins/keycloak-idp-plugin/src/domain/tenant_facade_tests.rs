@@ -11,12 +11,14 @@ use account_management_sdk::idp::IdpProvisionTenantRequest;
 use account_management_sdk::idp_user::IdpTenantContext;
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialPatch, CredentialWrite, PutOutcome,
-    PutPrecondition, Secret, SecretRef, SecretValue, SharingMode, Validator, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, SharingMode,
+    Validator, WritePrecondition,
 };
 use gts::GtsTypeId;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -181,6 +183,14 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
     ) -> Result<(), CredStoreError> {
         self.delete_calls.lock().push(key.as_ref().to_owned());
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

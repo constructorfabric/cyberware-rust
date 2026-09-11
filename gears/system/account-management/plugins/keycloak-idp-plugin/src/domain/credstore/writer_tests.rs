@@ -1,8 +1,11 @@
 use super::*;
 use crate::domain::system_actor::build_system_ctx;
 use async_trait::async_trait;
-use credstore_sdk::{Credential, CredentialPatch, PutOutcome, Secret, Validator};
+use credstore_sdk::{
+    Credential, CredentialListItem, CredentialPatch, PutOutcome, Secret, Validator,
+};
 use parking_lot::Mutex;
+use toolkit_odata::{ODataQuery, Page};
 use uuid::Uuid;
 
 /// One recorded `put` invocation — `(key_str, value_bytes, sharing)`.
@@ -78,6 +81,14 @@ impl CredStoreClientV1 for StubMutator {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         self.delete_response.lock().take().unwrap_or(Ok(()))
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

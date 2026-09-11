@@ -25,7 +25,7 @@ use types_registry_sdk::TypesRegistryClient;
 use crate::client::CredStoreLocalClient;
 use crate::config::CredStoreConfig;
 use crate::domain::ports::metrics::CredStoreMetricsPort;
-use crate::domain::secret::service::{GcSettings, Service};
+use crate::domain::secret::service::{GcSettings, ListSettings, Service};
 use crate::infra::metrics::CredStoreMetricsMeter;
 use crate::infra::plugin_select::GtsCredStorePluginSelector;
 use crate::infra::storage::repo_impl::SecretRepoImpl;
@@ -147,6 +147,10 @@ impl Gear for CredStoreGear {
                 pending_max_age_secs: cfg.gc.pending_max_age_secs,
                 batch_size: cfg.gc.batch_size,
             },
+            ListSettings {
+                max_limit: cfg.list.max_limit,
+                value_mode_cap: cfg.list.value_mode_cap,
+            },
         ));
 
         self.service
@@ -154,9 +158,20 @@ impl Gear for CredStoreGear {
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
         let client: Arc<dyn credstore_sdk::CredStoreClientV1> =
-            Arc::new(CredStoreLocalClient::new(svc));
+            Arc::new(CredStoreLocalClient::new(Arc::clone(&svc)));
         ctx.client_hub()
             .register::<dyn credstore_sdk::CredStoreClientV1>(client);
+
+        // The periodic maintenance job's entry point (ADR-0006): an
+        // in-process trait, not a REST route. Registered next to
+        // `CredStoreClientV1` so the host (a `gc` subcommand of the
+        // application binary under a CronJob, or a scheduler gear) can
+        // resolve and invoke it on its own schedule; credstore itself runs
+        // no timer for it.
+        let maintenance: Arc<dyn credstore_sdk::CredStoreMaintenanceV1> =
+            Arc::new(CredStoreLocalClient::new(svc));
+        ctx.client_hub()
+            .register::<dyn credstore_sdk::CredStoreMaintenanceV1>(maintenance);
 
         info!("credstore module initialized");
         Ok(())

@@ -1,8 +1,12 @@
 //! Read-only repo methods: `resolve_for_get`, `find_own`, `find_for_write`,
-//! `scope_includes_tenant`.
+//! `scope_includes_tenant`, and the collection read's two-step candidate
+//! queries (`list_candidate_references`, `list_candidate_types`,
+//! `list_candidates_for_references` — ADR-0005).
 
 use credstore_sdk::{OwnerId, SecretRef, SharingMode, TenantId};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect};
+use sea_orm::{
+    ColumnTrait, Condition, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, QuerySelect,
+};
 use toolkit_db::secure::{ScopeError, SecureEntityExt};
 use toolkit_security::access_scope::ScopeFilter;
 use toolkit_security::{AccessScope, pep_properties};
@@ -141,6 +145,30 @@ pub(super) async fn resolve_for_get(
     best.map(entity_to_model).transpose()
 }
 
+/// Visibility predicate shared by [`resolve_candidates`] and the collection
+/// read's candidate queries (ADR-0005): in the caller's own tenant, every
+/// sharing-visible row of any status (so the record view can report a
+/// `declared` own row's `status`/`fallback`/validator even though it never
+/// resolves); in ancestor tenants, `shared` rows only, and only those that
+/// pass [`resolution_eligible_condition`] — an ancestor's `declared`/
+/// `inherit` row is invisible here exactly as it is to a value read.
+fn chain_visibility_condition(req: Uuid, subject: Uuid, ancestors: &[Uuid]) -> Condition {
+    let mut visibility = Condition::any().add(
+        Condition::all()
+            .add(entity::secrets::Column::TenantId.eq(req))
+            .add(own_tenant_visibility_condition(req, subject)),
+    );
+    if !ancestors.is_empty() {
+        visibility = visibility.add(
+            Condition::all()
+                .add(entity::secrets::Column::TenantId.is_in(ancestors.to_vec()))
+                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
+                .add(resolution_eligible_condition()),
+        );
+    }
+    visibility
+}
+
 pub(super) async fn resolve_candidates(
     repo: &SecretRepoImpl,
     req_tenant: TenantId,
@@ -151,31 +179,189 @@ pub(super) async fn resolve_candidates(
     let conn = repo.db.conn()?;
     let req = req_tenant.0;
     let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
-
-    // Own tenant: every sharing-visible row, any status (so the record view
-    // can report a `declared` own row's `status`/`fallback`/validator even
-    // though it never resolves). Ancestors: `shared` rows only, and only
-    // those that pass the resolution predicate — an ancestor's
-    // `declared`/`inherit` row is invisible here exactly as it is to a value
-    // read (ADR-0004, ADR-0005 "Reducing a reference to one item").
-    let mut visibility = Condition::any().add(
-        Condition::all()
-            .add(entity::secrets::Column::TenantId.eq(req))
-            .add(own_tenant_visibility_condition(req, subject.0)),
-    );
-    if !ancestors.is_empty() {
-        visibility = visibility.add(
-            Condition::all()
-                .add(entity::secrets::Column::TenantId.is_in(ancestors))
-                .add(entity::secrets::Column::Sharing.eq(sharing_to_i16(SharingMode::Shared)))
-                .add(resolution_eligible_condition()),
-        );
-    }
+    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
 
     let rows = entity::secrets::Entity::find()
         .secure()
         .scope_with(&AccessScope::allow_all())
         .filter(Condition::all().add(entity::secrets::Column::Reference.eq(key.as_ref())))
+        .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
+        .filter(visibility)
+        .all(&conn)
+        .await
+        .map_err(scope_err_to_domain)?;
+
+    rows.into_iter().map(entity_to_model).collect()
+}
+
+/// Row-shape helper for a `SELECT DISTINCT reference` projection.
+#[derive(FromQueryResult)]
+struct ReferenceRow {
+    reference: String,
+}
+
+/// Row-shape helper for a `SELECT DISTINCT secret_type_uuid` projection.
+#[derive(FromQueryResult)]
+struct SecretTypeUuidRow {
+    secret_type_uuid: Uuid,
+}
+
+/// Applies the caller's `reference`/`secret_type_uuid` clamps to `filter`
+/// when given — shared by [`list_candidate_references`] and
+/// [`list_candidate_types`], which clamp identically (ADR-0005 §"Filter in
+/// SQL first…": "a second small DISTINCT query over the same predicate").
+fn apply_reference_and_type_clamps(
+    mut filter: Condition,
+    reference_in: Option<&[String]>,
+    type_uuid_in: Option<&[Uuid]>,
+) -> Condition {
+    if let Some(refs) = reference_in {
+        filter = filter.add(entity::secrets::Column::Reference.is_in(refs.to_vec()));
+    }
+    if let Some(types) = type_uuid_in {
+        filter = filter.add(entity::secrets::Column::SecretTypeUuid.is_in(types.to_vec()));
+    }
+    filter
+}
+
+/// Collection read, step 1 (ADR-0005): candidate **references** visible
+/// across `chain`, under [`chain_visibility_condition`], clamped by an exact
+/// `reference` or `secret_type_uuid` set when the caller's `$filter` named
+/// one (both invariant across a reference's chain, so both are sound SQL
+/// clamps — ADR-0005 §"What stays out of the filter"). `DISTINCT reference`,
+/// ordered by `reference` (`desc` when `desc`), keyset-paginated by
+/// `cursor` (exclusive: `reference > cursor` ascending, `reference < cursor`
+/// descending). Fetches at most `limit` references — the caller passes
+/// `page_limit + 1` in metadata mode to detect a next page, or
+/// `value_mode_cap + 1` in value mode (no cursor, always ascending).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every clamp the collection read's step 1 query supports, named rather than \
+              bundled into an ad-hoc struct only this call site would use"
+)]
+pub(super) async fn list_candidate_references(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    subject: OwnerId,
+    chain: &[Uuid],
+    reference_in: Option<&[String]>,
+    type_uuid_in: Option<&[Uuid]>,
+    cursor: Option<&str>,
+    desc: bool,
+    limit: u64,
+) -> Result<Vec<String>, DomainError> {
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
+    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
+
+    let mut filter = Condition::all()
+        .add(entity::secrets::Column::TenantId.is_in(chain.to_vec()))
+        .add(visibility);
+    filter = apply_reference_and_type_clamps(filter, reference_in, type_uuid_in);
+    if let Some(after) = cursor {
+        filter = filter.add(if desc {
+            entity::secrets::Column::Reference.lt(after)
+        } else {
+            entity::secrets::Column::Reference.gt(after)
+        });
+    }
+
+    let rows: Vec<ReferenceRow> = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(filter)
+        .project_all(&conn, |sel| {
+            let sel = sel
+                .select_only()
+                .column(entity::secrets::Column::Reference)
+                .distinct();
+            let sel = if desc {
+                sel.order_by_desc(entity::secrets::Column::Reference)
+            } else {
+                sel.order_by_asc(entity::secrets::Column::Reference)
+            };
+            sel.limit(limit).into_model::<ReferenceRow>()
+        })
+        .await
+        .map_err(scope_err_to_domain)?;
+
+    Ok(rows.into_iter().map(|r| r.reference).collect())
+}
+
+/// Collection read, the authorization side's small second query (ADR-0005
+/// §"Filter in SQL first, reduce the hierarchy in memory": "a second small
+/// `DISTINCT` query over the same predicate"): the distinct
+/// `secret_type_uuid`s among the candidate rows of `references` — the same
+/// visibility predicate and the same `type_uuid_in` clamp step 1 applied,
+/// restricted to the references step 1 actually found. Deliberately clamped
+/// (not a scan of every row of `references` regardless of type): this is
+/// what lets a reduced winner whose type step 1's clamp never selected for
+/// (an override-type-consistency violation) be told apart in memory from an
+/// ordinary PDP denial — see
+/// [`crate::domain::secret::service`]'s collection-read authorization.
+pub(super) async fn list_candidate_types(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    subject: OwnerId,
+    chain: &[Uuid],
+    references: &[String],
+    type_uuid_in: Option<&[Uuid]>,
+) -> Result<Vec<Uuid>, DomainError> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
+    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
+
+    let filter = Condition::all()
+        .add(entity::secrets::Column::Reference.is_in(references.to_vec()))
+        .add(entity::secrets::Column::TenantId.is_in(chain.to_vec()))
+        .add(visibility);
+    let filter = apply_reference_and_type_clamps(filter, None, type_uuid_in);
+
+    let rows: Vec<SecretTypeUuidRow> = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(filter)
+        .project_all(&conn, |sel| {
+            sel.select_only()
+                .column(entity::secrets::Column::SecretTypeUuid)
+                .distinct()
+                .into_model::<SecretTypeUuidRow>()
+        })
+        .await
+        .map_err(scope_err_to_domain)?;
+
+    Ok(rows.into_iter().map(|r| r.secret_type_uuid).collect())
+}
+
+/// Collection read, step 2 (ADR-0005): every visible row of `references`,
+/// whole and unclamped by type, exactly as [`resolve_candidates`] would
+/// return for each reference individually — so reduction sees every row a
+/// value read would see, never fewer because a `$filter=type…`/authorization
+/// clamp narrowed the candidate set before reduction ran.
+pub(super) async fn list_candidates_for_references(
+    repo: &SecretRepoImpl,
+    req_tenant: TenantId,
+    subject: OwnerId,
+    chain: &[Uuid],
+    references: &[String],
+) -> Result<Vec<SecretRow>, DomainError> {
+    if references.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = repo.db.conn()?;
+    let req = req_tenant.0;
+    let ancestors: Vec<Uuid> = chain.iter().copied().filter(|t| *t != req).collect();
+    let visibility = chain_visibility_condition(req, subject.0, &ancestors);
+
+    let rows = entity::secrets::Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(Condition::all().add(entity::secrets::Column::Reference.is_in(references.to_vec())))
         .filter(Condition::all().add(entity::secrets::Column::TenantId.is_in(chain.to_vec())))
         .filter(visibility)
         .all(&conn)

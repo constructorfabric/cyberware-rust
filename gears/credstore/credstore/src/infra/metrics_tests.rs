@@ -36,6 +36,7 @@ fn global_meter_records_all_instruments() {
     m.gc_deleted(3);
     m.gc_pending_reclaimed(1);
     m.expired_deleted(2);
+    m.list_type_invariant_violation();
 }
 
 #[test]
@@ -121,4 +122,18 @@ fn gc_counters_accumulate_independently() {
         1
     );
     assert_eq!(h.counter_value("credstore_expired_deleted_total", &[]), 4);
+}
+
+#[test]
+#[cfg(feature = "test-support")]
+fn list_type_invariant_violation_accumulates() {
+    let h = MetricsHarness::new();
+    let m = h.metrics();
+    m.list_type_invariant_violation();
+    m.list_type_invariant_violation();
+    h.force_flush();
+    assert_eq!(
+        h.counter_value("credstore_list_type_invariant_violation_total", &[]),
+        2
+    );
 }

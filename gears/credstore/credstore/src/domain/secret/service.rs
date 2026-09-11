@@ -132,6 +132,16 @@ pub struct GcSettings {
     pub batch_size: u64,
 }
 
+/// Collection-read settings (`Service::list`, ADR-0005/ADR-0004), from
+/// `ListCfg`: the metadata-mode page-size cap (`limit`/`$top`) and the
+/// value-mode (`$select` containing `secret`) match-set cap.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct ListSettings {
+    pub max_limit: u64,
+    pub value_mode_cap: u64,
+}
+
 /// Outcome of one [`Service::run_gc`] invocation.
 #[domain_model]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -186,6 +196,7 @@ pub struct Service {
     types: Arc<dyn SecretTypeResolver>,
     metrics: Arc<dyn CredStoreMetricsPort>,
     gc: GcSettings,
+    list: ListSettings,
     /// In-process cache of the value-fingerprint fence key (auto-generated,
     /// stored in the value-store backend under `(TenantId::nil(),
     /// FENCE_KEY_VALUE_ID)`). A fingerprint mismatch triggers a
@@ -214,6 +225,11 @@ pub struct Service {
 impl Service {
     /// Creates a new [`Service`].
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one dependency/settings value per collaborator the domain service wires \
+                  together; a builder would only move the same eight names into a second type"
+    )]
     pub fn new(
         repo: Arc<dyn SecretRepo>,
         dir: Arc<dyn TenantDirectory>,
@@ -222,6 +238,7 @@ impl Service {
         types: Arc<dyn SecretTypeResolver>,
         metrics: Arc<dyn CredStoreMetricsPort>,
         gc: GcSettings,
+        list: ListSettings,
     ) -> Self {
         Self {
             repo,
@@ -231,6 +248,7 @@ impl Service {
             types,
             metrics,
             gc,
+            list,
             fence_key: std::sync::RwLock::new(None),
             bootstrap_lock: tokio::sync::Mutex::new(()),
             last_fence_refresh: std::sync::Mutex::new(None),
@@ -742,20 +760,66 @@ impl Service {
             return Ok(None);
         }
 
+        let plugin = self.plugins.resolve().await?;
+        self.read_value_for_row(
+            &plugin,
+            ctx,
+            req,
+            subject,
+            key,
+            &chain,
+            &row,
+            &resolved.gts_id,
+        )
+        .await
+    }
+
+    /// Read and fingerprint-verify the backend value named by `row.value_id`
+    /// (ADR-0003, narrowed by ADR-0006), retrying once against a freshly
+    /// re-resolved row if the backend reports the pointer missing — the
+    /// shared tail of [`Self::get_secret`] and, per reduced winner, the
+    /// collection read's value mode (ADR-0005 "Bulk secret read"), so both
+    /// apply the identical retry-once-and-verify-fingerprint protocol.
+    ///
+    /// Callers MUST have already checked `row.value_id.is_some()` (a
+    /// `declared`/suppressed row has nothing to read) and authorized
+    /// `resolved_gts_id` — this method performs neither the resolution nor
+    /// the PDP gate, only the read.
+    ///
+    /// Returns `Ok(None)` (with the corresponding metric already recorded)
+    /// on a legitimate miss: the retry finds the reference gone or switched
+    /// to a value-less generation, or the fingerprint fails to verify even
+    /// after a one-shot fence-key refresh.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries every field the retry + fence-verification protocol needs: identity, \
+                  the row being read, and the type name for the returned Secret"
+    )]
+    async fn read_value_for_row(
+        &self,
+        plugin: &Arc<dyn CredStorePluginClientV1>,
+        ctx: &SecurityContext,
+        req: TenantId,
+        subject: OwnerId,
+        key: &SecretRef,
+        chain: &[Uuid],
+        row: &SecretRow,
+        resolved_gts_id: &str,
+    ) -> Result<Option<Secret>, DomainError> {
+        let Some(value_id) = row.value_id else {
+            // Defensive: callers already filter out a value-less row before
+            // calling this (nothing to authorize or read for it).
+            return Ok(None);
+        };
+
         let depth = chain
             .iter()
             .position(|c| *c == row.tenant_id.0)
             .unwrap_or(chain.len());
         self.metrics.walkup_depth(depth as u64);
 
-        let plugin = self.plugins.resolve().await?;
-
-        let Some(value_id) = row.value_id else {
-            return Err(DomainError::NotFound);
-        };
-
         let Some((value, served_row)) = self
-            .fetch_with_retry(&plugin, ctx, req, subject, key, &chain, &row, value_id)
+            .fetch_with_retry(plugin, ctx, req, subject, key, chain, row, value_id)
             .await?
         else {
             self.metrics.read_outcome(ReadOutcome::Miss);
@@ -779,12 +843,12 @@ impl Service {
                 cause: None,
             }
         })?;
-        let fkey = self.fence_key(&plugin).await?;
+        let fkey = self.fence_key(plugin).await?;
         let mut fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp);
         if !fp_ok {
             // One-shot key refresh: a replica whose cached key went stale
             // (key re-created under it) self-heals before failing closed.
-            let fkey = self.refresh_fence_key(&plugin).await?;
+            let fkey = self.refresh_fence_key(plugin).await?;
             fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp);
         }
         if fp_ok {
@@ -795,9 +859,8 @@ impl Service {
             tracing::warn!(
                 tenant = %served_row.tenant_id.0,
                 key = %key.as_ref(),
-                "credstore get_secret: value fingerprint mismatch; failing closed \
-                 (the backend entry the row points to was altered or corrupted out of band; \
-                 a fresh write recovers it)"
+                "credstore: value fingerprint mismatch; failing closed (the backend entry the \
+                 row points to was altered or corrupted out of band; a fresh write recovers it)"
             );
             return Ok(None);
         }
@@ -811,7 +874,7 @@ impl Service {
 
         Ok(Some(Secret {
             reference: key.clone(),
-            secret_type: resolved.gts_id,
+            secret_type: resolved_gts_id.to_owned(),
             expires_at: served_row.expires_at,
             value,
             validator: Validator {
@@ -1960,6 +2023,14 @@ impl Service {
         }
     }
 }
+
+/// The collection read (`Service::list`, ADR-0005/ADR-0004) — a child module
+/// so its `impl Service` block can reach the fields and helper methods
+/// above (`repo`, `dir`, `plugins`, `metrics`, `scope_for_timed`,
+/// `resolve_stored`, `read_value_for_row`, …) without making any of them
+/// crate-visible beyond this file's own module subtree.
+#[path = "service/list.rs"]
+mod list;
 
 #[cfg(test)]
 #[path = "service_tests.rs"]

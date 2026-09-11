@@ -11,21 +11,29 @@
 //! * [`MockCredStoreClient::always_failing`] — every operation fails with
 //!   [`CredStoreError::Internal`].
 //!
-//! Only `get`/`get_secret` carry behaviour; the write half (`put`/`patch`/
-//! `delete`) is a no-op that succeeds (or fails, in the always-failing mode)
-//! to match, returning a placeholder validator — this double is read-oriented,
-//! for consumers that only resolve credentials.
+//! Only `get`/`get_secret`/`list` carry behaviour; the write half (`put`/
+//! `patch`/`delete`) is a no-op that succeeds (or fails, in the
+//! always-failing mode) to match, returning a placeholder validator — this
+//! double is read-oriented, for consumers that only resolve credentials.
+//! `list` returns every stored reference as one unfiltered, unpaginated item
+//! (it does not model the `OData` allowlist or cursor semantics a real server
+//! enforces); [`MockCredStoreClient`] also implements
+//! [`crate::CredStoreMaintenanceV1`], whose `run_gc` mirrors the write
+//! half's success/failure behaviour and reports an all-zero
+//! [`crate::GcReport`].
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use toolkit_odata::{ODataQuery, Page, PageInfo};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialPatch, CredentialStatus,
-    CredentialWrite, Fallback, InheritanceStatus, OwnerId, PutOutcome, PutPrecondition, Secret,
-    SecretRef, SecretType, SecretValue, SharingMode, Validator, WritePrecondition,
+    CredStoreClientV1, CredStoreError, CredStoreMaintenanceV1, Credential, CredentialListItem,
+    CredentialPatch, CredentialStatus, CredentialWrite, Fallback, GcReport, InheritanceStatus,
+    OwnerId, PutOutcome, PutPrecondition, Secret, SecretRef, SecretType, SecretValue, SharingMode,
+    Validator, WritePrecondition,
 };
 
 enum Behavior {
@@ -210,5 +218,58 @@ impl CredStoreClientV1 for MockCredStoreClient {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         self.write_result()
+    }
+
+    /// Minimal double: every stored reference is returned as one item
+    /// (unfiltered, unpaginated — this test double is read-oriented and does
+    /// not model the `OData` allowlist, reduction, or cursor semantics a real
+    /// server enforces). `secret` is populated only when `query`'s `$select`
+    /// names it, mirroring the real value-mode switch.
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        let limit = query.limit.unwrap_or(50);
+        let value_mode = query
+            .selected_fields()
+            .is_some_and(|fields| fields.iter().any(|f| f.eq_ignore_ascii_case("secret")));
+        match &self.behavior {
+            Behavior::Failing => Err(CredStoreError::Internal("backend failure".into())),
+            Behavior::NotFound | Behavior::AnyValue(_) => Ok(Page::empty(limit)),
+            Behavior::Store(store) => {
+                let mut items: Vec<CredentialListItem> = store
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let key = SecretRef::new(k.clone()).ok()?;
+                        Some(CredentialListItem {
+                            credential: Self::credential(&key),
+                            secret: value_mode.then(|| SecretValue::new(v.clone())),
+                        })
+                    })
+                    .collect();
+                items.sort_by(|a, b| {
+                    a.credential
+                        .reference
+                        .as_ref()
+                        .cmp(b.credential.reference.as_ref())
+                });
+                Ok(Page::new(
+                    items,
+                    PageInfo {
+                        next_cursor: None,
+                        prev_cursor: None,
+                        limit,
+                    },
+                ))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl CredStoreMaintenanceV1 for MockCredStoreClient {
+    async fn run_gc(&self, _ctx: &SecurityContext) -> Result<GcReport, CredStoreError> {
+        self.write_result().map(|()| GcReport::default())
     }
 }

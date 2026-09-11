@@ -70,6 +70,53 @@ impl SecretRepo for SecretRepoImpl {
         Ok(reads::scope_includes_tenant(scope, tenant))
     }
 
+    async fn list_candidate_references(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        reference_in: Option<&[String]>,
+        type_uuid_in: Option<&[Uuid]>,
+        cursor: Option<&str>,
+        desc: bool,
+        limit: u64,
+    ) -> Result<Vec<String>, DomainError> {
+        reads::list_candidate_references(
+            self,
+            req_tenant,
+            subject,
+            chain,
+            reference_in,
+            type_uuid_in,
+            cursor,
+            desc,
+            limit,
+        )
+        .await
+    }
+
+    async fn list_candidate_types(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        references: &[String],
+        type_uuid_in: Option<&[Uuid]>,
+    ) -> Result<Vec<Uuid>, DomainError> {
+        reads::list_candidate_types(self, req_tenant, subject, chain, references, type_uuid_in)
+            .await
+    }
+
+    async fn list_candidates_for_references(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        references: &[String],
+    ) -> Result<Vec<SecretRow>, DomainError> {
+        reads::list_candidates_for_references(self, req_tenant, subject, chain, references).await
+    }
+
     async fn gc_insert_pending(
         &self,
         value_id: ValueId,

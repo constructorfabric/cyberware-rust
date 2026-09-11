@@ -294,6 +294,113 @@ impl CredentialDto {
     }
 }
 
+/// One item of `GET /credstore/v1/credentials` (ADR-0005/ADR-0004): the same
+/// fields as [`CredentialDto`], plus `secret` — populated only in value mode
+/// (`$select` containing `secret`) and only for an item the caller may read;
+/// absent from the wire entirely in metadata mode or when the item's value
+/// could not be served (refused, missing, fingerprint mismatch — omitted by
+/// the domain layer already, never reported as an error for one item).
+///
+/// `Debug` is hand-written to redact `secret`.
+#[derive(Clone, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub struct CredentialListItemDto {
+    pub reference: String,
+    #[serde(rename = "type")]
+    pub secret_type: String,
+    pub sharing: SharingModeDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<FallbackDto>,
+    pub status: CredentialStatusDto,
+    pub inheritance: InheritanceStatusDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(format = DateTime)]
+    pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(format = DateTime)]
+    pub expires_at: Option<String>,
+    /// The decrypted value — the same wire form as [`SecretDto::value`] —
+    /// present only in value mode, for an item the caller may read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialListItemDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialListItemDto")
+            .field("reference", &self.reference)
+            .field("type", &self.secret_type)
+            .field("sharing", &self.sharing)
+            .field("fallback", &self.fallback)
+            .field("status", &self.status)
+            .field("inheritance", &self.inheritance)
+            .field("version", &self.version)
+            .field("updated_at", &self.updated_at)
+            .field("owner_id", &self.owner_id)
+            .field("expires_at", &self.expires_at)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl CredentialListItemDto {
+    /// Convert one domain [`CredentialListItem`] into the REST DTO shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Internal`] if `updated_at`/`expires_at` fail to
+    /// format as RFC 3339, or the value is not valid UTF-8 (never expected
+    /// in practice).
+    pub fn try_from_list_item(
+        item: &credstore_sdk::CredentialListItem,
+    ) -> Result<Self, DomainError> {
+        let c = &item.credential;
+        let updated_at = c
+            .updated_at
+            .map(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|e| DomainError::internal(format!("updated_at failed to format: {e}")))
+            })
+            .transpose()?;
+        let expires_at = c
+            .expires_at
+            .map(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|e| DomainError::internal(format!("expires_at failed to format: {e}")))
+            })
+            .transpose()?;
+        let secret = item
+            .secret
+            .as_ref()
+            .map(|v| {
+                String::from_utf8(v.as_bytes().to_vec()).map_err(|_| {
+                    DomainError::internal(
+                        "secret value is not valid UTF-8 and cannot be encoded for the REST \
+                         transport",
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            reference: c.reference.as_ref().to_owned(),
+            secret_type: c.secret_type.clone(),
+            sharing: c.sharing.into(),
+            fallback: c.fallback.map(Into::into),
+            status: c.status.into(),
+            inheritance: c.inheritance.into(),
+            version: c.version,
+            updated_at,
+            owner_id: c.owner_id.map(|o| o.0.to_string()),
+            expires_at,
+            secret,
+        })
+    }
+}
+
 /// Response body for `GET /credstore/v1/credentials/{ref}/secret`
 /// (ADR-0004): the value with exactly what is needed to use it.
 ///

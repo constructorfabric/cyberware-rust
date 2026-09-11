@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{CredStoreLocalClient, DomainError, Service};
 use crate::domain::ports::metrics::NoopMetrics;
-use crate::domain::secret::service::GcSettings;
+use crate::domain::secret::service::{GcSettings, ListSettings};
 use crate::domain::secret::test_support::{
     FakeDir, FakePlugin, FakePluginSelector, FakeSecretRepo, catalog_type_resolver, make_ctx,
     mock_enforcer,
@@ -51,6 +51,10 @@ fn build_client(repo: Arc<FakeSecretRepo>, dir: Arc<FakeDir>) -> CredStoreLocalC
         GcSettings {
             pending_max_age_secs: 3600,
             batch_size: 256,
+        },
+        ListSettings {
+            max_limit: 200,
+            value_mode_cap: 25,
         },
     ));
     CredStoreLocalClient::new(svc)
@@ -309,4 +313,36 @@ async fn patch_precondition_maps_sdk_matches_to_domain_version() {
         .expect("matching put precondition");
     assert!(!out.created);
     assert_eq!(out.validator.version, v.version + 1);
+}
+
+// ── CredStoreMaintenanceV1 (ADR-0006) ───────────────────────────────────────
+
+#[tokio::test]
+async fn maintenance_trait_resolves_from_client_hub_and_empty_store_reports_zeros() {
+    use credstore_sdk::CredStoreMaintenanceV1;
+
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let dir = Arc::new(FakeDir::single(tenant));
+    // Mirrors `gear.rs::init`'s registration: the same `CredStoreLocalClient`
+    // implements both `CredStoreClientV1` and `CredStoreMaintenanceV1`,
+    // registered in `ClientHub` under the maintenance trait next to the
+    // client trait.
+    let client: Arc<dyn CredStoreMaintenanceV1> = Arc::new(build_client(repo, dir));
+
+    let hub = toolkit::ClientHub::new();
+    hub.register::<dyn CredStoreMaintenanceV1>(client);
+
+    let resolved = hub
+        .get::<dyn CredStoreMaintenanceV1>()
+        .expect("CredStoreMaintenanceV1 must resolve from the hub after registration");
+
+    let ctx = make_ctx(Uuid::nil(), Uuid::nil());
+    let report = resolved
+        .run_gc(&ctx)
+        .await
+        .expect("run_gc on an empty store");
+    assert_eq!(report.expired_deleted, 0);
+    assert_eq!(report.gc_deleted, 0);
+    assert_eq!(report.gc_pending_reclaimed, 0);
 }

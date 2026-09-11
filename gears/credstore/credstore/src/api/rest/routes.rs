@@ -5,10 +5,14 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, OperationBuilder, ParamLocation, ParamSpec};
 
-use super::dto::{CredentialDto, CredentialPatchDto, PutCredentialRequestDto, SecretDto};
+use super::dto::{
+    CredentialDto, CredentialListItemDto, CredentialPatchDto, PutCredentialRequestDto, SecretDto,
+};
 use super::handlers::{self, ConcreteService};
+use crate::domain::secret::list_filter::CredentialFilterField;
 
 const TAG: &str = "Credential Store";
 
@@ -40,6 +44,39 @@ pub fn register_routes(
     openapi: &dyn OpenApiRegistry,
     svc: Arc<ConcreteService>,
 ) -> Router {
+    let router = OperationBuilder::get("/credstore/v1/credentials")
+        .operation_id("credstore.list_credentials")
+        .summary("List credentials")
+        .description(
+            "Upward-rooted collection read (ADR-0005): one reduced item per reference, from \
+             the caller's tenant and its ancestor chain only. `$filter` accepts `reference`/ \
+             `type` (SQL-clamped, eq/in) and `sharing`/`fallback`/`expires_at` (applied after \
+             reduction); `$orderby` accepts only `reference`. Selecting `secret` in `$select` \
+             switches to value mode (ADR-0004): no `limit`/`cursor`/`$orderby`, a `reference` or \
+             `type` selector only, capped and unpaginated.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .query_param_typed("limit", false, "Page size (metadata mode only)", "integer")
+        .query_param(
+            "cursor",
+            false,
+            "Opaque continuation token from a previous page",
+        )
+        .with_odata_filter::<CredentialFilterField>()
+        .with_odata_orderby::<CredentialFilterField>()
+        .with_odata_select()
+        .handler(handlers::list_credentials)
+        .json_response_with_schema::<toolkit_odata::Page<CredentialListItemDto>>(
+            openapi,
+            StatusCode::OK,
+            "A page of reduced credential items (value-mode items additionally carry `secret`)",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     let router = OperationBuilder::get("/credstore/v1/credentials/{ref}")
         .operation_id("credstore.get_credential")
         .summary("Get a credential record by reference")

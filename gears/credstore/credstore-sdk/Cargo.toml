@@ -36,6 +36,7 @@ toolkit-gts = { workspace = true }
 # ToolKit dependencies
 toolkit = { workspace = true }
 toolkit-security = { workspace = true }
+toolkit-odata = { workspace = true }
 
 # Domain types owned by tenant-resolver
 tenant-resolver-sdk = { workspace = true }

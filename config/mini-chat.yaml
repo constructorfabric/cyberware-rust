@@ -111,10 +111,7 @@ gears:
       vendor: "constructorfabric"
 
   static-credstore-plugin:
-    config:
-      secrets:
-        - key: "azure-openai-key"
-          value: "${AZURE_OPENAI_API_KEY}"
+    config: {}   # values are written through the credstore API (ADR-0006 withdrew config seeding)
 
   file-parser:
     config:

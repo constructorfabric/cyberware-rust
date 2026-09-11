@@ -10,11 +10,13 @@ use crate::domain::test_support::{NoopMetrics, StubCredStore, keycloak_cfg};
 use crate::infra::kc_http::ReqwestKcTransport;
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialPatch, CredentialWrite, PutOutcome,
-    PutPrecondition, Secret, SecretRef, SecretValue, Validator, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, Validator,
+    WritePrecondition,
 };
 use parking_lot::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 use wiremock::matchers::{header, method, path};
@@ -82,6 +84,14 @@ impl CredStoreClientV1 for StubOnce {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

@@ -16,7 +16,7 @@ use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::resolver::TenantDirectory;
 use crate::domain::secret::model::PutPrecondition;
 use crate::domain::secret::repo::SecretRepo;
-use crate::domain::secret::service::{GcSettings, Service};
+use crate::domain::secret::service::{GcSettings, ListSettings, Service};
 use crate::domain::secret::test_support::{
     FakeDir, FakeMetrics, FakePlugin, FakePluginSelector, FakeSecretRepo, catalog_type_resolver,
     make_ctx, mock_enforcer,
@@ -63,6 +63,10 @@ fn build_harness() -> TestHarness {
         GcSettings {
             pending_max_age_secs: 3600,
             batch_size: 256,
+        },
+        ListSettings {
+            max_limit: 200,
+            value_mode_cap: 25,
         },
     ));
     let openapi = OpenApiRegistryImpl::new();
@@ -826,6 +830,156 @@ async fn invalid_ref_on_delete_returns_400() {
         .body(Body::empty())
         .unwrap();
     req.extensions_mut().insert(test_ctx());
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── GET /credentials (collection read, ADR-0005/ADR-0004) ───────────────────
+
+fn list_uri(query: &str) -> String {
+    if query.is_empty() {
+        "/credstore/v1/credentials".to_owned()
+    } else {
+        format!("/credstore/v1/credentials?{query}")
+    }
+}
+
+#[tokio::test]
+async fn list_credentials_smoke_returns_200_json() {
+    let h = build_harness();
+    let req = json_request("GET", &list_uri(""), None, test_ctx());
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let content_type = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(content_type.starts_with("application/json"));
+    assert_eq!(
+        resp.headers().get(axum::http::header::CACHE_CONTROL),
+        Some(&axum::http::HeaderValue::from_static("no-store"))
+    );
+    let body = body_json(resp).await;
+    assert!(body["items"].as_array().is_some());
+    assert!(body["page_info"].is_object());
+}
+
+#[tokio::test]
+async fn list_credentials_without_select_returns_the_full_credential_shape() {
+    let h = build_harness();
+    seed_credential(&h, "list-full", "value").await;
+
+    let req = json_request("GET", &list_uri(""), None, test_ctx());
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["items"].as_array().expect("items array");
+    let item = items
+        .iter()
+        .find(|i| i["reference"] == "list-full")
+        .expect("seeded item present");
+
+    let mut keys: Vec<&str> = item
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "fallback",
+            "inheritance",
+            "owner_id",
+            "reference",
+            "sharing",
+            "status",
+            "type",
+            "updated_at",
+            "version",
+        ],
+        "no `secret` key outside value mode (no expiry set on this fixture, so `expires_at` is \
+         skipped too)"
+    );
+    assert_eq!(item["status"], "active");
+    assert_eq!(item["inheritance"], "own");
+}
+
+#[tokio::test]
+async fn list_credentials_select_projects_only_the_requested_fields() {
+    let h = build_harness();
+    seed_credential(&h, "list-projected", "value").await;
+
+    let req = json_request(
+        "GET",
+        &list_uri("%24select=reference%2Ctype"),
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["items"].as_array().expect("items array");
+    let item = items
+        .iter()
+        .find(|i| i["reference"] == "list-projected")
+        .expect("seeded item present");
+    let mut keys: Vec<&str> = item
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["reference", "type"]);
+}
+
+#[tokio::test]
+async fn list_credentials_value_mode_returns_the_value() {
+    let h = build_harness();
+    seed_credential(&h, "list-value", "top-secret").await;
+
+    let req = json_request(
+        "GET",
+        &list_uri("%24select=reference%2Csecret&%24filter=reference%20eq%20%27list-value%27"),
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let items = body["items"].as_array().expect("items array");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["reference"], "list-value");
+    assert_eq!(items[0]["secret"], "top-secret");
+    assert!(body["page_info"]["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn list_credentials_value_mode_rejects_limit() {
+    let h = build_harness();
+    let req = json_request(
+        "GET",
+        &list_uri("%24select=reference%2Csecret&%24filter=reference%20eq%20%27x%27&limit=5"),
+        None,
+        test_ctx(),
+    );
+    let resp = h.router.oneshot(req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["context"]["field_violations"][0]["reason"],
+        "VALUE_MODE_NO_PAGINATION"
+    );
+}
+
+#[tokio::test]
+async fn list_credentials_unsupported_orderby_field_returns_400() {
+    let h = build_harness();
+    let req = json_request("GET", &list_uri("%24orderby=updated_at"), None, test_ctx());
     let resp = h.router.oneshot(req).await.expect("router");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

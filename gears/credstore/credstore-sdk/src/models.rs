@@ -505,6 +505,41 @@ impl CredentialPatch {
     }
 }
 
+/// One item of the collection read (`CredStoreClientV1::list`, ADR-0005): the
+/// reduced [`Credential`] a reference resolves to, plus its decrypted value
+/// (`secret`) when the request ran in **value mode**
+/// (`$select` containing `secret`, ADR-0004 "Bulk secret read: the collection
+/// in value mode"). `secret` is `None` in ordinary (metadata-mode) listing —
+/// the collection never carries a value unless the caller opted into value
+/// mode, and even then only for the items whose value the caller may read.
+#[derive(Debug)]
+pub struct CredentialListItem {
+    /// The reduced credential record (ADR-0005, "Reducing a reference to one
+    /// item"): one item per reference, matching what a point read
+    /// (`CredStoreClientV1::get`) of that reference would resolve to.
+    pub credential: Credential,
+    /// The decrypted value, present only in value mode and only for an item
+    /// the caller may read (`read_secret`); a refused, missing, or
+    /// fingerprint-mismatched item is omitted from the page entirely rather
+    /// than carrying `None` here.
+    pub secret: Option<SecretValue>,
+}
+
+/// Outcome of one [`CredStoreMaintenanceV1::run_gc`](crate::CredStoreMaintenanceV1::run_gc)
+/// invocation (ADR-0006). Mirrors the gear-internal report the domain service
+/// returns; the gear's `ClientHub` adapter converts between the two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Expired `active` rows removed (maintenance job pass 1).
+    pub expired_deleted: u64,
+    /// Versions deleted by the gc drain (`reason != pending`: superseded,
+    /// removed, or aborted).
+    pub gc_deleted: u64,
+    /// Orphaned `pending` versions reclaimed (older than
+    /// `gc.pending_max_age_secs` and unreferenced by any row).
+    pub gc_pending_reclaimed: u64,
+}
+
 #[cfg(test)]
 mod models_tests {
     use super::*;
@@ -660,5 +695,36 @@ mod models_tests {
             }
             .is_empty()
         );
+    }
+
+    #[test]
+    fn gc_report_default_is_all_zeros() {
+        let report = GcReport::default();
+        assert_eq!(report.expired_deleted, 0);
+        assert_eq!(report.gc_deleted, 0);
+        assert_eq!(report.gc_pending_reclaimed, 0);
+    }
+
+    #[test]
+    fn credential_list_item_carries_no_secret_in_metadata_mode() {
+        let credential = Credential {
+            reference: SecretRef::new("ref").expect("valid"),
+            secret_type: "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"
+                .to_owned(),
+            sharing: SharingMode::Tenant,
+            fallback: Some(Fallback::Inherit),
+            status: CredentialStatus::Active,
+            inheritance: InheritanceStatus::Own,
+            version: Some(1),
+            updated_at: None,
+            owner_id: Some(OwnerId::nil()),
+            expires_at: None,
+            validator: None,
+        };
+        let item = CredentialListItem {
+            credential,
+            secret: None,
+        };
+        assert!(item.secret.is_none());
     }
 }

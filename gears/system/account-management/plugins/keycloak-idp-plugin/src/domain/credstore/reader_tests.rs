@@ -2,11 +2,12 @@ use super::*;
 use crate::domain::system_actor::build_system_ctx;
 use async_trait::async_trait;
 use credstore_sdk::{
-    Credential, CredentialPatch, CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretValue,
-    Validator, WritePrecondition,
+    Credential, CredentialListItem, CredentialPatch, CredentialWrite, PutOutcome, PutPrecondition,
+    Secret, SecretValue, Validator, WritePrecondition,
 };
 use parking_lot::Mutex;
 use secrecy::ExposeSecret;
+use toolkit_odata::{ODataQuery, Page};
 use uuid::Uuid;
 
 /// Stub serving one canned response (`Secret` is not `Clone` because
@@ -71,6 +72,14 @@ impl CredStoreClientV1 for StubClient {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

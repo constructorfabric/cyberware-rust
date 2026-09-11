@@ -26,6 +26,8 @@ const CREDSTORE_FENCE_VERIFY: &str = "credstore_fence_verify_total";
 const CREDSTORE_GC_DELETED: &str = "credstore_gc_deleted_total";
 const CREDSTORE_GC_PENDING_RECLAIMED: &str = "credstore_gc_pending_reclaimed_total";
 const CREDSTORE_EXPIRED_DELETED: &str = "credstore_expired_deleted_total";
+const CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION: &str =
+    "credstore_list_type_invariant_violation_total";
 
 /// OpenTelemetry-backed metrics handle for the credstore module.
 pub struct CredStoreMetricsMeter {
@@ -38,6 +40,7 @@ pub struct CredStoreMetricsMeter {
     gc_deleted: Counter<u64>,
     gc_pending_reclaimed: Counter<u64>,
     expired_deleted: Counter<u64>,
+    list_type_invariant_violation: Counter<u64>,
 }
 
 impl std::fmt::Debug for CredStoreMetricsMeter {
@@ -100,6 +103,14 @@ impl CredStoreMetricsMeter {
                 .u64_counter(CREDSTORE_EXPIRED_DELETED)
                 .with_description("Maintenance job: expired active rows removed")
                 .build(),
+            list_type_invariant_violation: meter
+                .u64_counter(CREDSTORE_LIST_TYPE_INVARIANT_VIOLATION)
+                .with_description(
+                    "Collection read: a reduced reference's winner named a type outside the \
+                     authorized set (override-type-consistency violated); the reference was \
+                     dropped from the page",
+                )
+                .build(),
         }
     }
 
@@ -157,6 +168,10 @@ impl CredStoreMetricsPort for CredStoreMetricsMeter {
 
     fn expired_deleted(&self, n: u64) {
         self.expired_deleted.add(n, &[]);
+    }
+
+    fn list_type_invariant_violation(&self) {
+        self.list_type_invariant_violation.add(1, &[]);
     }
 }
 

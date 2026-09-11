@@ -213,23 +213,7 @@ gears:
       vendor: "constructorfabric"
 
   static-credstore-plugin:
-    config:
-      secrets:
-        # Test-only fake client ID, not a real credential
-        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
-          key: "openai-key"
-          value: "sk-test-e2e-fake-key"
-        # Test-only fake credentials for OAuth2 client ID and secret
-        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
-          key: "test-oauth2-client-id"
-          value: "test-client-id"
-        # Test-only fake client secret, not a real credential
-        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          owner_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
-          key: "test-oauth2-client-secret"
-          value: "test-client-secret"
+    config: {}   # values are written through the credstore API (ADR-0006 withdrew config seeding)
 
   grpc-hub:
     config:

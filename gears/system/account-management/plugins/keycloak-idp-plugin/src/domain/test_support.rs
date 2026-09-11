@@ -16,10 +16,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialPatch, CredentialWrite, PutOutcome,
-    PutPrecondition, Secret, SecretRef, SecretValue, Validator, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, Validator,
+    WritePrecondition,
 };
 use toolkit_macros::domain_model;
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -146,6 +148,14 @@ impl CredStoreClientV1 for StubCredStore {
     ) -> Result<(), CredStoreError> {
         Ok(())
     }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
+    }
 }
 
 /// Configurable stub keyed by `SecretRef`.
@@ -237,6 +247,14 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

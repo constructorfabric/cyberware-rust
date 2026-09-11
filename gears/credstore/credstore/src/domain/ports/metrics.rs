@@ -126,6 +126,16 @@ pub trait CredStoreMetricsPort: Send + Sync + 'static {
     /// Maintenance job: expired `active` rows removed (and their versions
     /// enqueued for collection).
     fn expired_deleted(&self, n: u64);
+    /// Collection read (ADR-0005): a reference's reduced winner named a
+    /// `secret_type_uuid` outside the set the request authorized per
+    /// distinct type found in the candidate-reference query. The reference
+    /// is dropped from the page rather than surfaced — a missing catalogue
+    /// entry, not a false one — and this is the operational signal: it means
+    /// the override-type-consistency invariant
+    /// (`cpt-cf-credstore-fr-override-type-consistency`) was violated for
+    /// that reference, which should never happen if every write went
+    /// through the write path's own check.
+    fn list_type_invariant_violation(&self);
 }
 
 #[domain_model]
@@ -140,6 +150,7 @@ impl CredStoreMetricsPort for NoopMetrics {
     fn gc_deleted(&self, _: u64) {}
     fn gc_pending_reclaimed(&self, _: u64) {}
     fn expired_deleted(&self, _: u64) {}
+    fn list_type_invariant_violation(&self) {}
 }
 
 #[cfg(test)]
@@ -185,5 +196,6 @@ mod tests {
         noop.gc_deleted(2);
         noop.gc_pending_reclaimed(1);
         noop.expired_deleted(4);
+        noop.list_type_invariant_violation();
     }
 }

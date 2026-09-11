@@ -8,9 +8,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, Credential, CredentialPatch, CredentialWrite, PutOutcome,
-    PutPrecondition, Secret, SecretRef, Validator,
+    CredStoreClientV1, CredStoreError, CredStoreMaintenanceV1, Credential, CredentialListItem,
+    CredentialPatch, CredentialWrite, GcReport, PutOutcome, PutPrecondition, Secret, SecretRef,
+    Validator,
 };
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
 use crate::domain::error::DomainError;
@@ -164,6 +166,26 @@ impl CredStoreClientV1 for CredStoreLocalClient {
             .delete(ctx, key, to_domain_precondition(precondition))
             .await
             .map_err(Into::into)
+    }
+
+    async fn list(
+        &self,
+        ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        self.svc.list(ctx, query).await.map_err(Into::into)
+    }
+}
+
+#[async_trait]
+impl CredStoreMaintenanceV1 for CredStoreLocalClient {
+    async fn run_gc(&self, ctx: &SecurityContext) -> Result<GcReport, CredStoreError> {
+        let report = self.svc.run_gc(ctx).await.map_err(CredStoreError::from)?;
+        Ok(GcReport {
+            expired_deleted: report.expired_deleted,
+            gc_deleted: report.gc_deleted,
+            gc_pending_reclaimed: report.gc_pending_reclaimed,
+        })
     }
 }
 

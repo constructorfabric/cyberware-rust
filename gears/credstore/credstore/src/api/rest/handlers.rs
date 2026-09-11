@@ -10,10 +10,12 @@ use credstore_sdk::{
     SharingMode,
 };
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::page_to_projected_json;
 use toolkit_security::SecurityContext;
 
 use super::dto::{
-    CredentialDto, CredentialPatchDto, PutCredentialRequestDto, SecretDto, weak_etag,
+    CredentialDto, CredentialListItemDto, CredentialPatchDto, PutCredentialRequestDto, SecretDto,
+    weak_etag,
 };
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{
@@ -160,6 +162,48 @@ fn parse_gts_type(field: &'static str, raw: &str) -> Result<GtsId, DomainError> 
         reason: reasons::UNKNOWN_SECRET_TYPE,
         detail: format!("{field} must be a full GTS type id: {raw}"),
     })
+}
+
+/// `GET /credstore/v1/credentials` (ADR-0005/ADR-0004): the collection read.
+///
+/// Metadata-mode responses carry every reduced item as the same shape
+/// `GET .../{ref}` returns (`secret` absent); selecting `secret` in
+/// `$select` switches to value mode (ADR-0004, "Bulk secret read"), whose
+/// items additionally carry the decrypted value — audited per item exactly
+/// like `GET .../{ref}/secret`, since both paths share
+/// `Service::read_value_for_row`'s retry/fence-verification/metrics.
+///
+/// # Errors
+///
+/// Returns a canonical `Problem` envelope on an unsupported `$filter`/
+/// `$orderby`/`$select` field or shape (400), an out-of-range `limit` or a
+/// malformed/inconsistent cursor (400), or — in value mode — pagination
+/// present, an invalid selector, or a match-set over the configured cap
+/// (400).
+pub async fn list_credentials(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    OData(query): OData,
+) -> ApiResult<impl IntoResponse> {
+    let page = svc.list(&ctx, &query).await?;
+    let mut items = Vec::with_capacity(page.items.len());
+    for item in &page.items {
+        items.push(CredentialListItemDto::try_from_list_item(item)?);
+    }
+    let dto_page = toolkit_odata::Page {
+        items,
+        page_info: page.page_info,
+    };
+    let body = match query.selected_fields() {
+        Some(fields) => Json(page_to_projected_json(&dto_page, Some(fields))).into_response(),
+        None => Json(dto_page).into_response(),
+    };
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        body,
+    )
+        .into_response())
 }
 
 /// `GET /credstore/v1/credentials/{ref}` (ADR-0004).

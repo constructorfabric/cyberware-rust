@@ -29,7 +29,7 @@ use crate::domain::secret::model::{
     Fallback, GcReason, PutPrecondition, SecretStatus, WritePrecondition,
 };
 use crate::domain::secret::repo::SecretRepo;
-use crate::domain::secret::service::{GcSettings, Service};
+use crate::domain::secret::service::{GcSettings, ListSettings, Service};
 use crate::domain::secret::test_support::*;
 
 fn key(s: &str) -> SecretRef {
@@ -47,6 +47,13 @@ fn test_gc_settings_zero_age() -> GcSettings {
     GcSettings {
         pending_max_age_secs: 0,
         batch_size: 256,
+    }
+}
+
+fn test_list_settings() -> ListSettings {
+    ListSettings {
+        max_limit: 200,
+        value_mode_cap: 25,
     }
 }
 
@@ -70,6 +77,7 @@ fn make_service_with_gc(
         catalog_type_resolver(),
         metrics,
         gc,
+        test_list_settings(),
     )
 }
 
@@ -1138,6 +1146,7 @@ async fn delete_with_no_plugin_fails_without_deleting_the_row() {
         catalog_type_resolver(),
         Arc::new(NoopMetrics),
         test_gc_settings(),
+        test_list_settings(),
     );
     let err = svc_no_plugin
         .delete(&ctx, &key("k"), exists())
@@ -1228,6 +1237,7 @@ async fn operations_return_service_unavailable_when_type_resolver_fails() {
         Arc::new(FailingTypeResolver),
         Arc::new(NoopMetrics),
         test_gc_settings(),
+        test_list_settings(),
     );
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     let err = svc

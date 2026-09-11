@@ -86,6 +86,62 @@ pub trait SecretRepo: Send + Sync {
         tenant: Uuid,
     ) -> Result<bool, DomainError>;
 
+    // ── Collection read (ADR-0005) ──────────────────────────────────────────
+
+    /// Step 1: candidate **references** visible across `chain`, under the
+    /// same predicate [`Self::resolve_candidates`] applies per reference —
+    /// own tenant: every sharing-visible row of any status; ancestors:
+    /// resolution-eligible `shared` rows only — clamped by an exact
+    /// `reference` or `secret_type_uuid` set when given (both invariant
+    /// across a reference's chain). `DISTINCT reference`, ordered by
+    /// `reference` (`desc` when `desc`), keyset-paginated by `cursor`
+    /// (exclusive); fetches at most `limit` references. Never a `COUNT`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "every clamp the collection read's step 1 query supports"
+    )]
+    async fn list_candidate_references(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        reference_in: Option<&[String]>,
+        type_uuid_in: Option<&[Uuid]>,
+        cursor: Option<&str>,
+        desc: bool,
+        limit: u64,
+    ) -> Result<Vec<String>, DomainError>;
+
+    /// The small second query of step 1 (ADR-0005): distinct
+    /// `secret_type_uuid`s among the candidate rows of `references` — the
+    /// same visibility predicate and `type_uuid_in` clamp
+    /// [`Self::list_candidate_references`] applied, restricted to the
+    /// references it found. This is what the collection read authorizes per
+    /// type; a reduced winner whose type is outside this set (an
+    /// override-type-consistency violation, since step 2 fetches whole rows
+    /// unclamped by type) is dropped and counted, distinct from an ordinary
+    /// PDP denial.
+    async fn list_candidate_types(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        references: &[String],
+        type_uuid_in: Option<&[Uuid]>,
+    ) -> Result<Vec<Uuid>, DomainError>;
+
+    /// Step 2: every visible row of `references`, whole and unclamped by
+    /// type — exactly what [`Self::resolve_candidates`] would return for
+    /// each reference individually, so reduction sees every row a value
+    /// read would see.
+    async fn list_candidates_for_references(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        references: &[String],
+    ) -> Result<Vec<SecretRow>, DomainError>;
+
     // ── Garbage-collection bookkeeping (`credstore_value_gc`) ───────────────
 
     /// Record a write's intent: `INSERT credstore_value_gc(value_id, tenant_id,

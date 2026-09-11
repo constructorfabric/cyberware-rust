@@ -794,6 +794,29 @@ impl FakeSecretRepo {
             SecretStatus::Declared => r.fallback == crate::domain::secret::model::Fallback::None,
         }
     }
+
+    /// Collection-read visibility predicate (ADR-0005): own tenant, every
+    /// sharing-visible row of any status; ancestor tenants, resolution-
+    /// eligible `shared` rows only. Mirrors
+    /// `resolve_candidates`'s per-row predicate above (minus the reference
+    /// match) and
+    /// `infra::storage::repo_impl::reads::chain_visibility_condition`.
+    fn is_candidate_visible(
+        r: &SecretRow,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+    ) -> bool {
+        chain.contains(&r.tenant_id.0)
+            && if r.tenant_id == req_tenant {
+                match r.sharing {
+                    SharingMode::Private => r.owner_id.0 == subject.0,
+                    SharingMode::Tenant | SharingMode::Shared => true,
+                }
+            } else {
+                r.sharing == SharingMode::Shared && Self::resolution_eligible(r)
+            }
+    }
 }
 
 impl Default for FakeSecretRepo {
@@ -936,6 +959,78 @@ impl SecretRepo for FakeSecretRepo {
         _tenant: Uuid,
     ) -> Result<bool, DomainError> {
         Ok(self.scope_allows)
+    }
+
+    async fn list_candidate_references(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        reference_in: Option<&[String]>,
+        type_uuid_in: Option<&[Uuid]>,
+        cursor: Option<&str>,
+        desc: bool,
+        limit: u64,
+    ) -> Result<Vec<String>, DomainError> {
+        let rows = self.rows.lock().expect("lock");
+        let mut refs: Vec<String> = rows
+            .iter()
+            .filter(|r| Self::is_candidate_visible(r, req_tenant, subject, chain))
+            .filter(|r| reference_in.is_none_or(|refs| refs.contains(&r.reference)))
+            .filter(|r| type_uuid_in.is_none_or(|types| types.contains(&r.secret_type_uuid)))
+            .map(|r| r.reference.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if desc {
+            refs.reverse();
+        }
+        if let Some(after) = cursor {
+            refs.retain(|r| {
+                if desc {
+                    r.as_str() < after
+                } else {
+                    r.as_str() > after
+                }
+            });
+        }
+        refs.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(refs)
+    }
+
+    async fn list_candidate_types(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        references: &[String],
+        type_uuid_in: Option<&[Uuid]>,
+    ) -> Result<Vec<Uuid>, DomainError> {
+        let rows = self.rows.lock().expect("lock");
+        let types: std::collections::BTreeSet<Uuid> = rows
+            .iter()
+            .filter(|r| references.contains(&r.reference))
+            .filter(|r| Self::is_candidate_visible(r, req_tenant, subject, chain))
+            .filter(|r| type_uuid_in.is_none_or(|types| types.contains(&r.secret_type_uuid)))
+            .map(|r| r.secret_type_uuid)
+            .collect();
+        Ok(types.into_iter().collect())
+    }
+
+    async fn list_candidates_for_references(
+        &self,
+        req_tenant: TenantId,
+        subject: OwnerId,
+        chain: &[Uuid],
+        references: &[String],
+    ) -> Result<Vec<SecretRow>, DomainError> {
+        let rows = self.rows.lock().expect("lock");
+        Ok(rows
+            .iter()
+            .filter(|r| references.contains(&r.reference))
+            .filter(|r| Self::is_candidate_visible(r, req_tenant, subject, chain))
+            .cloned()
+            .collect())
     }
 
     async fn gc_insert_pending(
@@ -1246,6 +1341,7 @@ pub struct FakeMetrics {
     pub gc_deleted_total: Mutex<u64>,
     pub gc_pending_reclaimed_total: Mutex<u64>,
     pub expired_deleted_total: Mutex<u64>,
+    pub list_type_invariant_violation_total: Mutex<u64>,
 }
 
 impl FakeMetrics {
@@ -1307,6 +1403,15 @@ impl FakeMetrics {
     pub fn expired_deleted_total(&self) -> u64 {
         *self.expired_deleted_total.lock().expect("lock")
     }
+
+    /// # Panics
+    /// Panics if the internal mutex is poisoned.
+    pub fn list_type_invariant_violation_total(&self) -> u64 {
+        *self
+            .list_type_invariant_violation_total
+            .lock()
+            .expect("lock")
+    }
 }
 
 impl Default for FakeMetrics {
@@ -1319,6 +1424,7 @@ impl Default for FakeMetrics {
             gc_deleted_total: Mutex::new(0),
             gc_pending_reclaimed_total: Mutex::new(0),
             expired_deleted_total: Mutex::new(0),
+            list_type_invariant_violation_total: Mutex::new(0),
         }
     }
 }
@@ -1345,5 +1451,11 @@ impl CredStoreMetricsPort for FakeMetrics {
     }
     fn expired_deleted(&self, n: u64) {
         *self.expired_deleted_total.lock().expect("lock") += n;
+    }
+    fn list_type_invariant_violation(&self) {
+        *self
+            .list_type_invariant_violation_total
+            .lock()
+            .expect("lock") += 1;
     }
 }

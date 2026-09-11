@@ -16,6 +16,7 @@ pub struct CredStoreConfig {
     pub vendor: String,
     pub hierarchy: HierarchyCfg,
     pub gc: GcCfg,
+    pub list: ListCfg,
 }
 
 impl Default for CredStoreConfig {
@@ -24,6 +25,7 @@ impl Default for CredStoreConfig {
             vendor: "constructorfabric".to_owned(),
             hierarchy: HierarchyCfg::default(),
             gc: GcCfg::default(),
+            list: ListCfg::default(),
         }
     }
 }
@@ -67,6 +69,34 @@ impl Default for GcCfg {
     }
 }
 
+/// Settings for the collection read (`GET /credstore/v1/credentials`,
+/// ADR-0005/ADR-0004): the metadata-mode page-size cap and the value-mode
+/// (`$select` containing `secret`) match-set cap. Neither is specified by a
+/// config key in the design docs; both are introduced here as the
+/// implementation's own knobs, named after the ADRs' proposed defaults.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ListCfg {
+    /// Maximum `limit`/`$top` for a metadata-mode page; a caller-supplied
+    /// value above this is rejected (400 `INVALID_LIMIT`) rather than
+    /// silently clamped.
+    pub max_limit: u64,
+    /// Cap on how many references a value-mode (`$select=…,secret`) request
+    /// may match. Enforced by fetching `cap + 1` candidate references and
+    /// failing closed with `400 TOO_MANY_MATCHES` if the `(cap + 1)`th
+    /// appears — never by a `COUNT` query.
+    pub value_mode_cap: u64,
+}
+
+impl Default for ListCfg {
+    fn default() -> Self {
+        Self {
+            max_limit: 200,
+            value_mode_cap: 25,
+        }
+    }
+}
+
 impl CredStoreConfig {
     /// # Errors
     /// Returns `Err` with a description if any field is invalid.
@@ -82,6 +112,12 @@ impl CredStoreConfig {
         }
         if self.hierarchy.ancestor_cache_ttl_secs == 0 {
             return Err("hierarchy.ancestor_cache_ttl_secs must be > 0".to_owned());
+        }
+        if self.list.max_limit == 0 {
+            return Err("list.max_limit must be > 0".to_owned());
+        }
+        if self.list.value_mode_cap == 0 {
+            return Err("list.value_mode_cap must be > 0".to_owned());
         }
         Ok(())
     }
@@ -101,6 +137,8 @@ mod tests {
         assert_eq!(cfg.hierarchy.ancestor_cache_ttl_secs, 300);
         assert_eq!(cfg.gc.pending_max_age_secs, 3600);
         assert_eq!(cfg.gc.batch_size, 256);
+        assert_eq!(cfg.list.max_limit, 200);
+        assert_eq!(cfg.list.value_mode_cap, 25);
         assert!(cfg.validate().is_ok());
     }
 
@@ -117,8 +155,17 @@ mod tests {
     }
 
     #[test]
+    fn deserializes_partial_list_config_with_defaults() {
+        let cfg: CredStoreConfig =
+            serde_json::from_str(r#"{"list":{"max_limit":50}}"#).expect("deserialize");
+        assert_eq!(cfg.list.max_limit, 50);
+        // Unspecified fields fall back to defaults.
+        assert_eq!(cfg.list.value_mode_cap, 25);
+    }
+
+    #[test]
     fn validate_rejects_each_invalid_field() {
-        use super::{GcCfg, HierarchyCfg};
+        use super::{GcCfg, HierarchyCfg, ListCfg};
 
         let empty_vendor = CredStoreConfig {
             vendor: String::new(),
@@ -151,6 +198,24 @@ mod tests {
             ..Default::default()
         };
         assert!(zero_ttl.validate().is_err());
+
+        let zero_max_limit = CredStoreConfig {
+            list: ListCfg {
+                max_limit: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(zero_max_limit.validate().is_err());
+
+        let zero_value_mode_cap = CredStoreConfig {
+            list: ListCfg {
+                value_mode_cap: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(zero_value_mode_cap.validate().is_err());
     }
 
     #[test]

@@ -221,12 +221,7 @@ gears:
       vendor: "constructorfabric"
 
   static-credstore-plugin:
-    config:
-      secrets:
-        - tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          owner_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-          key: "openai-key"
-          value: "sk-test-e2e-fake-key"
+    config: {}   # values are written through the credstore API (ADR-0006 withdrew config seeding)
 
   # File parser gear configuration (no database needed)
   file-parser:
