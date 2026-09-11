@@ -925,7 +925,7 @@ table** rather than globally, because ten of the nineteen are deliberately mutab
 | `orders_order_admin` | `01 §3.7` | capture | **mutable** — administrative content |
 | `orders_order_line_admin` | `01 §3.7` | capture | **mutable** — administrative content |
 | `orders_resolved_total` | `01 §3.7` | gate-and-pin | append-only |
-| `orders_transition_audit` | `01 §3.7` | engine | append-only, hash-chained over committed entries; no UPDATE grant to any role, DELETE only to the retention worker for expired refused rows — `01 §3.7` is the canonical grant and retention contract |
+| `orders_transition_audit` | `01 §3.7` | engine | append-only, hash-chained over committed entries; **no standing** UPDATE grant to any role (the erasure role's is time-boxed to one run, §4.3), DELETE only to the retention worker for expired refused rows — `01 §3.7` is the canonical grant and retention contract |
 | `orders_idempotency` | `01 §3.7` | engine | **mutable** — marker settles |
 | `orders_event_outbox` | `01 §3.7` | engine | **mutable** — delivery bookkeeping; delivered rows purged |
 | `orders_line_fulfillment` | `01 §3.7` | workflow-seam | **mutable** — projection advances |
@@ -1054,7 +1054,7 @@ applicable**; it consumes an authorization *outcome* only.
 | A partner manufactures customer consent | The placing party records the acceptance instant themselves | Commercial-evidence boundary | The placing actor is normatively barred from recording acceptance for the order they placed | An offline collusion between partner and a customer principal is out of scope for a technical control |
 | State asserted without a guard | A caller reaches a state-setting path directly | Engine boundary | There is no such path: every state change is a guarded transition and the engine is sole writer | A privileged database credential bypasses the engine; mitigated by runtime-owned privilege and the audit hash chain making it detectable |
 | Sibling-gear impersonation | Any caller presents the Workflow actor class | Service boundary | Gateway-asserted service principal plus a gear-scoped claim | A compromised platform gateway; out of this gear's control |
-| Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant on the audit role, plus a per-order predecessor-hash chain verified periodically | A holder of the migration role can drop the grant; detectable via the chain and the grant audit |
+| Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No standing UPDATE or DELETE grant on the audit role, plus a per-order predecessor-hash chain verified by the audit-chain verifier of `design/01-foundation.md` §3.8 | A holder of the migration role can drop the grant; detectable via the chain and the grant audit. The erasure role's time-boxed UPDATE (§4.3) is a deliberate, recorded window, and the verifier distinguishes a declared re-derivation from an undeclared one — an erasure run that wrote no record would alert exactly as tampering does |
 | Preview amplification | Unauthenticated-shaped basket calls fan out to six ports and write outcome rows | Cost and dependency boundary | Preview declares its actor classes, carries a rate limit, and its outcome rows have a bounded retention | A high-volume authorised caller can still consume port capacity, bounded by the per-port bulkhead |
 | Unbounded audit growth | Repeated refused attempts against one order | Availability boundary | Refusal rows carry 90-day retention and repeated refusals are rate-limited | A distributed low-rate refusal campaign remains possible and is a monitoring concern |
 | An order held in-flight indefinitely | An actor cycles the dwell before each TTL elapses — **hold/resume** with hold permission, or **amendment** with amend permission; both reset `state_entered_at` | Commercial-promise boundary | Two counters no transition resets, each with its own guard: `resume_count` (cap 5, `design/07-hold-and-expiry.md` §4.2) and `amendment_count` (cap 20, `design/04-versioning.md` §4.1). At most 26 state entries, so in-flight life is bounded at `26 × the largest configured TTL` | Where the states' TTLs are **unset** the caps bound nothing, because the dwell they multiply is itself unbounded; disclosed as [`DECISIONS.md`](./DECISIONS.md) Q-27 and alerted per `07 §3.8` |
@@ -1070,11 +1070,19 @@ and tenant identifiers in the audit trail are **personal-minimal**; the free-tex
 fields — display labels and internal notes — are **personal-minimal** and carry length bounds and
 input validation. No masking requirement arises, because no surface returns another tenant's data.
 
-**Erasure** is the one case that touches the immutable stores. Because they are append-only, an
-erasure obligation is satisfied by **pseudonymising actor identifiers in place** — the single
-permitted mutation of the audit store, itself performed as an audited transition and recorded, so
-the hash chain is re-derived rather than broken. Commercial content is not erased, because it is a
-financial record retained under the program retention policy.
+**Erasure** is the one case that touches the immutable stores, and it needs a mechanism rather than
+a sentence. An erasure obligation is satisfied by **pseudonymising actor identifiers in place** —
+commercial content is not erased, because it is a financial record retained under the program
+retention policy. But "in place" on an append-only store with **no UPDATE grant to any role**
+(`design/01-foundation.md` §3.7) is not executable as stated, so five things are specified here.
+
+1. **It is a privileged procedure, not a transition.** An earlier version of this paragraph called it "an audited transition". It cannot be: the transition table is closed at twenty-five rows, adding one is an engine change under `01 §4.6`, and no row exists. Erasure is an out-of-band operational procedure, run deliberately and rarely.
+2. **The grant is time-boxed, not standing.** `01 §3.7`'s rule becomes "**no standing UPDATE grant** to any role". A dedicated erasure role receives UPDATE on `orders_transition_audit` for the duration of one execution and holds none between executions, so the steady-state posture — the one the threat model rests on — is unchanged.
+3. **It records itself where it cannot reach.** Each execution writes a record — the requesting authority, the instant, the subject pseudonymised, and the orders whose entries were touched — to a store the erasure role has **no UPDATE or DELETE grant on**. An erasure that could edit its own record would defeat the purpose of having one.
+4. **Chain re-derivation is part of the procedure and is declared.** Pseudonymising a row changes its hash, so every later entry for that order must have its predecessor hash recomputed. The procedure re-derives forward from the mutated row and **records the re-derivation against those orders** in the same record as (3).
+5. **The verifier reads that record, or it reports erasure as tampering.** The audit-chain verifier (`design/01-foundation.md` §3.8) alerts on any mismatch and **cannot repair** — so without (4) every legitimate erasure would raise a tamper alert on the affected orders and the alert would be indistinguishable from an attack. The verifier **MUST** consult the erasure record and treat a re-derivation it names as expected. A mismatch on an order with **no** such record is a genuine finding and still alerts.
+
+What is deliberately **not** claimed: that erasure leaves the trail cryptographically indistinguishable from one that was never erased. It does not — the record in (3) exists precisely so the change is visible and attributable, which is the correct trade for an audit store.
 
 **Residency**: for residency-bound tenants every gear-owned store — tables, read projection,
 audit, idempotency registry, outbox, backups and the synchronous standby — is pinned to an

@@ -214,7 +214,10 @@ line, resolved-total, audit, idempotency or outbox tables outside a transition. 
 what the audit guarantee means in practice, and it has an operational cost worth stating: a
 data-repair need becomes a new transition-table row with its own guard and reason, not a manual
 update. The one exception is pseudonymisation of actor identifiers to satisfy an erasure
-obligation, which is itself an audited transition ([`../DECISIONS.md`](../DECISIONS.md) D-44).
+obligation, which is a **privileged out-of-band procedure and not a transition** — the transition
+table is closed and no row expresses it — specified with its grant, its own record and its chain
+re-derivation in [`../DESIGN.md`](../DESIGN.md) §4.3
+([`../DECISIONS.md`](../DECISIONS.md) D-44).
 
 #### The idempotency window is 24 hours and is not a commercial bound
 
@@ -1152,17 +1155,25 @@ table omitted: **`(order_id, created_at, audit_id)`** serves the paged audit rea
 skips rows at page boundaries, silently. A **partial index** on
 `(created_at) WHERE outcome = 'refused'` serves the 90-day refusal purge, which cannot use the
 primary key and must not scan the committed trail.
-FK to `orders_order`. **No UPDATE grant to any role.** DELETE is granted to **one** role — the retention worker — and only for rows
+FK to `orders_order`. **No standing UPDATE grant to any role** — the one exception is the
+time-boxed grant held by the erasure role for the duration of a single pseudonymisation run, which
+`../DESIGN.md` §4.3 specifies as a privileged procedure with its own tamper-proof record and a
+declared chain re-derivation; between runs that role holds no UPDATE either, so the steady-state
+posture the threat model rests on is unchanged. DELETE is granted to **one** role — the retention worker — and only for rows
 whose `outcome` is `refused` and whose `created_at` is past the refusal window. The committed trail
 carries no DELETE grant at all.
 
-**Why the grant is split.** Stating "no UPDATE or DELETE grant" against the whole table made the
+**Why the grant is split three ways, not two.** Stating "no UPDATE or DELETE grant" against the whole table made the
 90-day refusal retention unimplementable by the only role that owns the table, so the window was
 declared and could never run — and ADR-0005 cites that window as the reason writing on every
 refusal is a bounded cost rather than an unbounded one. Deleting a chained row would also sever
 the predecessor-hash chain at that point and make routine retention indistinguishable from
 tampering, which is why the chain now links **committed** entries only and a refused-attempt row
-carries a NULL `prev_hash`. Refusals remain fully audited — the 100 % guarantee is about the entry
+carries a NULL `prev_hash`. The third split is the **erasure role's time-boxed UPDATE**: a
+standing "no UPDATE to any role" made the pseudonymisation `../DESIGN.md` §4.3 requires for an
+erasure obligation unexecutable, so that rule is stated as **no *standing* grant** and the
+exception is bounded to one recorded run rather than left as a contradiction between two documents.
+Refusals remain fully audited — the 100 % guarantee is about the entry
 existing at the time of the attempt, not about retaining it forever — and the committed commercial
 trail keeps both the chain and the absent DELETE grant that make it tamper-evident.
 
@@ -1356,6 +1367,7 @@ on work that had no owner. The worker is therefore declared here with the three 
 * **Scope is per order, walked in a rolling pass.** The chain is per-order (`§3.7`), so a run verifies one order's committed entries end to end and moves on. Verifying the whole trail in one pass does not scale — at the D-41 capacity baseline the committed trail reaches the order of billions of rows inside the 24-month tier — and a per-order unit is both the natural boundary and independently restartable.
 * **Cadence is a full pass within a design-owned window, baseline 30 days**, so the worst-case detection latency for tampering is bounded and stateable rather than emergent. An order under dispute **MAY** additionally be verified on demand; that path is a read, not a mutation.
 * **A mismatch alerts and MUST NOT repair.** The verifier holds no UPDATE or DELETE grant — it uses the audit role's SELECT — so it cannot silently rewrite a chain it finds broken, which is the only posture consistent with the trail being evidence. It **MUST** skip refused rows: those carry a NULL `sequence` and join no chain (`§3.7`), so including them would report a mismatch on every order that has ever refused an attempt.
+* **It MUST consult the erasure record before alerting.** A pseudonymisation run re-derives the chain forward from the row it changed (`../DESIGN.md` §4.3), so on the affected orders the chain legitimately differs from what a naive re-computation expects. The verifier **MUST** treat a re-derivation named in that record as expected, and **MUST** still alert on a mismatch against an order the record does not name — otherwise every lawful erasure fires a tamper alert indistinguishable from an attack, and the alert becomes noise exactly where it needs to be trusted.
 
 Database privilege is
 runtime-owned; the slice exposes migrations and receives scoped access, and the audit role is
