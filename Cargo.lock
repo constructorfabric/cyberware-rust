@@ -3458,6 +3458,7 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-opentelemetry",
+ "tracing-serde",
  "tracing-subscriber",
  "tracing-test",
  "trybuild",

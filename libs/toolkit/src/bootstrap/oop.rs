@@ -143,11 +143,11 @@ fn build_oop_config_and_db(
     local_config: &AppConfig,
     gear_name: &str,
     rendered_config: Option<&RenderedGearConfig>,
-) -> Result<(AppConfig, LoggingConfig, DbOptions)> {
+) -> Result<(AppConfig, DbOptions)> {
     let home_dir = PathBuf::from(&local_config.server.home_dir);
 
     // Build final_config for gear's "config" section
-    let final_config = if let Some(rendered) = rendered_config {
+    let mut final_config = if let Some(rendered) = rendered_config {
         // TOOLKIT_MODULE_CONFIG exists: use rendered config as BASE, local config as OVERRIDE
         let mut config = local_config.clone();
 
@@ -185,10 +185,16 @@ fn build_oop_config_and_db(
     };
 
     // Merge logging: master logging (base) + local logging (override by key)
-    let final_logging = merge_logging_configs(
+    final_config.logging = merge_logging_configs(
         rendered_config.as_ref().and_then(|r| r.logging.as_ref()),
         &local_config.logging,
     );
+
+    // Telemetry comes from master when rendered (the same section init_tracing
+    // reads), so the log identity cannot diverge from the OTel resource.
+    if let Some(otel) = rendered_config.and_then(|r| r.opentelemetry.as_ref()) {
+        final_config.opentelemetry = otel.clone();
+    }
 
     // Build DbOptions using Figment merge + DbManager
     // This allows field-by-field merge: master db config (base) -> local db config (override)
@@ -199,7 +205,7 @@ fn build_oop_config_and_db(
         local_config,
     )?;
 
-    Ok((final_config, final_logging, db_options))
+    Ok((final_config, db_options))
 }
 
 /// Merges logging configurations: master as base, local as override (by key).
@@ -463,7 +469,7 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     // 1. Rendered config from master host (base)
     // 2. Local config file (override)
     // This also merges logging configuration for proper initialization
-    let (final_config, merged_logging, db_options) =
+    let (final_config, db_options) =
         build_oop_config_and_db(&config, &opts.gear_name, rendered_config.as_ref())?;
 
     // Use OpenTelemetry config from rendered (master) config only.
@@ -491,7 +497,7 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         .and_then(|cfg| crate::telemetry::init::init_metrics_provider(cfg).err());
 
     // Initialize logging with MERGED config (master base + local override)
-    init_logging_unified(&merged_logging, &config.server.home_dir, otel_layer);
+    init_logging_unified(&final_config, otel_layer);
 
     // Now that logging is available, report deferred metrics init error
     #[cfg(feature = "otel")]

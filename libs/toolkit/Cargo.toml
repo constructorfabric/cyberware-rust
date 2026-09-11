@@ -88,6 +88,7 @@ bootstrap = [
     "dep:tracing-appender",
     "dep:file-rotate",
     "dep:tracing-log",
+    "dep:tracing-serde",
     "dep:tracing-subscriber",
     "dep:chrono",
     "dep:url",
@@ -175,6 +176,7 @@ opentelemetry_sdk = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 tracing-log = { workspace = true, optional = true }
+tracing-serde = { workspace = true, optional = true }
 tracing-appender = { workspace = true, optional = true }
 supports-color = { workspace = true, optional = true }
 enable-ansi-support = { workspace = true, optional = true }

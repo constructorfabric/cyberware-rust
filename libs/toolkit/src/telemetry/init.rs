@@ -40,12 +40,15 @@ pub(crate) fn build_resource(cfg: &OpenTelemetryResource) -> Resource {
         cfg.service_name
     );
     let mut attrs = vec![KeyValue::new("service.name", cfg.service_name.clone())];
+    if let Some(version) = cfg.effective_service_version() {
+        attrs.push(KeyValue::new("service.version", version.to_owned()));
+    }
 
     for (k, v) in &cfg.attributes {
-        // Skip any caller-supplied "service.name" entry: the dedicated field
-        // cfg.service_name already seeds attrs above and a duplicate key would
+        // Skip caller-supplied "service.name" / "service.version" entries: the
+        // dedicated seeds above already carry them and a duplicate key would
         // create ambiguity in the resource attributes.
-        if k == "service.name" {
+        if k == "service.name" || k == "service.version" {
             continue;
         }
         attrs.push(KeyValue::new(k.clone(), v.clone()));
@@ -545,6 +548,34 @@ mod tests {
 
     #[test]
     #[cfg(feature = "otel")]
+    fn build_resource_carries_the_effective_service_version_once() {
+        let mut attrs = BTreeMap::new();
+        attrs.insert("service.version".to_owned(), "from-attr".to_owned());
+
+        let from_field = build_resource(&OpenTelemetryResource {
+            service_name: "svc".to_owned(),
+            service_version: Some("1.2.3".to_owned()),
+            attributes: attrs.clone(),
+        });
+        let from_attr = build_resource(&OpenTelemetryResource {
+            service_name: "svc".to_owned(),
+            service_version: None,
+            attributes: attrs,
+        });
+
+        let versions = |resource: &Resource| {
+            resource
+                .iter()
+                .filter(|(k, _)| k.as_str() == "service.version")
+                .map(|(_, v)| v.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versions(&from_field), ["1.2.3"]);
+        assert_eq!(versions(&from_attr), ["from-attr"]);
+    }
+
+    #[test]
+    #[cfg(feature = "otel")]
     fn test_init_tracing_with_resource_attributes() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let _guard = rt.enter();
@@ -556,6 +587,7 @@ mod tests {
         let otel = OpenTelemetryConfig {
             resource: OpenTelemetryResource {
                 service_name: "test-service".to_owned(),
+                service_version: None,
                 attributes: attrs,
             },
             tracing: TracingConfig {

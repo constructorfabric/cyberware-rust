@@ -598,16 +598,16 @@ mod full_oop_config {
         let result = build_oop_config_and_db(&local_config, "test_gear", None);
 
         assert!(result.is_ok());
-        let (final_config, merged_logging, db_options) = result.unwrap();
+        let (final_config, db_options) = result.unwrap();
 
         // Config should be from local
         let gear_config = final_config.gears.get("test_gear").unwrap();
         assert_eq!(gear_config["config"]["setting"], "local_value");
 
         // Logging should be from local
-        assert_eq!(merged_logging.len(), 1);
+        assert_eq!(final_config.logging.len(), 1);
         assert_eq!(
-            merged_logging.get("default").unwrap().console_level,
+            final_config.logging.get("default").unwrap().console_level,
             Some(Level::DEBUG)
         );
 
@@ -636,7 +636,8 @@ mod full_oop_config {
         let result = build_oop_config_and_db(&local_config, "test_gear", Some(&rendered));
 
         assert!(result.is_ok());
-        let (final_config, merged_logging, _) = result.unwrap();
+        let (final_config, _) = result.unwrap();
+        let merged_logging = &final_config.logging;
 
         // Config should be from master (local has no config section)
         let gear_config = final_config.gears.get("test_gear").unwrap();
@@ -675,7 +676,7 @@ mod full_oop_config {
         let result = build_oop_config_and_db(&local_config, "test_gear", Some(&rendered));
 
         assert!(result.is_ok());
-        let (final_config, _, _) = result.unwrap();
+        let (final_config, _) = result.unwrap();
 
         // Config should be from LOCAL (full replacement)
         let gear_config = final_config.gears.get("test_gear").unwrap();
@@ -722,7 +723,8 @@ mod full_oop_config {
         let result = build_oop_config_and_db(&local_config, "test_gear", Some(&rendered));
 
         assert!(result.is_ok());
-        let (_, merged_logging, _) = result.unwrap();
+        let (final_config, _) = result.unwrap();
+        let merged_logging = &final_config.logging;
 
         // 3 keys total: default (overridden), sqlx (from master), new_key (from local)
         assert_eq!(merged_logging.len(), 3);
@@ -771,7 +773,7 @@ mod full_oop_config {
         let result = build_oop_config_and_db(&local_config, "test_gear", Some(&rendered));
 
         assert!(result.is_ok());
-        let (final_config, _, _) = result.unwrap();
+        let (final_config, _) = result.unwrap();
 
         // Config should be from master since local is null
         let gear_config = final_config.gears.get("test_gear").unwrap();
@@ -799,7 +801,7 @@ mod full_oop_config {
         let result = build_oop_config_and_db(&local_config, "test_gear", Some(&rendered));
 
         assert!(result.is_ok());
-        let (final_config, _, _) = result.unwrap();
+        let (final_config, _) = result.unwrap();
 
         // Config should be from master
         let gear_config = final_config.gears.get("test_gear").unwrap();

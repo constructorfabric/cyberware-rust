@@ -312,7 +312,7 @@ pub fn init_procedure(config: &AppConfig) -> Result<()> {
     let otel_layer = None;
 
     // Initialize logging + otel in one Registry
-    init_logging_unified(&config.logging, &config.server.home_dir, otel_layer);
+    init_logging_unified(config, otel_layer);
 
     // Register custom panic hook to reroute panic backtrace into tracing.
     init_panic_tracing();

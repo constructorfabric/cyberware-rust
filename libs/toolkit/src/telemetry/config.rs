@@ -42,6 +42,9 @@ pub struct OpenTelemetryResource {
     /// Logical service name.
     #[serde(default = "default_service_name")]
     pub service_name: String,
+    /// Release version (`service.version` semconv); also on every JSON log line.
+    #[serde(default)]
+    pub service_version: Option<String>,
     /// Extra resource attributes added to every span and metric data point.
     #[serde(default)]
     pub attributes: BTreeMap<String, String>,
@@ -52,10 +55,21 @@ fn default_service_name() -> String {
     "cf-gears".to_owned()
 }
 
+impl OpenTelemetryResource {
+    /// `service_version`, falling back to an `attributes["service.version"]` entry.
+    #[must_use]
+    pub fn effective_service_version(&self) -> Option<&str> {
+        self.service_version
+            .as_deref()
+            .or_else(|| self.attributes.get("service.version").map(String::as_str))
+    }
+}
+
 impl Default for OpenTelemetryResource {
     fn default() -> Self {
         Self {
             service_name: default_service_name(),
+            service_version: None,
             attributes: BTreeMap::default(),
         }
     }

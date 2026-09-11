@@ -32,6 +32,7 @@ database:
 logging:
   default:
     console_level: info
+    console_format: text # or: json (one object per line, for container log collectors)
     file: "logs/cf-gears.log"
     file_level: info
 
@@ -52,6 +53,13 @@ gears:
 - **API gateway** — `bind_addr`, `enable_docs`, `prefix_path`, CORS, rate limits, timeouts.
 - **Deployment shape** — `gears.<name>.runtime.type: local | oop` selects in-process vs
   out-of-process. See [Run a gear out-of-process](../out-of-process/).
+- **Logging** — `logging.default.console_level` and `console_format: text | json`.
+  Every JSON line (console and file) carries top-level `service` and `version`
+  keys from `opentelemetry.resource.{service_name,service_version}`
+  (`version` falls back to an `attributes."service.version"` entry; an empty
+  `service_name` omits both keys). `text` output is for local development —
+  one known binary in a terminal — and carries no identity keys; collectors
+  parse `json`.
 - **Tracing** — a `tracing:` block points at an OTLP backend. See
   [Add observability](../add-observability/).
 - **Database** — `database.servers.<name>` connection templates (`engine`, `params`, `pool`) that gears inherit; SQLite, PostgreSQL, and MariaDB engines are supported.

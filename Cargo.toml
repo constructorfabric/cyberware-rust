@@ -468,6 +468,7 @@ tracing-subscriber = { version = "0.3", features = [
     "local-time",
 ] }
 tracing-log = "0.2"
+tracing-serde = "0.2"
 tracing-opentelemetry = "0.33"
 tracing-appender = "0.2"
 tracing-test = "0.2"

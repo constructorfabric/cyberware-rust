@@ -1,4 +1,5 @@
-use super::super::config::{ConsoleFormat, LoggingConfig, Section};
+use super::super::config::{AppConfig, ConsoleFormat, LoggingConfig, Section};
+use crate::telemetry::config::OpenTelemetryResource;
 use anyhow::Context;
 use std::io::Write;
 use std::path::Path;
@@ -15,6 +16,121 @@ pub type OtelLayer = tracing_opentelemetry::OpenTelemetryLayer<
 >;
 #[cfg(not(feature = "otel"))]
 pub type OtelLayer = ();
+
+// ================= per-line service identity =================
+
+/// The gears-owned JSON line format: the same shape tracing-subscriber's
+/// `Json` emits, plus top-level `service` / `version` identity entries.
+struct GearsJsonFormat {
+    service: String,
+    version: Option<String>,
+}
+
+impl GearsJsonFormat {
+    fn new(resource: &OpenTelemetryResource) -> Self {
+        Self {
+            service: resource.service_name.clone(),
+            version: resource.effective_service_version().map(str::to_owned),
+        }
+    }
+}
+
+/// A span's `FormattedFields` (stored by the layer as a JSON object string)
+/// flattened next to its `name`, as the upstream Json format renders spans.
+struct SerializableSpan<'a, S, N>(
+    tracing_subscriber::registry::SpanRef<'a, S>,
+    std::marker::PhantomData<N>,
+)
+where
+    S: for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>;
+
+impl<S, N> serde::Serialize for SerializableSpan<'_, S, N>
+where
+    S: for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    N: for<'writer> fmt::FormatFields<'writer> + 'static,
+{
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        let extensions = self.0.extensions();
+        let formatted = extensions
+            .get::<fmt::FormattedFields<N>>()
+            .map(|fields| fields.fields.as_str())
+            .unwrap_or_default();
+        match serde_json::from_str::<serde_json::Value>(formatted) {
+            Ok(serde_json::Value::Object(fields)) => {
+                for (key, value) in fields {
+                    map.serialize_entry(&key, &value)?;
+                }
+            }
+            _ => map.serialize_entry("fields", formatted)?,
+        }
+        map.serialize_entry("name", self.0.metadata().name())?;
+        map.end()
+    }
+}
+
+impl<S, N> fmt::FormatEvent<S, N> for GearsJsonFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        use serde::ser::{SerializeMap, Serializer as _};
+        use tracing_log::NormalizeEvent;
+        use tracing_serde::fields::AsMap;
+
+        let normalized = event.normalized_metadata();
+        let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
+        let span_marker: std::marker::PhantomData<N> = std::marker::PhantomData;
+
+        let serialize = || {
+            let mut buf = Vec::with_capacity(256);
+            let mut serializer = serde_json::Serializer::new(&mut buf);
+            let mut map = serializer.serialize_map(None)?;
+
+            let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+            map.serialize_entry("timestamp", &timestamp)?;
+            map.serialize_entry("level", meta.level().as_str())?;
+            if !self.service.is_empty() {
+                map.serialize_entry("service", &self.service)?;
+                if let Some(version) = &self.version {
+                    map.serialize_entry("version", version)?;
+                }
+            }
+
+            map.serialize_entry("fields", &event.field_map())?;
+            map.serialize_entry("target", meta.target())?;
+
+            if let Some(span) = ctx.event_scope().and_then(|mut scope| scope.next()) {
+                map.serialize_entry("span", &SerializableSpan(span, span_marker))?;
+            }
+            if let Some(scope) = ctx.event_scope() {
+                let spans: Vec<_> = scope
+                    .from_root()
+                    .map(|span| SerializableSpan::<S, N>(span, span_marker))
+                    .collect();
+                map.serialize_entry("spans", &spans)?;
+            }
+
+            map.end()?;
+            Ok::<_, serde_json::Error>(buf)
+        };
+
+        let buf = serialize().map_err(|_| std::fmt::Error)?;
+        writer.write_str(std::str::from_utf8(&buf).map_err(|_| std::fmt::Error)?)?;
+        writer.write_char('\n')
+    }
+}
 
 // ================= level helpers =================
 
@@ -193,9 +309,14 @@ fn create_rotating_writer_at_path(
 // the background flush thread and silently loses buffered log output.
 static CONSOLE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
-/// Unified initializer used by both functions above.
+/// Unified initializer: logging config, home dir and the per-line service
+/// identity all come from the app config.
 #[allow(unknown_lints, de1301_no_print_macros)] // runs before tracing subscriber is installed
-pub fn init_logging_unified(cfg: &LoggingConfig, base_dir: &Path, otel_layer: Option<OtelLayer>) {
+pub fn init_logging_unified(config: &AppConfig, otel_layer: Option<OtelLayer>) {
+    let cfg = &config.logging;
+    let base_dir: &Path = &config.server.home_dir;
+    let resource = &config.opentelemetry.resource;
+
     CONSOLE_GUARD.get_or_init(|| {
         // Bridge `log` → `tracing` *before* installing the subscriber
         if let Err(e) = tracing_log::LogTracer::init() {
@@ -226,6 +347,7 @@ pub fn init_logging_unified(cfg: &LoggingConfig, base_dir: &Path, otel_layer: Op
             file_router,
             console_format,
             otel_layer,
+            resource,
         )
     });
 }
@@ -393,6 +515,7 @@ fn install_subscriber(
     file_router: MultiFileRouter,
     console_format: ConsoleFormat,
     #[cfg_attr(not(feature = "otel"), allow(unused_variables))] otel_layer: Option<OtelLayer>,
+    resource: &OpenTelemetryResource,
 ) -> WorkerGuard {
     use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
@@ -425,9 +548,7 @@ fn install_subscriber(
                     .json()
                     .with_writer(nb_stderr)
                     .with_ansi(false)
-                    .with_target(true)
-                    .with_level(true)
-                    .with_timer(fmt::time::UtcTime::rfc_3339())
+                    .event_format(GearsJsonFormat::new(resource))
                     .with_filter(console_targets.clone()),
             ),
         ),
@@ -441,10 +562,8 @@ fn install_subscriber(
             fmt::layer()
                 .json()
                 .with_ansi(false)
-                .with_target(true)
-                .with_level(true)
-                .with_timer(fmt::time::UtcTime::rfc_3339())
                 .with_writer(file_router)
+                .event_format(GearsJsonFormat::new(resource))
                 .with_filter(file_targets.clone()),
         )
     };
@@ -761,5 +880,152 @@ mod tests {
             content.contains("fallback"),
             "expected write to land in default log, got: {content:?}"
         );
+    }
+
+    // ===== per-line service identity =====
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+
+    fn capture_json_line(
+        resource: &OpenTelemetryResource,
+        emit: impl FnOnce(),
+    ) -> serde_json::Value {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = Buf::default();
+        let layer = fmt::layer()
+            .json()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(GearsJsonFormat::new(resource));
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, emit);
+
+        let captured = buf.0.lock().unwrap().clone();
+        let line = String::from_utf8(captured).expect("utf8 log line");
+        serde_json::from_str(line.lines().next().expect("one line")).expect("valid JSON line")
+    }
+
+    #[test]
+    fn json_lines_carry_service_and_version_at_top_level() {
+        let resource = OpenTelemetryResource {
+            service_name: "probe-service".to_owned(),
+            service_version: Some("1.2.3".to_owned()),
+            ..OpenTelemetryResource::default()
+        };
+
+        let line = capture_json_line(&resource, || tracing::info!("identity probe"));
+
+        assert_eq!(line["service"], "probe-service");
+        assert_eq!(line["version"], "1.2.3");
+        assert_eq!(line["fields"]["message"], "identity probe");
+        assert_eq!(line["level"], "INFO");
+        assert!(line["timestamp"].is_string(), "timestamp survives: {line}");
+    }
+
+    #[test]
+    fn identity_values_are_json_escaped() {
+        let resource = OpenTelemetryResource {
+            service_name: "probe \"quoted\" service".to_owned(),
+            service_version: None,
+            ..OpenTelemetryResource::default()
+        };
+
+        let line = capture_json_line(&resource, || tracing::info!("escape probe"));
+
+        assert_eq!(line["service"], "probe \"quoted\" service");
+        assert!(line.get("version").is_none(), "no version key when unset");
+    }
+
+    #[test]
+    fn span_fields_render_in_the_span_chain() {
+        let resource = OpenTelemetryResource {
+            service_name: "probe-service".to_owned(),
+            ..OpenTelemetryResource::default()
+        };
+
+        let line = capture_json_line(&resource, || {
+            tracing::info_span!("outer", request_id = "rid-1")
+                .in_scope(|| tracing::info!("span probe"));
+        });
+
+        assert_eq!(line["span"]["name"], "outer");
+        assert_eq!(line["span"]["request_id"], "rid-1");
+        assert_eq!(line["spans"][0]["name"], "outer");
+        assert_eq!(line["spans"][0]["request_id"], "rid-1");
+    }
+
+    #[test]
+    fn the_version_falls_back_to_the_resource_attribute() {
+        let mut attributes = std::collections::BTreeMap::new();
+        attributes.insert("service.version".to_owned(), "from-attr".to_owned());
+        let resource = OpenTelemetryResource {
+            service_name: "probe-service".to_owned(),
+            service_version: None,
+            attributes,
+        };
+
+        let line = capture_json_line(&resource, || tracing::info!("fallback probe"));
+
+        assert_eq!(line["version"], "from-attr");
+    }
+
+    #[test]
+    fn non_json_span_fields_render_as_a_raw_string() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buf = Buf::default();
+        let resource = OpenTelemetryResource {
+            service_name: "probe-service".to_owned(),
+            ..OpenTelemetryResource::default()
+        };
+        let layer = fmt::layer()
+            .fmt_fields(fmt::format::DefaultFields::new())
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(GearsJsonFormat::new(&resource));
+        let subscriber = tracing_subscriber::Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("outer", request_id = "rid-1")
+                .in_scope(|| tracing::info!("raw span probe"));
+        });
+
+        let captured = buf.0.lock().unwrap().clone();
+        let line: serde_json::Value =
+            serde_json::from_str(String::from_utf8(captured).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(line["span"]["name"], "outer");
+        assert_eq!(line["span"]["fields"], "request_id=\"rid-1\"");
+    }
+
+    #[test]
+    fn an_empty_identity_injects_nothing() {
+        let resource = OpenTelemetryResource {
+            service_name: String::new(),
+            ..OpenTelemetryResource::default()
+        };
+
+        let line = capture_json_line(&resource, || tracing::info!("plain probe"));
+
+        assert!(line.get("service").is_none(), "no service key: {line}");
+        assert_eq!(line["fields"]["message"], "plain probe");
     }
 }
