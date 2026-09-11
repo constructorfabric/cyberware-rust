@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use toolkit_db::outbox::{
     Batch, HandlerResult, LeasedHandler, LeasedMessageHandler, MessageResult, Outbox,
-    OutboxMessage, Partitions, WorkerTuning, outbox_migrations,
+    OutboxMessage, Partitions, Record, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -96,10 +96,9 @@ async fn main() -> anyhow::Result<()> {
             .outbox()
             .enqueue(
                 &conn,
-                "orders",
-                i % 2,
-                payload.into_bytes(),
-                "application/json;orders.placed.v1",
+                Record::to("orders", i % 2)
+                    .payload(payload.into_bytes(), "application/json;orders.placed.v1")
+                    .build()?,
             )
             .await?;
     }
@@ -109,10 +108,9 @@ async fn main() -> anyhow::Result<()> {
             .outbox()
             .enqueue(
                 &conn,
-                "notifications",
-                0,
-                payload.into_bytes(),
-                "text/plain;notifications.welcome.v1",
+                Record::to("notifications", 0)
+                    .payload(payload.into_bytes(), "text/plain;notifications.welcome.v1")
+                    .build()?,
             )
             .await?;
     }

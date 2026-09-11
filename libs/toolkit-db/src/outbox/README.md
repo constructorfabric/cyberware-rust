@@ -126,17 +126,29 @@ let handle = Outbox::builder(db)
 
 ### Enqueue (inside a business transaction)
 
+A submission is built, not constructed as a literal: everything checkable
+without the database is checked while it is built, so a rejected submission has
+issued no statement.
+
 ```rust
 let outbox = handle.outbox();
-// Atomic with your business logic:
-outbox.enqueue( & txn, "orders", partition, payload, "application/json").await?;
 
-// Batch enqueue:
-outbox.enqueue_batch( & txn, "orders", & [
-EnqueueMessage { partition: 0, payload: p1, payload_type: "application/json" },
-EnqueueMessage { partition: 1, payload: p2, payload_type: "application/json" },
-]).await?;
+// Atomic with your business logic:
+outbox.enqueue(&txn, Record::to("orders", partition)
+    .payload(payload, "application/json")
+    .build()?).await?;
+
+// A batch states the queue and the payload type once:
+outbox.enqueue_batch(&txn, Records::to("orders")
+    .payload_type("application/json")
+    .push(0, first)
+    .push(1, second)
+    .push_with_type(2, legacy, "application/vnd.legacy+json")
+    .build()?).await?;
 ```
+
+A batch is all-or-nothing: one entity that breaks a rule rejects the whole
+submission, and nothing is written.
 
 ### Multi-queue with tuning
 
@@ -160,6 +172,138 @@ handle.stop().await;
 ```
 
 ---
+
+## Traces: being told when a batch is done
+
+Submit a batch under a trace, and the outbox tells you once every entity in it
+has reached a terminal state - handler success or permanent rejection. The
+batch is the unit: you are told once, not per message.
+
+```rust
+// Subscribe before the transaction commits. A completion cannot precede that
+// commit, so registering first means nothing can be missed.
+let waiting = outbox.subscribe("import-2026-09-08");
+
+db.in_transaction(|txn| async move {
+    orders_repo.insert(txn, &orders).await?;
+    outbox.enqueue_batch(txn, Records::to("orders")
+        .payload_type("application/json")
+        .trace("import-2026-09-08")
+        .push(0, first)
+        .push(1, second)
+        .build()?).await
+}).await?;
+
+match waiting.await {
+    Some(outcome) if outcome.is_clean() => info!(entities = outcome.entities, "all delivered"),
+    Some(outcome) => warn!(failures = outcome.failures, "batch finished with failures"),
+    // This process can no longer answer - it was stopped, for instance.
+    // The trace row still can; see `trace_status` below.
+    None => {}
+}
+```
+
+Dropping the subscription releases it and issues no statement. A trace is
+optional per submission: a batch that names none records nothing and costs
+nothing.
+
+### The completion goes to the instance that submitted it
+
+Any instance may process the work, because partitions are leased rather than
+owned. Only the instance that submitted the batch is told. Two marks make that
+work, with two different owners:
+
+| mark | who sets it | means |
+|---|---|---|
+| `completed_at` | whichever instance acks the last entity | the work is done |
+| `notified_at` | only the submitting instance | you have been told |
+
+When the submitting instance is also the one that finishes the work - the
+common case, and every single-instance deployment - the ack delivers the
+completion itself and no notification query runs at all. Otherwise the
+submitter collects it, and an instance with nothing outstanding issues no query
+either.
+
+There is nothing to configure for this. Each running outbox generates its own
+identity, which only has to be unique among *running* processes: a restarted
+process holds no subscription for a completion to be delivered to, so a stable
+name would buy nothing. Mail addressed to a process that is gone is collected
+by the sweep, and a restarted process asks `trace_status` instead.
+
+### Being told when a batch is stuck
+
+Waiting on a subscription tells you nothing until the batch is done, which is
+no help when it is stuck rather than slow. Ask the subscription for a progress
+receiver and you are told while it is in flight:
+
+```rust
+let waiting = outbox.subscribe("import-2026-09-08");
+let mut stalls = waiting.progress();
+tokio::spawn(async move {
+    while stalls.changed().await.is_ok() {
+        match stalls.borrow_and_update().clone() {
+            Some(stalled) => warn!(
+                attempts = stalled.attempts,
+                for_secs = stalled.stalled_for().num_seconds(),
+                error = ?stalled.last_error,
+                "import is stuck"
+            ),
+            None => info!("import is moving again"),
+        }
+    }
+});
+let outcome = waiting.await;
+```
+
+The receiver holds `None` while the batch is moving and `Some(TraceProgress)`
+while a handler is retrying one of its entities; the outbox decides nothing
+about what a stall means, which is the point - a batch retrying for ten seconds
+against a rate-limited API is healthy, and the same batch retrying for an hour
+is not.
+
+Taking a receiver is what makes an instance look for stalls. A caller that only
+awaits the completion never takes one, and an instance whose callers all do that
+issues no stall query at all.
+
+### Asking instead of waiting
+
+The trace row outlives both the messages it describes and the process that
+submitted them, so it is also the durable answer after a restart:
+
+```rust
+if let Some(status) = outbox.trace_status(&conn, "import-2026-09-08").await? {
+    if status.is_stalled() {
+        // A batch stuck retrying rather than merely slow: `attempts`,
+        // `stalled_since` and `last_error` say why and for how long.
+        warn!(attempts = status.attempts, since = ?status.stalled_since, "import stalled");
+    }
+}
+```
+
+`stalled_since` keeps the *first* stall time rather than the latest attempt, so
+what you read is how long it has been stuck. Progress clears it.
+
+Which entities failed is answerable too: a dead letter carries the trace it
+belonged to, so the failures of one batch can be listed without deserializing
+any payload.
+
+### Trace rows are collected when they are finished
+
+The sweep reads **one table**: liveness comes from the trace row's own fields,
+so a five-minute background sweep never touches the body or dead-letter tables.
+
+| condition | action |
+|---|---|
+| delivered, no failures, past `retention` | collected |
+| completed but never collected, past `orphan_after` | collected: the owner is evidently gone |
+| delivered **with** failures, past `leftover_after` | collected: a dead letter outlives the delivery it failed, so its trace has to outlive the dead letter |
+| never completed, past `leftover_after` | collected |
+
+The last rule is worth knowing about: a trace whose handler has been retrying
+for longer than `leftover_after` is collected even though its messages still
+exist, and `trace_status` then answers `None` for it. The window is seven days
+by default, so this means a handler that has made no progress for a week. The
+messages themselves are untouched - only the notification aid is.
 
 ## Use-Case Scenarios
 

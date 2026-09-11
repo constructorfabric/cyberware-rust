@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
+use super::super::core::Outbox;
 use super::super::handler::HandlerResult;
 use super::super::statements::OutboxStatements;
 use super::super::store::OutboxStore;
@@ -159,6 +160,7 @@ pub struct PartitionProcessor<S: ProcessingStrategy> {
     tuning: super::super::types::WorkerTuning,
     db: Db,
     statements: Arc<OutboxStatements>,
+    mailbox: Arc<super::super::subscription::Mailbox>,
     partition_mode: PartitionMode,
 }
 
@@ -168,14 +170,19 @@ impl<S: ProcessingStrategy> PartitionProcessor<S> {
         partition_id: i64,
         tuning: super::super::types::WorkerTuning,
         db: Db,
-        statements: Arc<OutboxStatements>,
+        // Both the statements and the mailbox hang off the outbox, so it is
+        // one argument in place of two.
+        outbox: &Arc<Outbox>,
     ) -> Self {
+        let statements = outbox.statements_arc();
+        let mailbox = outbox.mailbox();
         Self {
             strategy,
             partition_id,
             tuning,
             db,
             statements,
+            mailbox,
             partition_mode: PartitionMode::new(),
         }
     }
@@ -204,6 +211,7 @@ impl<S: ProcessingStrategy> WorkerAction for PartitionProcessor<S> {
             db: &self.db,
             store,
             partition_id: self.partition_id,
+            mailbox: &self.mailbox,
         };
 
         let result = self.strategy.process(&ctx, effective_size).await?;

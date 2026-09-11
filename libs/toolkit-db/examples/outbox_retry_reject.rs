@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use toolkit_db::outbox::{
     DeadLetterFilter, LeasedMessageHandler, MessageResult, Outbox, OutboxMessage, Partitions,
-    WorkerTuning, outbox_migrations,
+    Record, WorkerTuning, outbox_migrations,
 };
 use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
 
@@ -71,10 +71,12 @@ async fn main() -> anyhow::Result<()> {
         .outbox()
         .enqueue(
             &conn,
-            "events",
-            0,
-            b"webhook-payload".to_vec(),
-            "application/octet-stream;webhooks.delivery.v1",
+            Record::to("events", 0)
+                .payload(
+                    b"webhook-payload".to_vec(),
+                    "application/octet-stream;webhooks.delivery.v1",
+                )
+                .build()?,
         )
         .await?;
     handle.outbox().flush();

@@ -53,7 +53,7 @@ fn build_processor_worker<S: super::strategy::ProcessingStrategy + 'static>(
         ctx.pid,
         ctx.tuning.clone(),
         ctx.db.clone(),
-        ctx.outbox.statements_arc(),
+        &ctx.outbox,
     );
     let name = format!("processor-{}", ctx.pid);
     let (poker_notify, _poker_handle) =
