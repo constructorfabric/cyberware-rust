@@ -88,6 +88,10 @@ liability that would couple intermediaries to a layout we want free to change.
     (clean logs / no `Referer` leak) and the **URL stable** across re-issue (clean CDN cache). (The token is **never**
     carried in `Authorization` — that header always carries the standard platform JWT.)
   * the query parameter is named **`fs-token`** and the header **`X-FS-Token`**.
+  * **If both are present, the query parameter wins** and the header is ignored — the sidecar reads the query first
+    and falls back to the header only when it is absent (`extract_token`, `bin/sidecar.rs`). The two values are
+    never compared, so a proxy that injects its own `X-FS-Token` cannot override a caller-supplied `?fs-token=`.
+    Callers should send exactly one envelope.
 * **Why a token, not discrete fields:** because we are not S3-compatible, the discrete-field benefits (external
   readability, edge/CDN/WAF/tooling interop, S3-shape familiarity) are moot — and they would lock intermediaries to our
   field layout. The token is **atomic** (signed/verified/rotated as one unit) and **opaque**, which is what makes the

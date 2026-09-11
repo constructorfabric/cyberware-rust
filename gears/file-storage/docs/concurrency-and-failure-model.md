@@ -5,8 +5,10 @@
 The exhaustive state / race / failure model of the write path, **as implemented** — every claim below is
 traceable to a function in `gears/file-storage/file-storage/src/`. Companion to [DESIGN.md](./DESIGN.md)
 (§3.6 upload sequences and the auto-bind-on-finalize behavior, §4.5 signed URLs, §4.7 multipart worked
-example) and [api.md](./api.md) (wire contract, `X-FS-Bound` / `bind_state`, `202 completing`). Where this
-document and those disagree, the code cited here wins; file an issue.
+example) and [api.md](./api.md) (wire contract). Note that `X-FS-Bound` / `bind_state` / `202 completing` are
+part of the upload-flow redesign and are described here and in DESIGN.md only until the accompanying code and
+wire-contract MR lands — api.md does not document them yet. Where this document and those disagree, the code
+cited here wins; file an issue.
 
 - [1. Ground rules](#1-ground-rules)
 - [2. State graph](#2-state-graph)
@@ -123,7 +125,7 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
 | F1: after create, before any bytes | `pending` version (+ file row) idles; **garbage**: pending version, swept by cleanup after grace; file row swept once versionless. Retry `POST /files` with the same `idempotency_key` replays the same ticket (fresh-signed URL) instead of a second file | create is one tx — either fully committed or nothing. Client retry: idempotency replay (committed) or plain re-create (not) | n/a (not involved yet) | n/a | same as "control plane dies": the tx committed; an idempotency-key retry converges on it, a keyless retry makes a second file (first becomes cleanup fodder) |
 | F2: mid-stream (single-part PUT / part PUT) | Sidecar sees the broken stream, never publishes / never reports; best-effort deletes the partial object. Version stays `pending` (single-part → cleanup fodder; multipart → the part is simply "missing", resume via `GET status`) | stream is sidecar↔backend; unaffected until finalize/report — see F5 | client gets a connection error; nothing published (create-exclusive publish is all-or-nothing per object; an S3 part that never completed is invisible). Retry the PUT / the part with the same token (until `exp`) or a fresh resume URL | sidecar's backend write fails → 5xx to client; partial object best-effort deleted; retry later. If S3 stays down: version stays `pending` → cleanup | n/a (the op did not finish) |
 | F3: blob published, finalize callback never sent (sidecar crashed in between) | — | — | Version stays `pending` with real bytes at `backend_path` — **garbage** until: (a) the client retries the `PUT` (replay: `publish_exclusive` refuses the write, finalize is still attempted with the retry's digest and converges — `bin/sidecar.rs::upload`'s `!created` decision table), or (b) cleanup sweeps blob+row after grace | — | — |
-| F4: finalize succeeded, response lost (client saw no 200 / sidecar died before answering) | Version is `available` (+bound if auto). Client retries the `PUT`: publish refused (`created: false`), finalize replays and **converges idempotently** — same size/hash against the stored version → 200, never a 409 (`finalize_upload_by_token`'s already-`available` branch; mismatched bytes still rejected via hash compare). The replay's `X-FS-Bound`/`ETag` headers are recomputed against the file's *current* `content_id`, so a concurrent bind in between can flip `bound`↔`conflict` | finalize tx committed or not — atomic. Not committed: F3. Committed: this cell | same convergence via PUT replay | n/a | this **is** that case |
+| F4: finalize succeeded, response lost (client saw no 200 / sidecar died before answering) | Version is `available` (+bound if auto). Client retries the `PUT`: publish refused (`created: false`), finalize replays and **converges idempotently** — same size/hash against the stored version → 200 (`finalize_upload_by_token`'s already-`available` branch; mismatched bytes still rejected via hash compare). That convergence branch is entered **only for a token carrying `bind_on_finalize`** (the auto-bind `POST /files` path); a manual-bind replay of an already-`available` version falls through to the normal finalize and is answered `409` ("version already finalized") — still never a silent overwrite. See operations.md's 502-retry guidance. The replay's `X-FS-Bound`/`ETag` headers are recomputed against the file's *current* `content_id`, so a concurrent bind in between can flip `bound`↔`conflict` | finalize tx committed or not — atomic. Not committed: F3. Committed: this cell | same convergence via PUT replay | n/a | this **is** that case |
 | F5: finalize in progress, control plane dies (or the 10 s callback timeout fires mid-read-back) | — | Handler future dropped → tx never ran → version `pending`, blob published = F3. Sidecar retries the callback up to 3× (transport/timeout), then answers `502` (fresh publish) or `409` (replay) — the client re-`PUT`s later and converges. ⚠ a single-part object whose read-back reliably exceeds 10 s will loop here — raise `FS_SIDECAR_FINALIZE_TIMEOUT_SECS` or use multipart (its complete has no full read-back, ADR-0006) | — | read-back fails → finalize 5xx → F3 recovery | — |
 | F6: session `in_progress`, some parts reported, client dies | Durable part rows survive (`multipart_upload_parts`). Anyone with `{file_id, upload_id}` resumes: `GET /files/{id}/multipart/{upload_id}` → `received` + `missing` with fresh URLs (`introspect_multipart_upload`) — until `expires_at`, after which cleanup aborts the session (backend `AbortMultipartUpload`, part rows + pending version deleted) and resume gets `404` | part reports are lost only for parts whose callback didn't land — those parts read as "missing", re-uploadable. No corruption | in-flight parts lost (→ missing), reported parts durable | parts can't be written until S3 returns; session survives up to `expires_at` | a part written but its report lost: part reads as missing; re-uploading it hits S3 `UploadPart` idempotently (same part number overwrites) and re-reports |
 | F7: `completing`, winner alive | The **detached task keeps running** (client disconnect ≠ cancellation); result is persisted. Any later `complete` (F5-refresh, other tab) gets `202` while the lease is live, then the replayed result | see F8 | sidecar not involved in complete | assembly fails → release-lease CAS → back to `in_progress`, error returned; immediate retry possible | response lost after `completed`: re-`complete` replays `complete_result` verbatim — idempotent by design |
@@ -185,9 +187,18 @@ The session is a lease-guarded state machine; `bind` happens inside `complete` f
   names the current ETag; one manual re-bind finishes the job.
 - **Bytes never mutate in place.** Backend objects are immutable per `(file_id, version_id)`
   (`publish_exclusive`; new content = new version + pointer swap, DESIGN §3.1/§3.6).
-- **Garbage is bounded and owned.** Every failure leaves at most: a `pending` version (+blob), an
-  unbound `available` version, orphan S3 parts of an aborted handle, or a lease-expired `completing`
-  session — each enumerated in §3 with its reaper (cleanup engine) or its converging retry.
+- **Garbage is bounded and owned**, with one documented exception. Every failure leaves at most: a
+  `pending` version (+blob), an unbound `available` version, orphan S3 parts of an aborted handle, or a
+  lease-expired `completing` session — each enumerated in §3 with its reaper (cleanup engine) or its
+  converging retry. The exception is the backend multipart handle: `initiate_multipart` runs between the
+  pending-version insert and the session insert (M1), and the compensation that aborts the handle
+  (`compensate_failed_session_create`) only covers a *returned* error, not a process crash in that window —
+  a handle orphaned that way has no persisted correlation, so no sweep can ever find it. The same is true of
+  a best-effort backend abort that fails after the session has already flipped to `aborted`, since later
+  passes only list `in_progress` and lease-expired `completing` sessions. No bytes are at stake in either
+  case (the parts were never uploaded, or are already abandoned), but S3 bills for incomplete uploads: put
+  an `AbortIncompleteMultipartUpload` lifecycle rule on the bucket (threshold comfortably above
+  `multipart_session_ttl_secs`) as the backstop reaper for both.
 
 ## 6. Traceability
 

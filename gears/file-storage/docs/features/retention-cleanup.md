@@ -248,9 +248,11 @@ retention_expired_deleted, idempotency_keys_deleted }`
 **Output**: count of sessions aborted
 
 **Steps**:
-1. [x] - `p1` - DB: list `in_progress` multipart sessions with `expires_at < now` - `inst-sweep-multipart-list`
+1. [x] - `p1` - DB: list multipart sessions with `expires_at < now` that are either still `in_progress` or left `completing` by a dead completer whose lease has also expired (`MultipartRepo::list_expired`; a live lease is never reaped mid-assembly) - `inst-sweep-multipart-list`
 2. [x] - `p1` - FOR EACH: CAS the session `in_progress -> aborted` **first**, via the same `Store::abort_multipart_upload` the user-driven abort path uses — that call also deletes the session's `multipart_upload_parts` rows in the same transaction as the state flip, so a concurrent `complete_multipart_upload` racing on the same session row can win instead (`in_progress -> completed`); only one side wins - `inst-sweep-multipart-cas`
 3. [x] - `p1` - **IF** the sweep won the CAS: best-effort abort the backend upload handle, then delete the pending version row **status-guarded** (`status = pending` only) — a version a racing complete already flipped to `available` via `finalize_version` (ahead of its own session CAS) is left untouched; the DELETE simply matches zero rows - `inst-sweep-multipart-cleanup`
+
+   The backend abort is best-effort and **not** retried: once the CAS has moved the session to `aborted`, no later pass lists it again (step 1 selects only `in_progress` and lease-expired `completing` sessions). A failed abort therefore leaves an incomplete multipart upload on the backend that FileStorage will never touch again — configure an `AbortIncompleteMultipartUpload` bucket lifecycle rule as the backstop reaper (see `concurrency-and-failure-model.md` §5).
 4. [x] - `p1` - **IF** the sweep lost the CAS (session already transitioned): skip version cleanup entirely and log — if the winner was `complete`, the version is now `Available` and bound; touching it would be data loss - `inst-sweep-multipart-skip`
 5. [x] - `p1` - RETURN the count of sessions the sweep itself won and aborted - `inst-sweep-multipart-return`
 

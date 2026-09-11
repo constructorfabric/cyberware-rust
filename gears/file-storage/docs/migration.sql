@@ -276,7 +276,7 @@ CREATE TABLE file_storage.multipart_uploads (
 
     -- Lifecycle state.
     state            text         NOT NULL  DEFAULT 'in_progress'
-                                  CHECK (state IN ('in_progress', 'completed', 'aborted')),
+                                  CHECK (state IN ('in_progress', 'completing', 'completed', 'aborted')),
 
     -- Validation state for content-type magic-bytes check (recorded after
     -- the first uploaded part).
@@ -290,6 +290,26 @@ CREATE TABLE file_storage.multipart_uploads (
     declared_size    bigint       NOT NULL  DEFAULT 0,
     part_size        bigint       NOT NULL  DEFAULT 0,
 
+    -- Bind mode, fixed at session creation (shipped,
+    -- m20260722_000001_multipart_auto_bind): `POST /files` can open the session
+    -- directly with `bind: "auto"`, in which case `complete` performs the
+    -- content bind itself, in the same transaction as the version finalize and
+    -- under the same CAS a manual `POST /files/{id}/bind` would use. Sessions
+    -- opened through the standalone `POST /files/{id}/multipart` keep `false`
+    -- (complete never binds; the client binds manually).
+    auto_bind        boolean      NOT NULL  DEFAULT false,
+
+    -- Completion lease (same migration). `complete` moves the session
+    -- `in_progress -> completing(lease_owner, lease_until) ->
+    -- completed(complete_result)` through single conditional UPDATEs, so no DB
+    -- transaction is held across the backend assembly I/O. A second caller
+    -- arriving while the lease is live is answered `202 completing` instead of
+    -- racing the assembly; the persisted `complete_result` makes a re-issued
+    -- `complete` replay the original answer verbatim.
+    lease_until      timestamptz,
+    lease_owner      text,
+    complete_result  text,
+
     -- TTL for abandoned uploads. The reaper marks expired in-flight uploads
     -- as 'aborted' and asks the backend to abort, freeing storage.
     created_at       timestamptz  NOT NULL  DEFAULT now(),
@@ -300,6 +320,12 @@ CREATE INDEX multipart_uploads_file_idx ON file_storage.multipart_uploads (file_
 CREATE INDEX multipart_uploads_expired_idx
     ON file_storage.multipart_uploads (expires_at)
     WHERE state = 'in_progress';
+-- Sweep index (shipped, m20260902_000001_index_hardening). The sweep filters
+-- `expires_at < now AND (state = 'in_progress' OR (state = 'completing' AND
+-- lease_until < now))`; the partial index above serves only the first branch,
+-- so this one is deliberately non-partial and leads with `state` to cover both.
+CREATE INDEX multipart_uploads_sweep_idx
+    ON file_storage.multipart_uploads (state, expires_at, lease_until);
 
 
 -- Table: file_storage.multipart_upload_parts ---------------------------------
@@ -376,6 +402,11 @@ CREATE TABLE file_storage.idempotency_keys (
 );
 
 CREATE INDEX idempotency_keys_expired_idx ON file_storage.idempotency_keys (expires_at);
+-- `file_id` carries ON DELETE CASCADE but is not part of the primary key, so
+-- without this index every `DELETE FROM files` seq-scans the whole table to
+-- find its cascade victims while already holding the row locks on `files`
+-- (shipped, m20260902_000001_index_hardening).
+CREATE INDEX idempotency_keys_file_idx ON file_storage.idempotency_keys (file_id);
 
 
 -- Table: file_storage.audit_outbox -------------------------------------------
