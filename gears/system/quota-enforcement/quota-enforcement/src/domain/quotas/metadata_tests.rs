@@ -105,11 +105,14 @@ async fn the_size_limit_applies_to_the_canonical_json_and_is_checked_first() {
         metrics.contract_failures().is_empty(),
         "a size rejection is not a contract violation"
     );
-    // Key order does not change the measured size: the map is sorted.
+    // Key order does not change the measured size. The size is the invariant,
+    // not the bytes: whether `serde_json::Map` sorts keys or keeps insertion
+    // order depends on whose `preserve_order` feature is unified into the
+    // build, and reordering keys cannot change the byte count either way.
     let reordered = object(&json!({ "b": 1, "a": 2 }));
     let ordered = object(&json!({ "a": 2, "b": 1 }));
     assert_eq!(
-        serde_json::to_vec(&reordered).expect("json"),
-        serde_json::to_vec(&ordered).expect("json")
+        serde_json::to_vec(&reordered).expect("json").len(),
+        serde_json::to_vec(&ordered).expect("json").len()
     );
 }

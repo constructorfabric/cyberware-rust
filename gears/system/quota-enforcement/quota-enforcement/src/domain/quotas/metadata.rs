@@ -3,9 +3,9 @@
 //!
 //! The operator's metadata object is validated once, at create or update,
 //! against the constraint contract attached to the metric's request contract,
-//! and never again during evaluation. The size bound applies to the canonical
-//! JSON form; `serde_json::Map` keeps its keys sorted, so `to_vec` is that
-//! form. The content stays opaque: it is validated for shape, stored and
+//! and never again during evaluation. The size bound applies to the compact
+//! JSON encoding, whose length is the same whatever order the keys are written
+//! in. The content stays opaque: it is validated for shape, stored and
 //! forwarded verbatim, and never logged.
 
 use quota_enforcement_sdk::ContractRef;
@@ -23,9 +23,14 @@ const LOG_TARGET: &str = "qe.quotas";
 ///
 /// # Errors
 ///
-/// `InvalidArgument` with `METADATA_TOO_LARGE` when the canonical JSON
+/// `InvalidArgument` with `METADATA_TOO_LARGE` when the compact JSON encoding
 /// exceeds `max_bytes`; `ConstraintContractMismatch` when the envelope
 /// violates the contract; `Internal` when the object does not serialize.
+///
+/// The measured size is independent of key order, so the bound is well
+/// defined. The encoding itself is not byte-canonical: key order follows
+/// whichever `serde_json` map implementation feature unification selects, so
+/// nothing may hash or compare these bytes.
 // @cpt-algo:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-quota-metadata:p1
 pub fn validate_metadata(
@@ -35,13 +40,13 @@ pub fn validate_metadata(
     metrics: &dyn QeMetrics,
 ) -> Result<ContractRef, DomainError> {
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size-if
-    let canonical = serde_json::to_vec(metadata)
+    let encoded = serde_json::to_vec(metadata)
         .map_err(|e| DomainError::Internal(format!("metadata does not serialize: {e}")))?;
-    if canonical.len() > max_bytes {
+    if encoded.len() > max_bytes {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size
         tracing::warn!(
             target: LOG_TARGET,
-            size = canonical.len(),
+            size = encoded.len(),
             limit = max_bytes,
             "quota metadata exceeds the configured size limit"
         );
