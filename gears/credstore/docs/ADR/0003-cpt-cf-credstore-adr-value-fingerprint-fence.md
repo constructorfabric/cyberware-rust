@@ -28,6 +28,8 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 
 **ID**: `cpt-cf-credstore-adr-value-fingerprint-fence`
 
+**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the fence is kept as an integrity check against out-of-band modification of a backend entry; its saga role — detecting a torn write between the row and the backend — no longer exists, because a row points only at bytes that were fully written before the pointer moved. The healing `If-Match: *` re-put is withdrawn, and so is the seeding mode that let a row with a value carry `value_fp IS NULL`, served on trust; a fingerprint now exists for every value and for nothing else — a value-less (`declared`) row still carries none, tied to `value_id`'s own nullability by `ck_credstore_fp_with_value`.
+
 ## Context and Problem Statement
 
 With a stateful gear ([ADR-0001](0001-cpt-cf-credstore-adr-stateful-gear.md)) a write spans two stores with no shared transaction: the value goes to the external value-store backend (`plugin.put`), the metadata (`sharing`, `version`, `expires_at`) to `credstore_secrets` (`touch`). On the last-writer-wins path (no `If-Match`) both a backend write and a metadata write happen, so two concurrent PUTs to one reference can interleave crosswise:
