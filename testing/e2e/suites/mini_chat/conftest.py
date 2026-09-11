@@ -456,6 +456,10 @@ def server(test_env):
     _db_summary_text = _print_db_summary()
 
 
+# Credential type for a plain opaque secret (ADR-0004).
+_GENERIC_TYPE = "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _provision_credstore_secrets(request, server):
     """Provision the LLM provider secrets through the credstore gateway.
@@ -465,7 +469,7 @@ def _provision_credstore_secrets(request, server):
     now-stateful credstore gateway. The gateway resolves a secret's metadata
     from its own DB before reading the value, so the secrets must be created
     through its API — pre-seeding the static plugin config alone is no longer
-    reachable.
+    reachable; the static plugin's config seeding is gone entirely (ADR-0006).
 
     The mini-chat rig is single-tenant (``single-tenant-tr-plugin``) with
     ``accept_all`` authn, so a ``tenant``-scoped secret resolves for the S2S
@@ -473,9 +477,11 @@ def _provision_credstore_secrets(request, server):
     (the mock provider ignores them); online mode uses the real env keys, the
     same ones ``_patch_mini_chat_config`` would otherwise inject.
 
-    Create-or-replace: POST (create-only), and on 409 — a rerun against an
-    already-provisioned rig — PUT with the explicit ``If-Match: *`` overwrite
-    (PUT no longer creates and requires a precondition). Reruns stay safe.
+    Create-or-replace: creation is a single ``PUT`` carrying both the record
+    and the value (ADR-0004) — there is no POST. We PUT with
+    ``If-None-Match: *`` (create-only), and on 409 — a rerun against an
+    already-provisioned rig — PUT again with the explicit ``If-Match: *``
+    overwrite (a replace never needs ``type``). Reruns stay safe.
     """
     if request.config.getoption("mode") == "online":
         secrets = {
@@ -503,18 +509,18 @@ def _provision_credstore_secrets(request, server):
         try:
             # The mini-chat rig serves all routes under the api-gateway
             # `prefix_path: "/cf"` (same prefix as API_PREFIX above).
-            resp = httpx.post(
-                f"{server}/cf/credstore/v1/secrets",
-                headers=headers,
-                json={"reference": ref, "value": value, "sharing": "tenant"},
+            resp = httpx.put(
+                f"{server}/cf/credstore/v1/credentials/{ref}",
+                headers={**headers, "If-None-Match": "*"},
+                json={"type": _GENERIC_TYPE, "sharing": "tenant", "value": value},
                 timeout=5.0,
             )
             if resp.status_code == 409:
                 # Already provisioned (rerun): overwrite in place.
                 resp = httpx.put(
-                    f"{server}/cf/credstore/v1/secrets/{ref}",
+                    f"{server}/cf/credstore/v1/credentials/{ref}",
                     headers={**headers, "If-Match": "*"},
-                    json={"value": value, "sharing": "tenant"},
+                    json={"sharing": "tenant", "value": value},
                     timeout=5.0,
                 )
         except httpx.RequestError:
@@ -526,7 +532,7 @@ def _provision_credstore_secrets(request, server):
             # read-timeout against a still-warming server is caught too.
             reachable = False
             break
-        if resp.status_code not in (200, 201, 204):
+        if resp.status_code not in (201, 204):
             msg = f"could not provision credstore secret {ref!r}: HTTP {resp.status_code}"
             if request.config.getoption("mode") == "offline":
                 # Offline mode is deterministic — a provisioning failure is a real
