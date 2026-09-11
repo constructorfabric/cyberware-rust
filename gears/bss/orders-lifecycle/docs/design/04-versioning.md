@@ -299,7 +299,13 @@ two are not read as one vocabulary ([`../DECISIONS.md`](../DECISIONS.md) D-82).
 
 **Reasons contributed to the registry**: payer-rebinding-requires-seller,
 tenant-axis-immutable, **administrative-field-in-amendment**, amendment-empty,
-version-not-found. `administrative-field-in-amendment` is registered **here and only here**: it
+version-not-found, **amendment-cap-exhausted**.
+`amendment-cap-exhausted` is registered **here and only here**: it is the refusal of rows 18, 19
+and 20 when `orders_order.amendment_count` has reached the cap of §4.1, and it names the cap and
+the count so a caller learns the order cannot be revised again and must be cancelled and
+re-placed. Like `resume-cap-exhausted` it is deliberately **not** folded into the engine's
+`not-admissible` — the row *is* admissible and the state *does* permit amendment; what refuses is a
+guard on data. `administrative-field-in-amendment` is registered **here and only here**: it
 is the amendment path's refusal for a delta naming any administrative field, and it names the
 offending field and directs the caller to `PATCH /orders/{orderId}` (§4.1). It is the mirror of
 capture's `commercial-field-immutable` — that reason refuses commercial content on the
@@ -346,7 +352,7 @@ place.
 Input: order_id, delta, amendment_reason, expected_version, idempotency_key, security_context
 Output: the new version, or a registered refusal
 
-1. [ ] - `p1` - Declare five guards the engine evaluates and audits, **in this registration order** (`01 §4.1`), so a delta failing more than one refuses deterministically on the first: admissibility, non-empty delta (`amendment-empty`), **no administrative field in the delta** (`administrative-field-in-amendment`, naming the field and directing the caller to `PATCH /orders/{orderId}`), **no commercial-frozen field in the delta** (`tenant-axis-immutable`, naming the field), and **no cross-seller payer change** (`payer-rebinding-requires-seller`) - `inst-am-declare-guards`
+1. [ ] - `p1` - Declare **six** guards the engine evaluates and audits, **in this registration order** (`01 §4.1`), so a delta failing more than one refuses deterministically on the first — the **amendment cap** of §4.1 runs **first**, because an order at the cap cannot be amended whatever the delta says and evaluating the delta would cost a full gate run to reach the same refusal; then admissibility, non-empty delta (`amendment-empty`), **no administrative field in the delta** (`administrative-field-in-amendment`, naming the field and directing the caller to `PATCH /orders/{orderId}`), **no commercial-frozen field in the delta** (`tenant-axis-immutable`, naming the field), and **no cross-seller payer change** (`payer-rebinding-requires-seller`) - `inst-am-declare-guards`
 2. [ ] - `p1` - Resolve those guards' inputs: classify every delta field through the shared declaration, and determine whether a `payer_tenant_id` change crosses seller scope — no paired seller rebinding is looked for, because `sellerTenantId` is commercial-frozen and the guard above it has already refused any delta naming it (§2.2, §4.1) - `inst-am-resolve-guard-inputs`
 3. [ ] - `p1` - Carry forward the current version's commercial content - `inst-am-carry-forward`
 4. [ ] - `p1` - Apply the delta over the carried-forward content - `inst-am-apply-delta`
@@ -443,6 +449,35 @@ of §4.3 has stalled.
 ## 4. Additional Context
 
 ### 4.1 Admissibility (normative)
+
+**The number of amendments per order is capped, and the cap is a commercial value owned here.**
+`orders_order.amendment_count` ([`01-foundation`](./01-foundation.md) §3.7) is incremented by rows
+18, 19 and 20 and reset by no transition, and all three rows carry a registered guard refusing
+`amendment-cap-exhausted` once it reaches the cap. The baseline is **20 amendments per order**.
+
+*Why a cap exists at all.* Rows 19 and 20 target `submitted` from `pending_approval` and
+`approved`, so the effective target differs from the outgoing state and `01 §3.6` *Attempt
+Transition* step 20.1 **resets `state_entered_at`**. `approved → submitted → approved` therefore restarts the dwell
+clock on every cycle, which is the same unbounded-lifetime loop D-90 closed for hold/resume,
+available through a second operation. Capping resumes alone left it open
+([`../DECISIONS.md`](../DECISIONS.md) D-90).
+
+*Why the cap is separate from the resume cap rather than one shared budget.* A shared counter would
+be structurally tidier — one column, and any future clock-resetting row covered by construction —
+and it is rejected on commercial grounds: a resume is a **seller-side operational** act (a
+compliance hold, a dispute) and an amendment a **buyer-side commercial** one (negotiation). One
+budget would let a seller's holds silently consume a buyer's ability to correct their own order,
+which is the wrong failure to design in.
+
+*Why 20.* Negotiated orders revise two to five times in practice, so twenty is roughly four times
+the plausible upper end and never fires in honest commerce. An amendment is a **re-quote, not an
+edit** — it re-runs all nine gate predicates, re-pins every line and resets the approval clock
+(§3.6) — so nobody reaches twenty by accident, and the cap also bounds a cost nothing else bounded:
+repeated amendments are repeated six-port fan-outs. It bounds a **buyer-facing** action, unlike the
+resume cap, so it is deliberately generous: an order a buyer cannot correct is a worse outcome than
+a long-lived order. A twenty-first revision is a signal to re-place the deal as a new order, and
+the refusal names the cap and the count so the caller can tell which. A deployment **MAY** raise or
+lower it and **MUST NOT** unset it; there is no unlimited value.
 
 Amendment **MUST** be admitted from `submitted`, `pending_approval` and `approved`, and **MUST
 NOT** be admitted from `draft`, `on_hold`, `in_fulfillment` or any terminal state. From `draft`

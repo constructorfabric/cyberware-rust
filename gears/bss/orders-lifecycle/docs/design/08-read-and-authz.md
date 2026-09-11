@@ -463,7 +463,7 @@ most often asked.
 
 **A failed access-log write blocks a served response and never blocks a refusal.** The write-path
 twin aborts its transaction when the audit append fails, so no state change survives without its
-trail ([`01-foundation`](./01-foundation.md) §3.6 step 21.1). A read has no state change to roll
+trail ([`01-foundation`](./01-foundation.md) §3.6 *Attempt Transition* step 23.1). A read has no state change to roll
 back, so the rule is stated on disclosure instead. Where the append fails on a **served**
 cross-tenant read — the audit read or any other — the read **MUST** fail with
 read-store-unavailable and **MUST NOT** return the payload: returning it would produce exactly the

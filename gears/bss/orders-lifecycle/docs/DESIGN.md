@@ -589,7 +589,9 @@ cannot be closed automatically.
 
 Hold and resume with the stored pre-hold state; the per-state TTL policy for `submitted`,
 `pending_approval`, `approved` and `on_hold`; the **resume cap** that stops a hold/resume cycle
-restarting the dwell without limit; the coordinated expiry scheduler; and the transition-table
+restarting the dwell without limit — its sibling, the amendment cap, is owned in
+[`design/04-versioning.md`](./design/04-versioning.md) §4.1 because its value is a commercial
+judgment; the coordinated expiry scheduler; and the transition-table
 exclusion of `in_fulfillment` and of holds taken from it, together with the handoff of those cases
 to the operational escalation owned by the sibling gear. It does **not** supply a fallback duration
 for a state whose TTL is unset — such a state is unbounded, disclosed in
@@ -1055,7 +1057,7 @@ applicable**; it consumes an authorization *outcome* only.
 | Audit tampering | A holder of database privilege edits or deletes trail rows | Data boundary | No UPDATE or DELETE grant on the audit role, plus a per-order predecessor-hash chain verified periodically | A holder of the migration role can drop the grant; detectable via the chain and the grant audit |
 | Preview amplification | Unauthenticated-shaped basket calls fan out to six ports and write outcome rows | Cost and dependency boundary | Preview declares its actor classes, carries a rate limit, and its outcome rows have a bounded retention | A high-volume authorised caller can still consume port capacity, bounded by the per-port bulkhead |
 | Unbounded audit growth | Repeated refused attempts against one order | Availability boundary | Refusal rows carry 90-day retention and repeated refusals are rate-limited | A distributed low-rate refusal campaign remains possible and is a monitoring concern |
-| An order held in-flight indefinitely | An actor with hold permission cycles hold and resume before each TTL elapses, restarting the dwell | Commercial-promise boundary | The resume cap of [`design/07-hold-and-expiry.md`](./design/07-hold-and-expiry.md) §4.2 — a counter only the resume transition increments and no transition resets — bounds total in-flight life at `(cap + 1) × TTL` | Where the state's TTL is **unset** the cap bounds nothing, because the dwell it multiplies is itself unbounded; disclosed as [`DECISIONS.md`](./DECISIONS.md) Q-27 and alerted per `07 §3.8` |
+| An order held in-flight indefinitely | An actor cycles the dwell before each TTL elapses — **hold/resume** with hold permission, or **amendment** with amend permission; both reset `state_entered_at` | Commercial-promise boundary | Two counters no transition resets, each with its own guard: `resume_count` (cap 5, `design/07-hold-and-expiry.md` §4.2) and `amendment_count` (cap 20, `design/04-versioning.md` §4.1). At most 26 state entries, so in-flight life is bounded at `26 × the largest configured TTL` | Where the states' TTLs are **unset** the caps bound nothing, because the dwell they multiply is itself unbounded; disclosed as [`DECISIONS.md`](./DECISIONS.md) Q-27 and alerted per `07 §3.8` |
 
 ### 4.3 Data protection, residency and retention
 

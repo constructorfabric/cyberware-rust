@@ -701,10 +701,15 @@ with nothing on the document saying so. That is not a money defect, because the 
 non-authoritative either way; it is a defect in the commercial record, which is the artifact this
 gear exists to be. The same rule binds an amendment's re-pin and re-evaluation to one version.
 
-Known staleness is accepted, and **what bounds it is the per-state TTL and nothing else**. Where a
-TTL is configured, an order cannot sit in `submitted` or `approved` past it, so `(cap + 1) × TTL`
-— the resume cap of `07 §4.2` bounding how often the dwell restarts — is the outer limit on how
-stale a pin can be when fulfilment begins. **Where the TTL is unset, that limit does not exist and
+Known staleness is accepted, and **what bounds it is the per-state TTL and nothing else**. The pin
+is captured at submit and re-composed only on amendment, so it is carried unchanged through **every
+pin-retaining state** — `submitted`, `pending_approval`, `approved` and `on_hold` — and the bound is
+the sum of those dwells, not one of them. Where their TTLs are configured, `07 §4.2`'s two
+re-entry caps bound the number of entries at 26, so the outer limit on pin staleness at the moment
+fulfilment begins is **26 × the largest configured TTL among those four states**. One case is
+outside it entirely: an `on_hold` order whose pre-hold state was `in_fulfillment` is exempt from
+automatic expiry (`07 §4.3`), so its pin has no staleness bound at all — though by then the spawn
+signal has usually issued and the pin has already been consumed downstream. **Where the TTL is unset, that limit does not exist and
 a pin can be arbitrarily stale**, which is this slice's share of the gap `07 §4.2` discloses and
 `DECISIONS.md` Q-27 routes. An earlier version of this paragraph named an absolute order lifetime
 as the backstop covering the unset case; that bound is withdrawn (D-90), and nothing replaced it,

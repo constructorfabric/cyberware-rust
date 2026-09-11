@@ -647,14 +647,15 @@ Output: committed outcome or registered refusal
     1. [ ] - `p1` - Set the aggregate's state to the effective target and set state_entered_at - `inst-set-state`
     2. [ ] - `p1` - **IF** the effective target is on_hold: store the outgoing state as the pre-hold state - `inst-store-pre-hold`
     3. [ ] - `p1` - **IF** the effective target is not `on_hold`: clear the pre-hold state - `inst-clear-pre-hold`
-    4. [ ] - `p1` - **IF** the trigger is resume: increment `resume_count`; it is an engine-owned column like `state_entered_at`, no contribution supplies it, and the row 22 guard that reads it ran at step 13 under this same row lock, so the increment cannot race the check ([`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.2) - `inst-increment-resume-count`
-21. [ ] - `p1` - Allocate the next audit sequence from the aggregate's counter and append the audit entry with from-state, to-state, trigger, outcome committed, actor, proof reference, reason, key, correlation_id, version in force and the predecessor hash - `inst-append-audit`
-22. [ ] - `p1` - **IF** the audit append fails: - `inst-if-audit-fails`
+    4. [ ] - `p1` - **IF** the trigger is resume: increment `resume_count` - `inst-increment-resume-count`
+21. [ ] - `p1` - **IF** the trigger is amendment: increment `amendment_count`; this sits outside step 20 because rows 18 and 20 differ in whether the state changes and both **MUST** count - `inst-increment-amendment-count`
+22. [ ] - `p1` - Allocate the next audit sequence from the aggregate's counter and append the audit entry with from-state, to-state, trigger, outcome committed, actor, proof reference, reason, key, correlation_id, version in force and the predecessor hash - `inst-append-audit`
+23. [ ] - `p1` - **IF** the audit append fails: - `inst-if-audit-fails`
     1. [ ] - `p1` - Abort the transaction so no state change survives without its trail - `inst-abort-on-audit-failure`
-23. [ ] - `p1` - **IF** the row declares an event type: enqueue exactly one outbox row for it - `inst-enqueue-outbox`
-24. [ ] - `p1` - Settle the idempotency record with the success outcome and a reference to the audit entry - `inst-settle-success`
-25. [ ] - `p1` - Commit the transaction - `inst-commit-transaction`
-26. [ ] - `p1` - **RETURN** the committed outcome - `inst-return-committed`
+24. [ ] - `p1` - **IF** the row declares an event type: enqueue exactly one outbox row for it - `inst-enqueue-outbox`
+25. [ ] - `p1` - Settle the idempotency record with the success outcome and a reference to the audit entry - `inst-settle-success`
+26. [ ] - `p1` - Commit the transaction - `inst-commit-transaction`
+27. [ ] - `p1` - **RETURN** the committed outcome - `inst-return-committed`
 
 **Description**: The evaluation order is fixed and total. Authorization precedes even the
 advisory idempotency probe, so an unauthorized caller learns nothing about the order's state or a
@@ -669,7 +670,7 @@ successes.
 ahead of the version append at 18 and ahead of every other contribution, and that position is the
 mechanism. Two properties force it. First, the enforcement is a **partial unique index** (`§3.7`
 `orders_inflight_overlap_claim`), and a raw unique violation aborts the whole PostgreSQL
-transaction — the one that step 20's audit append and step 24's settle still have to run in — so
+transaction — the one that step 22's audit append and step 25's settle still have to run in — so
 the claim is taken with `ON CONFLICT … DO NOTHING` and the conflict detected as a **row shortfall**
 rather than raised as an error; `order-in-flight-for-key`, the design's only
 concurrency-correctness refusal, would otherwise be unwritable. Second, a refusal decided at step
@@ -871,6 +872,7 @@ key and the engine's choice between them is undefined (`§4.6`).
 | current_version | integer, **NOT NULL, `1` from creation** | Pointer into the version chain (deferred FK). Creation appends version 1 carrying the empty draft; submit appends version 2 carrying the gated content |
 | pre_hold_state | enum, nullable | Set by a hold, consumed and cleared by a resume |
 | resume_count | integer, **NOT NULL, `0` from creation** | Resumes taken on this order. Incremented by row 22 and by nothing else; **no transition decrements or resets it**, which is what makes the resume cap of `07 §4.2` a bound rather than a quota. Read by row 22's guard on the already-locked aggregate row, so the cap costs no scan and no index |
+| amendment_count | integer, **NOT NULL, `0` from creation** | Amendments appended to this order. Incremented by rows 18, 19 and 20 and by nothing else; **no transition decrements or resets it**. Read by those rows' guard on the already-locked aggregate row. It is a **separate counter from `resume_count` on purpose** — a resume is a seller-side operational act and an amendment a buyer-side commercial one, so a seller's compliance holds **MUST NOT** consume a buyer's ability to revise the order (`04 §4.1`, `07 §4.2`) |
 | spawn_signal_at | timestamptz, nullable | Written by the spawn-signal transition; never cleared |
 | authorization_failure_tolerated_at | timestamptz, nullable | The tolerated-authorization risk flag; records a decision taken at an instant and is never cleared |
 | compensation_evidence | jsonb, nullable | Workflow-supplied evidence of drafts voided, activated subscriptions rolled back and at-sale facts emitted; recorded only by failure acknowledgement or workflow-mediated cancellation |
@@ -880,7 +882,7 @@ key and the engine's choice between them is undefined (`§4.6`).
 **PK**: order_id
 
 **Constraints**: `order_number` UNIQUE per `seller_tenant_id`; `pre_hold_state` NULL unless
-`state` is `on_hold`; `resume_count >= 0`.
+`state` is `on_hold`; `resume_count >= 0`; `amendment_count >= 0`.
 
 This CHECK is why `§3.6` *Attempt Transition* step 20.3 clears `pre_hold_state` on **any** transition whose target is not `on_hold`, not only on resume. Rows 23 (`on_hold → cancelled`) and 24 (`on_hold → expired`) move a held order to a terminal state; clearing only on resume would leave the column populated against a non-`on_hold` state, the UPDATE would fail the constraint, and both transitions — one of them the TTL sweep's main path out of `on_hold` — would be unable to commit at all.
 
@@ -1528,9 +1530,9 @@ five callers and naming it per caller is the defect the registry exists to preve
 15. [ ] - `p1` - **FROM** `in_fulfillment` **TO** `cancelled` **WHEN** `cancel` — no spawn signal is recorded (state-only, `OrderCancelled`) - `inst-tr-in-fulfillment-direct-cancel`
 16. [ ] - `p1` - **FROM** `in_fulfillment` **TO** `cancelled` **WHEN** `cancel-workflow-mediated` — the cancel carries compensation evidence (state-only, `OrderCancelled`) - `inst-tr-in-fulfillment-mediated-cancel`
 17. [ ] - `p1` - **FROM** `submitted`, `pending_approval` or `approved` **TO** `cancelled` **WHEN** `cancel` (state-only, `OrderCancelled`) - `inst-tr-pre-fulfillment-cancel`
-18. [ ] - `p1` - **FROM** `submitted` **TO** the same state **WHEN** `amendment` (versioning, `OrderAmended`) - `inst-tr-amend-in-place`
-19. [ ] - `p1` - **FROM** `pending_approval` **TO** `submitted` **WHEN** `amendment` (versioning, `OrderAmended`) - `inst-tr-amend-from-pending`
-20. [ ] - `p1` - **FROM** `approved` **TO** `submitted` **WHEN** `amendment` (versioning, `OrderAmended`) - `inst-tr-amend-from-approved`
+18. [ ] - `p1` - **FROM** `submitted` **TO** the same state **WHEN** `amendment` — guarded by the amendment cap of [`04-versioning`](./04-versioning.md) §4.1, and incrementing `amendment_count` (versioning, `OrderAmended`) - `inst-tr-amend-in-place`
+19. [ ] - `p1` - **FROM** `pending_approval` **TO** `submitted` **WHEN** `amendment` — same guard and increment (versioning, `OrderAmended`) - `inst-tr-amend-from-pending`
+20. [ ] - `p1` - **FROM** `approved` **TO** `submitted` **WHEN** `amendment` — same guard and increment (versioning, `OrderAmended`) - `inst-tr-amend-from-approved`
 21. [ ] - `p1` - **FROM** `submitted`, `pending_approval`, `approved` or `in_fulfillment` **TO** `on_hold` **WHEN** `hold` — storing the outgoing state (state-only, `OrderHeld`) - `inst-tr-hold`
 22. [ ] - `p1` - **FROM** `on_hold` **TO** the stored pre-hold state **WHEN** `resume` — guarded by the resume cap of [`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.2, and incrementing `resume_count` (state-only, `OrderResumed`) - `inst-tr-resume`
 23. [ ] - `p1` - **FROM** `on_hold` **TO** `cancelled` **WHEN** `cancel` — the pre-hold state's own cancel guard admits it (state-only, `OrderCancelled`) - `inst-tr-hold-cancel`

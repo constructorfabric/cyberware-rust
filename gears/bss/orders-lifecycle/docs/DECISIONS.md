@@ -62,7 +62,7 @@
   - [D-87 (H) A parked outbox row blocks its own order's stream and no other](#d-87-h-a-parked-outbox-row-blocks-its-own-orders-stream-and-no-other)
   - [D-88 (H) The idempotency key is scoped by authorized principal *(closes an IDOR finding)*](#d-88-h-the-idempotency-key-is-scoped-by-authorized-principal-closes-an-idor-finding)
   - [D-89 (M) The subscription axis of the overlap rule is disclosed as open, not bounded by a timed window](#d-89-m-the-subscription-axis-of-the-overlap-rule-is-disclosed-as-open-not-bounded-by-a-timed-window)
-  - [D-90 (H) Bounded lifetime is a per-state TTL plus a resume cap, and the residual gap is disclosed](#d-90-h-bounded-lifetime-is-a-per-state-ttl-plus-a-resume-cap-and-the-residual-gap-is-disclosed)
+  - [D-90 (H) Bounded lifetime is a per-state TTL plus two re-entry caps, and the residual gap is disclosed](#d-90-h-bounded-lifetime-is-a-per-state-ttl-plus-two-re-entry-caps-and-the-residual-gap-is-disclosed)
 - [Open questions](#open-questions)
 - [Traceability](#traceability)
 
@@ -1012,7 +1012,7 @@ any**, so the release never executed and every `completed` order would have held
 permanently — a leak on the happy path, externally indistinguishable from the deliberate
 `in_fulfillment` exemption. It is now sub-step **17.1**, ahead of that branch.
 
-**Propagated**: `01 §3.6` *Attempt Transition* step 17 (sub-steps 17.1–17.6) and steps 18–26,
+**Propagated**: `01 §3.6` *Attempt Transition* step 17 (sub-steps 17.1–17.6) and steps 18–27,
 `§3.7` `orders_inflight_overlap_claim`; `ADR/0007`.
 
 ### D-87 (H) A parked outbox row blocks its own order's stream and no other
@@ -1122,16 +1122,19 @@ needs a column, a guard, a refusal reason and a value, none of which this design
 **Propagated**: `03 §2.2`, `§3.6` *Re-check Activation Preconditions* steps 3 and 5, `06 §4.3`,
 `UPSTREAM_REQS.md` §2.1 (`SUB-O5` enforcement ask).
 
-### D-90 (H) Bounded lifetime is a per-state TTL plus a resume cap, and the residual gap is disclosed
+### D-90 (H) Bounded lifetime is a per-state TTL plus two re-entry caps, and the residual gap is disclosed
 
 **Decision**: **Layer 1** is the per-state TTL, measured from `state_entered_at`, which a resume
 restarts — and which holds only where a TTL is configured. An unconfigured TTL **MUST NOT** block
-startup, because the values are Product-owned open questions. **Layer 2** is a **resume cap**:
-`orders_order.resume_count` is incremented by `01 §4.3` row 22 and reset by no transition, and row
-22 carries a registered guard refusing `resume-cap-exhausted` at the cap, baseline **5**. Together
-they bound an order's in-flight life at `(cap + 1) × TTL` **for every state whose TTL is
-configured**. Where a TTL is unset the state is **unbounded**, and that is disclosed in `07 §4.2`
-and alerted in `07 §3.8` rather than covered by a design-owned fallback.
+startup, because the values are Product-owned open questions. **Layer 2** is **two re-entry caps**,
+one per transition that resets `state_entered_at`: `orders_order.resume_count`, incremented by
+`01 §4.3` row 22, guard `resume-cap-exhausted`, baseline **5**; and
+`orders_order.amendment_count`, incremented by rows 18, 19 and 20, guard
+`amendment-cap-exhausted`, baseline **20**, owned in `04 §4.1`. No transition resets either.
+Together they bound an order at **26 state entries**, so its in-flight life is at most
+**26 × the largest configured TTL** among the expirable states. Where a TTL is unset that state is
+**unbounded**, and that is disclosed in `07 §4.2` and alerted in `07 §3.8` rather than covered by a
+design-owned fallback.
 
 **Rationale**: `state_entered_at` was the sole dwell input and resume rewrites it, so any actor
 holding hold permission could cycle hold/resume and keep an order in `submitted` or `approved`
@@ -1151,14 +1154,34 @@ recorded here because the shape of the mistake is reusable:
 * Its value was a commercial policy with no PRD basis (Q-27), taken autonomously.
 
 The count cap was rejected in that earlier version for permitting `n × TTL` and needing a counter,
-a reset rule and a new refusal. That reasoning is inverted here. `(cap + 1) × TTL` is a **bound**,
-which is what was asked for; the counter is written by one transition and reset by none, so there
-is no reset rule to get wrong; and the new refusal is the point — a bound whose breach is a
-refused, audited transition is observable, where a backstop's failure to fire is not.
+a reset rule and a new refusal. That reasoning is inverted here. A finite multiple of a configured
+TTL is a **bound**, which is what was asked for; each counter is written by one trigger and reset
+by none, so there is no reset rule to get wrong; and the new refusal is the point — a bound whose
+breach is a refused, audited transition is observable, where a backstop's failure to fire is not.
+
+**The first statement of this decision capped only resumes, and the loop stayed open**
+*(corrected 2026-09-11, from a CodeRabbit Major on PR #4775 and what checking it exposed)*. It
+claimed `(cap + 1) × TTL` as the order's bound, which was wrong twice. It bounded **one state's**
+repeated dwell, while an order traverses several states each with its own TTL — so it was never an
+upper bound on the order. And **amendments reset the dwell too**: rows 19 and 20 target `submitted`
+from `pending_approval` and `approved`, the effective target differs from the outgoing state, and
+`01 §3.6` *Attempt Transition* step 20.1 sets `state_entered_at`. `approved → submitted → approved`
+therefore restarted the clock indefinitely through an entirely uncapped operation — the same defect
+on a different trigger.
+
+**Two counters rather than one shared budget**, and the reason is commercial rather than
+structural. A single re-entry budget would be tidier — one column, and any future clock-resetting
+row covered by construction — but a resume is a **seller-side operational** act and an amendment a
+**buyer-side commercial** one, so one budget would let a seller's compliance holds consume a
+buyer's ability to correct their own order. The amendment baseline of 20 is argued in `04 §4.1`:
+negotiated orders revise two to five times, an amendment is a re-quote rather than an edit, and a
+buyer-facing cap must be generous because an order a buyer cannot correct is worse than a
+long-lived one.
 
 **Propagated**: `07 §1.1`, `§2.1`, `§2.2`, `§3.1`, `§3.2`, `§3.3`, `§3.6` *Sweep Expired Orders*
 and *Hold Then Resume*, `§3.7`, `§3.8`, `§4.1`, `§4.2`, `§4.3`, `§4.4`, `§4.5`, `§5`;
-`01 §3.7` `orders_order` schema and index list, `§4.3` row 22; `05 §2.2`.
+`01 §3.7` `orders_order` schema and index list, `§3.6` steps 20.4 and 21, `§4.3` rows 18, 19, 20
+and 22; `04 §3.3`, `§3.6`, `§4.1`; `03 §4.3`; `05 §2.2`; `DESIGN.md` §3.2 and §4.2.
 
 ## Open questions
 

@@ -61,12 +61,12 @@ SLA raised by the sibling gear instead of an automatic transition.
 
 The bound has **two layers**, and they answer different questions. The **per-state TTL** is
 Product-owned configuration with no code default, so it is only in force where it has been
-configured. The **resume cap** is a design-owned baseline on the number of times one order may be
-resumed, enforced as a guard on the resume transition itself. It exists because a per-state TTL
-alone bounds nothing an actor can restart: resume rewrites the dwell input, so hold-then-resume
-before each elapse was an unbounded lifetime available to any actor holding hold permission. With
-the cap in force an order's in-flight life is bounded by `(cap + 1) × TTL` wherever a TTL is
-configured. Where one is **not** configured, that state has no bound at all and the cap does not
+configured. The **re-entry caps** are design-owned baselines on how many times one order may
+restart a dwell — **5** resumes and **20** amendments, enforced as guards on those transitions
+themselves. They exist because a per-state TTL alone bounds nothing an actor can restart: both
+resume and amendment rewrite the dwell input, so either loop was an unbounded lifetime available
+to a permitted actor. With both caps in force an order makes at most **26** state entries, so its
+in-flight life is bounded by `26 × the largest configured TTL`. Where one is **not** configured, that state has no bound at all and the cap does not
 supply one — §4.2 states that residual gap rather than papering over it, which is the difference
 between these two layers and the absolute-lifetime backstop an earlier draft claimed.
 
@@ -148,10 +148,12 @@ because the order has genuinely re-entered the state and the state's TTL asks ho
 dwell there. What must not be unlimited is the **number of restarts**. `state_entered_at` was the
 sole dwell input, and it is writable by an ordinary operation any actor holding `hold` already
 has, so hold-then-resume before each TTL elapses was an unbounded lifetime available to a
-permitted actor — not an attack, just a loop. The loop is closed where it is created: `resume`
-([`01-foundation`](./01-foundation.md) §4.3 row 22) carries a **registered guard** that refuses
-once `orders_order.resume_count` has reached the cap, and every successful resume increments that
-counter. No transition decrements or resets it. The bound is therefore enforced at the operation
+permitted actor — not an attack, just a loop. **There are two such loops, not one**: amendment
+rows 19 and 20 also change state and so also reset the column, which capping resumes alone left
+open. Each loop is closed where it is created: `resume`
+([`01-foundation`](./01-foundation.md) §4.3 row 22) and `amendment` (rows 18, 19 and 20) each
+carry a **registered guard** that refuses once its own counter — `resume_count` or
+`amendment_count` — has reached its cap, and every successful transition increments it. No transition decrements or resets it. The bound is therefore enforced at the operation
 that extends the life, its breach is a refused, audited transition with a named reason rather than
 an absence of something happening, and the arithmetic is closed: at most `cap` restarts of a
 bounded dwell is a bounded total.
@@ -197,15 +199,18 @@ platform versus seller — are all PRD open questions owned by Product. This sli
 **policy model** and leaves the numbers as configuration with no code default, because a code
 default would quietly become the answer.
 
-The **resume cap** is deliberately **not** in that group. It is a design-owned value with a
-working baseline (§4.5), because it closes a hole this design opened — resume rewrites the dwell
-input — and a mitigation whose value is also unchosen would be no mitigation at all. It bounds a
-count rather than a duration, so it cannot pre-empt a per-state TTL Product later chooses,
-whatever that TTL turns out to be.
+The **two re-entry caps** are deliberately **not** in that group. Both are design-owned values
+with working baselines — the resume cap here (§4.5), the amendment cap in
+[`04-versioning`](./04-versioning.md) §4.1 — because they close a hole this design opened (resume
+and amendment both rewrite the dwell input) and a mitigation whose value is also unchosen would be
+no mitigation at all. Both bound a **count** rather than a duration, so neither can pre-empt a
+per-state TTL Product later chooses, whatever those TTLs turn out to be. The amendment cap's
+value is additionally a **commercial** judgment about how often a buyer may revise an order, which
+is why `04 §4.1` owns and argues it rather than this section.
 
 **What remains unbounded, and it is a Product dependency and not a design gap to close here.**
 Where no TTL is configured for a state, that state has **no bound**: the per-state pass skips it
-(§3.6) and the resume cap bounds restarts of a dwell that is itself unbounded, so `cap` × ∞ is
+(§3.6) and the re-entry caps bound restarts of a dwell that is itself unbounded, so `26 × ∞` is
 still ∞. An earlier draft covered this with an absolute order lifetime measured from `created_at`;
 §4.2 records why that backstop was withdrawn rather than kept. Until PRD §15 row 7 is answered the
 gap is **disclosed** — surfaced as the no-configured-TTL metric and alert of §3.8 — rather than
@@ -226,7 +231,7 @@ hold is ever in force.
 The per-state time-to-live configuration: the state it bounds, its duration, and its
 configuration scope. Resolved at sweep time rather than stored per order, so a policy change
 takes effect on orders already in flight. It is **per-state and optional**; where it is unset the
-state is unbounded, and the resume cap below limits restarts rather than supplying a duration.
+state is unbounded, and the re-entry caps limit restarts rather than supplying a duration.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-entity-resume-cap`
 
@@ -622,21 +627,31 @@ tolerated rather than fatal — a missing TTL **MUST NOT** block startup, since 
 Product-owned PRD open questions (§2.2, §4.5) and refusing to start would make an unanswered
 question an outage.
 
-**Layer 2 — the resume cap, which holds unconditionally but bounds a count and not a duration.**
-`orders_order.resume_count` **MUST** be incremented by the resume transition
-([`01-foundation`](./01-foundation.md) §4.3 row 22) in the same transaction that changes state, and
-row 22 **MUST** carry a registered guard refusing with `resume-cap-exhausted` once the counter has
-reached the cap resolved from configuration with the design-owned baseline of §4.5 — therefore
-**never unset**. Guard and increment are both engine-side and both under the aggregate row lock
-(`01 §3.6` *Attempt Transition* steps 13 and 20.4), so two concurrent resumes cannot both observe
-a count below the cap. No transition **MAY** decrement or reset the counter. What this layer guarantees
-is exact and worth stating as arithmetic rather than as a slogan: **an order's total in-flight
-life is at most `(cap + 1) × TTL` for every state whose TTL is configured**, because the only
-operation that restarts a dwell is bounded to `cap` uses. No actor holding any permission this
-gear grants can exceed it.
+**Layer 2 — two re-entry caps, which hold unconditionally and bound counts rather than durations.**
+Two transitions restart a dwell by resetting `orders_order.state_entered_at`, and each is capped
+separately:
+
+* **Resume.** `orders_order.resume_count` **MUST** be incremented by row 22 ([`01-foundation`](./01-foundation.md) §4.3), which **MUST** carry a registered guard refusing `resume-cap-exhausted` at the cap of §4.5 — baseline **5**.
+* **Amendment.** `orders_order.amendment_count` **MUST** be incremented by rows 18, 19 and 20, which **MUST** carry a registered guard refusing `amendment-cap-exhausted` at the cap owned in [`04-versioning`](./04-versioning.md) §4.1 — baseline **20**. Rows 19 and 20 target `submitted` from `pending_approval` and `approved`, so the target differs from the outgoing state and step 20.1 resets the clock; capping resumes alone left this loop open through a second operation.
+
+Both counters are resolved from configuration and are **never unset**. No transition **MAY**
+decrement or reset either. Guards and increments are all engine-side and all under the aggregate
+row lock (`01 §3.6` *Attempt Transition* steps 13, 20.4 and 21), so two concurrent re-entries
+cannot both observe a count below its cap. The two budgets are **separate on purpose**: a resume is
+a seller-side operational act and an amendment a buyer-side commercial one, so a seller's
+compliance holds **MUST NOT** consume a buyer's ability to revise the order (`04 §4.1`).
+
+**What the caps actually bound, stated as arithmetic.** One state entry is bounded by that state's
+TTL, and the number of entries an order can make is bounded by `1 + 20 + 5 = 26` — the first entry
+plus the capped amendments plus the capped resumes. Therefore **an order's total in-flight life is
+at most 26 x the largest configured TTL among the expirable states.** An earlier version of this
+section claimed `(cap + 1) x TTL`, which bounded *one state's* repeated dwell and was not an upper
+bound on the order at all: an order traverses several states, each with its own TTL, and the number
+of traversals was itself unbounded while amendments were uncapped. The bound above is coarser and
+true.
 
 **What neither layer bounds, disclosed rather than covered.** Where a state's TTL is unset, that
-state has no bound, and the resume cap supplies none — it multiplies a dwell that is itself
+state has no bound, and the re-entry caps supply none — they multiply a dwell that is itself
 unbounded. Two states are outside both layers entirely by §4.3's exemption: `in_fulfillment`, and
 an `on_hold` order whose pre-hold state is `in_fulfillment`. Those remain bounded by the
 operational SLA and by no transition in this gear. So the unqualified sentence "an in-flight order
@@ -709,8 +724,8 @@ has had no state transition since creation.
 
 **Where the auto-void TTL is unset, `draft` is unbounded, and there is no fallback.** An earlier
 version had this sweep fall back to the absolute order lifetime of §4.2; that bound is withdrawn
-(§4.2 states why) and nothing replaced it, because the resume cap does not apply — a `draft` is
-never held or resumed. `draft` is therefore the state with the largest exposure to an unanswered
+(§4.2 states why) and nothing replaced it, because neither re-entry cap applies — a `draft` is
+never held, resumed or amended. `draft` is therefore the state with the largest exposure to an unanswered
 Product value: baskets accumulate until the auto-void TTL of §4.5 is chosen. This is the same
 disclosure §4.2 makes for the other states, and the same §3.8 alert covers it. It is **not** closed
 by a code default, per §2.2, and closing it is `../DECISIONS.md` Q-07.
@@ -742,10 +757,11 @@ idempotency-key window is **24 hours**, settled in [`01-foundation`](./01-founda
 | Sweep cadence | every 5 minutes per worker | Bounds expiry latency to one cadence past the TTL |
 | Sweep batch size | 500 orders | Keeps a sweep transaction short enough not to hold the aggregate locks it takes |
 | Overdue window | **24 hours** past expected fulfillment time | **Not** an open question: the PRD commits this as a business default; it is recorded here as committed rather than as unchosen |
+| **Amendment cap** | **20** amendments per order | The other half of Layer 2, **owned and argued in [`04-versioning`](./04-versioning.md) §4.1** because its value is a commercial judgment about how often a buyer may revise an order, not an operational one. Listed here so both re-entry caps are visible in one place |
 | **Resume cap** | **5** resumes per order | Layer 2 of §4.2, enforced as a guard on `01 §4.3` row 22 against `orders_order.resume_count`, which no transition resets. It bounds a **count**, not a duration, so it pre-empts no per-state TTL Product later chooses whatever that value turns out to be — which is why this design can own it while the durations stay open. Five is set from the operational shape the loop has: a compliance or dispute hold that genuinely needs re-taking more than five times on one order is an escalation, not a workflow, and the sixth attempt refuses with `resume-cap-exhausted` and says so on the audit trail. A deployment **MAY** raise or lower it and **MUST NOT** unset it; there is no "unlimited" value |
 
 Leaving the Product-owned values unset means an unconfigured state is **not swept at all**, and
-orders in it **do not expire**. That is stated without softening: the resume cap bounds restarts
+orders in it **do not expire**. That is stated without softening: the re-entry caps bound restarts
 of a dwell, so where the dwell has no bound the total has none either, and an earlier version of
 this section claimed an absolute lifetime made the bound's *tightness* the only casualty. §4.2
 records why that claim was withdrawn. The failure mode is instead made **visible** — the
