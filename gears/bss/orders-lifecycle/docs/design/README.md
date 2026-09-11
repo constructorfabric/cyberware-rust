@@ -50,7 +50,7 @@ dependencies exist.
 | `01-foundation` | 6.1 (state machine, idempotency), 6.5, 7.1 | 0/1 | — |
 | `02-capture` | 6.1 (create, line dates) | 1 | 01 |
 | `03-gate-and-pin` | 6.1 (submit), 9.1 (Preview) | 1 | 01, 02 |
-| `04-versioning` | 6.2 | 2 | 01, 02, 03 |
+| `04-versioning` | 6.2 | 2 | 01, 02, 03; upstream `…-upreq-workflow-amendment-verdict` for §4.3 |
 | `05-preconditions` | 6.1 (acceptance, payment auth) | 2 | 01, 02, 03 |
 | `06-workflow-seam` | 6.1 (atomic fulfillment, linkage), 6.4 | 2 | 01, 03, 05 |
 | `07-hold-and-expiry` | 6.3 | 2/3 | 01, 02, 06 |
@@ -74,8 +74,12 @@ which waits on that gear's window-linkage slice; **(5)** the per-market GA gate 
 prepaid-execution gate; and **(6)** the registry `sellable` flag, which is **not a pricing fact at
 all** — it is owned by the `products` gear, which carries a PRD and no implementation. A reader
 sequencing this work should therefore treat `products` as a submit-path dependency of equal
-standing to pricing, which the dependency tables in [`../DESIGN.md`](../DESIGN.md) §3.5 and
-[`../PRD.md`](../PRD.md) §13 do not make obvious. Capture and the engine are buildable and
+standing to pricing. That standing is now declared rather than left to be inferred: `products` is a
+row of its own in [`../DESIGN.md`](../DESIGN.md) §3.5, the version-pinned `sellable` read is
+registered as [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md)
+`…-upreq-sellable-flag-read` at `p1`, and [`../PRD.md`](../PRD.md) §13 already carries the
+product-registry dependency at `p1` — so an implementation cannot omit the input and still look
+complete. Capture and the engine are buildable and
 testable; a submit that *passes* is not, until those lanes exist. That is designed behaviour, not
 a defect, and it is stated here so the phase map is not read as a delivery promise it cannot keep.
 The operator-visible half is routed as [`../DECISIONS.md`](../DECISIONS.md) Q-15.
@@ -118,14 +122,24 @@ contract, the idempotency semantics with their four exhaustive outcomes, the sta
 **twenty-five-row** table with its normative exclusions, the audit and outbox rules, and the
 canonical schema for all **fourteen** engine-owned tables.
 
-Two slices carry a dependency on an unagreed upstream ask rather than a gap in their own design.
-[`03-gate-and-pin.md`](./03-gate-and-pin.md) needs the overlap-presence read (`SUB-O5`) for the
-against-existing-subscriptions half of the overlap rule; until it lands that half is unevaluable
-and therefore a refusal, which fails closed. [`06-workflow-seam.md`](./06-workflow-seam.md)
-depends on six: the compensation cancel reason (`SUB-O1`), the order reference on `create`
-(`SUB-O2`), the overlap-presence read (`SUB-O5`), correlation propagation (`SUB-O9`) and the
-explicit subscription start instant (`SUB-O10`). Each is stated as a constraint naming its ask, so the
-design is complete and the boundary is honest, and the **Workflow-side amendment verdict** (`…-upreq-workflow-amendment-verdict`). That last one is not upstream *code* but an upstream **document**: the sibling Workflow PRD restricts verdict acquisition to `OrderSubmitted`, so it needs amending before the two-step re-approval seam of [`04-versioning`](./04-versioning.md) §4.3 can be implemented at all (`p1`; see [`../DECISIONS.md`](../DECISIONS.md) Q-12).
+**Three** slices carry a dependency on an unagreed upstream ask rather than a gap in their own
+design. [`03-gate-and-pin.md`](./03-gate-and-pin.md) needs the overlap-presence read (`SUB-O5`) for
+the against-existing-subscriptions half of the overlap rule; until it lands that half is unevaluable
+and therefore a refusal, which fails closed.
+[`06-workflow-seam.md`](./06-workflow-seam.md) depends on six: the compensation cancel reason
+(`SUB-O1`), the order reference on `create` (`SUB-O2`), the overlap-presence read (`SUB-O5`),
+correlation propagation (`SUB-O9`), the explicit subscription start instant (`SUB-O10`) and the
+**Workflow-side amendment verdict** (`…-upreq-workflow-amendment-verdict`). Each is stated as a
+constraint naming its ask, so the design is complete and the boundary is honest.
+
+That last one is not upstream *code* but an upstream **document**: the sibling Workflow PRD
+restricts verdict acquisition to `OrderSubmitted`, so it needs amending before the two-step
+re-approval seam of [`04-versioning`](./04-versioning.md) §4.3 can be implemented at all (`p1`; see
+[`../DECISIONS.md`](../DECISIONS.md) Q-12). It therefore has **two consumers**, and they need it for
+different things: `04` owns the seam the amendment opens, and `06` consumes `OrderAmended`, obtains
+the new version's verdict and exposes the reflected-verdict API. All six asks stay listed under `06`
+so the ask is counted once, and the dependency is recorded against `04` in the slice map above so
+the build order does not read as though only `06` waits on it.
 
 One thing remains outstanding for the gear, and it is not a slice. The **`SUB-O*` register has
 forked** — the Subscriptions seam map defines `SUB-O1` through `SUB-O6` while the sibling

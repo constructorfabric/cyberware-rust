@@ -77,7 +77,18 @@ violation has already aborted. Two things resolve it, both normative in
 [`../design/01-foundation.md`](../design/01-foundation.md) **§3.6** *Attempt Transition*
 (`DECISIONS.md` D-86). The claim is acquired with `ON CONFLICT … DO NOTHING` and the collision
 detected as a **row shortfall** rather than raised as an error, so the transaction is never
-aborted and stays usable for the audit append and the settle. And acquisition is **step 17**,
+aborted and stays usable for the audit append and the settle. `DO NOTHING` buys that at the cost of
+**per-row** semantics: offered a free key and a taken one together it inserts the free key and skips
+the taken one, so the shortfall branch is reached with rows already inserted. Acquisition is
+therefore required to be **all-or-none** — the shortfall branch **MUST** delete the rows the same
+statement returned before it settles and commits the refusal, and a test **MUST** cover one
+conflicting key and one free key in one acquisition. Without it the refused order keeps a live claim
+on the free key and has **no transition of its own to release it**: a refused submit leaves the order
+in `draft`, and 17.1's terminal release does not run until an auto-void or a cancel eventually
+fires, so the key stays blocked for every other order in between — the rule's enforcement producing
+the collision the rule exists to prevent. The unwind needs no savepoint: the insert returns the rows
+it made, the transaction is still usable, and the delete is an ordinary statement in it. And
+acquisition is **step 17**,
 ahead of the version append and every other contribution, so a refusal has nothing durable to
 unwind: had it run later, the refusal would have to discard a committed version row and a moved
 current-version pointer in tables that grant no DELETE. **There is consequently no savepoint

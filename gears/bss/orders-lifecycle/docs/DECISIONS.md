@@ -671,8 +671,9 @@ upstream load pure waste and the observability series misleading.
 ### D-66 (H) Both begin-fulfillment elections are policy rows with safe fallbacks *(autonomous)*
 
 **Decision**: `orders_policy_election` (introduced by `05 §3.7`) holds
-`tolerate_authorization_failure` and `acceptance_required` keyed `(election, scope, scope_id)`,
-seller scope overriding platform. An unset election reads as its safe value — tolerate-failure not
+`tolerate_authorization_failure` and `acceptance_required`, looked up by
+`(election, scope, scope_id)` — a unique constraint over a surrogate `election_id` primary key,
+since `scope_id` is NULL on the platform row — seller scope overriding platform. An unset election reads as its safe value — tolerate-failure not
 elected, acceptance required — and the guard records whether it read a row or the fallback.
 
 **Rationale**: both guards were specified as reads with no source: no table, no configuration key,
@@ -1135,8 +1136,10 @@ one per transition that resets `state_entered_at`: `orders_order.resume_count`, 
 `01 §4.3` row 22, guard `resume-cap-exhausted`, baseline **5**; and
 `orders_order.amendment_count`, incremented by rows 18, 19 and 20, guard
 `amendment-cap-exhausted`, baseline **20**, owned in `04 §4.1`. No transition resets either.
-Together they bound an order at **26 state entries**, so its in-flight life is at most
-**26 × the largest configured TTL** among the expirable states. Where a TTL is unset that state is
+Together they bound an order at **31 visits to TTL-bearing states** — the first entry, one per
+capped amendment, and a hold **and** a resume per capped resume cycle — so its in-flight life is at
+most the sum of those dwells, and at most **31 × the largest configured TTL** among the expirable
+states as the coarse bound. Where a TTL is unset that state is
 **unbounded**, and that is disclosed in `07 §4.2` and alerted in `07 §3.8` rather than covered by a
 design-owned fallback.
 

@@ -33,7 +33,7 @@ Orders Workflow PRD ([`DECISIONS.md`](./DECISIONS.md) Q-04).
 
 | Requesting gear | Why it needs the target |
 |-----------------|-------------------------|
-| `orders-lifecycle` | Owns the order document and its state machine; needs Subscriptions to accept an explicit start instant, expose an overlap-presence read, and carry an order reference and a compensation cancellation reason. Needs Rating to supply a pre-subscription evaluation and an annualised TCV figure. Needs the billing chain to propagate the external reference and to answer an indicative tax read. Needs Account Management to issue verifiable delegation proof. Needs a Payments capability that does not exist. |
+| `orders-lifecycle` | Owns the order document and its state machine; needs Products to expose a version-pinned `sellable` read for the sixth adopted gate predicate. Needs Subscriptions to accept an explicit start instant, expose an overlap-presence read, and carry an order reference and a compensation cancellation reason. Needs Rating to supply a pre-subscription evaluation and an annualised TCV figure. Needs the billing chain to propagate the external reference and to answer an indicative tax read. Needs Account Management to issue verifiable delegation proof. Needs a Payments capability that does not exist. |
 | `orders-workflow` | Must consume `OrderAmended`, obtain the approval-requirement verdict for the new order version, and reflect the new version onward from `submitted`; without this the Lifecycle two-step re-approval seam stalls. |
 
 ## 2. Requirements
@@ -197,12 +197,35 @@ the reflection arrives, the order remains `submitted` and its submitted TTL cont
 The current Workflow PRD restricts verdict acquisition to `OrderSubmitted`; it therefore needs an
 amendment before this seam can be implemented. See `DECISIONS.md` Q-12.
 
+### 2.7 Products
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-lifecycle-upreq-sellable-flag-read`
+
+A **version-pinned read of the registry `sellable` flag** for a SKU or plan, resolvable at a
+`catalogVersion` the caller fixes rather than at "now", and answerable for a whole basket in one
+call. It is adopted predicate **(6)** of the submit gate, and it is **not a pricing fact**: the
+`pricing` gear publishes the adopted predicate set, but the flag is owned by `products`, which
+carries a PRD and no implementation. Until it exists the predicate is **unevaluable** and every
+submit that reaches it fails closed ([`./ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md`](./ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md)),
+which makes `products` a submit-path dependency of the **same standing as pricing** — the point
+[`./design/README.md`](./design/README.md) makes about the phase map, and the reason the ask is
+registered here rather than left in slice prose. The version pin is part of the ask, not an
+optimisation: a flag read at "now" would let the frontier advance mid-run and admit a basket under
+two different catalog versions ([`./design/03-gate-and-pin.md`](./design/03-gate-and-pin.md) §3.6
+step 3).
+
 ## 3. Priorities
 
 | Priority | Requirements |
 |----------|-------------|
-| `p1` (critical) | `…-upreq-subscription-start-instant`, `…-upreq-overlap-presence-read`, `…-upreq-compensation-cancel-reason`, `…-upreq-pre-subscription-evaluation`, `…-upreq-tcv-with-annualisation`, `…-upreq-external-reference-propagation`, `…-upreq-delegation-proof-credential`, `…-upreq-authorization-outcome`, `…-upreq-workflow-amendment-verdict` |
+| `p1` (critical) | `…-upreq-subscription-start-instant`, `…-upreq-overlap-presence-read`, `…-upreq-overlap-activation-atomicity`, `…-upreq-compensation-cancel-reason`, `…-upreq-pre-subscription-evaluation`, `…-upreq-tcv-with-annualisation`, `…-upreq-external-reference-propagation`, `…-upreq-delegation-proof-credential`, `…-upreq-authorization-outcome`, `…-upreq-workflow-amendment-verdict`, `…-upreq-sellable-flag-read` |
 | `p2` (important) | `…-upreq-order-reference-on-create`, `…-upreq-two-phase-pair-preserved`, `…-upreq-correlation-propagation`, `…-upreq-indicative-tax-read`, `…-upreq-payer-commercial-profile` |
+
+`…-upreq-overlap-activation-atomicity` and `…-upreq-overlap-presence-read` are tracked
+**separately** and both are outstanding: the presence read supplies the *read* the gate's
+pre-check needs, the activation atomicity supplies the *enforcement* on the subscription axis, and
+neither substitutes for the other (§2.1). The register above is the authoritative list of `p1`
+blockers, so an ask marked `p1` in §2 that is absent from it understates what is outstanding.
 
 Two asks are cheaper now than later for structural reasons rather than scheduling ones. The
 compensation cancel reason rides event payloads that downstream consumers key on. The start

@@ -640,7 +640,7 @@ Output: committed outcome or registered refusal
     2. [ ] - `p1` - **IF** the contribution carries no resolved overlap keys — every non-terminal row but submit and amendment: **SKIP TO** step 18, leaving the claim set untouched - `inst-skip-claims`
     3. [ ] - `p1` - Compute the **distinct** resolved key set and partition it into keys this order **already holds** an unreleased claim on and keys it does not - `inst-partition-claim-keys`
     4. [ ] - `p1` - Insert one claim row per key in the **second** partition only, offered in a **total order** — sorted — so two concurrent multi-key orders acquire in the same sequence and cannot deadlock, with `ON CONFLICT (payer_tenant_id, overlap_scope_key) WHERE released_at IS NULL DO NOTHING`, returning the inserted rows - `inst-take-claims`
-    5. [ ] - `p1` - **IF** fewer rows return than keys were offered: settle the idempotency record with `order-in-flight-for-key`, append the refused-attempt audit entry, commit, and **RETURN** that refusal — **nothing has been released, so the order still holds every claim it held on entry** - `inst-if-claim-conflict`
+    5. [ ] - `p1` - **IF** fewer rows return than keys were offered: **delete the rows sub-step 17.4 just returned** — acquisition is **all-or-none**, and `ON CONFLICT … DO NOTHING` inserts the free keys while skipping the conflicting one, so a partial insert left in place would leave a refused order holding keys it was never admitted on — then settle the idempotency record with `order-in-flight-for-key`, append the refused-attempt audit entry, commit, and **RETURN** that refusal. **Nothing acquired before this attempt has been released, so the order still holds every claim it held on entry, and nothing this attempt inserted survives it** - `inst-if-claim-conflict`
     6. [ ] - `p1` - Release this order's unreleased claims on keys **not** in the resolved set; acquisition has already succeeded, so no refusal can reach this step - `inst-release-superseded-claims`
 18. [ ] - `p1` - **IF** the row's versioning behaviour is versioning: - `inst-if-versioning-row`
     1. [ ] - `p1` - Append a new version row from the contribution, with supersedes_version set to the outgoing current version - `inst-append-version`
@@ -691,6 +691,20 @@ first — the earlier shape — committed the release along with the refusal, so
 surrendered its own key ([`../DECISIONS.md`](../DECISIONS.md) **D-86**). Partitioning also removes
 the amendment's self-collision **structurally**: a key the order already holds is never re-offered,
 so it cannot conflict with itself, and the release no longer has to come first for any reason.
+
+**The one thing that does need unwinding is the partial insert, and it is bounded.** `ON CONFLICT …
+DO NOTHING` is not all-or-none by itself: offered a free key and a taken one in the same statement,
+it inserts the free key and silently skips the taken one, and the shortfall at 17.5 is exactly that
+skip. Committing the refusal over that partial insert would leave the refused order holding a live
+claim on the free key with **no transition of its own to release it** — the order stays where it
+was, and a `draft` that is never re-submitted holds that key until its auto-void reaches 17.1. The
+key is then blocked for every other order in the meantime, which is the collision the rule exists to
+prevent, caused by the enforcement of the rule. Sub-step 17.5 therefore deletes the rows 17.4
+returned, in the same transaction, before it settles and audits. The unwind needs **no savepoint and
+no rollback**: 17.4 returns the rows it inserted, so the set to delete is known exactly, the
+transaction was never aborted (that is what `DO NOTHING` bought), and the delete is an ordinary
+statement inside it. A test **MUST** offer one conflicting key and one free key in a single
+acquisition and assert that the free key carries **no** claim row after the refusal commits.
 
 **Step 17 runs on every row, not only the acquiring ones.** Its first sub-step is the terminal
 release. That placement is load-bearing: the acquisition branch is reached only when the
@@ -1009,7 +1023,9 @@ one-in-flight-order constraint, and *exactly one* is what PRD §6.1(g) requires 
 order cap is fixed there, unlike the concurrent-**subscription** cardinality of §6.1(f), which
 Catalog or Contract may configure. A UNIQUE index expresses exactly one, so it expresses the rule
 directly ([`../DECISIONS.md`](../DECISIONS.md) D-83). The table is mutable only to set
-`released_at`; claims are never deleted.
+`released_at`; an **admitted** claim is never deleted. The one delete the design permits is the
+all-or-none unwind of `§3.6` step 17.5 — rows a single acquisition inserted before the same
+acquisition refused, removed inside that transaction — and those rows were never admitted claims.
 
 **How the collision is taken, normatively.** The claim is acquired at `§3.6` *Attempt
 Transition* **step 17**, which sits **before** the version append of step 18 and before every other
@@ -1020,10 +1036,12 @@ permanently. **This table therefore carries no foreign key to `orders_order_vers
 `order_id` and the version the claim was taken for as data, and giving it an FK would force the
 version to pre-exist the claim, which is exactly the ordering that produces the phantom version.
 
-Four further properties the mechanism depends on. Acquisition is **check-then-mutate**: step 17
-partitions the resolved keys, acquires only those the order does not already hold, refuses before
-releasing anything, and releases superseded claims only after acquisition succeeds (D-86 records
-why releasing first was wrong). Keys are offered **distinct** — two lines of one order
+Four further properties the mechanism depends on. Acquisition is **check-then-mutate** and
+**all-or-none**: step 17 partitions the resolved keys, acquires only those the order does not
+already hold, refuses before releasing anything, **deletes every row the refusing attempt inserted**
+— `ON CONFLICT … DO NOTHING` takes the free keys and skips the taken one, so without that delete a
+refused multi-key order would keep a live claim it was never admitted on — and releases superseded
+claims only after acquisition succeeds (D-86 records why releasing first was wrong). Keys are offered **distinct** — two lines of one order
 resolving to the same key are one claim, not two, because `ON CONFLICT … DO NOTHING` inserts a
 single row for a repeated key and a shortfall count would otherwise read that as a collision and
 refuse the order against itself. Keys are offered in a **total order**, so two concurrent multi-key
@@ -1044,7 +1062,8 @@ carries no resolved keys, so a release inside the acquisition branch would never
 All other in-flight transitions retain the claim. A collision refuses with
 `order-in-flight-for-key`, settled and audited in the **same** transaction — the refusal is
 decided at 17.5, before anything durable has been contributed **and before any claim has been
-released**, which is why no rollback machinery is needed to unwind it; the refusal is a **failed slice guard** in the seven-class taxonomy of `§4.1` — the
+released**, and 17.5 removes the rows its own partial insert created, which is why no rollback
+machinery is needed to unwind it; the refusal is a **failed slice guard** in the seven-class taxonomy of `§4.1` — the
 in-transaction enforcement of [`03-gate-and-pin`](./03-gate-and-pin.md) §4.2 predicate 9 — so it
 settles, audits and commits like any other guard refusal and adds no eighth class. It is therefore
 the concurrency enforcement behind the gate's friendly pre-check.

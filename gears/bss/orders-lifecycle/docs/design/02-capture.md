@@ -351,10 +351,23 @@ surfaces disagreeing about an effective date after a policy switch changes.
 
 ### 3.7 Database Schemas and Tables
 
-This slice introduces no table. It owns the content of `orders_order_line`
-(`cpt-cf-bss-orders-lifecycle-dbtable-order-line`) and contributes columns to `orders_order`,
-both specified normatively in [`01-foundation`](./01-foundation.md) §3.7. Two additions to that
-specification belong here:
+This slice introduces no table. It owns the **line content model** — the authored columns, their
+identity and their resolved date triple — and contributes columns to `orders_order`. The model is
+carried by two tables, and which one a write lands in is not a detail: **authoring writes
+`orders_draft_content`, never `orders_order_line`.** Every line insert, amendment and removal on a
+`draft` mutates that mutable, non-version-scoped table
+(`cpt-cf-bss-orders-lifecycle-dbtable-draft-content`, keyed `(order_id, line_id)`); the only other
+row authoring creates is the `orders_order_line_identity` row that records a `line_id`'s first
+appearance, which is order-scoped and so belongs to neither version. `orders_order_line`
+(`cpt-cf-bss-orders-lifecycle-dbtable-order-line`) is append-only and version-scoped, and its rows
+are produced **only** by the submit transition of
+[`03-gate-and-pin`](./03-gate-and-pin.md), which reads the draft working set, materialises it into
+**version 2**, and removes the draft rows in the same commit
+([`01-foundation`](./01-foundation.md) §3.7). The gate therefore reads `orders_draft_content`, and
+every later reader — projection, historical version read, amendment — reads `orders_order_line`.
+Without that split, "a draft is freely modifiable" and "the version chain is append-only" would
+contradict each other (§4.1). Both tables are specified normatively in
+[`01-foundation`](./01-foundation.md) §3.7; two additions to that specification belong here:
 
 - Order-scoped line identity is a **real key**: `orders_order_line_identity(order_id, line_id)` is the parent every version-scoped line row, per-line total and per-line projection references. The line row's own key remains `(order_id, version, line_id)`, so the row is version-scoped while the identity is not — and the uniqueness the projection depends on is enforced rather than asserted.
 - `orders_order_line` carries the **resolved** date triple plus the policy-switch state that governed it, so the resolution is auditable after the switch changes.

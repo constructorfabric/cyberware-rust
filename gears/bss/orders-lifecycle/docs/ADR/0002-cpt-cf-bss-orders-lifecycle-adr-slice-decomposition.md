@@ -28,7 +28,7 @@ decision-makers: BSS Orders team
 ## Context and Problem Statement
 
 The order document has eleven states, twenty-five transitions, twenty-five endpoints and two
-callers, spanning six PRD capability areas. Every capability — draft authoring, the submit gate,
+callers, spanning seven PRD capability areas. Every capability — draft authoring, the submit gate,
 amendment, preconditions, the workflow seam, hold and expiry, read and authorization — needs the
 same four guarantees over the same aggregate: authorization, idempotency, an audited transition and
 an optimistic version check.

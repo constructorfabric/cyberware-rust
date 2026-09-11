@@ -143,7 +143,7 @@ this constraint's real content rather than footnotes. The `approved` TTL is a **
 question with no code default**, so **while it is unset this order has no automatic exit at all** —
 only a caller-driven cancel retires it ([`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.5). And
 where it *is* set, the **two re-entry caps** of `07 §4.2` are what stop a hold/resume or amendment
-cycle restarting the dwell without limit, bounding the exit at `26 × the largest configured TTL`
+cycle restarting the dwell without limit, bounding the exit at `31 × the largest configured TTL`
 rather than at nothing (`../DECISIONS.md` D-90). There is no re-authorize
 operation, no payment failure event and no order-visible outcome, because there is no Payments
 capability to supply one. This is routed as [`../DECISIONS.md`](../DECISIONS.md) Q-08 — the PRD
@@ -302,8 +302,8 @@ Input: order_id, recording_actor, security_context, idempotency_key
 Output: recorded, or a registered refusal
 
 1. [ ] - `p1` - Declare four guards the engine evaluates and audits: non-terminal, **recording-path-admissible**, not-already-recorded and recording-party - `inst-ra-declare-guards`
-2. [ ] - `p1` - Resolve whether acceptance is required: from the referenced contract where present, else the platform default - `inst-ra-resolve-requirement`
-3. [ ] - `p1` - Resolve the recording-path-admissible input and the requirement source together: on the **self-service** path a separate recording is inadmissible where acceptance is not required, because the instant rode the submit commit, and the guard refuses with `acceptance-not-required-for-order`; on the **partner-placed** path the recording is admissible either way, with `requirement_source` resolving to `contract`, `platform-default` or `volunteered` (§4.1) - `inst-ra-resolve-path-admissibility`
+2. [ ] - `p1` - Resolve whether acceptance is required: from the referenced contract where present, else the platform default. **IF** neither resolves — the contracts port is unreachable, or the default lookup is unavailable — **RETURN** `acceptance-requirement-unevaluable` rather than assuming either answer, since `requirement_source` would otherwise be recorded from a guess - `inst-ra-resolve-requirement`
+3. [ ] - `p1` - Resolve the recording-path-admissible input and the requirement source together. **A standalone recording is admissible only on the `partner-placed` path**, where it is admitted whether or not acceptance is required, with `requirement_source` resolving to `contract`, `platform-default` or `volunteered` (§4.1). On the **self-service** path it is **never** admissible, and both arms carry a registered reason: where acceptance **was** required the submit commit already wrote the row as a contribution (§4.2, [`03-gate-and-pin`](./03-gate-and-pin.md) §3.6 step 15), so the not-already-recorded guard of step 4 refuses with `acceptance-already-recorded`; where it was **not** required no row is owed and this guard refuses with `acceptance-not-required-for-order`. The two arms are exhaustive over the self-service path, so no self-service order reaches step 5 and no standalone recording can conflict with the row submit wrote - `inst-ra-resolve-path-admissibility`
 4. [ ] - `p1` - Resolve the not-already-recorded guard's input by reading whether an acceptance row exists; a second attempt refuses with `acceptance-already-recorded` - `inst-ra-resolve-already-recorded`
 5. [ ] - `p1` - Record the instant as the commit time, with the recording actor and the requirement source - `inst-ra-record-instant`
 6. [ ] - `p1` - Request the state-only acceptance transition so the engine audits it and publishes OrderAcceptanceRecorded - `inst-ra-request-transition`
@@ -326,15 +326,19 @@ sequenceDiagram
     participant C as Direct Customer
     participant L as Orders Lifecycle
     C ->> L: submit (buyer is the resource tenant)
-    L ->> L: gate passes; record acceptance in the same commit
+    L ->> L: gate passes; where acceptance is required, record it in the same commit
     L -->> C: submitted, acceptance recorded
     Note over L: one commit, two facts, ONE event -<br/>OrderSubmitted carries the acceptance instant
 ```
 
 **Description**: On the self-service path the submitting party *is* the accepting party, so a
-second call would ask the buyer to agree to something they just bought. The recording is a
-contribution to the submit commit and audits with it, and the instant travels in the
-`OrderSubmitted` payload — a single event, because a single transition emits a single event.
+second call would ask the buyer to agree to something they just bought. Where acceptance is
+required, the recording is a contribution to the submit commit
+([`03-gate-and-pin`](./03-gate-and-pin.md) §3.6 step 15) and audits with it, and the instant travels
+in the `OrderSubmitted` payload — a single event, because a single transition emits a single event.
+Where it is **not** required, nothing is recorded. Either way the standalone *Record Acceptance*
+operation is inadmissible on this path (§4.2), so the acceptance row has exactly one writer and the
+two paths can never both produce one.
 
 #### Begin-fulfillment guard evaluation
 
@@ -349,10 +353,12 @@ contribution to the submit commit and audits with it, and the instant travels in
 Input: order_id, authorization_outcome, security_context
 Output: admit, admit-with-risk-flag, or a registered refusal
 
-1. [ ] - `p1` - Resolve whether acceptance is required for this order - `inst-bg-resolve-requirement`
-2. [ ] - `p1` - **IF** required **AND** no acceptance row exists: - `inst-bg-if-acceptance-missing`
+1. [ ] - `p1` - Resolve whether acceptance is required for this order: from the referenced contract where present, else the platform default - `inst-bg-resolve-requirement`
+2. [ ] - `p1` - **IF** the requirement cannot be resolved — the contracts port is unreachable, or the platform-default lookup is unavailable: - `inst-bg-if-requirement-unevaluable`
+   1. [ ] - `p1` - **RETURN** acceptance-requirement-unevaluable refusal, **before** the acceptance row is consulted. Absence of an answer is **not** "not required": an unevaluable requirement admitted as false would begin fulfillment on an order whose acceptance was never recorded, which is the one outcome `03 §2.1`'s fail-closed posture exists to prevent ([`../ADR/0003`](../ADR/0003-cpt-cf-bss-orders-lifecycle-adr-fail-closed-gate.md)). The order stays `approved` and the sibling gear retries, exactly as for `authorization-pending` - `inst-bg-return-requirement-unevaluable`
+3. [ ] - `p1` - **IF** required **AND** no acceptance row exists: - `inst-bg-if-acceptance-missing`
    1. [ ] - `p1` - **RETURN** acceptance-required-not-recorded refusal - `inst-bg-return-acceptance-missing`
-3. [ ] - `p1` - **MATCH** the authorization outcome: - `inst-bg-match-authorization`
+4. [ ] - `p1` - **MATCH** the authorization outcome: - `inst-bg-match-authorization`
    1. [ ] - `p1` - **WHEN** authorized: **RETURN** admit - `inst-bg-when-authorized`
    2. [ ] - `p1` - **WHEN** pending: **RETURN** authorization-pending refusal (the order stays `approved`) - `inst-bg-when-pending`
    3. [ ] - `p1` - **WHEN** failed: - `inst-bg-when-failed`
@@ -360,7 +366,14 @@ Output: admit, admit-with-risk-flag, or a registered refusal
       2. [ ] - `p1` - **IF** tolerate-failure is not elected: **RETURN** authorization-failed refusal - `inst-bg-if-not-tolerated`
       3. [ ] - `p1` - **RETURN** admit-with-risk-flag, to be recorded on the order and audited - `inst-bg-return-tolerated`
 
-**Description**: Pending and failed are genuinely different answers and collapsing them would
+**Description**: Step 2 is the fail-closed branch for this slice's own port. The registry carries
+`acceptance-requirement-unevaluable` (§3.3) precisely because the requirement is resolved from the
+contracts port, and `01 §3.6` *Attempt Transition* step 3.1 settles an unresolvable guard input with
+the guard's registered unevaluable reason — without an explicit branch here an implementation could
+read an unknown requirement as "not required" and admit. *Record Acceptance* (§3.6) resolves the
+same input at its step 2 and refuses with the same reason for the same reason.
+
+Pending and failed are genuinely different answers and collapsing them would
 either stall silently or provision a non-paying tenant. Neither refusal changes order state —
 the order stays `approved`, and the sibling gear retries or escalates.
 
@@ -383,15 +396,23 @@ cleared, since it records a decision taken at a moment rather than a current con
 
 **ID**: `cpt-cf-bss-orders-lifecycle-dbtable-policy-election`
 
-**Schema**: `election` enum (`tolerate_authorization_failure`, `acceptance_required`), `scope`
-enum (`platform`, `seller`), `scope_id` (null for platform scope), `elected`, `elected_by`,
-`elected_at`.
+**Schema**: `election_id` uuid (election identity), `election` enum
+(`tolerate_authorization_failure`, `acceptance_required`), `scope` enum (`platform`, `seller`),
+`scope_id` (null for platform scope), `elected`, `elected_by`, `elected_at`.
 
-**PK**: (election, scope, scope_id)
+**PK**: election_id
 
-**Constraints**: `NULLS NOT DISTINCT` on the key so a second platform row for one election is
-impossible; `scope_id` NOT NULL where `scope = 'seller'` and NULL where `scope = 'platform'`.
-Mutable — an election is a standing policy that a seller may change.
+**Constraints**: `(election, scope, scope_id)` UNIQUE **with `NULLS NOT DISTINCT`**, so a second
+platform row for one election is impossible; `scope_id` NOT NULL where `scope = 'seller'` and NULL
+where `scope = 'platform'`. Mutable — an election is a standing policy that a seller may change.
+
+The scope tuple is a **unique constraint over a surrogate key**, not the primary key, and the
+difference is load-bearing rather than stylistic: `scope_id` is NULL for the platform row, no
+primary-key column may be NULL, and `NULLS NOT DISTINCT` does not change that — it governs
+uniqueness, not nullability. Declared as the primary key, the documented platform-scoped fallback
+row could not be stored at all, and the fallback is the row every unconfigured seller reads. This
+is the same shape [`07-hold-and-expiry`](./07-hold-and-expiry.md) §3.7 gives
+`orders_state_ttl_policy` for the same reason ([`../DECISIONS.md`](../DECISIONS.md) D-28).
 
 **Additional info**: seller scope overrides platform scope. An election with no row is read as its
 safe value (tolerate-failure not elected; acceptance required), and the guard records whether it
@@ -439,9 +460,12 @@ withholding the fact ([`../DECISIONS.md`](../DECISIONS.md) D-71).
 
 ### 4.2 Acceptance on the two paths (normative)
 
-On the **self-service** path, submit by the buyer **constitutes** acceptance and **MUST** be
-recorded as such within the submit commit — as a **contribution to the submit transition**, not as
-a second transition. Only `OrderSubmitted` is published, carrying the acceptance instant in its
+On the **self-service** path, submit by the buyer **constitutes** acceptance and, **where
+acceptance is required**, **MUST** be recorded as such within the submit commit — as a
+**contribution to the submit transition** ([`03-gate-and-pin`](./03-gate-and-pin.md) §3.6 step 15),
+not as a second transition. Where it is **not** required, nothing is recorded and no row is owed;
+either way the standalone recording operation is **inadmissible** on this path (§3.6 *Record
+Acceptance* step 3), so the row has exactly one writer. Only `OrderSubmitted` is published, carrying the acceptance instant in its
 payload; `OrderAcceptanceRecorded` is published **only** on the partner-placed path. One commit
 cannot be two transition rows and cannot enqueue two outbox rows without breaking the engine's
 one-row invariant and the outbox's per-order sequence uniqueness
@@ -499,9 +523,10 @@ the risk **MUST** be flagged on the order and audited. The flag records a decisi
 instant and **MUST NOT** be cleared later.
 
 **Where the election is stored.** Both begin-fulfillment policy inputs are **policy rows, not
-code defaults**, held in `orders_policy_election` (this slice, §3.7) keyed
-`(election, scope, scope_id)` with `scope` in (`platform`, `seller`) and seller scope overriding
-platform. The two elections are `tolerate_authorization_failure` and `acceptance_required`. An
+code defaults**, held in `orders_policy_election` (this slice, §3.7), looked
+up by `(election, scope, scope_id)` — a **unique constraint** over the table's surrogate
+`election_id` key rather than the primary key itself, because `scope_id` is NULL on the platform
+row — with `scope` in (`platform`, `seller`) and seller scope overriding platform. The two elections are `tolerate_authorization_failure` and `acceptance_required`. An
 **unset** election is read as its safe value — tolerate-failure **not** elected, acceptance
 **required** — and the read is recorded so an audit can tell an explicit election from a fallback.
 This matters because the design previously specified both as reads with no source: no table, no

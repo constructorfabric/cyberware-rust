@@ -65,8 +65,10 @@ configured. The **re-entry caps** are design-owned baselines on how many times o
 restart a dwell — **5** resumes and **20** amendments, enforced as guards on those transitions
 themselves. They exist because a per-state TTL alone bounds nothing an actor can restart: both
 resume and amendment rewrite the dwell input, so either loop was an unbounded lifetime available
-to a permitted actor. With both caps in force an order makes at most **26** state entries, so its
-in-flight life is bounded by `26 × the largest configured TTL`. Where one is **not** configured, that state has no bound at all and the cap does not
+to a permitted actor. With both caps in force an order makes at most **31** visits to TTL-bearing states — the first
+entry, one per capped amendment, and a hold **and** a resume per capped resume cycle — so its
+in-flight life is bounded by `Σ TTL` over those visits, and coarsely by `31 × the largest
+configured TTL`. Where one is **not** configured, that state has no bound at all and the cap does not
 supply one — §4.2 states that residual gap rather than papering over it, which is the difference
 between these two layers and the absolute-lifetime backstop an earlier draft claimed.
 
@@ -210,7 +212,7 @@ is why `04 §4.1` owns and argues it rather than this section.
 
 **What remains unbounded, and it is a Product dependency and not a design gap to close here.**
 Where no TTL is configured for a state, that state has **no bound**: the per-state pass skips it
-(§3.6) and the re-entry caps bound restarts of a dwell that is itself unbounded, so `26 × ∞` is
+(§3.6) and the re-entry caps bound restarts of a dwell that is itself unbounded, so `31 × ∞` is
 still ∞. An earlier draft covered this with an absolute order lifetime measured from `created_at`;
 §4.2 records why that backstop was withdrawn rather than kept. Until PRD §15 row 7 is answered the
 gap is **disclosed** — surfaced as the no-configured-TTL metric and alert of §3.8 — rather than
@@ -434,17 +436,19 @@ Input: current time
 Output: expired count
 
 1. [ ] - `p1` - Acquire the singleton sweep lease; **IF** not acquired, **RETURN** without work - `inst-es-acquire-lease`
-2. [ ] - `p1` - **FOR EACH** expirable state — `submitted`, `pending_approval`, `approved`, `on_hold`: - `inst-es-for-each-state`
+1a. [ ] - `p1` - Initialize `remaining` to the sweep batch size of §4.5 — **one budget for the whole run**, not one per state and not one per seller scope - `inst-es-init-budget`
+2. [ ] - `p1` - **FOR EACH** expirable state — `submitted`, `pending_approval`, `approved`, `on_hold` — **beginning at the state after the one the previous run stopped on**, recorded with the lease, so a saturated cadence cannot starve the states behind it: - `inst-es-for-each-state`
    1. [ ] - `p1` - Resolve the TTL policy for that state at its configuration scope - `inst-es-resolve-ttl`
    2. [ ] - `p1` - **IF** no TTL is configured: increment the no-configured-TTL gauge of `§3.8` and **SKIP TO** the next state (no code default); that state has **no bound at all** this cadence, which §4.2 discloses rather than covers - `inst-es-if-no-ttl`
-   3. [ ] - `p1` - **FOR EACH** seller scope with its own policy for this state: select orders in that state, for that seller, whose `state_entered_at` is older by that seller's TTL, up to the batch size, using the `(seller_tenant_id, state, state_entered_at)` index - `inst-es-select-eligible`
-   3a. [ ] - `p1` - Then, once for the platform fallback, select orders in that state whose `state_entered_at` is older by the **platform** TTL **and whose `seller_tenant_id` has no policy of its own for this state** — the exclusion is required, not an optimisation: without it an order whose seller configured a longer TTL is selected by the platform pass and expired under the shorter one, silently overriding the override `§3.7` grants - `inst-es-select-platform-fallback`
+   3. [ ] - `p1` - **FOR EACH** seller scope with its own policy for this state: select orders in that state, for that seller, whose `state_entered_at` is older by that seller's TTL, **up to `remaining`**, using the `(seller_tenant_id, state, state_entered_at)` index; decrement `remaining` by the number selected - `inst-es-select-eligible`
+   3a. [ ] - `p1` - Then, once for the platform fallback, **up to the `remaining` the seller selections left**, select orders in that state whose `state_entered_at` is older by the **platform** TTL **and whose `seller_tenant_id` has no policy of its own for this state** — the exclusion is required, not an optimisation: without it an order whose seller configured a longer TTL is selected by the platform pass and expired under the shorter one, silently overriding the override `§3.7` grants - `inst-es-select-platform-fallback`
    4. [ ] - `p1` - **FOR EACH** selected order: - `inst-es-for-each-order`
       1. [ ] - `p1` - **IF** the state is `on_hold` **AND** its pre-hold state is `in_fulfillment`: - `inst-es-if-hold-from-fulfillment`
          1. [ ] - `p1` - **SKIP TO** the next order; this case is escalated, never expired - `inst-es-skip-exempt-hold`
       2. [ ] - `p1` - Derive a deterministic idempotency key from order and version - `inst-es-derive-key`
-      3. [ ] - `p1` - Request the expiry transition with actor class `system` - `inst-es-request-expiry`
+      3. [ ] - `p1` - Request the expiry transition with actor class `system`, passing **the version the order was selected at as `expected_version`** - `inst-es-request-expiry`
       4. [ ] - `p1` - **IF** the engine refuses as not-admissible: record and continue — the table is the authority - `inst-es-if-refused`
+   5. [ ] - `p1` - **IF** `remaining` has reached zero: record this state as the run's stopping point, raise the batch-saturation signal of `§3.8`, and **SKIP TO** step 3 — the orders not reached are expired one cadence later, which is the latency §4.2 already bounds at one cadence past the TTL - `inst-es-if-budget-exhausted`
 3. [ ] - `p1` - **RETURN** the expired count for the sweep metric - `inst-es-return-count`
 
 **Description**: The two selection steps are separate because **seller scope overrides platform
@@ -458,6 +462,28 @@ performance optimisation, not the safety mechanism — the safety mechanism is t
 `in_fulfillment` expiry row exists, so a sweep defect produces a refusal rather than an orphaned
 order. The sweep therefore has **one pass**, over `state_entered_at`, and it bounds exactly what a
 configured TTL bounds.
+
+**The batch size is a budget for the run, not a limit per query.** §4.5 sets **one** sweep batch,
+chosen to keep the run short enough not to hold aggregate locks across the cadence. Applied
+per selection it would not be that bound at all: a state with fifty seller policies plus the
+platform fallback would admit fifty-one batches in one pass, and the run would overrun the
+five-minute cadence that makes "expiry latency is one cadence past the TTL" true. Step 1a therefore
+takes the budget once and every selection spends from it, seller scopes and platform fallback
+alike. Exhausting it is **not** an error: it stops the run at a recorded state, raises the
+saturation signal §3.8 already alerts on, and the remainder expires on the next cadence. The
+rotation in step 2 exists because a fixed state order plus a shared budget would let a permanently
+saturated `submitted` starve `on_hold` indefinitely — the budget bounds the run, and the rotation
+keeps it fair.
+
+**Expiry carries the optimistic version check, because the idempotency key is not one.** Selection
+at 2.3 and the transition request at 2.4.3 are separate statements, and an order can transition
+between them — a buyer submits an amendment, an operator resumes a hold. The deterministic key of
+2.4.2 makes a **re-run** of the same attempt absorb rather than duplicate; it does not detect that
+the order has moved on, so without `expected_version` the sweep would expire a state the order is
+no longer in, off a stale read. The singleton lease does not help either: it serialises sweep
+workers against each other, not against ordinary callers. Passing the selected version makes the
+engine's version check refuse the stale attempt, which the sweep records at 2.4.4 and continues —
+the order is simply re-examined next cadence against its new `state_entered_at`.
 
 **There is deliberately no second pass.** An earlier draft added an absolute-lifetime pass
 selecting on `orders_order.created_at`; it shared one deterministic idempotency key with this pass,
@@ -629,14 +655,20 @@ cannot both observe a count below its cap. The two budgets are **separate on pur
 a seller-side operational act and an amendment a buyer-side commercial one, so a seller's
 compliance holds **MUST NOT** consume a buyer's ability to revise the order (`04 §4.1`).
 
-**What the caps actually bound, stated as arithmetic.** One state entry is bounded by that state's
-TTL, and the number of entries an order can make is bounded by `1 + 20 + 5 = 26` — the first entry
-plus the capped amendments plus the capped resumes. Therefore **an order's total in-flight life is
-at most 26 x the largest configured TTL among the expirable states.** An earlier version of this
-section claimed `(cap + 1) x TTL`, which bounded *one state's* repeated dwell and was not an upper
-bound on the order at all: an order traverses several states, each with its own TTL, and the number
-of traversals was itself unbounded while amendments were uncapped. The bound above is coarser and
-true.
+**What the caps actually bound, stated as arithmetic.** The quantity to bound is the number of
+**visits an order can make to TTL-bearing states** over a valid transition path, because one visit is
+bounded by that state's TTL and the order's life is the **sum of its visits**: `Σ TTL(state_i)` over
+the path. The caps bound the number of terms in that sum, not the terms themselves.
+
+A hold/resume cycle contributes **two** visits, not one, and that is where an earlier `1 + 20 + 5 =
+26` undercounted: hold enters `on_hold`, which is itself TTL-bearing, and resume then re-enters the
+pre-hold state. So the worst case is `1 + 20 + 5 + 5 = 31` — the first entry, plus one re-entry per
+capped amendment, plus one `on_hold` visit **and** one re-entry per capped resume. Therefore **an
+order's total in-flight life is at most `Σ TTL` over 31 visits, and at most `31 × the largest
+configured TTL` among the expirable states** as the coarse upper bound. Two earlier statements of
+this arithmetic were wrong in the same direction: `(cap + 1) × TTL` bounded *one state's* repeated
+dwell rather than the order, and `26 × TTL` counted the resume but not the hold it returns from.
+Both understated pin staleness (`03 §4.4`) and the documented in-flight lifetime.
 
 **What neither layer bounds, disclosed rather than covered.** Where a state's TTL is unset, that
 state has no bound, and the re-entry caps supply none — they multiply a dwell that is itself
@@ -658,7 +690,10 @@ amendment than its cap allows must be cancelled and re-placed, or the cap raised
 visible, audited refusal with a named reason — the property the absolute bound lacked.
 
 Expiry **MUST** be scheduler-driven and **MUST NOT** be a public operation. Its idempotency key
-**MUST** be deterministic from order and version so a re-run is absorbed rather than duplicated.
+**MUST** be deterministic from order and version so a re-run is absorbed rather than duplicated, and
+it **MUST** additionally carry the selected version as `expected_version` so an order that moved
+between selection and request is refused rather than expired off a stale read — the key absorbs a
+repeat of the same attempt, it does not detect a changed order (§3.6).
 There is **one** expiry pass, so no two passes can select one order and no key is shared.
 
 A **fail-closed park does not suspend the clock**: where the sibling gear cannot obtain an
@@ -703,6 +738,30 @@ be singleton-coordinated and **MUST NOT** touch any order past `draft`.
 
 Dwell is measured from the order's creation instant for this sweep specifically, since a `draft`
 has had no state transition since creation.
+
+**Singleton coordination is not idempotency, and the auto-void needs both.** The lease of §3.8 stops
+two replicas sweeping at once; it says nothing about the same order being swept twice, which is the
+case a lease expiring mid-batch produces. The sweep therefore carries the same three rules the
+expiry sweep of §3.6 carries, stated here because the auto-void has its own worker:
+
+* **A deterministic idempotency key.** Each auto-void attempt **MUST** derive its key from the order
+  and its current version, exactly as §3.6 step 2.4.2 does. A `draft` carries version 1
+  ([`01-foundation`](./01-foundation.md) §3.7), so the key is stable across re-runs of the same
+  order and distinct across orders, and a re-run resolves against the stored outcome rather than
+  opening a second attempt.
+* **Replay returns the stored outcome.** A second attempt under that key **MUST** be settled by
+  `01 §4.2`'s idempotent-replay path — it returns the first attempt's result and performs no second
+  transition, so a re-swept order produces neither a duplicate `OrderExpired` nor a second refusal
+  row. An order already auto-voided by an earlier pass is a terminal order, and the engine refuses
+  it as `not-admissible`; the sweep records that and continues, as §3.6 step 2.4.4 does.
+* **Lease loss is not a reason to keep working.** A worker that loses or cannot renew its lease
+  **MUST** stop before its next transition request rather than finish the batch. The keys above make
+  the successor's overlap harmless, so the two rules are complementary: the lease bounds the
+  duplicate work, the key bounds its effect.
+
+Those rules are why the auto-void is safe to run on a schedule at all, and they are the reason the
+transition is absent from the public surface ([`../DESIGN.md`](../DESIGN.md) §3.3) — there is no
+caller to supply a key, so the sweep **MUST** supply one.
 
 **Where the auto-void TTL is unset, `draft` is unbounded, and there is no fallback.** Neither
 re-entry cap applies — a `draft` is never held, resumed or amended — and the absolute-lifetime

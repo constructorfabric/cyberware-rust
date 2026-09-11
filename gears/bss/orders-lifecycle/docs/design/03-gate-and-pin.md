@@ -517,12 +517,15 @@ Output: submitted order with pin and total, or a refusal listing every failure
     1. [ ] - `p1` - Pass pin-unresolvable as the contribution so the engine audits the refusal and settles the idempotency record, exactly as step 10.1 does - `inst-gs-contribute-pin-refusal`
     2. [ ] - `p1` - **RETURN** the pin-unresolvable refusal; the order stays in `draft` - `inst-gs-return-pin-unresolvable`
 14. [ ] - `p1` - Assemble the resolved total rows and the TCV figure per §4.4 - `inst-gs-assemble-total`
-15. [ ] - `p1` - Request the submit transition, contributing pin, total, market, the resolved line dates and policy-switch state, gate outcome and the **submitting principal as the initiating actor** - `inst-gs-request-transition`
+15. [ ] - `p1` - Request the submit transition, contributing pin, total, market, the resolved line dates and policy-switch state, gate outcome and the **submitting principal as the initiating actor**; on the **self-service** path, where acceptance is required, additionally contribute the **acceptance instant** so the acceptance row lands in this same commit and `OrderSubmitted` carries it ([`05-preconditions`](./05-preconditions.md) §4.2) — it is a declared contribution to this transition, **not** a second transition and **not** a second event - `inst-gs-request-transition`
 16. [ ] - `p1` - **RETURN** the submitted order - `inst-gs-return-submitted`
 
 **Description**: Steps 6 through 11 are the all-failures contract. Every input is resolved before
 *Run Gate and Submit* step 15, so the transaction that commits `submitted` performs no network call and the pin lands
-in the same commit as the state.
+in the same commit as the state. The acceptance contribution in step 15 is the reason
+[`05-preconditions`](./05-preconditions.md) §3.6 *Record Acceptance* refuses a standalone recording
+on the self-service path at all: the instant is already in this commit, so the two paths cannot both
+write the row.
 
 #### Preview a basket
 
@@ -710,8 +713,10 @@ Known staleness is accepted, and **what bounds it is the per-state TTL and nothi
 is captured at submit and re-composed only on amendment, so it is carried unchanged through **every
 pin-retaining state** — `submitted`, `pending_approval`, `approved` and `on_hold` — and the bound is
 the sum of those dwells, not one of them. Where their TTLs are configured, `07 §4.2`'s two
-re-entry caps bound the number of entries at 26, so the outer limit on pin staleness at the moment
-fulfilment begins is **26 × the largest configured TTL among those four states**. One case is
+re-entry caps bound the number of visits at 31 — the first entry, one per capped amendment, and a
+hold **and** a resume per capped resume cycle — so the outer limit on pin staleness at the moment
+fulfilment begins is the sum of those dwells, and coarsely **31 × the largest configured TTL among
+those four states**. One case is
 outside it entirely: an `on_hold` order whose pre-hold state was `in_fulfillment` is exempt from
 automatic expiry (`07 §4.3`), so its pin has no staleness bound at all — though by then the spawn
 signal has usually issued and the pin has already been consumed downstream. **Where the TTL is unset, that limit does not exist and

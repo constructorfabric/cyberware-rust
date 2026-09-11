@@ -347,7 +347,7 @@ Authentication is terminated at the inbound gateway and the gear receives an aut
 
 **Use cases**: `cpt-cf-bss-orders-lifecycle-usecase-order-new-acquisition`
 
-**Actors**: `cpt-cf-bss-orders-lifecycle-actor-orders-partner-admin`, `cpt-cf-bss-orders-lifecycle-actor-orders-direct-customer`, `cpt-cf-bss-orders-lifecycle-actor-orders-seller-operator`
+**Actors**: `cpt-cf-bss-orders-lifecycle-actor-orders-partner-admin`, `cpt-cf-bss-orders-lifecycle-actor-orders-direct-customer`, `cpt-cf-bss-orders-lifecycle-actor-orders-seller-operator`, `cpt-cf-bss-orders-lifecycle-actor-orders-workflow`
 
 **Algorithm: Read One Order**
 
@@ -355,33 +355,52 @@ Input: order_id, security_context
 Output: the composed read view, or a registered refusal
 
 1. [ ] - `p1` - Resolve the caller's actor class and delegated scope - `inst-sr-resolve-actor`
-2. [ ] - `p1` - Load the aggregate row, whose tenant axes are the input the relationship check of step 3 is evaluated against. The row loaded here serves the authorization decision **only**: no part of it, and no fact derived from it — not its existence, not its state, not its axes — **MUST** reach a caller who fails step 3 or step 4 - `inst-sr-load-aggregate`
-3. [ ] - `p1` - **IF** no aggregate row exists for order_id **OR** the caller has no relationship to any of the order's axes: - `inst-sr-if-no-relationship`
-   1. [ ] - `p1` - Append the read access-log row: this operation, `outcome` = `refused`, `refusal_reason` = order-not-found, `requested_order_ref` = the requested identifier, `order_id` = that identifier where the row exists and NULL where it does not (§3.7), and the delegation proof reference where one was presented - `inst-sr-log-not-found`
+2. [ ] - `p1` - Load the aggregate row, whose tenant axes are the input the relationship check of step 3 is evaluated against, and where no row exists carry the fixed-shape absent-order placeholder of step 3 forward in its place. The row loaded here serves the authorization decision **only**: no part of it, and no fact derived from it — not its existence, not its state, not its axes — **MUST** reach a caller who fails step 4 or step 5 - `inst-sr-load-aggregate`
+3. [ ] - `p1` - Evaluate the relationship check **unconditionally**, on both arms: where no aggregate row exists, evaluate it against a **fixed-shape absent-order placeholder** whose axes are constants rather than skipping the evaluation, so the work the two arms perform is equivalent and the caller cannot read the distinction out of response time - `inst-sr-evaluate-relationship`
+4. [ ] - `p1` - **IF** no aggregate row exists for order_id **OR** the relationship check refused: - `inst-sr-if-no-relationship`
+   1. [ ] - `p1` - Append the read access-log row, **written identically on both arms** — same operation, same `outcome` = `refused`, same `refusal_reason` = order-not-found, same `requested_order_ref` = the requested identifier, same delegation proof reference where one was presented, and the same one row with the same index writes. `order_id` alone differs, and only because it carries a foreign key that a non-existent identifier cannot satisfy (§3.7); it is never returned to a caller and the column is not a response channel - `inst-sr-log-not-found`
    2. [ ] - `p1` - **RETURN** order-not-found, so existence is not leaked - `inst-sr-return-not-found`
-4. [ ] - `p1` - **IF** the relationship is cross-tenant **AND** no valid delegation proof is present: - `inst-sr-if-no-delegation`
+5. [ ] - `p1` - **IF** the relationship is cross-tenant **AND** no valid delegation proof is present: - `inst-sr-if-no-delegation`
    1. [ ] - `p1` - Append the read access-log row: `outcome` = `refused`, `refusal_reason` = delegation-proof-required, with `order_id` and `requested_order_ref` both carrying the requested identifier — this arm is only reachable where the row exists - `inst-sr-log-delegation-required`
    2. [ ] - `p1` - **RETURN** delegation-proof-required refusal - `inst-sr-return-delegation-required`
-5. [ ] - `p1` - Load the current version's lines with their pins and resolved total - `inst-sr-load-current-version`
-6. [ ] - `p1` - Load the per-line fulfillment projection - `inst-sr-load-projection`
-7. [ ] - `p1` - **IF** any line's quoted service-activation date precedes expected fulfillment time: - `inst-sr-if-deferred`
+6. [ ] - `p1` - Load the current version's lines with their pins and resolved total - `inst-sr-load-current-version`
+7. [ ] - `p1` - Load the per-line fulfillment projection - `inst-sr-load-projection`
+8. [ ] - `p1` - **IF** any line's quoted service-activation date precedes expected fulfillment time: - `inst-sr-if-deferred`
    1. [ ] - `p1` - Include expected fulfillment time and the per-line deferral - `inst-sr-include-deferral`
-8. [ ] - `p1` - Include the resolved total's declared exclusions - `inst-sr-include-exclusions`
-9. [ ] - `p1` - **IF** the read was cross-tenant: append the read access-log row — `outcome` = `served`, with the delegation proof reference. An **own-tenant** read appends nothing: the log exists to make the delegation-proof claim true, which is a claim about cross-tenant access only (§4.4) - `inst-sr-log-served`
-10. [ ] - `p1` - **RETURN** the composed view with the current version as the ETag - `inst-sr-return-view`
+9. [ ] - `p1` - Include the resolved total's declared exclusions - `inst-sr-include-exclusions`
+10. [ ] - `p1` - **IF** the read was cross-tenant: append the read access-log row — `outcome` = `served`, with the delegation proof reference. An **own-tenant** read appends nothing: the log exists to make the delegation-proof claim true, which is a claim about cross-tenant access only (§4.4) - `inst-sr-log-served`
+11. [ ] - `p1` - **RETURN** the composed view with the current version as the ETag - `inst-sr-return-view`
 
-**Description**: Step 3 returns not-found rather than forbidden by design: to a caller with no
+**Description**: Step 4 returns not-found rather than forbidden by design: to a caller with no
 relationship, the difference between "this order is not yours" and "no such order" is itself
 information about another tenant's activity. Its two arms — no row, and a row the caller has no
 relationship to — **MUST** be indistinguishable in the response: same reason, same body, same
 status, and no timing or error-shape difference a caller could read the distinction out of.
+
+**Indistinguishable in the response is not enough on its own, which is why step 3 is a separate
+step.** An earlier shape evaluated the relationship only where a row existed and skipped it
+otherwise, and logged `order_id` as NULL on the missing arm and as the identifier on the other. Both
+was a **side channel**: the skipped evaluation makes the missing arm measurably cheaper — an
+`account-management` scope resolution is the most expensive thing on this path — so repeated
+requests separate "no such order" from "not yours" by timing alone, however identical the two
+responses look. The two arms therefore **MUST** perform equivalent work: step 3 evaluates the
+relationship on both, against a fixed-shape placeholder where no row exists, and the result is
+discarded on the missing arm rather than not computed. The access-log row is likewise written
+identically on both arms except for `order_id`, whose foreign key a non-existent identifier cannot
+satisfy — `requested_order_ref` is the column that records the probe, deliberately carries no FK,
+and is populated on both arms (§3.7), and no part of the log reaches a caller.
+Verification is a **bounded timing-equivalence test**: the distributions for
+a non-existent identifier and an existing out-of-scope one **MUST** be statistically
+indistinguishable at the declared read-latency budget, asserted over a sample large enough to detect
+a difference smaller than one port round trip. This closes the response-shape channel the paragraph
+above closes, on the two surfaces that sit behind it (CWE-208).
 
 **Why the row is loaded before the check, and what that does not permit.** The relationship of
 step 3 is evaluated *against the order's tenant axes*, so those axes have to be read before the
 decision can be taken; there is no ordering in which an order-scoped read authorizes without
 resolving the row it is scoped to. The aggregate row loaded at step 2 is therefore an input to the
 authorization decision and nothing else — it is **never** returned, in whole or in part, to a
-caller who fails step 3 or step 4, and §4.2's exposure rules apply only from step 5 onward. This is
+caller who fails step 4 or step 5, and §4.2's exposure rules apply only from step 6 onward. This is
 what §4.3's requirement that the evaluator runs "before any part of the store is disclosed" means
 on this path: nothing is disclosed before authorization, and the pre-decision load is confined to
 the row whose axes the decision is taken against.
@@ -392,7 +411,7 @@ the row whose axes the decision is taken against.
 
 **Use cases**: `cpt-cf-bss-orders-lifecycle-usecase-order-new-acquisition`
 
-**Actors**: `cpt-cf-bss-orders-lifecycle-actor-orders-partner-admin`, `cpt-cf-bss-orders-lifecycle-actor-orders-seller-operator`
+**Actors**: `cpt-cf-bss-orders-lifecycle-actor-orders-partner-admin`, `cpt-cf-bss-orders-lifecycle-actor-orders-direct-customer`, `cpt-cf-bss-orders-lifecycle-actor-orders-seller-operator`, `cpt-cf-bss-orders-lifecycle-actor-orders-workflow`
 
 **Algorithm: List Orders**
 
@@ -454,7 +473,7 @@ carries no internal diagnostics.
 paths.** A **cross-tenant** audit read **MUST** append its `orders_read_access_log` row —
 `operation` = the audit read, `outcome` = `served`, with the delegation proof reference — and that
 row **MUST** be committed **before** the trail is returned. A refused audit read appends its row on
-exactly the terms of *Read One Order* steps 3.1 and 4.1, including the `requested_order_ref` rule of
+exactly the terms of *Read One Order* steps 4.1 and 5.1, including the `requested_order_ref` rule of
 §3.7 for an order that does not exist. An **own-tenant** audit read appends nothing, per §3.7. Of all
 the read surfaces this is the one where the omission mattered most: the audit trail is the widest
 disclosure the gear makes, and an unlogged cross-tenant read of it would leave the §4.4 claim —
@@ -502,7 +521,7 @@ only for a list call), `actor`, `actor_class`, `operation`, `outcome` (`served` 
 **Indexes**: `(accessed_at)` for the 90-day purge; `(order_id, accessed_at)` for the per-order access history a review asks for; `(requested_order_ref, accessed_at)`, which is the one that answers "who has been asking for orders that do not exist".
 
 **Constraints**: append-only; FK on `order_id` to `orders_order` where present. Written by the read
-paths — by §3.6 *Read One Order* steps 3.1, 4.1 and 9, *List Orders* step 6, and by the audit read
+paths — by §3.6 *Read One Order* steps 4.1, 5.1 and 10, *List Orders* step 6, and by the audit read
 of §3.6 *Audit retrieval* on the same served-and-refused pattern — and the reason it exists at all:
 reads register no transition, so the audit store
 cannot record them, and a cross-tenant read with no record would make the delegation-proof audit
@@ -511,7 +530,7 @@ claim untrue ([`../DECISIONS.md`](../DECISIONS.md) D-35).
 **Why `order_id` and `requested_order_ref` are both there.** They are not redundant, and the
 not-found refusal is the case that forces the distinction. `order_id` is the foreign-key column: it
 can hold only an identifier that names a real `orders_order` row, so on the missing-aggregate arm of
-*Read One Order* step 3 it **MUST** be NULL — writing the requested identifier there would violate
+*Read One Order* step 4 it **MUST** be NULL — writing the requested identifier there would violate
 the FK and cost the refusal its log row entirely, which is the one row a probe should always leave.
 `requested_order_ref` is a plain value column and therefore records what was asked for without
 asserting that it exists. The resulting representation is exact in all four shapes: a list call has
