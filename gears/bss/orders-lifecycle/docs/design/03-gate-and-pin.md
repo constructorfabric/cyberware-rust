@@ -164,16 +164,12 @@ carries a **deadline**. Five of the six sit on the submit path; the indicative-t
 | **Submit budget** (five ports; tax not invoked) | **1.5 s** |
 | **Preview budget** (all six) | **1.75 s** |
 
-**Every deadline above is per port per run, not per line, and that is a requirement on the call
-shape rather than an observation.** A port whose input scales with the basket — catalog
-predicates, price evaluation, overlap presence and pin composition all do — **MUST** be invoked
-**once per run with the whole line set**, and **MUST NOT** be invoked once per line. The line cap
-of **200** ([`02-capture`](./02-capture.md) §3.7) is set on the assumption that a capped basket
-resolves inside the 250 ms catalog deadline, and that assumption is only true of a batched call:
-per-line invocation would need 1.25 ms round trips to hold, which no network port achieves. Stating
-the cap without stating the call shape left the two consistent only by accident, and an
-implementation that fans out per line would miss the budget at a fraction of the cap while
-satisfying every other rule in this slice.
+**Every deadline above is per port per run, not per line.** A port whose input scales with the
+basket — catalog predicates, price evaluation, overlap presence and pin composition all do —
+**MUST** be invoked **once per run with the whole line set**, and **MUST NOT** be invoked once per
+line. The line cap of **200** ([`02-capture`](./02-capture.md) §3.7) fits the 250 ms catalog
+deadline only under a batched call; per-line invocation would need 1.25 ms round trips
+([`../DECISIONS.md`](../DECISIONS.md) **D-94**).
 
 This budget covers **port resolution only**, which completes before the transaction opens. The
 PRD's `p95 < 1 s` is scoped to the commit — the durable write and event publish — so the two are
@@ -233,15 +229,20 @@ that upstream enforcement is agreed — the same seam as the `SUB-O5` presence r
 against it in [`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) — **the subscription axis is open, and
 this design does not bound it.** That is the honest statement and it replaces an earlier one.
 
-**Why no timed window is stated.** An earlier version of this section gave the proceed verdict a
-30-second validity window, required the sibling gear to dispatch inside it or re-invoke, and called
-the result "bounded rather than closed". Four things were wrong with it, and each is a reason not
-to restate the bound in some other duration:
-
-* **Nothing carries the deadline.** `§3.6` *Re-check Activation Preconditions* returns "proceed, or a per-line rejection reason" to its caller. A validity origin and a window are not fields of any declared port operation, event payload or endpoint response in this design set, and the transition the caller then drives — `spawn-signal`, [`01-foundation`](./01-foundation.md) §4.3 row 12 — is deliberately event-less. There is therefore no interface through which this gear tells anyone the verdict has expired.
-* **"Invoke the algorithm again" is not an obligation this gear can place.** The re-check is invoked by Subscriptions' caller at its own discretion; this slice publishes no signal that would trigger a re-invocation and observes no failure if none happens. A **MUST** with no observable violation is not a requirement.
-* **One verdict cannot cover N activations.** The design's own sequence puts an entire fulfillment wave between the re-check and the last line's activation — the two-phase barrier of [`06-workflow-seam`](./06-workflow-seam.md) §4.3 explicitly defers lines. A single window measured from one read instant says nothing about the line activated last, and per-line windows would need per-line re-checks the sequence does not contain.
-* **There is no shared clock to measure it against.** The origin instant would be read in this gear and the deadline evaluated in another, with no declared clock source, no skew bound and no way for either side to detect that it disagreed. Both skew directions fail silently: one lets an expired verdict be honoured, the other discards a valid one. The gate's own circuit breaker (§2.2, held open for **10 seconds**) would consume a third of a 30-second window on its own.
+**Why no timed window is stated.** An earlier version gave the proceed verdict a 30-second
+validity window and called the result "bounded rather than closed". Two of its four faults are
+design constraints a reader needs here, because they are why no *other* duration would work
+either. **Nothing carries the deadline**: `§3.6` *Re-check Activation Preconditions* returns
+"proceed, or a per-line rejection reason" to its caller, no declared port operation, event payload
+or endpoint response carries a validity origin, and the transition the caller then drives —
+`spawn-signal`, [`01-foundation`](./01-foundation.md) §4.3 row 12 — is deliberately event-less. And
+**one verdict cannot cover N activations**: the two-phase barrier of
+[`06-workflow-seam`](./06-workflow-seam.md) §4.3 puts an entire fulfillment wave between the
+re-check and the last line's activation, so a window measured from one read instant says nothing
+about the line activated last. The other two faults — that "re-invoke the re-check" places a
+**MUST** on a party this gear cannot signal, and that the origin and the deadline would be
+evaluated on two gears' clocks with no declared skew bound — are recorded in
+[`../DECISIONS.md`](../DECISIONS.md) **D-89**.
 
 **What is actually true, and enforceable.** The order axis is closed, in-transaction, by the index
 named above. On the subscription axis two obligations remain and both are expressible. Subscriptions
@@ -253,9 +254,9 @@ one:
 * **Before the `active` commit** — the collision is found by this slice's re-check, or by Subscriptions ahead of its own commit. It is a **per-line rejection** and a **pre-activation abort**: no subscription was ever activated, so the compensation evidence is satisfiable by construction and records only the voided wave-1 drafts ([`06-workflow-seam`](./06-workflow-seam.md) §4.3).
 * **After the `active` commit** — the collision is found once a subscription already exists. It is **not** a line rejection: the subscription is active, and reporting it as rejected would model one subscription as simultaneously active and refused, which no downstream consumer can reconcile. It is a **fulfillment failure**, and the acknowledgement **MUST NOT** be accepted unless its compensation evidence shows every activated subscription rolled back (§4.4 of the seam slice already requires the evidence to assert that no active subscription remains).
 
-`overlap-collision` is the failure reason in both cases; what differs is the outcome it is carried
-on. An earlier version of this section said a collision "at or after activation" was a line
-rejection, which collapsed the two and described the second case wrongly. The re-check remains valuable as an
+`overlap-collision` is the failure reason in both cases; what differs is the outcome carrying it.
+Collapsing the two — reporting a post-activation collision as a line rejection — would model one
+subscription as simultaneously active and refused. The re-check remains valuable as an
 **early abort** — it catches collisions that already exist and saves the provisioning work — and it
 is specified as exactly that, with no admission guarantee attached
 ([`../DECISIONS.md`](../DECISIONS.md) D-89).
@@ -699,14 +700,11 @@ re-pin as part of its own commit.
 **One catalog version governs a whole submit.** The pin-eligibility frontier is read **once**, at
 `§3.6` *Run Gate and Submit* step 3, and the resulting `catalog_version` **MUST** govern every
 catalog-facing resolution in that run — the adopted predicates, the price evaluation that produces
-the resolved total, and the pin itself. No step **MAY** re-read the frontier, and an advance of the
-frontier mid-run **MUST NOT** be picked up. Without this rule the algorithm resolves the total at
-step 4 and composes the pin at step 12, and the frontier can advance between them well inside the
-1.5 s budget — the pricing gear publishes the frontier with an advance instant precisely because it
-moves. The order would then commit a total evaluated at one version and a pin frozen at another,
-with nothing on the document saying so. That is not a money defect, because the total is
-non-authoritative either way; it is a defect in the commercial record, which is the artifact this
-gear exists to be. The same rule binds an amendment's re-pin and re-evaluation to one version.
+the resolved total, and the pin itself. No step **MAY** re-read the frontier, and an advance mid-run
+**MUST NOT** be picked up. The same rule binds an amendment's re-pin and re-evaluation. Without it
+the total resolves at step 4 and the pin at step 12, the frontier advances between them well inside
+the 1.5 s budget, and the order commits a total evaluated at one version against a pin frozen at
+another ([`../DECISIONS.md`](../DECISIONS.md) **D-93**).
 
 Known staleness is accepted, and **what bounds it is the per-state TTL and nothing else**. The pin
 is captured at submit and re-composed only on amendment, so it is carried unchanged through **every
@@ -718,9 +716,9 @@ outside it entirely: an `on_hold` order whose pre-hold state was `in_fulfillment
 automatic expiry (`07 §4.3`), so its pin has no staleness bound at all — though by then the spawn
 signal has usually issued and the pin has already been consumed downstream. **Where the TTL is unset, that limit does not exist and
 a pin can be arbitrarily stale**, which is this slice's share of the gap `07 §4.2` discloses and
-`DECISIONS.md` Q-27 routes. An earlier version of this paragraph named an absolute order lifetime
-as the backstop covering the unset case; that bound is withdrawn (D-90), and nothing replaced it,
-so the staleness question returns to Q-06 unanswered rather than bounded by a design-owned value. PRD §16 additionally asks for an acceptable staleness window to be
+`DECISIONS.md` Q-27 routes. The absolute-lifetime backstop that once covered the unset case is
+withdrawn (D-90) and nothing replaced it, so the staleness question returns to Q-06 unanswered
+rather than bounded by a design-owned value. PRD §16 additionally asks for an acceptable staleness window to be
 documented in the NFR workshop; that is routed as Q-17 rather than dropped. If the catalog
 publishes a change after submit, the
 pinned rows are stale relative to the newest version and the customer binds to the pinned rows.
