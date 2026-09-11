@@ -1085,7 +1085,7 @@ Atomicity is unreachable from this gear because the committing transaction belon
 An earlier version of this decision bounded the gap on three terms, the first being a **30-second
 verdict validity window**. It is withdrawn, because the window was not implementable from anything
 this design declares. No port operation, event payload or endpoint response carries a validity
-origin or a deadline, and the transition the caller then drives — `spawn-signal`, `01 §4.3` row 11
+origin or a deadline, and the transition the caller then drives — `spawn-signal`, `01 §4.3` row 12
 — is event-less, so the expiry could not be communicated. "Re-invoke the re-check" placed a
 **MUST** on a party this gear cannot signal and whose violation it cannot observe. The design's own
 two-phase barrier puts a whole fulfillment wave between the read and the last line's activation, so
