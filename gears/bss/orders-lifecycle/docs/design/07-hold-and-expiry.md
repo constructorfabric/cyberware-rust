@@ -459,21 +459,13 @@ performance optimisation, not the safety mechanism — the safety mechanism is t
 order. The sweep therefore has **one pass**, over `state_entered_at`, and it bounds exactly what a
 configured TTL bounds.
 
-**There is deliberately no second pass, and an earlier draft had one.** That draft added an
-absolute-lifetime pass selecting on `orders_order.created_at`, to close the hold/resume loop and to
-cover states whose TTL is unset. It is withdrawn because it could not do either, and §4.2 records
-the reasoning in full. The mechanical half belongs here: the second pass was specified to derive
-the **same** deterministic idempotency key as this pass, from order and version, so that an order
-both selected would expire once. But a refusal **settles** its record and replays under that key
-([`../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md`](../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md)),
-and the key was invariant in the order's version — so a per-state attempt refused as not-admissible
-settled that refusal under the shared key, and every subsequent absolute-pass request for the same
-order and version **replayed the refusal instead of attempting**, for the whole idempotency window.
-The backstop was inert for precisely the orders something had already gone wrong with, and the
-inertness was invisible: a replayed refusal and a genuine refusal are the same response. Deriving
-distinct keys would have fixed the replay and reintroduced the double-expiry the shared key
-existed to prevent. The loop is closed at `resume` instead (§4.2), which needs no second pass and
-therefore no key to share.
+**There is deliberately no second pass.** An earlier draft added an absolute-lifetime pass
+selecting on `orders_order.created_at`; it shared one deterministic idempotency key with this pass,
+and because a refusal settles and replays under its key, a per-state attempt refused as
+not-admissible made every later absolute-pass request replay that refusal instead of attempting.
+The backstop was inert for exactly the orders something had already gone wrong with.
+[`../DECISIONS.md`](../DECISIONS.md) **D-90** carries the reasoning; the restart bound lives on
+`resume` and `amendment` instead, which needs no second pass and therefore no key to share.
 
 #### Overdue escalation handoff
 
@@ -549,13 +541,11 @@ order state from the audit store. A resumed order restarts its **per-state** bou
 sets that column. The same column serves the "in this state since" list filter, so the two slices
 no longer specify opposite sources for one fact ([`../DECISIONS.md`](../DECISIONS.md) D-22).
 
-**The restart bound needs no dwell input and no index.** `orders_order.resume_count`
-([`01-foundation`](./01-foundation.md) §3.7) is read by the resume guard on the aggregate row the
-transition has already loaded and locked, so the cap costs no scan, no second sweep pass and no
-composite index. That is the practical difference from the withdrawn absolute bound, which needed
-a `(state, created_at)` composite the existing `(seller_tenant_id, state, state_entered_at)` and
-`(resource_tenant_id, state, state_entered_at)` indexes do not serve — an index this slice
-requested in `01 §3.7`'s canonical list and no longer needs.
+**The restart bounds need no dwell input and no index.** `orders_order.resume_count` and
+`amendment_count` ([`01-foundation`](./01-foundation.md) §3.7) are read by their guards on the
+aggregate row the transition has already loaded and locked, so the caps cost no scan, no second
+sweep pass and no composite index — unlike the withdrawn absolute bound, which needed a
+`(state, created_at)` composite that `01 §3.7` no longer carries (D-90).
 
 ### 3.8 Deployment Topology
 
@@ -609,12 +599,10 @@ point and why the absolute-lifetime backstop was withdrawn.
 
 ### 4.2 Bounded lifetime (normative)
 
-Bounded lifetime is delivered in **two layers**, and neither is unconditional. Stating that
-plainly is the point: an earlier text claimed every in-flight state has a bounded lifetime while
-§3.7 and §4.5 permitted a TTL to be unset and merely monitored, and only one of those two could be
-true. A later text closed the contradiction by asserting an absolute backstop that could not
-fire. What follows is the third statement and the first honest one — the two layers together
-bound every order whose states have configured TTLs, and disclose the orders they do not bound.
+Bounded lifetime is delivered in **two layers**, and **neither is unconditional** — which is the
+point of stating them separately. Together they bound every order whose states have configured
+TTLs, and disclose the orders they do not bound. Two earlier statements of this section got it
+wrong in opposite directions, and D-90 records both.
 
 **Layer 1 — the per-state TTL, which holds only where it is configured.** A configurable TTL
 **MAY** be set per state for `submitted`, `pending_approval`, `approved` and `on_hold`. Where a
@@ -660,20 +648,14 @@ above, its precondition (a configured TTL), and the visibility of the preconditi
 (§3.8's no-configured-TTL alert). Closing the residual gap is PRD §15 row 7, a Product decision,
 and this design **MUST NOT** pre-empt it with a code default (§2.2).
 
-**Why the resume cap rather than an absolute order lifetime.** An earlier version of this section
-made Layer 2 an **absolute lifetime measured from `orders_order.created_at`** — attractive because
-it is a property of a column nothing writes after creation, so it needs no counter to maintain
-correctly. It is withdrawn for four reasons, and each is a reason not to restore it in another
-form:
-
-* **It could not fire where it mattered.** Its enforcement was a second sweep pass sharing one deterministic idempotency key with the per-state pass, so that an order both selected would expire once. But refusals settle and replay under their key ([`../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md`](../ADR/0005-cpt-cf-bss-orders-lifecycle-adr-refusals-commit.md)), and the key was invariant in the order's version — so a per-state attempt refused as not-admissible settled that refusal, and every later absolute-pass request for the same order and version replayed it instead of attempting. The backstop went inert for exactly the orders something had already gone wrong with, and a replayed refusal is indistinguishable from a fresh one. §3.6 records the mechanics.
-* **It did not close the loop it was created for.** The hold an operator can cycle indefinitely is the one taken from `in_fulfillment`, and §4.3 exempts that from both layers. The absolute bound never applied to the case that motivated it.
-* **It pre-empted orders nobody was cycling.** A single gear-level duration cannot distinguish an order abandoned on day one from an enterprise order legitimately awaiting a slow approval; both were expired at the same instant. The cap cannot make that mistake, because an order nobody resumes never approaches it.
-* **Its value had no basis.** 90 days was a design-owned number for a commercial policy, with no PRD requirement behind it, raised as `DECISIONS.md` Q-27. A count of restarts is a mechanical property of the loop being closed, not a commercial policy, so this design can own it.
-
-The cap's own cost, stated plainly: an order that legitimately needs one more resume than the cap
-allows must be cancelled and re-created, or the cap raised. That is a visible, audited refusal
-with a named reason — which is the property the absolute bound lacked.
+**Why re-entry caps rather than an absolute order lifetime.** An earlier version of this section
+made Layer 2 an absolute lifetime measured from `orders_order.created_at`. It is withdrawn on four
+grounds — it could not fire where it mattered, it did not close the loop it was created for, it
+pre-empted orders nobody was cycling, and its value had no PRD basis — each recorded in
+[`../DECISIONS.md`](../DECISIONS.md) **D-90**, which is the single home for that argument. The cost
+of the caps, stated here because it is caller-visible: an order needing one more resume or
+amendment than its cap allows must be cancelled and re-placed, or the cap raised. That is a
+visible, audited refusal with a named reason — the property the absolute bound lacked.
 
 Expiry **MUST** be scheduler-driven and **MUST NOT** be a public operation. Its idempotency key
 **MUST** be deterministic from order and version so a re-run is absorbed rather than duplicated.
@@ -722,13 +704,12 @@ be singleton-coordinated and **MUST NOT** touch any order past `draft`.
 Dwell is measured from the order's creation instant for this sweep specifically, since a `draft`
 has had no state transition since creation.
 
-**Where the auto-void TTL is unset, `draft` is unbounded, and there is no fallback.** An earlier
-version had this sweep fall back to the absolute order lifetime of §4.2; that bound is withdrawn
-(§4.2 states why) and nothing replaced it, because neither re-entry cap applies — a `draft` is
-never held, resumed or amended. `draft` is therefore the state with the largest exposure to an unanswered
-Product value: baskets accumulate until the auto-void TTL of §4.5 is chosen. This is the same
-disclosure §4.2 makes for the other states, and the same §3.8 alert covers it. It is **not** closed
-by a code default, per §2.2, and closing it is `../DECISIONS.md` Q-07.
+**Where the auto-void TTL is unset, `draft` is unbounded, and there is no fallback.** Neither
+re-entry cap applies — a `draft` is never held, resumed or amended — and the absolute-lifetime
+backstop that once covered this case is withdrawn (D-90). `draft` is therefore the state with the
+largest exposure to an unanswered Product value: baskets accumulate until the auto-void TTL of
+§4.5 is chosen. The §3.8 alert covers it, no code default closes it (§2.2), and
+[`../DECISIONS.md`](../DECISIONS.md) **Q-07** is where it is answered.
 
 ### 4.5 Policy values (open)
 
@@ -761,13 +742,12 @@ idempotency-key window is **24 hours**, settled in [`01-foundation`](./01-founda
 | **Resume cap** | **5** resumes per order | Layer 2 of §4.2, enforced as a guard on `01 §4.3` row 22 against `orders_order.resume_count`, which no transition resets. It bounds a **count**, not a duration, so it pre-empts no per-state TTL Product later chooses whatever that value turns out to be — which is why this design can own it while the durations stay open. Five is set from the operational shape the loop has: a compliance or dispute hold that genuinely needs re-taking more than five times on one order is an escalation, not a workflow, and the sixth attempt refuses with `resume-cap-exhausted` and says so on the audit trail. A deployment **MAY** raise or lower it and **MUST NOT** unset it; there is no "unlimited" value |
 
 Leaving the Product-owned values unset means an unconfigured state is **not swept at all**, and
-orders in it **do not expire**. That is stated without softening: the re-entry caps bound restarts
-of a dwell, so where the dwell has no bound the total has none either, and an earlier version of
-this section claimed an absolute lifetime made the bound's *tightness* the only casualty. §4.2
-records why that claim was withdrawn. The failure mode is instead made **visible** — the
-no-configured-TTL gauge and its production alert (§3.8), which fire on the condition itself rather
-than on orders eventually reaching a backstop — which is preferable to a code default silently
-becoming the platform answer, and honest about what is at stake in answering PRD §15 row 7.
+orders in it **do not expire**. Stated without softening: the re-entry caps bound restarts of a
+dwell, so where the dwell has no bound the total has none either. The failure mode is made
+**visible** instead — the no-configured-TTL gauge and its production alert (§3.8) fire on the
+condition itself rather than on orders eventually reaching a backstop — which is preferable to a
+code default silently becoming the platform answer, and honest about what is at stake in answering
+PRD §15 row 7.
 
 ### 4.6 The ordinary cancel operation (normative)
 
