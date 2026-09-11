@@ -63,6 +63,10 @@
   - [D-88 (H) The idempotency key is scoped by authorized principal *(closes an IDOR finding)*](#d-88-h-the-idempotency-key-is-scoped-by-authorized-principal-closes-an-idor-finding)
   - [D-89 (M) The subscription axis of the overlap rule is disclosed as open, not bounded by a timed window](#d-89-m-the-subscription-axis-of-the-overlap-rule-is-disclosed-as-open-not-bounded-by-a-timed-window)
   - [D-90 (H) Bounded lifetime is a per-state TTL plus two re-entry caps, and the residual gap is disclosed](#d-90-h-bounded-lifetime-is-a-per-state-ttl-plus-two-re-entry-caps-and-the-residual-gap-is-disclosed)
+  - [D-91 (H) No table in this gear is partitioned *(closes a defect found in the 2026-09-11 buildability review)*](#d-91-h-no-table-in-this-gear-is-partitioned-closes-a-defect-found-in-the-2026-09-11-buildability-review)
+  - [D-92 (H) The audit-chain verifier is a declared worker, not an assumed job *(closes a defect found in the 2026-09-11 buildability review)*](#d-92-h-the-audit-chain-verifier-is-a-declared-worker-not-an-assumed-job-closes-a-defect-found-in-the-2026-09-11-buildability-review)
+  - [D-93 (H) One catalog version governs a whole submit *(closes a defect found in the 2026-09-11 buildability review)*](#d-93-h-one-catalog-version-governs-a-whole-submit-closes-a-defect-found-in-the-2026-09-11-buildability-review)
+  - [D-94 (M) Ports that scale with the basket are called once per run *(closes a defect found in the 2026-09-11 buildability review)*](#d-94-m-ports-that-scale-with-the-basket-are-called-once-per-run-closes-a-defect-found-in-the-2026-09-11-buildability-review)
 - [Open questions](#open-questions)
 - [Traceability](#traceability)
 
@@ -95,7 +99,7 @@ entry carries the same three fields either way; only the room given to the ratio
 resolve the 74 findings of the **2026-09-08 review wave** (`R-01`…`R-74`),
 whose finding ids (`R-nn`) are cited per entry; D-58…D-60 come from the verification passes over
 that remediation, which found two decisions asserted but not fully applied; D-61…D-90 come from
-the 2026-09-09 and 2026-09-10 waves and from the review of PR #4775. **Thirty items are
+the 2026-09-09 to 2026-09-11 waves and from the review of PR #4775. **Thirty items are
 routed as open questions** (`Q-01`…`Q-30`), of which twenty-six are routed and unanswered — Q-10
 is out of this gear's scope, and Q-02 and Q-14 are closed by design decisions.
 
@@ -111,7 +115,7 @@ is out of this gear's scope, and Q-02 and Q-14 are closed by design decisions.
 | F. Ownership and inventory | D-36…D-38 | [H] ×1, [M] ×2 | decided (autonomous) — resolves R-43…R-51, R-74 |
 | G. Non-functional posture | D-39…D-55 | [H] ×10, [M] ×5, [L] ×2 | decided (autonomous, working baselines) — resolves R-52…R-67 |
 | H. PRD fidelity | D-56…D-74 | [H] ×10, [M] ×9 | decided; §15 rows and PRD-wording asks routed to owners |
-| I. Slice-local calls | D-75…D-90 | [H] ×8, [M] ×8 | decided; D-79 is a historical see-D-74 stub; **D-82…D-90 sit outside the area table**, each carrying its own full entry below |
+| I. Slice-local calls | D-75…D-94 | [H] ×11, [M] ×9 | decided; D-79 is a historical see-D-74 stub; **D-82…D-94 sit outside the area table**, each carrying its own full entry below. D-91…D-94 record decisions taken in the 2026-09-11 review round whose only home had been the slice prose they govern |
 | Open questions | Q-01…Q-30 | — | 26 routed and unanswered; Q-10 out of scope for this gear; Q-02, Q-13 and Q-14 closed without a Product decision (D-84; the PRD's own reason-phrase usage; a design correction) |
 
 ## A. Foundational shape
@@ -1182,6 +1186,77 @@ long-lived one.
 and *Hold Then Resume*, `§3.7`, `§3.8`, `§4.1`, `§4.2`, `§4.3`, `§4.4`, `§4.5`, `§5`;
 `01 §3.7` `orders_order` schema and index list, `§3.6` steps 20.4 and 21, `§4.3` rows 18, 19, 20
 and 22; `04 §3.3`, `§3.6`, `§4.1`; `03 §4.3`; `05 §2.2`; `DESIGN.md` §3.2 and §4.2.
+
+### D-91 (H) No table in this gear is partitioned *(closes a defect found in the 2026-09-11 buildability review)*
+
+**Decision**: no table is range-partitioned. The read access log and Preview gate outcomes are
+purged row-wise by the **retention purge sweep**, through the partial indexes their own tables
+declare (`08 §3.7`, `03 §3.7`). `orders_transition_audit` is likewise unpartitioned, and
+`orders_event_outbox` is unpartitioned for the separate reason D-87 records.
+
+**Rationale**: an earlier `01 §3.7` range-partitioned the two traffic-driven append-only stores by
+month so retention would be a partition drop. Three independent faults.
+
+* It **contradicted both owning slices**, each of which declares a row-level purge against an index it names. A table's owner is authoritative over its own retention mechanism, and this paragraph was the only statement claiming otherwise.
+* **A monthly partition cannot express a 7-day retention.** Preview outcomes are kept 7 days, and no month contains only rows older than a week — so the scheme was not merely coarser, it was unable to implement its own declared window.
+* **Nothing created the partitions.** No declared worker managed them, and a range-partitioned table with no partition covering the current month **rejects every insert**. For the read access log that is not degraded service: the audit read's access-log write is fail-closed (`08 §4.2`), so every audit read would have begun failing at midnight on the first of the month.
+
+A sixth worker to manage partitions was the alternative and buys nothing the two index-driven
+purges already deliver.
+
+**Propagated**: `01 §3.7` *Partitioning*; `ADR/0006` Consequences.
+
+### D-92 (H) The audit-chain verifier is a declared worker, not an assumed job *(closes a defect found in the 2026-09-11 buildability review)*
+
+**Decision**: the **audit-chain verifier** is the gear's sixth lease-coordinated worker. Scope is
+**per order**, walked in a rolling pass. Cadence is a full pass within a design-owned window,
+baseline **30 days**. A mismatch **alerts and MUST NOT repair** — the verifier holds only the audit
+role's SELECT. It **MUST** skip refused rows, whose NULL `sequence` joins no chain, and **MUST**
+consult the erasure record of `DESIGN.md` §4.3 so a declared chain re-derivation is not reported as
+tampering while an undeclared one still is.
+
+**Rationale**: `01 §3.7` required the predecessor-hash chain to be verified periodically and
+`§3.8` already alerted on "any chain-verification mismatch" — while naming five workers, none of
+them the verifier. `DESIGN.md` §4.2's threat model answers audit tampering with *the chain plus the
+absent UPDATE grant*, so that mitigation rested on work nobody owned; a chain nothing checks
+detects nothing. Per-order scope is forced by the chain being per-order and by the committed trail
+reaching the order of billions of rows inside the 24-month tier, which no single-pass verification
+survives. The no-repair posture is the only one consistent with the trail being evidence rather
+than state.
+
+**Propagated**: `01 §3.4`, `§3.7`, `§3.8`; `DESIGN.md` §3.7 inventory, §4.2, §4.3.
+
+### D-93 (H) One catalog version governs a whole submit *(closes a defect found in the 2026-09-11 buildability review)*
+
+**Decision**: the catalog **pin-eligibility frontier** is read once, at `03 §3.6` *Run Gate and
+Submit* step 3, and the resulting `catalog_version` governs every catalog-facing resolution in that
+run — the adopted predicates, the price evaluation producing the resolved total, and the pin. No
+step **MAY** re-read the frontier and an advance mid-run **MUST NOT** be picked up. The same rule
+binds an amendment's re-pin and re-evaluation.
+
+**Rationale**: the algorithm resolved the total at step 4 and composed the pin at step 12 with
+nothing binding them to one version, and the pricing gear publishes the frontier with an advance
+instant *precisely because it moves* — well inside the 1.5 s submit budget. An order could commit a
+total evaluated at one version and a pin frozen at another, with nothing on the document saying so.
+Not a money defect, since the total is non-authoritative either way; a defect in the **commercial
+record**, which is the artifact this gear exists to be.
+
+**Propagated**: `03 §3.6` *Run Gate and Submit* steps 3, 4 and 12, `§4.3`.
+
+### D-94 (M) Ports that scale with the basket are called once per run *(closes a defect found in the 2026-09-11 buildability review)*
+
+**Decision**: every port deadline in `03 §2.2` is **per port per run, not per line**. A port whose
+input scales with the basket — catalog predicates, price evaluation, overlap presence, pin
+composition — **MUST** be invoked once with the whole line set and **MUST NOT** be invoked per line.
+
+**Rationale**: the 200-line cap is justified as fitting the 250 ms catalog deadline, which holds
+only of a batched call: per-line invocation would need 1.25 ms round trips, which no network port
+achieves. The cap and the deadline were consistent only by accident, and an implementation that
+fanned out per line would miss the budget at a fraction of the cap while satisfying every other
+rule in the slice. Stating the cap without stating the call shape left the requirement inferable
+rather than declared.
+
+**Propagated**: `03 §2.2` port deadline table; `02 §3.7` line cap.
 
 ## Open questions
 

@@ -1168,7 +1168,7 @@ without touching the engine; a state, a transition row, an event type, an envelo
 an engine-owned column requires an engine change, and adding a state or event type is
 additionally a PRD question because both sets are enumerated there.
 
-**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — ninety entries plus **thirty**
+**Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — **ninety-four** entries plus **thirty**
 routed open questions, twenty-six of them still unanswered — with **seven** ADRs in [`ADR/`](./ADR/) carrying full alternatives
 analysis. **Upstream asks** are declared in [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md),
 including `SUB-O10`, which this design raises.
