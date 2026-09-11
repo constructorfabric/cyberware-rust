@@ -1,13 +1,15 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use simple_user_settings_sdk::models::{
     SimpleUserSettings, SimpleUserSettingsPatch, SimpleUserSettingsUpdate,
 };
+use simple_user_settings_sdk::owner::SettingsOwnerResolver;
 use toolkit_db::DBProvider;
 use toolkit_macros::domain_model;
 use toolkit_security::{SecurityContext, pep_properties};
+use uuid::Uuid;
 
 use super::error::DomainError;
 use super::fields::SettingsFields;
@@ -56,6 +58,9 @@ pub struct Service<R: SettingsRepository> {
     repo: Arc<R>,
     policy_enforcer: PolicyEnforcer,
     config: ServiceConfig,
+    /// Supplied by the deployment in the REST phase; `Some(None)` means it
+    /// published none and the token subject is the key.
+    owner_resolver: OnceLock<Option<Arc<dyn SettingsOwnerResolver>>>,
 }
 
 impl<R: SettingsRepository> Service<R> {
@@ -70,14 +75,42 @@ impl<R: SettingsRepository> Service<R> {
             repo,
             policy_enforcer,
             config,
+            owner_resolver: OnceLock::new(),
         }
+    }
+
+    /// Hand the service the deployment's view of who a caller is.
+    ///
+    /// Separate from `new` because the resolver comes from another gear, and
+    /// the REST phase is the first point at which every gear is known to have
+    /// initialized. Calling it twice is ignored.
+    pub fn attach_owner_resolver(&self, resolver: Option<Arc<dyn SettingsOwnerResolver>>) {
+        if self.owner_resolver.set(resolver).is_err() {
+            tracing::debug!("settings owner resolver already attached; keeping the first");
+        }
+    }
+
+    /// The key this caller's settings are filed under.
+    ///
+    /// The token subject unless the deployment published a resolver that knows
+    /// better — see [`SettingsOwnerResolver`]. One place decides it, so a read
+    /// and a write can never disagree about whose settings they are.
+    async fn owner_of(&self, ctx: &SecurityContext) -> Result<Uuid, DomainError> {
+        let Some(Some(resolver)) = self.owner_resolver.get() else {
+            return Ok(ctx.subject_id());
+        };
+        Ok(resolver
+            .settings_owner(ctx)
+            .await
+            .map_err(DomainError::from)?
+            .unwrap_or_else(|| ctx.subject_id()))
     }
 
     pub async fn get_settings(
         &self,
         ctx: &SecurityContext,
     ) -> Result<SimpleUserSettings, DomainError> {
-        let user_id = ctx.subject_id();
+        let user_id = self.owner_of(ctx).await?;
         let tenant_id = ctx.subject_tenant_id();
 
         let scope = self
@@ -113,7 +146,7 @@ impl<R: SettingsRepository> Service<R> {
         self.validate_field(SettingsFields::THEME, &update.theme)?;
         self.validate_field(SettingsFields::LANGUAGE, &update.language)?;
 
-        let user_id = ctx.subject_id();
+        let user_id = self.owner_of(ctx).await?;
         let tenant_id = ctx.subject_tenant_id();
 
         let scope = self
@@ -155,7 +188,7 @@ impl<R: SettingsRepository> Service<R> {
             self.validate_field(SettingsFields::LANGUAGE, language)?;
         }
 
-        let user_id = ctx.subject_id();
+        let user_id = self.owner_of(ctx).await?;
         let tenant_id = ctx.subject_tenant_id();
 
         let scope = self

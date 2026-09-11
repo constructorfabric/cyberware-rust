@@ -112,12 +112,150 @@ mod tests {
             .unwrap()
     }
 
+    /// A caller in a named organization.
+    ///
+    /// Settings are keyed on `(user, tenant)`, so a test about *whose* settings
+    /// these are has to hold the tenant still or it measures both at once.
+    fn context_in(tenant_id: Uuid) -> SecurityContext {
+        SecurityContext::builder()
+            .subject_id(Uuid::new_v4())
+            .subject_tenant_id(tenant_id)
+            .build()
+            .unwrap()
+    }
+
     fn build_service(db: Db, config: ServiceConfig) -> ConcreteService {
         let repo = Arc::new(SeaOrmSettingsRepository::new());
         let db: Arc<DBProvider<toolkit_db::DbError>> = Arc::new(DBProvider::new(db));
         let authz: Arc<dyn AuthZResolverApi> = Arc::new(MockAuthZResolver);
         let policy_enforcer = PolicyEnforcer::new(authz);
         Service::new(db, repo, policy_enforcer, config)
+    }
+
+    /// A deployment whose people hold more than one login.
+    ///
+    /// Answers with one fixed key for every caller, which is the shape that
+    /// matters: two different subjects must reach the same settings.
+    struct OnePerson(Option<Uuid>);
+
+    #[async_trait]
+    impl simple_user_settings_sdk::SettingsOwnerResolver for OnePerson {
+        async fn settings_owner(
+            &self,
+            _ctx: &SecurityContext,
+        ) -> Result<Option<Uuid>, CanonicalError> {
+            Ok(self.0)
+        }
+    }
+
+    /// A resolver that is having a bad day.
+    struct Broken;
+
+    #[async_trait]
+    impl simple_user_settings_sdk::SettingsOwnerResolver for Broken {
+        async fn settings_owner(
+            &self,
+            _ctx: &SecurityContext,
+        ) -> Result<Option<Uuid>, CanonicalError> {
+            Err(CanonicalError::internal("directory unavailable").create())
+        }
+    }
+
+    // =========================================================================
+    // whose settings these are
+    // =========================================================================
+
+    /// The point of the resolver: one human, two logins, one set of settings.
+    #[tokio::test]
+    async fn two_subjects_resolving_to_one_person_share_their_settings() {
+        let db = inmem_db().await;
+        let service = build_service(db, ServiceConfig::default());
+        let person = Uuid::new_v4();
+        service.attach_owner_resolver(Some(Arc::new(OnePerson(Some(person)))));
+
+        let org = Uuid::new_v4();
+        let first_login = context_in(org);
+        service
+            .update_settings(
+                &first_login,
+                SimpleUserSettingsUpdate {
+                    theme: "dark".to_owned(),
+                    language: "en".to_owned(),
+                },
+            )
+            .await
+            .expect("stored under the person");
+
+        // A different subject entirely — the same human signing in the other way.
+        let second_login = context_in(org);
+        assert_ne!(first_login.subject_id(), second_login.subject_id());
+
+        let seen = service
+            .get_settings(&second_login)
+            .await
+            .expect("read under the person");
+        assert_eq!(seen.theme.as_deref(), Some("dark"));
+        assert_eq!(seen.user_id, person, "settings belong to the person");
+    }
+
+    /// Without a resolver the gear behaves exactly as it always has, which is
+    /// what makes this addition safe for every deployment that has one login
+    /// per human.
+    #[tokio::test]
+    async fn with_no_resolver_the_subject_is_still_the_key() {
+        let db = inmem_db().await;
+        let service = build_service(db, ServiceConfig::default());
+        service.attach_owner_resolver(None);
+
+        let ctx = create_test_context();
+        let stored = service
+            .update_settings(
+                &ctx,
+                SimpleUserSettingsUpdate {
+                    theme: "light".to_owned(),
+                    language: "en".to_owned(),
+                },
+            )
+            .await
+            .expect("stored");
+        assert_eq!(stored.user_id, ctx.subject_id());
+    }
+
+    /// A resolver with no opinion about this caller yields to the subject
+    /// rather than denying somebody their preferences.
+    #[tokio::test]
+    async fn a_resolver_that_declines_falls_back_to_the_subject() {
+        let db = inmem_db().await;
+        let service = build_service(db, ServiceConfig::default());
+        service.attach_owner_resolver(Some(Arc::new(OnePerson(None))));
+
+        let ctx = create_test_context();
+        let stored = service
+            .update_settings(
+                &ctx,
+                SimpleUserSettingsUpdate {
+                    theme: "light".to_owned(),
+                    language: "en".to_owned(),
+                },
+            )
+            .await
+            .expect("stored");
+        assert_eq!(stored.user_id, ctx.subject_id());
+    }
+
+    /// A resolver that fails is reported, not guessed around: filing settings
+    /// under a key the next request will not produce loses them silently.
+    #[tokio::test]
+    async fn a_resolver_that_fails_fails_the_request() {
+        let db = inmem_db().await;
+        let service = build_service(db, ServiceConfig::default());
+        service.attach_owner_resolver(Some(Arc::new(Broken)));
+
+        let err = service
+            .get_settings(&create_test_context())
+            .await
+            .expect_err("the read must not fall back");
+        assert!(matches!(err, DomainError::Internal(_)), "got {err:?}");
     }
 
     // =========================================================================

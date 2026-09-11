@@ -10,7 +10,7 @@ use tracing::info;
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 
-use simple_user_settings_sdk::SimpleUserSettingsClientV1;
+use simple_user_settings_sdk::{SettingsOwnerResolver, SimpleUserSettingsClientV1};
 
 use crate::api::rest::routes;
 use crate::config::SettingsConfig;
@@ -20,6 +20,21 @@ use crate::infra::storage::sea_orm_repo::SeaOrmSettingsRepository;
 
 /// Type alias for the concrete service type with ORM repository.
 type ConcreteService = Service<SeaOrmSettingsRepository>;
+
+/// Who a caller is, as the deployment understands it.
+///
+/// Looked up in the REST phase rather than in `init`: the resolver comes from
+/// another gear and this gear does not depend on it, so init order guarantees
+/// nothing — whereas every gear's `init` has run before any gear's REST phase.
+/// A deployment that publishes none keeps the token subject as the key, which
+/// is what this gear has always done.
+fn owner_resolver(ctx: &GearCtx) -> Option<Arc<dyn SettingsOwnerResolver>> {
+    let resolver = ctx.client_hub().get::<dyn SettingsOwnerResolver>().ok();
+    if resolver.is_some() {
+        info!("Settings gear: settings are keyed by the deployment's own user resolver");
+    }
+    resolver
+}
 
 #[toolkit::gear(
     name = "simple-user-settings",
@@ -82,7 +97,7 @@ impl Gear for SettingsGear {
 impl toolkit::contracts::RestApiCapability for SettingsGear {
     fn register_rest(
         &self,
-        _ctx: &GearCtx,
+        ctx: &GearCtx,
         router: Router,
         openapi: &dyn OpenApiRegistry,
     ) -> anyhow::Result<Router> {
@@ -92,6 +107,8 @@ impl toolkit::contracts::RestApiCapability for SettingsGear {
             .get()
             .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?
             .clone();
+
+        service.attach_owner_resolver(owner_resolver(ctx));
 
         let router = routes::register_routes(router, openapi, service);
         info!("Settings gear: REST routes registered successfully");
