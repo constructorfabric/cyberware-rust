@@ -29,7 +29,8 @@
   - [4.4 Observability](#44-observability)
   - [4.5 Error handling and the outbox failure posture](#45-error-handling-and-the-outbox-failure-posture)
   - [4.6 Testability](#46-testability)
-  - [4.7 Extension and provenance](#47-extension-and-provenance)
+  - [4.7 Accepted residual limits](#47-accepted-residual-limits)
+  - [4.8 Extension and provenance](#48-extension-and-provenance)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -1133,7 +1134,23 @@ against a contract double** before Subscriptions exists. The sibling gears' prec
 jointly-owned golden fixtures before implementation applies to the gate's adopted predicates,
 since forking them silently is exactly what a shared fixture catches.
 
-### 4.7 Extension and provenance
+### 4.7 Accepted residual limits
+
+These are **decided, not open**, which is why none carries a `Q-` number — the register is for
+questions with an owner, and putting a settled trade-off there would misrepresent it as undecided.
+But each is a limit somebody will eventually hit, and a limit with no named party is a limit nobody
+answers for. So the party who would have to act is named here, and the row is the whole of the
+disclosure.
+
+| Accepted limit | Why it is accepted | Who acts when it bites |
+|----------------|--------------------|------------------------|
+| A **wedged `in_fulfillment` order holds its overlap key indefinitely**, blocking any new order on that key for that payer | `in_fulfillment` is expiry-exempt because a spawn signal may already have issued and expiry would orphan provisioned resources with no compensation path (`design/07-hold-and-expiry.md` §4.3). No transition in this gear can clear the claim, and ADR-0007 names this its sharpest residual cost | **Orders Workflow operations** — the escalation SLA on an overdue `in_fulfillment` order is the only route. If it proves too slow in practice the fix is an operator-initiated claim release, which is new scope and is not designed |
+| A **parked outbox row suspends its order's event stream for an unbounded duration** | Deliberate: the alternative is publishing `OrderCompleted` before `OrderSubmitted`, and a consumer cannot reconstruct a commercial trail from an out-of-order stream (D-87, ADR-0006). One order halts; no other order is affected | **Platform operations** — the dead-letter alert fires immediately and an operator re-drive is the close. Re-drive is refused while a lower undelivered sequence exists, so the order of repair is forced |
+| **Two principals can each create a duplicate order** from the same request under the same key text | The idempotency key is scoped by principal to close an IDOR (D-88), which makes the same key text from a different principal a different key. For every operation but `create` the fingerprint's `order_id` and `expected_version` still catch the duplicate; on a create there is neither | **Product** — deciding whether a cross-principal create duplicate is a real commercial scenario. If it is, the answer is an upstream de-duplication key on the request, not a change to the registry's scoping |
+| The **stored resolved total is not the amount the customer will be invoiced** — non-authoritative, pre-tax, and excluding subscription-scoped overlays | Tax has no order-time owner and overlays need context a subscription has not yet created. Reporting a total that silently omitted them would be worse than declaring the omission (`design/03-gate-and-pin.md` §4.5) | **Every consumer surface** — a buyer portal, partner console or confirmation email. §4.2 of `design/08-read-and-authz.md` makes rendering the total without its declared exclusions prohibited on this gear's read, and the same obligation is stated as an expectation on surfaces this gear does not own |
+| **`new_sale` covers net-new acquisition only**; expansion has no order document, no gate at the point of change, no pin and none of this audit trail | Declared PRD phasing — `change` is modeled and refused at creation, with the enum left open (Q-01). Not a design gap | **Product** — "Orders is live" and "commercial changes are governed by Orders" become true at different times, and only the first is true at the end of this phase |
+
+### 4.8 Extension and provenance
 
 **Extension points** are normative in [`design/01-foundation`](./design/01-foundation.md) §4.6:
 a slice may add a guard, a reason, a document contribution, a policy row or a table of its own
@@ -1142,7 +1159,7 @@ an engine-owned column requires an engine change, and adding a state or event ty
 additionally a PRD question because both sets are enumerated there.
 
 **Decisions** are recorded in [`DECISIONS.md`](./DECISIONS.md) — ninety entries plus **thirty**
-routed open questions — with **seven** ADRs in [`ADR/`](./ADR/) carrying full alternatives
+routed open questions, twenty-six of them still unanswered — with **seven** ADRs in [`ADR/`](./ADR/) carrying full alternatives
 analysis. **Upstream asks** are declared in [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md),
 including `SUB-O10`, which this design raises.
 
