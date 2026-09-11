@@ -610,9 +610,8 @@ failure reason so the cause survives on the audit entry.
 make the check atomic with the transaction that commits a subscription to `active`, and it also
 cannot express a deadline: the re-check returns proceed or a per-line rejection to its caller, and
 the transition Workflow then drives — `spawn-signal`, `01 §4.3` row 12 — is event-less, so no
-declared interface carries a validity origin or a window. `03 §2.2` states this in full and
-withdraws the 30-second window an earlier version asserted. What Workflow **MUST** do is narrower
-and checkable: **MUST NOT** treat a proceed verdict as an admission guarantee, and **MUST** handle
+declared interface carries a validity origin or a window (`03 §2.2`, D-89). What Workflow **MUST**
+do is narrower and checkable: **MUST NOT** treat a proceed verdict as an admission guarantee, and **MUST** handle
 an `overlap-collision` raised by Subscriptions at any point after the re-check — including after
 lines the two-phase barrier deferred, which is precisely the case one window could never have
 covered. Such a collision arrives on the failure-acknowledgement path of §4.4 with compensation

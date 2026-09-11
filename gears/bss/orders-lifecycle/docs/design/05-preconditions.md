@@ -142,11 +142,9 @@ withheld and the order remains `approved` until its TTL elapses. Two qualificati
 this constraint's real content rather than footnotes. The `approved` TTL is a **Product-owned open
 question with no code default**, so **while it is unset this order has no automatic exit at all** —
 only a caller-driven cancel retires it ([`07-hold-and-expiry`](./07-hold-and-expiry.md) §4.5). And
-where it *is* set, the **two re-entry caps** of `07 §4.2` are what stop a hold/resume or
-amendment cycle restarting the dwell without limit, bounding the exit at `26 × the largest
-configured TTL` rather than at nothing (`../DECISIONS.md` D-90). An earlier version of this constraint claimed an absolute order lifetime
-retired the order in the unset case; that backstop is withdrawn and `07 §4.2` states why, so the
-unset case is disclosed here rather than covered. There is no re-authorize
+where it *is* set, the **two re-entry caps** of `07 §4.2` are what stop a hold/resume or amendment
+cycle restarting the dwell without limit, bounding the exit at `26 × the largest configured TTL`
+rather than at nothing (`../DECISIONS.md` D-90). There is no re-authorize
 operation, no payment failure event and no order-visible outcome, because there is no Payments
 capability to supply one. This is routed as [`../DECISIONS.md`](../DECISIONS.md) Q-08 — the PRD
 carries **no** §15 row for it — and stated as a designed limitation rather
