@@ -1164,6 +1164,12 @@ silent inertness into a refusal at configuration load, following the nesting-inv
 **Consequence**: the upstream ask stays open — this interim does not close it — but it is no longer
 a blocker. The park, its timer and its operator escalation are fully operable today.
 
+**Propagates to**: `gears/bss/orders-workflow/docs/design/03-approval-execution.md` §4.2 (the
+configuration values and the startup nesting check),
+`gears/bss/orders-workflow/docs/ADR/0007-cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park.md`
+(the escalation obligation the inequality serves); the upstream field stays registered as
+`UPSTREAM_REQS.md` `…-upreq-submitted-ttl-visibility`
+
 **Propagates to**: `design/03-approval-execution.md` §4.2; `UPSTREAM_REQS.md` §2.4.
 
 **ADR**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`.
@@ -1323,6 +1329,7 @@ and that hand-check is the only guarantee this document offers.
 | D-54 | L Cross-cutting (partial failure) | `design/04-fulfillment-plan.md` §3.6, `design/07-manual-tasks.md` §3.6 |
 | D-55 | L Cross-cutting (remediation) | `design/07-manual-tasks.md` §3.6, `design/06-saga-and-compensation.md` §3.6 |
 | D-56 | L Cross-cutting (separation of duties) | `design/03-approval-execution.md` §3.3, `design/09-read-and-authz.md` §4.1 |
+| D-57 | K Tuning baselines (approval path) | `design/03-approval-execution.md` §4.2, `ADR/0007-cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park.md`, `UPSTREAM_REQS.md` (`…-upreq-submitted-ttl-visibility`) |
 
-Highest decision number used: **D-56**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-57**. Numbering is one continuous sequence across the whole
 register; there are no parts.
