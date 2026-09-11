@@ -336,7 +336,7 @@ It deletes nothing and touches no order past `draft`.
 as actor class, which is what makes "who expired this order" answerable as `system` rather than
 as whichever caller happened to trigger it.
 
-**Reasons contributed to the registry**: already-on-hold, not-on-hold, resume-target-missing,
+**Reasons contributed to the registry**: already-on-hold, resume-target-missing,
 **resume-cap-exhausted**, hold-cancel-refused-by-prehold-guard, **cancel-reason-required**,
 **direct-cancel-window-closed** (shared with the seam slice, defined once here).
 `resume-cap-exhausted` is registered **here and only here**: it is row 22's guard refusal when
@@ -346,10 +346,12 @@ deliberately **not** folded into the engine's `not-admissible` — the row *is* 
 state *does* permit resume; what refuses is a guard on data, which is the distinction `01 §4.1`
 draws between the transition table and the guard set. The engine's own
 `not-admissible` covers an inadmissible hold, resume, cancel or expiry alike, so this slice
-registers no second name for any of it — the earlier `hold-not-admitted-in-state` and
-`cancel-not-admitted-in-state` were exactly such second names and are deleted, matching the
-treatment [`04-versioning`](./04-versioning.md) §3.3 records for the analogous amendment case
-([`../DECISIONS.md`](../DECISIONS.md) D-38, `01 §3.3`).
+registers no second name for any of it — the earlier `hold-not-admitted-in-state`,
+`cancel-not-admitted-in-state` and **`not-on-hold`** were exactly such second names and are
+deleted, matching the treatment [`04-versioning`](./04-versioning.md) §3.3 records for the
+analogous amendment case ([`../DECISIONS.md`](../DECISIONS.md) D-38, `01 §3.3`). `not-on-hold` went
+last, in 2026-09-11: a resume against an order that is not `on_hold` is an inadmissible
+`(state, trigger)` pair and nothing more.
 
 ### 3.4 Internal Dependencies
 
@@ -376,29 +378,38 @@ slice publishes.
 
 **Algorithm: Hold Then Resume**
 
-Input: order_id, holding_actor, reason, security_context, idempotency_key
+Input: order_id, holding_actor, reason, security_context, idempotency_key, **expected_version** —
+one per request, since hold and resume are two calls and each carries its own
 Output: on_hold then the restored state, or a registered refusal
 
 1. [ ] - `p1` - Declare hold admissibility as an engine guard: the current state is `submitted`, `pending_approval`, `approved` or `in_fulfillment`; an inadmissible state refuses with the engine's `not-admissible` - `inst-hr-declare-admissibility-guard`
 2. [ ] - `p1` - Supply the current state as the **pre-hold contribution** to the hold transition; the engine writes the column inside the transition transaction (`01 §3.6` *Attempt Transition* step 20.2) - `inst-hr-store-prehold`
-3. [ ] - `p1` - Request the hold transition; the engine publishes OrderHeld - `inst-hr-request-hold`
+3. [ ] - `p1` - Request the hold transition with the request's `expected_version`; the engine publishes OrderHeld - `inst-hr-request-hold`
 4. [ ] - `p1` - **RETURN** on_hold - `inst-hr-return-on-hold`
 5. [ ] - `p1` - **WHEN** resume is later requested: - `inst-hr-when-resume`
-   1. [ ] - `p1` - **IF** the current state is not `on_hold`: **RETURN** not-on-hold refusal - `inst-hr-if-not-on-hold`
-   2. [ ] - `p1` - **IF** no pre-hold state is stored: **RETURN** resume-target-missing refusal - `inst-hr-if-target-missing`
-   3. [ ] - `p1` - **Resume-cap guard**, registered on row 22 and evaluated by the engine against the aggregate row it has already locked: **IF** `orders_order.resume_count` is at or above the cap of §4.5: **RETURN** a `resume-cap-exhausted` refusal naming the cap and the count - `inst-hr-if-resume-cap`
-   4. [ ] - `p1` - Read the stored pre-hold state as the transition target - `inst-hr-read-prehold`
-   5. [ ] - `p1` - Request the resume transition; the engine clears the pre-hold column, increments `resume_count` and publishes OrderResumed, all inside the transition transaction (`01 §3.6` *Attempt Transition* steps 20.3 and 20.4) — the counter is engine-owned and this slice contributes no value for it - `inst-hr-request-resume`
-   6. [ ] - `p1` - **RETURN** the restored state - `inst-hr-return-restored`
+   1. [ ] - `p1` - Declare the **resume-cap guard** on row 22, so the engine evaluates it under the aggregate row lock: it fails with `resume-cap-exhausted`, naming the cap and the count, when `orders_order.resume_count` is at or above the cap of §4.5 - `inst-hr-declare-resume-cap`
+   2. [ ] - `p1` - Request the resume transition with the request's `expected_version`, resolving no state and reading no column first — **an order that is not `on_hold` is refused by the engine as `not-admissible`, and one with no stored pre-hold state by `§3.6` step 15** - `inst-hr-request-resume`
+   3. [ ] - `p1` - The engine reads the stored pre-hold state as the effective target, clears the pre-hold column, increments `resume_count` and publishes OrderResumed, all inside the transition transaction (`01 §3.6` *Attempt Transition* steps 14, 20.3 and 20.4) — both the target and the counter are engine-owned and this slice contributes neither - `inst-hr-engine-resolves-resume`
+   4. [ ] - `p1` - **RETURN** the restored state - `inst-hr-return-restored`
 
 **Description**: Nothing about the spawned subscriptions changes at either end. A hold from
 `in_fulfillment` leaves activated subscriptions serving and billing, and leaves wave-1 drafts
 alone — including their own auto-void TTL, which this gear cannot pause.
 
-**Why the cap is read and written inside the transition rather than checked first.** Step 5.3 is a
-**registered guard**, so the engine evaluates it at `01 §3.6` *Attempt Transition* step 13 — under
-the aggregate row lock taken at step 5 — and increments the counter at step 20.4 under that same
-lock, in the same transaction. A pre-check outside the
+**No step here refuses ahead of the engine, and two that did have been removed.** Earlier versions
+of this algorithm returned `not-on-hold` and `resume-target-missing` from the slice before the
+engine was called. Both violated `01 §2.1`: a check that refuses before the engine produces **no
+audit entry and no settled idempotency record**, which is precisely the silent drop ADR-0005 exists
+to prevent, and `not-on-hold` was additionally a **second name** for the engine's `not-admissible`,
+which D-38's one-name-per-condition rule forbids. The engine already decides both — admissibility
+at step 11 on the `(state, trigger)` lookup, and the missing pre-hold target at step 15 — and
+decides them with an audit row and a settlement. `not-on-hold` is therefore deregistered as a
+reason; `resume-target-missing` stays registered, because it names a condition the engine has no
+other name for, and the engine returns it.
+
+**Why the cap is a guard rather than a pre-check.** Step 5.1 declares it, so the engine evaluates it
+at `01 §3.6` *Attempt Transition* step 13 — under the aggregate row lock taken at step 5 — and
+increments the counter at step 20.4 under that same lock, in the same transaction. A pre-check outside the
 transaction would let two concurrent resumes both read a count below the cap and both commit, so
 the cap would be exceeded by exactly the concurrency the engine's single-writer rule exists to
 exclude — and a slice check that refuses ahead of the engine produces no audit row and no settled
@@ -421,7 +432,8 @@ Output: expired count
 2. [ ] - `p1` - **FOR EACH** expirable state — `submitted`, `pending_approval`, `approved`, `on_hold`: - `inst-es-for-each-state`
    1. [ ] - `p1` - Resolve the TTL policy for that state at its configuration scope - `inst-es-resolve-ttl`
    2. [ ] - `p1` - **IF** no TTL is configured: increment the no-configured-TTL gauge of `§3.8` and **SKIP TO** the next state (no code default); that state has **no bound at all** this cadence, which §4.2 discloses rather than covers - `inst-es-if-no-ttl`
-   3. [ ] - `p1` - **FOR EACH** seller scope with its own policy, and once for the platform fallback: select orders in that state whose `state_entered_at` is older than the TTL, up to the batch size, using the `(seller_tenant_id, state, state_entered_at)` index - `inst-es-select-eligible`
+   3. [ ] - `p1` - **FOR EACH** seller scope with its own policy for this state: select orders in that state, for that seller, whose `state_entered_at` is older by that seller's TTL, up to the batch size, using the `(seller_tenant_id, state, state_entered_at)` index - `inst-es-select-eligible`
+   3a. [ ] - `p1` - Then, once for the platform fallback, select orders in that state whose `state_entered_at` is older by the **platform** TTL **and whose `seller_tenant_id` has no policy of its own for this state** — the exclusion is required, not an optimisation: without it an order whose seller configured a longer TTL is selected by the platform pass and expired under the shorter one, silently overriding the override `§3.7` grants - `inst-es-select-platform-fallback`
    4. [ ] - `p1` - **FOR EACH** selected order: - `inst-es-for-each-order`
       1. [ ] - `p1` - **IF** the state is `on_hold` **AND** its pre-hold state is `in_fulfillment`: - `inst-es-if-hold-from-fulfillment`
          1. [ ] - `p1` - **SKIP TO** the next order; this case is escalated, never expired - `inst-es-skip-exempt-hold`
@@ -430,7 +442,13 @@ Output: expired count
       4. [ ] - `p1` - **IF** the engine refuses as not-admissible: record and continue — the table is the authority - `inst-es-if-refused`
 3. [ ] - `p1` - **RETURN** the expired count for the sweep metric - `inst-es-return-count`
 
-**Description**: Step 2.4.4 is deliberate. The sweep's own exemption check at 2.4.1 is a
+**Description**: The two selection steps are separate because **seller scope overrides platform
+scope** (`§3.7`), and a fallback that did not exclude seller-policied orders would not be a fallback
+— it would be a second, shorter, unconditional TTL applied behind the seller's back. Resolving the
+effective policy per order before selection is the equivalent formulation and is equally
+acceptable; what is not acceptable is two unqualified queries whose union is wider than either.
+
+Step 2.4.4 is deliberate. The sweep's own exemption check at 2.4.1 is a
 performance optimisation, not the safety mechanism — the safety mechanism is that no
 `in_fulfillment` expiry row exists, so a sweep defect produces a refusal rather than an orphaned
 order. The sweep therefore has **one pass**, over `state_entered_at`, and it bounds exactly what a
@@ -654,9 +672,13 @@ fires.
 ### 4.3 The `in_fulfillment` exemption (normative)
 
 `in_fulfillment` **MUST NOT** be auto-expired, and neither **MUST** an `on_hold` order whose
-pre-hold state is `in_fulfillment`. This is an explicit exemption from **both layers** of §4.2 —
-the per-state TTL and the resume cap alike, and the resume cap does not even engage, since it
-bounds restarts rather than expiring anything — taken because a
+pre-hold state is `in_fulfillment`. **The exemption is from automatic expiry only.** It covers
+Layer 1 of §4.2 — the per-state TTL — and it does **not** reach Layer 2: row 22 carries the
+resume-cap guard unconditionally, so a hold taken from `in_fulfillment` and resumed still increments
+`resume_count` and still refuses at the cap like any other. An earlier version of this paragraph
+said the exemption covered "both layers alike", which would have left exactly one hold/resume cycle
+uncapped — the `in_fulfillment` one, which is the cycle an operator is most able to repeat and the
+one D-90 was written to close. The exemption is taken because a
 subscription spawn signal may already have been issued and expiry would orphan provisioned
 resources with no compensation path.
 
