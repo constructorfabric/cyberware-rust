@@ -10,7 +10,7 @@ use crate::types::SECRET_TYPE_CATALOG;
 #[test]
 fn sharing_modes_schema_matches_enum() {
     let registered = toolkit_gts::all_inventory_type_schemas().expect("inventory schemas parse");
-    let want_id = serde_json::json!(format!("gts://{}", super::SECRET_RESOURCE_TYPE));
+    let want_id = serde_json::json!(format!("gts://{}", super::CREDENTIAL_RESOURCE_TYPE));
     let base = registered
         .iter()
         .find(|s| s["$id"] == want_id)
@@ -47,7 +47,7 @@ fn sharing_modes_schema_matches_enum() {
 #[test]
 fn secret_base_type_is_abstract_and_still_carries_traits() {
     let registered = toolkit_gts::all_inventory_type_schemas().expect("inventory schemas parse");
-    let want_id = serde_json::json!(format!("gts://{}", super::SECRET_RESOURCE_TYPE));
+    let want_id = serde_json::json!(format!("gts://{}", super::CREDENTIAL_RESOURCE_TYPE));
     let base = registered
         .iter()
         .find(|s| s["$id"] == want_id)

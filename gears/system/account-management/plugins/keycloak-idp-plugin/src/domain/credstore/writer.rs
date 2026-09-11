@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WritePrecondition,
+    CredStoreClientV1, CredStoreError, CredentialWrite, Fallback, PutPrecondition, SecretRef,
+    SecretType, SecretValue, SharingMode, WritePrecondition,
 };
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
@@ -30,14 +31,17 @@ impl CredStoreWriter {
 
     /// Create or replace one secret.
     ///
-    /// The credstore contract splits these: `create` is the only
-    /// preconditionless write, and `put` never creates — a missing target
-    /// fails its precondition with [`CredStoreError::Conflict`]. So
-    /// create-or-replace is `create` first, falling back to a
-    /// [`WritePrecondition::Exists`] overwrite when the reference already
-    /// exists. `Exists` is the documented opt-out for exactly this shape:
-    /// a provisioning writer that owns its references and whose new value
-    /// is not derived from the stored one, so there is no version to carry.
+    /// ADR-0004's `put` never creates on a missing target when guarded by
+    /// [`PutPrecondition::Exists`] — it fails the precondition with
+    /// [`CredStoreError::Conflict`] instead. So create-or-replace is a
+    /// [`PutPrecondition::CreateOnly`] attempt first (with `secret_type` set
+    /// to `generic`, since a create must name a type), falling back to a
+    /// [`PutPrecondition::Exists`] overwrite (which must *not* repeat the
+    /// type, since `put` treats a replace's `secret_type` as an immutability
+    /// check against the stored type) when the reference already exists.
+    /// `Exists` is the documented opt-out for exactly this shape: a
+    /// provisioning writer that owns its references and whose new value is
+    /// not derived from the stored one, so there is no validator to carry.
     /// Concurrent writers to one reference therefore race last-writer-wins,
     /// which is the pre-existing behaviour of this path.
     ///
@@ -54,23 +58,32 @@ impl CredStoreWriter {
         // `SecretValue` is a non-Clone newtype over the raw bytes, so keep a
         // copy to rebuild it for the overwrite leg instead of cloning.
         let bytes = value.as_bytes().to_vec();
+        let create = CredentialWrite {
+            secret_type: Some(SecretType::generic().into()),
+            sharing,
+            fallback: Fallback::Inherit,
+            expires_at: None,
+            value,
+        };
         match self
             .inner
-            .create(&self.system_ctx, key, value, sharing)
+            .put(&self.system_ctx, key, create, PutPrecondition::CreateOnly)
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             // Already present: fall through to the explicit overwrite.
             Err(CredStoreError::Conflict) => {
+                let replace = CredentialWrite {
+                    secret_type: None,
+                    sharing,
+                    fallback: Fallback::Inherit,
+                    expires_at: None,
+                    value: SecretValue::new(bytes),
+                };
                 self.inner
-                    .put(
-                        &self.system_ctx,
-                        key,
-                        SecretValue::new(bytes),
-                        sharing,
-                        WritePrecondition::Exists,
-                    )
+                    .put(&self.system_ctx, key, replace, PutPrecondition::Exists)
                     .await
+                    .map(|_| ())
             }
             Err(e) => Err(e),
         }

@@ -25,7 +25,7 @@ fn uuid_of(gts_id: &str) -> Uuid {
 /// inherits the complete generic value for it.
 fn secret_envelope() -> Arc<GtsTypeSchema> {
     let raw = json!({
-        "$id": format!("gts://{SECRET_RESOURCE_TYPE}"),
+        "$id": format!("gts://{CREDENTIAL_RESOURCE_TYPE}"),
         "type": "object",
         "x-gts-abstract": true,
         "x-gts-traits": {
@@ -35,7 +35,7 @@ fn secret_envelope() -> Arc<GtsTypeSchema> {
         },
     });
     Arc::new(
-        GtsTypeSchema::try_new(GtsTypeId::new(SECRET_RESOURCE_TYPE), raw, None, None)
+        GtsTypeSchema::try_new(GtsTypeId::new(CREDENTIAL_RESOURCE_TYPE), raw, None, None)
             .expect("envelope schema"),
     )
 }
@@ -45,7 +45,7 @@ fn derived(type_id: &str, traits: &serde_json::Value) -> GtsTypeSchema {
     let raw = json!({
         "$id": format!("gts://{type_id}"),
         "type": "object",
-        "allOf": [{"$ref": format!("gts://{SECRET_RESOURCE_TYPE}")}],
+        "allOf": [{"$ref": format!("gts://{CREDENTIAL_RESOURCE_TYPE}")}],
         "x-gts-traits": traits,
     });
     GtsTypeSchema::try_new(GtsTypeId::new(type_id), raw, None, Some(secret_envelope()))
@@ -57,7 +57,7 @@ fn resolver(registry: Arc<dyn TypesRegistryClient>) -> GtsSecretTypeResolver {
 }
 
 const CUSTOM_TYPE_ID: &str =
-    gts_id!("cf.core.credstore.secret.v1~acme.connectors.creds.db_password.v1~");
+    gts_id!("cf.core.credstore.credential.v1~acme.connectors.creds.db_password.v1~");
 
 #[tokio::test]
 async fn resolves_gts_id_and_effective_traits() {
@@ -98,7 +98,7 @@ async fn the_abstract_envelope_itself_is_rejected_as_a_secret_type() {
     let envelope = (*secret_envelope()).clone();
     let registry = Arc::new(MockTypesRegistryClient::new().with_type_schemas([envelope]));
     let err = resolver(registry)
-        .resolve(uuid_of(SECRET_RESOURCE_TYPE))
+        .resolve(uuid_of(CREDENTIAL_RESOURCE_TYPE))
         .await
         .expect_err("abstract base type must not type a secret");
     assert!(

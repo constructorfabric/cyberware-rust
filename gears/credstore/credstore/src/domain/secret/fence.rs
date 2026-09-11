@@ -1,34 +1,32 @@
 //! Value-fingerprint fence — the crypto and constants binding a secret's
 //! backend value to the metadata row that governs its visibility.
 //!
-//! Every API write stamps `credstore_secrets.value_fp` with
-//! `HMAC-SHA256(fence_key, value)`; every read recomputes it from the value
-//! the backend returned and serves the value only when the row agrees. The
-//! gear performs a dual write (backend value + DB metadata) with no
-//! transaction spanning both stores, so two concurrent unconditional PUTs
-//! can interleave crosswise; the fingerprint makes the poisoned combination
-//! unreadable (fail-closed 404) instead of a cross-tenant disclosure. See
-//! `docs/features/001-value-fingerprint-fence.md`.
+//! Every write stamps `credstore_secrets.value_fp` with
+//! `HMAC-SHA256(fence_key, value)` in the same transaction that switches the
+//! row's `value_id` pointer; every read recomputes it from the value the
+//! backend returned and serves the value only when the row agrees. Under
+//! ADR-0006's immutable value versions, a row never points at a `value_id`
+//! until the bytes under that exact id are already fully written (the
+//! backend `put` precedes the row CAS), so a torn write can no longer
+//! produce a mismatch — the fence's remaining role is an integrity check: a
+//! mismatch now means the backend entry the row currently points to was
+//! altered or corrupted out of band. Recovery is an ordinary new write (a
+//! fresh `value_id`), never a re-`PUT` of the same bytes into the old
+//! key — there is no "same key" left to re-inject into.
 //!
 //! The fence key is deployment state, not configuration: auto-generated and
-//! stored in the value-store backend itself under [`FENCE_KEY_REF`] (nil
-//! tenant, no metadata row — unreachable through the API by construction).
-//! Split knowledge: fingerprints live in the gear DB, the key lives with
-//! the values, so a read-only DB compromise alone cannot dictionary-test
-//! fingerprints, and backend compromise yields the plaintexts anyway.
-//! The fingerprint itself never leaves the gear (no API field, header,
-//! or log line).
+//! stored in the value-store backend itself under
+//! `(TenantId::nil(), `[`credstore_sdk::FENCE_KEY_VALUE_ID`]`)` — no metadata
+//! row ever points at that id, so no API path can resolve, overwrite, or
+//! delete it. Split knowledge: fingerprints live in the gear DB, the key
+//! lives with the values, so a read-only DB compromise alone cannot
+//! dictionary-test fingerprints, and backend compromise yields the
+//! plaintexts anyway. The fingerprint itself never leaves the gear (no API
+//! field, header, or log line).
 
 use aws_lc_rs::hmac;
 
 use crate::domain::error::DomainError;
-
-/// Reserved backend reference the auto-generated fence key is stored under
-/// (tenant = nil UUID, owner = `None`). It has no `credstore_secrets` row,
-/// so no API path can resolve, overwrite, or delete it: resolution always
-/// starts from a metadata row, and external callers always carry a real
-/// tenant, never nil.
-pub const FENCE_KEY_REF: &str = "cfs-internal-fence-key";
 
 /// Fence-key id stamped into `fp_key_id` alongside every fingerprint.
 /// v1 uses a single key; the id column plus the reserved-reference naming
@@ -119,10 +117,5 @@ mod tests {
         let b = generate_key().expect("key");
         assert_eq!(a.len(), FENCE_KEY_LEN);
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn fence_key_ref_is_a_valid_secret_ref() {
-        assert!(credstore_sdk::SecretRef::new(FENCE_KEY_REF).is_ok());
     }
 }

@@ -11,12 +11,14 @@ use account_management_sdk::idp::IdpProvisionTenantRequest;
 use account_management_sdk::idp_user::IdpTenantContext;
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
-    WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, SharingMode,
+    Validator, WritePrecondition,
 };
 use gts::GtsTypeId;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -87,7 +89,7 @@ struct ConfigurableStubOpenBao {
     next_put_response: Mutex<Option<Result<(), CredStoreError>>>,
     /// Keyed read responses (consumed on first match — same semantics as
     /// [`ConfigurableStubCS`]).
-    get_responses: Mutex<std::collections::HashMap<String, GetSecretResponse>>,
+    get_responses: Mutex<std::collections::HashMap<String, Secret>>,
 }
 
 impl ConfigurableStubOpenBao {
@@ -103,15 +105,15 @@ impl ConfigurableStubOpenBao {
     fn seed_get(&self, key: &str, value: &str) {
         self.get_responses.lock().insert(
             key.to_owned(),
-            GetSecretResponse {
-                value: SecretValue::from(value),
-                id: uuid::Uuid::nil(),
+            Secret {
+                reference: SecretRef::new(key).expect("valid SecretRef"),
                 secret_type: String::new(),
                 expires_at: None,
-                owner_tenant_id: credstore_sdk::TenantId::nil(),
-                sharing: SharingMode::Tenant,
-                is_inherited: false,
-                version: 1,
+                value: SecretValue::from(value),
+                validator: Validator {
+                    id: uuid::Uuid::nil(),
+                    version: 1,
+                },
             },
         );
     }
@@ -119,22 +121,19 @@ impl ConfigurableStubOpenBao {
 
 #[async_trait]
 impl CredStoreClientV1 for ConfigurableStubOpenBao {
-    async fn create(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-    ) -> Result<(), CredStoreError> {
-        self.put(ctx, key, value, sharing, WritePrecondition::Exists)
-            .await
-    }
-
     async fn get(
         &self,
         _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<Option<Credential>, CredStoreError> {
+        Ok(None)
+    }
+
+    async fn get_secret(
+        &self,
+        _ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+    ) -> Result<Option<Secret>, CredStoreError> {
         Ok(self.get_responses.lock().remove(key.as_ref()))
     }
 
@@ -142,14 +141,38 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-        _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
-        self.put_calls
+        write: CredentialWrite,
+        _precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
+        self.put_calls.lock().push((
+            key.as_ref().to_owned(),
+            write.value.as_bytes().to_vec(),
+            write.sharing,
+        ));
+        self.next_put_response
             .lock()
-            .push((key.as_ref().to_owned(), value.as_bytes().to_vec(), sharing));
-        self.next_put_response.lock().take().unwrap_or(Ok(()))
+            .take()
+            .unwrap_or(Ok(()))
+            .map(|()| PutOutcome {
+                created: true,
+                validator: Validator {
+                    id: uuid::Uuid::nil(),
+                    version: 1,
+                },
+            })
+    }
+
+    async fn patch(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _patch: CredentialPatch,
+        _precondition: WritePrecondition,
+    ) -> Result<Validator, CredStoreError> {
+        Ok(Validator {
+            id: uuid::Uuid::nil(),
+            version: 1,
+        })
     }
 
     async fn delete(
@@ -160,6 +183,14 @@ impl CredStoreClientV1 for ConfigurableStubOpenBao {
     ) -> Result<(), CredStoreError> {
         self.delete_calls.lock().push(key.as_ref().to_owned());
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

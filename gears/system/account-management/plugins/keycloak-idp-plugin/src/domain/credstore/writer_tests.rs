@@ -1,8 +1,11 @@
 use super::*;
 use crate::domain::system_actor::build_system_ctx;
 use async_trait::async_trait;
-use credstore_sdk::GetSecretResponse;
+use credstore_sdk::{
+    Credential, CredentialListItem, CredentialPatch, PutOutcome, Secret, Validator,
+};
 use parking_lot::Mutex;
+use toolkit_odata::{ODataQuery, Page};
 use uuid::Uuid;
 
 /// One recorded `put` invocation — `(key_str, value_bytes, sharing)`.
@@ -21,24 +24,19 @@ struct StubMutator {
 
 #[async_trait]
 impl CredStoreClientV1 for StubMutator {
-    async fn create(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-    ) -> Result<(), CredStoreError> {
-        // `create` is the one preconditionless write; the stub records it
-        // through the same `put_calls` log so assertions stay unchanged.
-        self.put(ctx, key, value, sharing, WritePrecondition::Exists)
-            .await
-    }
-
     async fn get(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+    ) -> Result<Option<Credential>, CredStoreError> {
+        Ok(None)
+    }
+
+    async fn get_secret(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<Option<Secret>, CredStoreError> {
         Ok(None)
     }
 
@@ -46,14 +44,34 @@ impl CredStoreClientV1 for StubMutator {
         &self,
         _ctx: &SecurityContext,
         key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
+        write: CredentialWrite,
+        _precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
+        self.put_calls.lock().push((
+            key.as_ref().to_owned(),
+            write.value.as_bytes().to_vec(),
+            write.sharing,
+        ));
+        Ok(PutOutcome {
+            created: true,
+            validator: Validator {
+                id: Uuid::nil(),
+                version: 1,
+            },
+        })
+    }
+
+    async fn patch(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
-        self.put_calls
-            .lock()
-            .push((key.as_ref().to_owned(), value.as_bytes().to_vec(), sharing));
-        Ok(())
+    ) -> Result<Validator, CredStoreError> {
+        Ok(Validator {
+            id: Uuid::nil(),
+            version: 1,
+        })
     }
 
     async fn delete(
@@ -63,6 +81,14 @@ impl CredStoreClientV1 for StubMutator {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         self.delete_response.lock().take().unwrap_or(Ok(()))
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

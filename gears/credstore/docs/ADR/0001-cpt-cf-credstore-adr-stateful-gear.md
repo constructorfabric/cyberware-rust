@@ -27,6 +27,8 @@ Updated:  2026-07-07 by Virtuozzo International GmbH
 
 **ID**: `cpt-cf-credstore-adr-stateful-gear`
 
+**Amended by [ADR-0006](0006-cpt-cf-credstore-adr-immutable-value-versions.md)**: the write saga with `provisioning`/`deprovisioning` statuses described below is replaced by immutable value versions with a pointer in the row and a gc table; the stateful-gear decision itself — metadata in the gear's table, values in a plugin — is unchanged and is what makes the pointer possible.
+
 ## Context and Problem Statement
 
 The original CredStore design was built on a **stateless gear**: all per-secret metadata (`sharing`, `owner_id`, `owner_tenant_id`) lived in the external backend and was returned on every `get`; secret identity was a deterministic ExternalID encoding `(tenant_id, key, owner_id) → base64url(...)`. Hierarchical resolution walked the tenant ancestor chain with up to N×2 backend round-trips (private probe + tenant/shared probe per level), authorization was a coarse permission-string check, and a private↔non-private sharing change had no atomic implementation ("no implicit migration guarantee"). Launching required the backend to first grow a three-value `sharing` enum and an `owner_id` column.

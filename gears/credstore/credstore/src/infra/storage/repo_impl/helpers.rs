@@ -4,12 +4,12 @@
 
 use std::sync::Arc;
 
-use credstore_sdk::{OwnerId, SharingMode, TenantId};
+use credstore_sdk::{OwnerId, SharingMode, TenantId, ValueId};
 use toolkit_db::DBProvider;
 use toolkit_db::secure::ScopeError;
 
 use crate::domain::error::DomainError;
-use crate::domain::secret::model::{SecretRow, SecretStatus};
+use crate::domain::secret::model::{Fallback, GcEntry, GcReason, SecretRow, SecretStatus};
 use crate::infra::canonical_mapping::classify_db_err_to_domain;
 use crate::infra::storage::entity;
 
@@ -41,6 +41,13 @@ pub(crate) fn entity_to_model(m: entity::secrets::Model) -> Result<SecretRow, Do
         diagnostic: format!("credstore_secrets.status out-of-domain value: {}", m.status),
         cause: None,
     })?;
+    let fallback = Fallback::from_smallint(m.fallback).ok_or_else(|| DomainError::Internal {
+        diagnostic: format!(
+            "credstore_secrets.fallback out-of-domain value: {}",
+            m.fallback
+        ),
+        cause: None,
+    })?;
     Ok(SecretRow {
         id: m.id,
         tenant_id: TenantId(m.tenant_id),
@@ -49,12 +56,32 @@ pub(crate) fn entity_to_model(m: entity::secrets::Model) -> Result<SecretRow, Do
         owner_id: OwnerId(m.owner_id),
         status,
         version: m.version,
+        updated_at: m.updated_at,
         // Opaque here: the domain layer resolves the UUID to the type id +
         // traits via the types-registry, so non-catalog types round-trip.
         secret_type_uuid: m.secret_type_uuid,
         expires_at: m.expires_at,
+        value_id: m.value_id.map(ValueId),
         value_fp: m.value_fp,
         fp_key_id: m.fp_key_id,
+        fallback,
+    })
+}
+
+/// Map a `credstore_value_gc` entity row to the domain [`GcEntry`].
+pub(crate) fn gc_entity_to_model(m: &entity::value_gc::Model) -> Result<GcEntry, DomainError> {
+    let reason = GcReason::from_smallint(m.reason).ok_or_else(|| DomainError::Internal {
+        diagnostic: format!(
+            "credstore_value_gc.reason out-of-domain value: {}",
+            m.reason
+        ),
+        cause: None,
+    })?;
+    Ok(GcEntry {
+        value_id: ValueId(m.value_id),
+        tenant_id: TenantId(m.tenant_id),
+        reason,
+        enqueued_at: m.enqueued_at,
     })
 }
 

@@ -137,6 +137,9 @@ _CREDSTORE_SECRETS = {
     "test-oauth2-client-secret": "test-client-secret",
 }
 
+# Credential type for a plain opaque secret (ADR-0004).
+_GENERIC_TYPE = "gts.cf.core.credstore.credential.v1~cf.core.credstore.generic.v1~"
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _provision_credstore_secrets(_check_oagw_reachable):
@@ -145,14 +148,17 @@ def _provision_credstore_secrets(_check_oagw_reachable):
     The credstore gateway is now stateful: a GET resolves the secret's
     metadata from the gateway's own database first, then reads the value from
     the backend plugin. A secret merely pre-seeded in the static plugin config
-    has no gateway metadata row and is therefore unreachable. So we create the
+    has no gateway metadata row and is therefore unreachable — the static
+    plugin's config seeding is gone entirely (ADR-0006). So we create the
     secrets via the gateway API (which writes the metadata row *and* the
     backend value).
 
-    We POST (create-only) and on 409 — a rerun against an already-provisioned
-    rig — PUT with the explicit ``If-Match: *`` overwrite (PUT no longer
-    creates and requires a precondition), with the same token the proxied
-    requests carry (``E2E_AUTH_TOKEN`` -> tenant ``00000000-df51-...``). Sharing is
+    Creation is a single ``PUT`` carrying both the record and the value
+    (ADR-0004) — there is no POST. We PUT with ``If-None-Match: *``
+    (create-only) and on 409 — a rerun against an already-provisioned rig —
+    PUT again with the explicit ``If-Match: *`` overwrite (a replace never
+    needs ``type``), with the same token the proxied requests carry
+    (``E2E_AUTH_TOKEN`` -> tenant ``00000000-df51-...``). Sharing is
     ``tenant`` so any subject in that tenant resolves the value — this matches
     the proxied-request context regardless of subject_id (the historical seed
     used owner-bound ``private``; the gateway lookup does not depend on the
@@ -168,22 +174,22 @@ def _provision_credstore_secrets(_check_oagw_reachable):
     # so nothing derived from the secret values flows into log messages.
     for ref in ("openai-key", "test-oauth2-client-id", "test-oauth2-client-secret"):
         try:
-            resp = httpx.post(
-                f"{base_url}/credstore/v1/secrets",
-                headers=headers,
+            resp = httpx.put(
+                f"{base_url}/credstore/v1/credentials/{ref}",
+                headers={**headers, "If-None-Match": "*"},
                 json={
-                    "reference": ref,
-                    "value": _CREDSTORE_SECRETS[ref],
+                    "type": _GENERIC_TYPE,
                     "sharing": "tenant",
+                    "value": _CREDSTORE_SECRETS[ref],
                 },
                 timeout=5.0,
             )
             if resp.status_code == 409:
                 # Already provisioned (rerun): overwrite in place.
                 resp = httpx.put(
-                    f"{base_url}/credstore/v1/secrets/{ref}",
+                    f"{base_url}/credstore/v1/credentials/{ref}",
                     headers={**headers, "If-Match": "*"},
-                    json={"value": _CREDSTORE_SECRETS[ref], "sharing": "tenant"},
+                    json={"sharing": "tenant", "value": _CREDSTORE_SECRETS[ref]},
                     timeout=5.0,
                 )
         except httpx.RequestError:
@@ -194,7 +200,7 @@ def _provision_credstore_secrets(_check_oagw_reachable):
             # and ERRORs the whole session instead of letting the per-test skip
             # take over (review finding #5).
             break
-        if resp.status_code not in (200, 201, 204):
+        if resp.status_code not in (201, 204):
             # Don't fail the session; the auth tests skip if the secret is
             # absent. Log only the ref name and status — never the response
             # body, which could reflect the secret value.

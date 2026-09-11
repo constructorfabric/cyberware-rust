@@ -4,7 +4,9 @@
 //! lookup, crash-safe writes, expiry, and the value-fingerprint fence.
 
 pub mod fence;
+pub mod list_filter;
 pub mod model;
+pub mod reduce;
 pub mod repo;
 pub mod service;
 #[cfg(test)]

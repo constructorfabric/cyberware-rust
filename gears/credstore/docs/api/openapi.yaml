@@ -2,24 +2,85 @@
 openapi: 3.1.0
 info:
   title: CredStore API
+  description: Credential records and their secret values, tenant-scoped, PDP-protected.
   version: 0.1.0
-  description: Stateful, tenant-scoped credential-storage gear. Extracted (credstore paths + referenced
-    components) from the platform OpenAPI document `docs/api/api.json`; regenerate via `make openapi`.
 paths:
-  /credstore/v1/secrets:
-    post:
-      description: Create a new secret for the authenticated tenant.
-      operationId: credstore.create_secret
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateSecretRequestDto'
-        description: Secret reference, value, and sharing mode
-        required: true
+  /credstore/v1/credentials:
+    get:
+      description: 'Upward-rooted collection read (ADR-0005): one reduced item per reference, from the
+        caller''s tenant and its ancestor chain only. `$filter` accepts `reference`/ `type` (SQL-clamped,
+        eq/in) and `sharing`/`fallback`/`expires_at` (applied after reduction); `$orderby` accepts only
+        `reference`. Selecting `secret` in `$select` switches to value mode (ADR-0004): no `limit`/`cursor`/`$orderby`,
+        a `reference` or `type` selector only, capped and unpaginated.'
+      operationId: credstore.list_credentials
+      parameters:
+      - description: Page size (metadata mode only)
+        in: query
+        name: limit
+        required: false
+        schema:
+          type: integer
+      - description: Opaque continuation token from a previous page
+        in: query
+        name: cursor
+        required: false
+        schema:
+          type: string
+      - description: 'OData v4 filter expression
+
+          - reference: eq|ne|contains|startswith|endswith|in
+
+          - type: eq|ne|contains|startswith|endswith|in
+
+          - sharing: eq|ne|contains|startswith|endswith|in
+
+          - fallback: eq|ne|contains|startswith|endswith|in
+
+          - expires_at: eq|ne|gt|ge|lt|le|in'
+        in: query
+        name: $filter
+        required: false
+        schema:
+          type: string
+      - description: 'OData v4 orderby expression
+
+          - reference asc
+
+          - reference desc
+
+          - type asc
+
+          - type desc
+
+          - sharing asc
+
+          - sharing desc
+
+          - fallback asc
+
+          - fallback desc
+
+          - expires_at asc
+
+          - expires_at desc'
+        in: query
+        name: $orderby
+        required: false
+        schema:
+          type: string
+      - description: OData v4 select expression
+        in: query
+        name: $select
+        required: false
+        schema:
+          type: string
       responses:
-        '201':
-          description: Secret created (see Location header)
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_CredentialListItemDto'
+          description: A page of reduced credential items (value-mode items additionally carry `secret`)
         '400':
           content:
             application/problem+json:
@@ -38,12 +99,24 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
           description: Forbidden
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
         '409':
           content:
             application/problem+json:
               schema:
                 $ref: '#/components/schemas/Problem'
           description: Conflict
+        '429':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Too Many Requests
         '500':
           content:
             application/problem+json:
@@ -58,24 +131,71 @@ paths:
           description: Service Unavailable
       security:
       - bearerAuth: []
-      summary: Create a secret
+      summary: List credentials
       tags:
       - Credential Store
-  /credstore/v1/secrets/{ref}:
+      x-odata-filter:
+        allowedFields:
+          expires_at:
+          - eq
+          - ne
+          - gt
+          - ge
+          - lt
+          - le
+          - in
+          fallback:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+          reference:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+          sharing:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+          type:
+          - eq
+          - ne
+          - contains
+          - startswith
+          - endswith
+          - in
+      x-odata-orderby:
+        allowedFields:
+        - reference asc
+        - reference desc
+        - type asc
+        - type desc
+        - sharing asc
+        - sharing desc
+        - fallback asc
+        - fallback desc
+        - expires_at asc
+        - expires_at desc
+  /credstore/v1/credentials/{ref}:
     delete:
-      description: Delete a secret owned by the authenticated tenant.
-      operationId: credstore.delete_secret
+      description: Delete the record and its value, releasing the reference at once.
+      operationId: credstore.delete_credential
       parameters:
-      - description: Secret reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+      - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
         in: path
         name: ref
         required: true
         schema:
           type: string
-      - description: Mandatory optimistic-concurrency precondition (RFC 7232). `*` requires the secret
-          to exist (explicit last-writer-wins overwrite); a quoted `"<id>.<version>"` ETag requires the
-          current version to match, otherwise the request fails with `409 OPTIMISTIC_LOCK_FAILURE`. A
-          missing header is a `400 IF_MATCH_REQUIRED`.
+      - description: Mandatory. `*` or a quoted `"<id>.<version>"` ETag.
         in: header
         name: If-Match
         required: true
@@ -83,7 +203,7 @@ paths:
           type: string
       responses:
         '204':
-          description: Secret deleted
+          description: Credential deleted
         '400':
           content:
             application/problem+json:
@@ -128,14 +248,15 @@ paths:
           description: Service Unavailable
       security:
       - bearerAuth: []
-      summary: Delete a secret by reference
+      summary: Delete a credential by reference
       tags:
       - Credential Store
     get:
-      description: Retrieve a secret for the authenticated tenant, with walk-up resolution.
-      operationId: credstore.get_secret
+      description: Retrieve the credential record for the authenticated tenant, with walk-up resolution.
+        Never carries the value -- see `.../secret`.
+      operationId: credstore.get_credential
       parameters:
-      - description: Secret reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+      - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
         in: path
         name: ref
         required: true
@@ -146,8 +267,8 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/GetSecretResponseDto'
-          description: Resolved secret value and metadata
+                $ref: '#/components/schemas/CredentialDto'
+          description: The resolved credential record
         '400':
           content:
             application/problem+json:
@@ -186,24 +307,23 @@ paths:
           description: Service Unavailable
       security:
       - bearerAuth: []
-      summary: Get a secret by reference
+      summary: Get a credential record by reference
       tags:
       - Credential Store
-    put:
-      description: 'Update an existing secret for the authenticated tenant. Requires `If-Match` and never
-        creates: a missing target fails the precondition (409); create via `POST /credstore/v1/secrets`.'
-      operationId: credstore.put_secret
+    patch:
+      description: 'RFC 7396 JSON Merge Patch over the record, the value, or both. Requires `Content-Type:
+        application/merge-patch+json` (415 otherwise) and a mandatory `If-Match`. Never creates. A body
+        carrying no `value` key whose metadata already matches the current record is a no-op (204, unchanged
+        ETag).'
+      operationId: credstore.patch_credential
       parameters:
-      - description: Secret reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+      - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
         in: path
         name: ref
         required: true
         schema:
           type: string
-      - description: Mandatory optimistic-concurrency precondition (RFC 7232). `*` requires the secret
-          to exist (explicit last-writer-wins overwrite); a quoted `"<id>.<version>"` ETag requires the
-          current version to match, otherwise the request fails with `409 OPTIMISTIC_LOCK_FAILURE`. A
-          missing header is a `400 IF_MATCH_REQUIRED`.
+      - description: Mandatory. `*` (unconditional) or a quoted `"<id>.<version>"` ETag (guarded).
         in: header
         name: If-Match
         required: true
@@ -213,12 +333,101 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpdateSecretRequestDto'
-        description: Secret value and sharing mode
+              $ref: '#/components/schemas/CredentialPatchDto'
+        description: 'Merge-patch body (Content-Type: application/merge-patch+json)'
         required: true
       responses:
         '204':
-          description: Secret stored
+          description: Credential updated
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '401':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Unauthorized
+        '403':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Forbidden
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '409':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Conflict
+        '415':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Unsupported Media Type
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+        '503':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Service Unavailable
+      security:
+      - bearerAuth: []
+      summary: Partially update a credential by reference
+      tags:
+      - Credential Store
+    put:
+      description: 'Whole-credential replace: record and value together, in one call. Exactly one of `If-None-Match:
+        *` (create-only) or `If-Match` (guarded/unconditional replace) is required. `value` is required
+        in the body -- a PUT always carries a value.'
+      operationId: credstore.put_credential
+      parameters:
+      - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+        in: path
+        name: ref
+        required: true
+        schema:
+          type: string
+      - description: '`*` -- create-only: fails if the caller''s own tenant already holds a record under
+          the reference. Mutually exclusive with `If-Match`.'
+        in: header
+        name: If-None-Match
+        required: false
+        schema:
+          type: string
+      - description: '`*` (replace, last-writer-wins) or a quoted `"<id>.<version>"` ETag (guarded replace).
+          Mutually exclusive with `If-None-Match`.'
+        in: header
+        name: If-Match
+        required: false
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutCredentialRequestDto'
+        description: Credential type, sharing, fallback, expiry, and value
+        required: true
+      responses:
+        '201':
+          description: Credential created (see Location/ETag headers)
         '400':
           content:
             application/problem+json:
@@ -257,66 +466,286 @@ paths:
           description: Service Unavailable
       security:
       - bearerAuth: []
-      summary: Update a secret by reference
+      summary: Create or replace a credential by reference
+      tags:
+      - Credential Store
+  /credstore/v1/credentials/{ref}/secret:
+    get:
+      description: Retrieve the resolved secret value for the authenticated tenant, with walk-up resolution.
+        A winning record with no value (declared, or suppressed) is the canonical 404.
+      operationId: credstore.get_secret
+      parameters:
+      - description: Credential reference (`[a-zA-Z0-9_-]+`, maximum length 255 characters)
+        in: path
+        name: ref
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretDto'
+          description: The resolved secret value
+        '400':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Bad Request
+        '401':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Unauthorized
+        '403':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Forbidden
+        '404':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Not Found
+        '500':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Internal Server Error
+        '503':
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+          description: Service Unavailable
+      security:
+      - bearerAuth: []
+      summary: Get a credential's secret value by reference
       tags:
       - Credential Store
 components:
   schemas:
-    CreateSecretRequestDto:
-      additionalProperties: false
-      description: 'Request body for `POST /credstore/v1/secrets`.
+    CredentialDto:
+      description: 'Response body for `GET /credstore/v1/credentials/{ref}` (ADR-0004): the
 
-
-        `Debug` is hand-written to redact `value` — a derived `Debug` would expose
-
-        the plaintext secret if this DTO is ever `{:?}`-logged by a future layer.'
+        credential record. Never carries the value — see [`SecretDto`].'
       properties:
         expires_at:
-          description: Expiry instant (RFC 3339); only for expirable types.
           format: date-time
           type:
           - string
           - 'null'
+        fallback:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FallbackDto'
+            description: 'The caller''s own row''s suppression policy; absent when the caller
+
+              holds no row under the reference (`status: none`).'
+        inheritance:
+          $ref: '#/components/schemas/InheritanceStatusDto'
+        owner_id:
+          description: 'Subject id that created the caller''s own row; absent iff `status` is
+
+            `none`. Never populated from an ancestor''s row — an inherited entry
+
+            must not disclose identifiers from another tenant, and a caller who
+
+            needs the ancestor''s owner acts in that tenant''s context and reads
+
+            it there.'
+          type:
+          - string
+          - 'null'
         reference:
-          description: Secret reference key — `[a-zA-Z0-9_-]+`, max 255 characters.
-          maxLength: 255
-          minLength: 1
-          pattern: ^[A-Za-z0-9_-]+$
           type: string
         sharing:
           $ref: '#/components/schemas/SharingModeDto'
-          description: Sharing mode for the secret.
+        status:
+          $ref: '#/components/schemas/CredentialStatusDto'
         type:
-          description: 'Secret type as a full GTS type id (built-in or custom); defaults to
+          type: string
+        updated_at:
+          description: 'The caller''s own row''s last-write instant; absent iff `status` is
 
-            the generic type. Resolved and existence-checked against the
+            `none`.'
+          format: date-time
+          type:
+          - string
+          - 'null'
+        version:
+          description: The caller's own row's version; absent iff `status` is `none`.
+          format: int64
+          type:
+          - integer
+          - 'null'
+      required:
+      - reference
+      - type
+      - sharing
+      - status
+      - inheritance
+      type: object
+    CredentialListItemDto:
+      description: 'One item of `GET /credstore/v1/credentials` (ADR-0005/ADR-0004): the same
 
-            types-registry.'
+        fields as [`CredentialDto`], plus `secret` — populated only in value mode
+
+        (`$select` containing `secret`) and only for an item the caller may read;
+
+        absent from the wire entirely in metadata mode or when the item''s value
+
+        could not be served (refused, missing, fingerprint mismatch — omitted by
+
+        the domain layer already, never reported as an error for one item).
+
+
+        `Debug` is hand-written to redact `secret`.'
+      properties:
+        expires_at:
+          format: date-time
+          type:
+          - string
+          - 'null'
+        fallback:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FallbackDto'
+        inheritance:
+          $ref: '#/components/schemas/InheritanceStatusDto'
+        owner_id:
+          type:
+          - string
+          - 'null'
+        reference:
+          type: string
+        secret:
+          description: 'The decrypted value — the same wire form as [`SecretDto::value`] —
+
+            present only in value mode, for an item the caller may read.'
+          type:
+          - string
+          - 'null'
+        sharing:
+          $ref: '#/components/schemas/SharingModeDto'
+        status:
+          $ref: '#/components/schemas/CredentialStatusDto'
+        type:
+          type: string
+        updated_at:
+          format: date-time
+          type:
+          - string
+          - 'null'
+        version:
+          format: int64
+          type:
+          - integer
+          - 'null'
+      required:
+      - reference
+      - type
+      - sharing
+      - status
+      - inheritance
+      type: object
+    CredentialPatchDto:
+      additionalProperties: false
+      description: 'Request body for `PATCH /credstore/v1/credentials/{ref}` (ADR-0004): an
+
+        RFC 7396 JSON Merge Patch. Every field is tri-state (`Option<Option<T>>`):
+
+        absent (untouched), explicit `null`, or a value. `secret_type`/`sharing`/
+
+        `fallback` have no valid `null` state on the wire (rejected as
+
+        `NULL_NOT_ALLOWED` by the handler, since none is a nullable column);
+
+        `expires_at`/`value` do — `null` clears/removes them.
+
+
+        `Debug` is hand-written to redact `value`.'
+      properties:
+        expires_at:
+          type:
+          - string
+          - 'null'
+        fallback:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FallbackDto'
+        sharing:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SharingModeDto'
+        type:
           type:
           - string
           - 'null'
         value:
-          description: Secret value as a UTF-8 string.
-          type: string
-      required:
-      - reference
-      - value
+          type:
+          - string
+          - 'null'
       type: object
-    GetSecretResponseDto:
-      description: 'Response body for `GET /credstore/v1/secrets/{ref}`.
+    CredentialStatusDto:
+      description: 'The caller''s own-row status for the REST transport layer (ADR-0004, "Two
 
+        representations").'
+      enum:
+      - none
+      - declared
+      - active
+      type: string
+    FallbackDto:
+      description: Suppression policy for the REST transport layer (ADR-0004, "Suppression").
+      enum:
+      - inherit
+      - none
+      type: string
+    InheritanceStatusDto:
+      description: 'The effective-row inheritance status for the REST transport layer
 
-        `Debug` is hand-written to redact `value` (see [`CreateSecretRequestDto`]).'
+        (ADR-0004, "Two representations").'
+      enum:
+      - own
+      - inherited
+      - overridden
+      - suppressed
+      type: string
+    PageInfo:
       properties:
-        metadata:
-          $ref: '#/components/schemas/SecretMetadataDto'
-          description: Access metadata for the resolved secret.
-        value:
-          description: Secret value as a UTF-8 string.
-          type: string
+        limit:
+          format: int64
+          minimum: 0
+          type: integer
+        next_cursor:
+          type:
+          - string
+          - 'null'
+        prev_cursor:
+          type:
+          - string
+          - 'null'
       required:
-      - value
-      - metadata
+      - limit
+      type: object
+    Page_CredentialListItemDto:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/CredentialListItemDto'
+          type: array
+        page_info:
+          $ref: '#/components/schemas/PageInfo'
+      required:
+      - items
+      - page_info
       type: object
     Problem:
       description: RFC 9457 problem+json. `context` varies by error category.
@@ -343,38 +772,73 @@ components:
       - detail
       - context
       type: object
-    SecretMetadataDto:
-      description: Access metadata returned alongside the secret value.
+    PutCredentialRequestDto:
+      additionalProperties: false
+      description: 'Request body for `PUT /credstore/v1/credentials/{ref}` (ADR-0004): a
+
+        whole-credential replace. `value` is modelled as optional at the wire
+
+        shape (`Option<String>`) so its *absence* can be distinguished from a
+
+        malformed body and rejected with the typed `VALUE_REQUIRED` reason rather
+
+        than a generic deserialization error.
+
+
+        `Debug` is hand-written to redact `value`.'
       properties:
         expires_at:
-          description: Expiry instant (RFC 3339), when set.
+          description: 'Expiry instant (RFC 3339); only for expirable types. A `PUT` is a
+
+            whole-value replace: omitting `expires_at` clears a stored expiry.'
           format: date-time
           type:
           - string
           - 'null'
-        is_inherited:
-          description: Whether the secret came from an ancestor tenant.
-          type: boolean
-        owner_tenant_id:
-          description: The tenant that owns this secret.
-          format: uuid
-          type: string
+        fallback:
+          $ref: '#/components/schemas/FallbackDto'
+          description: Suppression policy; defaults to `inherit`.
         sharing:
           $ref: '#/components/schemas/SharingModeDto'
-          description: The sharing mode that governed the lookup result.
+          description: Sharing mode — required (ADR-0004).
         type:
-          description: Secret type as its full GTS type id.
-          type: string
-        version:
-          description: Monotonic version of the resolved secret (also returned as `ETag`).
-          format: int64
-          type: integer
+          description: 'Full GTS type id. Required on create; on replace it must equal the
+
+            stored type (`TYPE_IMMUTABLE` otherwise).'
+          type:
+          - string
+          - 'null'
+        value:
+          description: The value to write. Required — its absence is `400 VALUE_REQUIRED`.
+          type:
+          - string
+          - 'null'
       required:
-      - owner_tenant_id
       - sharing
-      - is_inherited
-      - version
+      type: object
+    SecretDto:
+      description: 'Response body for `GET /credstore/v1/credentials/{ref}/secret`
+
+        (ADR-0004): the value with exactly what is needed to use it.
+
+
+        `Debug` is hand-written to redact `value`.'
+      properties:
+        expires_at:
+          format: date-time
+          type:
+          - string
+          - 'null'
+        reference:
+          type: string
+        type:
+          type: string
+        value:
+          type: string
+      required:
+      - reference
       - type
+      - value
       type: object
     SharingModeDto:
       description: Sharing mode for the REST transport layer.
@@ -383,47 +847,6 @@ components:
       - tenant
       - shared
       type: string
-    UpdateSecretRequestDto:
-      additionalProperties: false
-      description: 'Request body for `PUT /credstore/v1/secrets/{ref}`.
-
-
-        `Debug` is hand-written to redact `value` (see [`CreateSecretRequestDto`]).'
-      properties:
-        expires_at:
-          description: 'Expiry instant (RFC 3339); only for expirable types. A PUT is a
-
-            whole-value replace: omitting `expires_at` clears a stored expiry.'
-          format: date-time
-          type:
-          - string
-          - 'null'
-        sharing:
-          oneOf:
-          - type: 'null'
-          - $ref: '#/components/schemas/SharingModeDto'
-            description: 'Sharing mode for the secret. **Optional: when omitted the secret''s
-
-              current sharing is preserved**, so rotating a `shared` secret''s value
-
-              with `{"value": "..."}` alone no longer silently narrows it back to
-
-              `tenant` (review finding #8). Send an explicit value to change the
-
-              sharing mode.'
-        type:
-          description: 'Secret type as a full GTS type id. Optional; when present must match
-
-            the existing secret''s type (the type is immutable).'
-          type:
-          - string
-          - 'null'
-        value:
-          description: Secret value as a UTF-8 string.
-          type: string
-      required:
-      - value
-      type: object
   securitySchemes:
     bearerAuth:
       bearerFormat: JWT

@@ -31,12 +31,24 @@ pub enum DomainError {
     PreconditionRequired { detail: String },
     #[error("unsupported sharing transition: {detail}")]
     UnsupportedTransition { detail: String },
-    /// A write violated the secret type's traits. `reason` is the stable
+    /// A write violated the secret type's traits, or names a type that
+    /// conflicts with the one already in play (`TYPE_IMMUTABLE`,
+    /// `TYPE_MISMATCH_WITH_INHERITED`). `reason` is the stable
     /// machine-readable code surfaced on the wire (e.g.
     /// `SHARING_NOT_ALLOWED_FOR_TYPE`); `field` names the offending request
     /// field for the canonical field violation.
     #[error("secret type violation ({reason}): {detail}")]
     TypeViolation {
+        field: &'static str,
+        reason: &'static str,
+        detail: String,
+    },
+    /// A request is malformed independently of any secret type (ADR-0004):
+    /// `VALUE_REQUIRED`, `EMPTY_PATCH`, `NULL_NOT_ALLOWED`,
+    /// `PRECONDITION_REQUIRED`, `TYPE_REQUIRED`. `reason` is the stable
+    /// machine-readable code; `field` names the offending request field.
+    #[error("invalid request ({reason}): {detail}")]
+    InvalidRequest {
         field: &'static str,
         reason: &'static str,
         detail: String,

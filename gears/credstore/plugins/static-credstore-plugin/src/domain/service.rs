@@ -1,48 +1,36 @@
-// Updated: 2026-06-06 — adapted to the per-tenant value-store `CredStorePluginClientV1`.
-//! Thread-safe in-memory secret-value store.
+// Updated: 2026-09-10 by Constructor Tech — rebuilt as a pure `tenant_id/value_id`
+// immutable value store (ADR-0006); out-of-band seeding withdrawn.
+//! Thread-safe in-memory immutable-value store.
 //!
-//! Configuration seeds private, tenant, shared, and global key classes; runtime
-//! writes mutate only private and tenant classes.
+//! Keyed by `(tenant_id, value_id)` (ADR-0006 "Backend key shape") — no
+//! `reference`, no sharing-derived key class, no `owner_id`. Every entry, once
+//! written, is immutable: `put` on an id already present is a contract
+//! violation the gear itself never issues, and this plugin defends against it
+//! by rejecting the call with [`CredStoreError::Conflict`]; `delete` of an id
+//! this store does not hold is success (idempotent).
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use credstore_sdk::{OwnerId, SecretRef, SecretValue, SharingMode, TenantId};
+use credstore_sdk::{CredStoreError, SecretValue, TenantId, ValueId};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::config::StaticCredStorePluginConfig;
 
-/// In-memory key classes backing the static plugin.
-///
-/// The `private`/`tenant` classes mirror the two classes the gear selects
-/// via `owner_id` (`Some`/`None`). The `shared`/`global` maps hold
-/// config-seeded entries that have no equivalent at write time; they are kept
-/// as read-only fallbacks for `owner_id = None` lookups so existing
-/// development configs keep resolving.
+/// In-memory backend store: `(tenant_id, value_id) -> value`.
 #[domain_model]
 #[derive(Debug, Default)]
 struct Store {
-    /// Private key class — keyed by `(tenant, owner, key)`.
-    private: HashMap<(TenantId, OwnerId, SecretRef), SecretValue>,
-    /// Tenant key class — keyed by `(tenant, key)`.
-    tenant: HashMap<(TenantId, SecretRef), SecretValue>,
-    /// Config-seeded `shared` secrets — read fallback for the tenant key class.
-    shared: HashMap<(TenantId, SecretRef), SecretValue>,
-    /// Config-seeded global secrets — final read fallback for the tenant class.
-    global: HashMap<SecretRef, SecretValue>,
+    values: HashMap<(Uuid, Uuid), SecretValue>,
 }
 
 /// Static credstore backend.
 ///
-/// A pure per-tenant value store implementing the `CredStorePluginClientV1`
-/// contract: `owner_id = Some` selects the private key class, `None` the
-/// tenant key class. Sharing, hierarchy and policy live in the gear, not
-/// here.
-///
-/// The store is seeded from configuration and stays mutable at runtime, so the
-/// stateful gear's write saga (`put`/`delete`) can use it as a development
-/// backend. Config-seeded `shared`/global entries remain read-only fallbacks
-/// for `owner_id = None` lookups.
+/// A pure per-tenant, per-version value store implementing the
+/// `CredStorePluginClientV1` contract: `get`/`put`/`delete` keyed by
+/// `(tenant_id, value_id)` only. No configuration seeds values any more
+/// (ADR-0006 withdraws out-of-band seeding) — the store starts empty and is
+/// populated only through the gear's write protocol.
 #[domain_model]
 #[derive(Debug, Default)]
 pub struct Service {
@@ -52,194 +40,73 @@ pub struct Service {
 impl Service {
     /// Create a service from plugin configuration.
     ///
-    /// Validates each configured key via `SecretRef::new` and seeds the
-    /// in-memory key classes from the resolved sharing mode.
+    /// Configuration carries only GTS-registration input (vendor, priority);
+    /// this constructor never fails but keeps the fallible signature other
+    /// plugin backends need. The store always starts empty.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - any configured key fails `SecretRef` validation
-    /// - duplicate keys within the same sharing scope
-    /// - a secret without `owner_id` has an explicit `SharingMode::Private`
-    /// - `tenant_id` or `owner_id` is an explicit nil UUID
-    /// - `owner_id` is set without `tenant_id`
-    pub fn from_config(cfg: &StaticCredStorePluginConfig) -> anyhow::Result<Self> {
-        let mut store = Store::default();
-
-        for entry in &cfg.secrets {
-            if entry.tenant_id == Some(Uuid::nil()) {
-                anyhow::bail!("secret '{}': tenant_id must not be nil UUID", entry.key);
-            }
-            if entry.owner_id == Some(Uuid::nil()) {
-                anyhow::bail!("secret '{}': owner_id must not be nil UUID", entry.key);
-            }
-            if entry.tenant_id.is_none() && entry.owner_id.is_some() {
-                anyhow::bail!(
-                    "secret '{}': owner_id cannot be set without tenant_id",
-                    entry.key
-                );
-            }
-
-            let sharing = entry.resolve_sharing();
-
-            if entry.owner_id.is_some() && sharing != SharingMode::Private {
-                anyhow::bail!(
-                    "secret '{}': owner_id is only valid for private sharing mode, \
-                     but resolved sharing is {sharing:?}",
-                    entry.key
-                );
-            }
-            if entry.owner_id.is_none() && sharing == SharingMode::Private {
-                anyhow::bail!(
-                    "secret '{}' with sharing mode 'private' requires an explicit owner_id",
-                    entry.key
-                );
-            }
-
-            let key = SecretRef::new(&entry.key)?;
-            let value = SecretValue::from(entry.value.as_str());
-
-            match (sharing, entry.tenant_id) {
-                (SharingMode::Shared, None) => {
-                    if store.global.contains_key(&key) {
-                        anyhow::bail!("duplicate global secret key '{}'", entry.key);
-                    }
-                    store.global.insert(key, value);
-                }
-                (SharingMode::Shared, Some(raw_tenant_id)) => {
-                    let tenant_id = TenantId(raw_tenant_id);
-                    let map_key = (tenant_id, key);
-                    if store.shared.contains_key(&map_key) {
-                        anyhow::bail!(
-                            "duplicate shared secret key '{}' for tenant {}",
-                            entry.key,
-                            tenant_id
-                        );
-                    }
-                    store.shared.insert(map_key, value);
-                }
-                (SharingMode::Tenant, _) => {
-                    let tenant_id = TenantId(entry.tenant_id.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "secret '{}': tenant sharing mode requires tenant_id",
-                            entry.key
-                        )
-                    })?);
-                    let map_key = (tenant_id, key);
-                    if store.tenant.contains_key(&map_key) {
-                        anyhow::bail!(
-                            "duplicate tenant secret key '{}' for tenant {}",
-                            entry.key,
-                            tenant_id
-                        );
-                    }
-                    store.tenant.insert(map_key, value);
-                }
-                (SharingMode::Private, _) => {
-                    let tenant_id = TenantId(entry.tenant_id.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "secret '{}': private sharing mode requires tenant_id",
-                            entry.key
-                        )
-                    })?);
-                    let owner_id = OwnerId(entry.owner_id.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "secret '{}': private sharing mode requires owner_id",
-                            entry.key
-                        )
-                    })?);
-                    let map_key = (tenant_id, owner_id, key);
-                    if store.private.contains_key(&map_key) {
-                        anyhow::bail!(
-                            "duplicate private secret key '{}' for tenant {} owner {}",
-                            entry.key,
-                            tenant_id,
-                            owner_id
-                        );
-                    }
-                    store.private.insert(map_key, value);
-                }
-            }
-        }
-
+    /// Never returns an error today; kept `Result` so a future backend that
+    /// does validate configuration does not need a signature change.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "signature matches the plugin construction contract other backends use, \
+                  which may validate configuration and fail"
+    )]
+    pub fn from_config(_cfg: &StaticCredStorePluginConfig) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: RwLock::new(store),
+            inner: RwLock::new(Store::default()),
         })
     }
 
-    /// Read a value for the selected key class.
-    ///
-    /// `owner_id = Some` reads the private class; `None` reads the tenant class
-    /// and falls back to config-seeded `shared` then global entries.
+    /// Read the value stored at `(tenant_id, value_id)`, or `None` if absent.
     #[must_use]
-    pub fn get_value(
-        &self,
-        tenant_id: &TenantId,
-        key: &SecretRef,
-        owner_id: Option<&OwnerId>,
-    ) -> Option<SecretValue> {
+    pub fn get_value(&self, tenant_id: &TenantId, value_id: &ValueId) -> Option<SecretValue> {
         let store = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bytes = match owner_id {
-            Some(owner) => store
-                .private
-                .get(&(*tenant_id, *owner, key.clone()))
-                .map(SecretValue::as_bytes),
-            None => store
-                .tenant
-                .get(&(*tenant_id, key.clone()))
-                .or_else(|| store.shared.get(&(*tenant_id, key.clone())))
-                .or_else(|| store.global.get(key))
-                .map(SecretValue::as_bytes),
-        };
-        // `SecretValue` is not `Clone` (it zeroizes on drop), so reconstruct.
-        bytes.map(|b| SecretValue::new(b.to_vec()))
+        // `SecretValue` is not `Clone` (it zeroizes on drop), so reconstruct
+        // from the stored bytes.
+        store
+            .values
+            .get(&(tenant_id.0, value_id.0))
+            .map(|v| SecretValue::new(v.as_bytes().to_vec()))
     }
 
-    /// Insert or overwrite a value in the selected key class.
+    /// Write a brand-new, immutable entry at `(tenant_id, value_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredStoreError::Conflict`] if an entry already exists at
+    /// this id — immutability guard; the gear never reissues a `value_id` it
+    /// has already written.
     pub fn put_value(
         &self,
         tenant_id: &TenantId,
-        key: &SecretRef,
+        value_id: &ValueId,
         value: SecretValue,
-        owner_id: Option<&OwnerId>,
-    ) {
+    ) -> Result<(), CredStoreError> {
         let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match owner_id {
-            Some(owner) => {
-                store
-                    .private
-                    .insert((*tenant_id, *owner, key.clone()), value);
-            }
-            None => {
-                store.tenant.insert((*tenant_id, key.clone()), value);
-            }
+        let key = (tenant_id.0, value_id.0);
+        if store.values.contains_key(&key) {
+            return Err(CredStoreError::Conflict);
         }
+        store.values.insert(key, value);
+        Ok(())
     }
 
-    /// Remove a value from the selected key class.
-    ///
-    /// Deletes address the **runtime** maps only. The config-seeded `shared`
-    /// and global fallbacks are cross-tenant reference data: a tenant-scoped
-    /// delete (including gear saga retries and reaper reconciliation
-    /// issued on behalf of one tenant) must never destroy an entry that
-    /// serves other tenants. A miss is a no-op — the gear treats a
-    /// missing backend value as success.
-    pub fn delete_value(&self, tenant_id: &TenantId, key: &SecretRef, owner_id: Option<&OwnerId>) {
+    /// Remove the entry at `(tenant_id, value_id)`. A miss is a no-op — the
+    /// gear treats a missing backend value as success (idempotent delete).
+    pub fn delete_value(&self, tenant_id: &TenantId, value_id: &ValueId) {
         let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(owner) = owner_id {
-            store.private.remove(&(*tenant_id, *owner, key.clone()));
-        } else {
-            store.tenant.remove(&(*tenant_id, key.clone()));
-        }
+        store.values.remove(&(tenant_id.0, value_id.0));
     }
 }
 

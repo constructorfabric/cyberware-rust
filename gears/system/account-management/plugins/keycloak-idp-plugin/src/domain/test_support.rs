@@ -16,10 +16,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, GetSecretResponse, SecretRef, SecretValue, SharingMode,
-    TenantId, WritePrecondition,
+    CredStoreClientV1, CredStoreError, Credential, CredentialListItem, CredentialPatch,
+    CredentialWrite, PutOutcome, PutPrecondition, Secret, SecretRef, SecretValue, Validator,
+    WritePrecondition,
 };
 use toolkit_macros::domain_model;
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -84,7 +86,7 @@ impl SaOpMetricsPort for NoopMetrics {
     fn sa_op_duration(&self, _op: SaOp, _secs: f64) {}
 }
 
-/// No-op `CredStoreClientV1` — every `get` returns `Ok(None)`.
+/// No-op `CredStoreClientV1` — every read returns `Ok(None)`.
 ///
 /// Suitable for Shared-mode tests that never resolve a `SecretSource::OpenBaoRef`
 /// (the bootstrap path uses the inline secret carried on the parsed config).
@@ -93,22 +95,19 @@ pub struct StubCredStore;
 
 #[async_trait]
 impl CredStoreClientV1 for StubCredStore {
-    async fn create(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-    ) -> Result<(), CredStoreError> {
-        self.put(ctx, key, value, sharing, WritePrecondition::Exists)
-            .await
-    }
-
     async fn get(
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+    ) -> Result<Option<Credential>, CredStoreError> {
+        Ok(None)
+    }
+
+    async fn get_secret(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<Option<Secret>, CredStoreError> {
         Ok(None)
     }
 
@@ -116,11 +115,29 @@ impl CredStoreClientV1 for StubCredStore {
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-        _value: SecretValue,
-        _sharing: SharingMode,
+        _write: CredentialWrite,
+        _precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
+        Ok(PutOutcome {
+            created: true,
+            validator: Validator {
+                id: Uuid::nil(),
+                version: 1,
+            },
+        })
+    }
+
+    async fn patch(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
-        Ok(())
+    ) -> Result<Validator, CredStoreError> {
+        Ok(Validator {
+            id: Uuid::nil(),
+            version: 1,
+        })
     }
 
     async fn delete(
@@ -131,18 +148,26 @@ impl CredStoreClientV1 for StubCredStore {
     ) -> Result<(), CredStoreError> {
         Ok(())
     }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
+    }
 }
 
 /// Configurable stub keyed by `SecretRef`.
 ///
 /// Adopted-mode tests seed a response for the per-realm `OpenBao` key so
-/// `realm_client(...)` can resolve the secret. `GetSecretResponse` is not
-/// `Clone` (contains `SecretValue`), so each entry is `take()`n on first
+/// `realm_client(...)` can resolve the secret via `get_secret`. `Secret` is
+/// not `Clone` (contains `SecretValue`), so each entry is `take()`n on first
 /// match — fine because the factory caches the resulting token.
 #[domain_model]
 #[derive(Default)]
 pub struct ConfigurableStubCS {
-    pub responses: Mutex<HashMap<String, GetSecretResponse>>,
+    pub responses: Mutex<HashMap<String, Secret>>,
 }
 
 impl ConfigurableStubCS {
@@ -151,15 +176,15 @@ impl ConfigurableStubCS {
         let mut map = HashMap::new();
         map.insert(
             key.to_owned(),
-            GetSecretResponse {
-                value: SecretValue::from(value),
-                id: uuid::Uuid::nil(),
+            Secret {
+                reference: SecretRef::new(key).expect("valid SecretRef"),
                 secret_type: String::new(),
                 expires_at: None,
-                owner_tenant_id: TenantId::nil(),
-                sharing: SharingMode::Tenant,
-                is_inherited: false,
-                version: 1,
+                value: SecretValue::from(value),
+                validator: Validator {
+                    id: Uuid::nil(),
+                    version: 1,
+                },
             },
         );
         Self {
@@ -170,22 +195,19 @@ impl ConfigurableStubCS {
 
 #[async_trait]
 impl CredStoreClientV1 for ConfigurableStubCS {
-    async fn create(
-        &self,
-        ctx: &SecurityContext,
-        key: &SecretRef,
-        value: SecretValue,
-        sharing: SharingMode,
-    ) -> Result<(), CredStoreError> {
-        self.put(ctx, key, value, sharing, WritePrecondition::Exists)
-            .await
-    }
-
     async fn get(
         &self,
         _ctx: &SecurityContext,
+        _key: &SecretRef,
+    ) -> Result<Option<Credential>, CredStoreError> {
+        Ok(None)
+    }
+
+    async fn get_secret(
+        &self,
+        _ctx: &SecurityContext,
         key: &SecretRef,
-    ) -> Result<Option<GetSecretResponse>, CredStoreError> {
+    ) -> Result<Option<Secret>, CredStoreError> {
         Ok(self.responses.lock().remove(key.as_ref()))
     }
 
@@ -193,11 +215,29 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         &self,
         _ctx: &SecurityContext,
         _key: &SecretRef,
-        _value: SecretValue,
-        _sharing: SharingMode,
+        _write: CredentialWrite,
+        _precondition: PutPrecondition,
+    ) -> Result<PutOutcome, CredStoreError> {
+        Ok(PutOutcome {
+            created: true,
+            validator: Validator {
+                id: Uuid::nil(),
+                version: 1,
+            },
+        })
+    }
+
+    async fn patch(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &SecretRef,
+        _patch: CredentialPatch,
         _precondition: WritePrecondition,
-    ) -> Result<(), CredStoreError> {
-        Ok(())
+    ) -> Result<Validator, CredStoreError> {
+        Ok(Validator {
+            id: Uuid::nil(),
+            version: 1,
+        })
     }
 
     async fn delete(
@@ -207,6 +247,14 @@ impl CredStoreClientV1 for ConfigurableStubCS {
         _precondition: WritePrecondition,
     ) -> Result<(), CredStoreError> {
         Ok(())
+    }
+
+    async fn list(
+        &self,
+        _ctx: &SecurityContext,
+        query: &ODataQuery,
+    ) -> Result<Page<CredentialListItem>, CredStoreError> {
+        Ok(Page::empty(query.limit.unwrap_or(0)))
     }
 }
 

@@ -9,8 +9,9 @@
 //!    client keeps a short TTL cache, so this is one cached lookup per
 //!    operation — no cache here).
 //! 2. Reject schemas whose chain does not descend from the credstore
-//!    secret base type (`gts.cf.core.credstore.secret.v1~`) — anything
-//!    else cannot legitimately carry `SecretTypeTraits`.
+//!    credential base type (`gts.cf.core.credstore.credential.v1~`,
+//!    renamed from `secret.v1~` by ADR-0004) — anything else cannot
+//!    legitimately carry `SecretTypeTraits`.
 //! 3. Read the effective traits via [`GtsTypeSchema::effective_traits`]
 //!    (chain merge: leaf-declared values win, the base fills the rest)
 //!    and deserialize them into [`SecretTypeTraits`].
@@ -26,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use credstore_sdk::{SECRET_RESOURCE_TYPE, SecretTypeTraits};
+use credstore_sdk::{CREDENTIAL_RESOURCE_TYPE, SecretTypeTraits};
 use toolkit_canonical_errors::CanonicalError;
 use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
 use uuid::Uuid;
@@ -75,19 +76,19 @@ impl GtsSecretTypeResolver {
         }
     }
 
-    /// Whether `schema` descends from the credstore secret base type.
+    /// Whether `schema` descends from the credstore credential base type.
     /// Walks `ancestors()` (self → parent → ...), so the base type itself
     /// also passes here; [`SecretTypeResolver::resolve`] then rejects it
     /// separately — it is an abstract trait carrier, not a concrete type.
     fn descends_from_secret_envelope(schema: &GtsTypeSchema) -> bool {
         schema
             .ancestors()
-            .any(|s| s.type_id.as_ref() == SECRET_RESOURCE_TYPE)
+            .any(|s| s.type_id.as_ref() == CREDENTIAL_RESOURCE_TYPE)
     }
 }
 
 /// `UNKNOWN_SECRET_TYPE` violation (canonical 400): the UUID does not
-/// name a registered credstore secret type.
+/// name a registered credstore credential type.
 fn unknown_type(detail: String) -> DomainError {
     DomainError::TypeViolation {
         field: "type",
@@ -138,7 +139,7 @@ impl SecretTypeResolver for GtsSecretTypeResolver {
             }
             Ok(Err(CanonicalError::NotFound { .. })) => {
                 return Err(unknown_type(format!(
-                    "secret type {type_uuid} is not registered"
+                    "credential type {type_uuid} is not registered"
                 )));
             }
             Ok(Err(err)) => {
@@ -150,18 +151,18 @@ impl SecretTypeResolver for GtsSecretTypeResolver {
 
         if !Self::descends_from_secret_envelope(&schema) {
             return Err(unknown_type(format!(
-                "type {} ({type_uuid}) is not a credstore secret type (does not descend from {SECRET_RESOURCE_TYPE})",
+                "type {} ({type_uuid}) is not a credstore credential type (does not descend from {CREDENTIAL_RESOURCE_TYPE})",
                 schema.type_id.as_ref(),
             )));
         }
 
         // The base type is abstract (`x-gts-abstract`) — a pure trait/schema
-        // carrier, never a concrete secret type. The types-registry SDK does
-        // not surface abstractness, so enforce the one abstract type we know
-        // by id.
-        if schema.type_id.as_ref() == SECRET_RESOURCE_TYPE {
+        // carrier, never a concrete credential type. The types-registry SDK
+        // does not surface abstractness, so enforce the one abstract type we
+        // know by id.
+        if schema.type_id.as_ref() == CREDENTIAL_RESOURCE_TYPE {
             return Err(unknown_type(format!(
-                "type {SECRET_RESOURCE_TYPE} ({type_uuid}) is the abstract secret base type and cannot type a secret; use a derived type",
+                "type {CREDENTIAL_RESOURCE_TYPE} ({type_uuid}) is the abstract credential base type and cannot type a credential; use a derived type",
             )));
         }
 

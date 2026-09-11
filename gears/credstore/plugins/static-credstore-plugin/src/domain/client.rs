@@ -1,51 +1,46 @@
-// Updated: 2026-06-06 — implements the per-tenant value-store `CredStorePluginClientV1`.
+// Updated: 2026-09-10 — implements the ADR-0006 `tenant_id/value_id` SPI.
 //! SDK adapter for the static value store.
 //!
 //! Requests are already authorized and resolved by the host gear, so this
-//! adapter keys values only by tenant, reference, and optional owner.
+//! adapter keys values purely by `(tenant_id, value_id)` — see
+//! `credstore_sdk::plugin_api`.
 use async_trait::async_trait;
-use credstore_sdk::{
-    CredStoreError, CredStorePluginClientV1, OwnerId, SecretRef, SecretValue, TenantId,
-};
+use credstore_sdk::{CredStoreError, CredStorePluginClientV1, SecretValue, TenantId, ValueId};
 use toolkit_security::SecurityContext;
 
 use super::service::Service;
 
-/// The static plugin is a pure per-tenant value store: it ignores the
-/// security context (the gear has already authorized the request and
-/// resolved tenant/owner) and keys purely on `(tenant_id, key, owner_id)`.
+/// The static plugin is a pure per-tenant, per-version value store: it
+/// ignores the security context (the gear has already authorized the
+/// request) and keys purely on `(tenant_id, value_id)`.
 #[async_trait]
 impl CredStorePluginClientV1 for Service {
     async fn get(
         &self,
         _ctx: &SecurityContext,
         tenant_id: &TenantId,
-        key: &SecretRef,
-        owner_id: Option<&OwnerId>,
+        value_id: &ValueId,
     ) -> Result<Option<SecretValue>, CredStoreError> {
-        Ok(self.get_value(tenant_id, key, owner_id))
+        Ok(self.get_value(tenant_id, value_id))
     }
 
     async fn put(
         &self,
         _ctx: &SecurityContext,
         tenant_id: &TenantId,
-        key: &SecretRef,
+        value_id: &ValueId,
         value: SecretValue,
-        owner_id: Option<&OwnerId>,
     ) -> Result<(), CredStoreError> {
-        self.put_value(tenant_id, key, value, owner_id);
-        Ok(())
+        self.put_value(tenant_id, value_id, value)
     }
 
     async fn delete(
         &self,
         _ctx: &SecurityContext,
         tenant_id: &TenantId,
-        key: &SecretRef,
-        owner_id: Option<&OwnerId>,
+        value_id: &ValueId,
     ) -> Result<(), CredStoreError> {
-        self.delete_value(tenant_id, key, owner_id);
+        self.delete_value(tenant_id, value_id);
         Ok(())
     }
 }

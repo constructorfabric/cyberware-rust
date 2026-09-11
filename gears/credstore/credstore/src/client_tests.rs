@@ -6,20 +6,66 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use credstore_sdk::{
-    CredStoreClientV1, CredStoreError, SecretRef, SecretValue, SharingMode, WriteOptions,
-    WritePrecondition,
+    CredStoreClientV1, CredStoreError, Fallback, PatchField, PutPrecondition, SecretRef,
+    SecretValue, SharingMode, Validator, WritePrecondition,
 };
 use uuid::Uuid;
 
 use super::{CredStoreLocalClient, DomainError, Service};
 use crate::domain::ports::metrics::NoopMetrics;
-use crate::domain::secret::service::ReaperSettings;
+use crate::domain::secret::service::{GcSettings, ListSettings};
 use crate::domain::secret::test_support::{
     FakeDir, FakePlugin, FakePluginSelector, FakeSecretRepo, catalog_type_resolver, make_ctx,
     mock_enforcer,
 };
 
+fn generic_write(value: &str) -> credstore_sdk::CredentialWrite {
+    credstore_sdk::CredentialWrite {
+        secret_type: Some(credstore_sdk::SecretType::generic().into()),
+        sharing: SharingMode::Tenant,
+        fallback: Fallback::Inherit,
+        expires_at: None,
+        value: SecretValue::from(value),
+    }
+}
+
+fn replace_write(value: &str) -> credstore_sdk::CredentialWrite {
+    credstore_sdk::CredentialWrite {
+        secret_type: None,
+        sharing: SharingMode::Tenant,
+        fallback: Fallback::Inherit,
+        expires_at: None,
+        value: SecretValue::from(value),
+    }
+}
+
+fn build_client(repo: Arc<FakeSecretRepo>, dir: Arc<FakeDir>) -> CredStoreLocalClient {
+    let selector = Arc::new(FakePluginSelector::new(FakePlugin::new()));
+    let svc = Arc::new(Service::new(
+        repo,
+        dir,
+        mock_enforcer(),
+        selector,
+        catalog_type_resolver(),
+        Arc::new(NoopMetrics),
+        GcSettings {
+            pending_max_age_secs: 3600,
+            batch_size: 256,
+        },
+        ListSettings {
+            max_limit: 200,
+            value_mode_cap: 25,
+        },
+    ));
+    CredStoreLocalClient::new(svc)
+}
+
 #[test]
+#[allow(
+    clippy::cognitive_complexity,
+    reason = "a flat enumeration of every DomainError variant's SDK-error mapping; splitting it \
+              would only scatter the one-to-one correspondence this test is checking"
+)]
 fn domain_error_maps_to_sdk_error() {
     assert!(matches!(
         CredStoreError::from(DomainError::NotFound),
@@ -57,6 +103,22 @@ fn domain_error_maps_to_sdk_error() {
         CredStoreError::from(DomainError::internal("x")),
         CredStoreError::Internal(_)
     ));
+    assert!(matches!(
+        CredStoreError::from(DomainError::TypeViolation {
+            field: "type",
+            reason: "TYPE_IMMUTABLE",
+            detail: "x".to_owned(),
+        }),
+        CredStoreError::TypeViolation { .. }
+    ));
+    assert!(matches!(
+        CredStoreError::from(DomainError::InvalidRequest {
+            field: "value",
+            reason: "EMPTY_PATCH",
+            detail: "x".to_owned(),
+        }),
+        CredStoreError::InvalidRequest { .. }
+    ));
     // The typed SDK cannot omit the precondition, so the domain guard crossing
     // the in-process boundary is an invariant breach, not a client error.
     assert!(matches!(
@@ -75,116 +137,63 @@ async fn local_client_round_trips_through_service() {
 
     let repo = Arc::new(FakeSecretRepo::new());
     let dir = Arc::new(FakeDir::single(tenant));
-    let selector = Arc::new(FakePluginSelector::new(FakePlugin::new()));
-    let svc = Arc::new(Service::new(
-        repo,
-        dir,
-        mock_enforcer(),
-        selector,
-        catalog_type_resolver(),
-        Arc::new(NoopMetrics),
-        ReaperSettings {
-            tick_secs: 60,
-            provisioning_timeout_secs: 300,
-            deprovisioning_timeout_secs: 300,
-        },
-    ));
-    let client = CredStoreLocalClient::new(svc);
+    let client = build_client(repo, dir);
 
     client
-        .create(
-            &ctx,
-            &k,
-            SecretValue::new(b"v".to_vec()),
-            SharingMode::Tenant,
-        )
+        .put(&ctx, &k, generic_write("v"), PutPrecondition::CreateOnly)
         .await
         .expect("create");
     // Rotation without a version in hand: the explicit LWW opt-in.
     client
-        .put(
-            &ctx,
-            &k,
-            SecretValue::new(b"v2".to_vec()),
-            SharingMode::Tenant,
-            WritePrecondition::Exists,
-        )
+        .put(&ctx, &k, replace_write("v2"), PutPrecondition::Exists)
         .await
         .expect("put");
     assert!(client.get(&ctx, &k).await.expect("get").is_some());
+    assert!(
+        client
+            .get_secret(&ctx, &k)
+            .await
+            .expect("get_secret")
+            .is_some()
+    );
     client
         .delete(&ctx, &k, WritePrecondition::Exists)
         .await
         .expect("delete");
+    assert!(client.get(&ctx, &k).await.expect("get").is_none());
 }
 
 #[tokio::test]
-async fn create_is_create_only_put_is_update_only() {
+async fn create_only_is_create_only_put_never_creates() {
     let tenant = Uuid::new_v4();
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     let k = SecretRef::new("create-key").expect("ref");
 
     let repo = Arc::new(FakeSecretRepo::new());
     let dir = Arc::new(FakeDir::single(tenant));
-    let selector = Arc::new(FakePluginSelector::new(FakePlugin::new()));
-    let svc = Arc::new(Service::new(
-        repo,
-        dir,
-        mock_enforcer(),
-        selector,
-        catalog_type_resolver(),
-        Arc::new(NoopMetrics),
-        ReaperSettings {
-            tick_secs: 60,
-            provisioning_timeout_secs: 300,
-            deprovisioning_timeout_secs: 300,
-        },
-    ));
-    let client = CredStoreLocalClient::new(svc);
+    let client = build_client(repo, dir);
 
     // First create succeeds.
     client
-        .create(
-            &ctx,
-            &k,
-            SecretValue::new(b"v1".to_vec()),
-            SharingMode::Tenant,
-        )
+        .put(&ctx, &k, generic_write("v1"), PutPrecondition::CreateOnly)
         .await
         .expect("first create");
-    // Second create of the same sharing class → Conflict (create-only).
+    // Second create-only of the same sharing class → Conflict.
     let err = client
-        .create(
-            &ctx,
-            &k,
-            SecretValue::new(b"v2".to_vec()),
-            SharingMode::Tenant,
-        )
+        .put(&ctx, &k, generic_write("v2"), PutPrecondition::CreateOnly)
         .await
         .expect_err("second create conflicts");
     assert!(matches!(err, CredStoreError::Conflict));
-    // `put` updates the existing secret (no conflict)…
+    // `put` under `Exists` replaces the existing credential (no conflict)…
     client
-        .put(
-            &ctx,
-            &k,
-            SecretValue::new(b"v3".to_vec()),
-            SharingMode::Tenant,
-            WritePrecondition::Exists,
-        )
+        .put(&ctx, &k, replace_write("v3"), PutPrecondition::Exists)
         .await
-        .expect("put updates");
+        .expect("put replaces");
     // …but never creates: on a missing reference the mandatory precondition
     // fails as a Conflict regardless of the variant.
     let missing = SecretRef::new("create-key-missing").expect("ref");
     let err = client
-        .put(
-            &ctx,
-            &missing,
-            SecretValue::new(b"v".to_vec()),
-            SharingMode::Tenant,
-            WritePrecondition::Exists,
-        )
+        .put(&ctx, &missing, replace_write("v"), PutPrecondition::Exists)
         .await
         .expect_err("put on missing reference conflicts");
     assert!(matches!(err, CredStoreError::Conflict), "got: {err:?}");
@@ -201,60 +210,50 @@ async fn precondition_guards_in_process_write_and_delete() {
 
     let repo = Arc::new(FakeSecretRepo::new());
     let dir = Arc::new(FakeDir::single(tenant));
-    let selector = Arc::new(FakePluginSelector::new(FakePlugin::new()));
-    let svc = Arc::new(Service::new(
-        repo,
-        dir,
-        mock_enforcer(),
-        selector,
-        catalog_type_resolver(),
-        Arc::new(NoopMetrics),
-        ReaperSettings {
-            tick_secs: 60,
-            provisioning_timeout_secs: 300,
-            deprovisioning_timeout_secs: 300,
-        },
-    ));
-    let client = CredStoreLocalClient::new(svc);
+    let client = build_client(repo, dir);
 
     client
-        .create(
-            &ctx,
-            &k,
-            SecretValue::new(b"v1".to_vec()),
-            SharingMode::Tenant,
-        )
+        .put(&ctx, &k, generic_write("v1"), PutPrecondition::CreateOnly)
         .await
         .expect("create");
     let observed = client.get(&ctx, &k).await.expect("get").expect("present");
+    let observed_validator = observed.validator.expect("own row has a strong validator");
     let stale = WritePrecondition::Matches {
-        id: observed.id,
-        version: observed.version,
+        id: observed_validator.id,
+        version: observed_validator.version,
     };
 
-    // A guarded update against the observed generation succeeds and bumps the
+    // A guarded patch against the observed generation succeeds and bumps the
     // version, so the same validator is now stale.
     client
-        .put_opts(
+        .patch(
             &ctx,
             &k,
-            SecretValue::new(b"v2".to_vec()),
-            SharingMode::Tenant,
+            credstore_sdk::CredentialPatch {
+                secret_type: None,
+                sharing: None,
+                fallback: None,
+                expires_at: PatchField::Absent,
+                value: PatchField::Set(SecretValue::from("v2")),
+            },
             stale,
-            WriteOptions::default(),
         )
         .await
-        .expect("guarded put matches current generation");
+        .expect("guarded patch matches current generation");
 
     // Re-using the stale validator is rejected as a conflict.
     let err = client
-        .put_opts(
+        .patch(
             &ctx,
             &k,
-            SecretValue::new(b"v3".to_vec()),
-            SharingMode::Tenant,
+            credstore_sdk::CredentialPatch {
+                secret_type: None,
+                sharing: None,
+                fallback: None,
+                expires_at: PatchField::Absent,
+                value: PatchField::Set(SecretValue::from("v3")),
+            },
             stale,
-            WriteOptions::default(),
         )
         .await
         .expect_err("stale precondition conflicts");
@@ -262,6 +261,7 @@ async fn precondition_guards_in_process_write_and_delete() {
 
     // A guarded delete: the stale validator conflicts, the current one succeeds.
     let current = client.get(&ctx, &k).await.expect("get").expect("present");
+    let current_validator = current.validator.expect("own row has a strong validator");
     let err = client
         .delete(&ctx, &k, stale)
         .await
@@ -272,11 +272,77 @@ async fn precondition_guards_in_process_write_and_delete() {
             &ctx,
             &k,
             WritePrecondition::Matches {
-                id: current.id,
-                version: current.version,
+                id: current_validator.id,
+                version: current_validator.version,
             },
         )
         .await
         .expect("guarded delete matches current generation");
     assert!(client.get(&ctx, &k).await.expect("get").is_none());
+}
+
+#[tokio::test]
+async fn patch_precondition_maps_sdk_matches_to_domain_version() {
+    // Exercises `to_domain_precondition`'s `Matches` arm directly (the
+    // `Exists` arm is already covered by the tests above).
+    let tenant = Uuid::new_v4();
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+    let k = SecretRef::new("k").expect("ref");
+    let repo = Arc::new(FakeSecretRepo::new());
+    let dir = Arc::new(FakeDir::single(tenant));
+    let client = build_client(repo, dir);
+
+    client
+        .put(&ctx, &k, generic_write("v1"), PutPrecondition::CreateOnly)
+        .await
+        .expect("create");
+    let cred = client.get(&ctx, &k).await.expect("get").expect("present");
+    let v = cred.validator.expect("some");
+
+    let out = client
+        .put(
+            &ctx,
+            &k,
+            replace_write("v2"),
+            PutPrecondition::Matches(Validator {
+                id: v.id,
+                version: v.version,
+            }),
+        )
+        .await
+        .expect("matching put precondition");
+    assert!(!out.created);
+    assert_eq!(out.validator.version, v.version + 1);
+}
+
+// ── CredStoreMaintenanceV1 (ADR-0006) ───────────────────────────────────────
+
+#[tokio::test]
+async fn maintenance_trait_resolves_from_client_hub_and_empty_store_reports_zeros() {
+    use credstore_sdk::CredStoreMaintenanceV1;
+
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let dir = Arc::new(FakeDir::single(tenant));
+    // Mirrors `gear.rs::init`'s registration: the same `CredStoreLocalClient`
+    // implements both `CredStoreClientV1` and `CredStoreMaintenanceV1`,
+    // registered in `ClientHub` under the maintenance trait next to the
+    // client trait.
+    let client: Arc<dyn CredStoreMaintenanceV1> = Arc::new(build_client(repo, dir));
+
+    let hub = toolkit::ClientHub::new();
+    hub.register::<dyn CredStoreMaintenanceV1>(client);
+
+    let resolved = hub
+        .get::<dyn CredStoreMaintenanceV1>()
+        .expect("CredStoreMaintenanceV1 must resolve from the hub after registration");
+
+    let ctx = make_ctx(Uuid::nil(), Uuid::nil());
+    let report = resolved
+        .run_gc(&ctx)
+        .await
+        .expect("run_gc on an empty store");
+    assert_eq!(report.expired_deleted, 0);
+    assert_eq!(report.gc_deleted, 0);
+    assert_eq!(report.gc_pending_reclaimed, 0);
 }

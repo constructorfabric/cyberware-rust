@@ -26,9 +26,20 @@ pub enum CredStoreError {
     UnsupportedTransition { detail: String },
     /// A write violated the secret type's traits (unknown type, disallowed
     /// sharing mode, schema/size/format violation, expiry on a
-    /// non-expirable type). `reason` is a stable machine-readable code.
+    /// non-expirable type), or named a type that conflicts with the one
+    /// already in play: a differing type on replace (`TYPE_IMMUTABLE`) or a
+    /// create over a reference that currently resolves to an ancestor's
+    /// `shared` record of a different type (`TYPE_MISMATCH_WITH_INHERITED`).
+    /// `reason` is a stable machine-readable code.
     #[error("secret type violation ({reason}): {detail}")]
     TypeViolation { reason: String, detail: String },
+    /// A request is malformed independently of any secret type — an empty
+    /// merge patch (`EMPTY_PATCH`), a required `value` missing from a `PUT`
+    /// (`VALUE_REQUIRED`), a merge-patch `null` on a non-nullable field
+    /// (`NULL_NOT_ALLOWED`), or a missing/conflicting write precondition
+    /// (`PRECONDITION_REQUIRED`). `reason` is a stable machine-readable code.
+    #[error("invalid request ({reason}): {detail}")]
+    InvalidRequest { reason: String, detail: String },
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -97,12 +108,14 @@ impl CredStoreError {
     }
 
     /// `true` for request-shape rejections (invalid secret reference,
-    /// secret-type trait violations).
+    /// secret-type trait violations, malformed request shape).
     #[must_use]
     pub fn is_validation_error(&self) -> bool {
         matches!(
             self,
-            Self::InvalidSecretRef { .. } | Self::TypeViolation { .. }
+            Self::InvalidSecretRef { .. }
+                | Self::TypeViolation { .. }
+                | Self::InvalidRequest { .. }
         )
     }
 
@@ -191,6 +204,13 @@ mod error_tests {
             .is_validation_error()
         );
         assert!(CredStoreError::unsupported_transition("x").is_precondition_failed());
+        assert!(
+            CredStoreError::InvalidRequest {
+                reason: "EMPTY_PATCH".to_owned(),
+                detail: "x".to_owned(),
+            }
+            .is_validation_error()
+        );
         assert!(CredStoreError::NoPluginAvailable.is_unavailable());
         assert!(CredStoreError::service_unavailable("down").is_unavailable());
         assert!(CredStoreError::service_unavailable("down").is_retryable());

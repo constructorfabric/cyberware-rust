@@ -45,7 +45,6 @@ impl Gear for StaticCredStorePlugin {
         info!(
             vendor = %cfg.vendor,
             priority = cfg.priority,
-            secret_count = cfg.secrets.len(),
             "Loaded plugin configuration"
         );
 

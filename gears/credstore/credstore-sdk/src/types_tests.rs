@@ -19,9 +19,9 @@ fn catalog_names_and_ids_are_unique_and_well_formed() {
     for d in SECRET_TYPE_CATALOG {
         assert!(
             d.gts_id.starts_with(&format!(
-                "{GTS_ID_PREFIX}cf.core.credstore.secret.v1~cf.core.credstore."
+                "{GTS_ID_PREFIX}cf.core.credstore.credential.v1~cf.core.credstore."
             )),
-            "{} not derived from the secret base type",
+            "{} not derived from the credential base type",
             d.name
         );
         assert!(d.gts_id.ends_with(".v1~"));
@@ -70,6 +70,29 @@ fn type_uuid_is_deterministic_and_matches_registry_v5() {
         GENERIC_TYPE_UUID_STR,
         "generic type uuid drifted; update the m0001 DEFAULT and this pin"
     );
+}
+
+#[test]
+fn fence_key_value_id_is_pinned_under_the_gts_namespace() {
+    // Recomputed via the crate's own namespace helper (also exercised by
+    // `type_uuid_is_deterministic_and_matches_registry_v5` transitively
+    // through `type_uuid`), so a drift in either the namespace or the fixed
+    // name shows up here.
+    let expected = Uuid::new_v5(&gts_namespace(), b"cfs-internal-fence-key");
+    assert_eq!(FENCE_KEY_VALUE_ID.0, expected);
+    assert_eq!(FENCE_KEY_VALUE_ID.0.get_version_num(), 5);
+    assert_eq!(
+        FENCE_KEY_VALUE_ID.0.to_string(),
+        "f7252add-b079-558f-81e1-7a03b14a9cc9",
+        "FENCE_KEY_VALUE_ID drifted; update the pin"
+    );
+    // Never collides with a catalog type's deterministic UUID.
+    for d in SECRET_TYPE_CATALOG {
+        assert_ne!(
+            FENCE_KEY_VALUE_ID.0,
+            type_uuid(d.gts_id).expect("catalog gts id resolves"),
+        );
+    }
 }
 
 #[test]
