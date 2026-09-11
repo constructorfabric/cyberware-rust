@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 #[cfg(feature = "db")]
 use super::commit::TxCommitHandleParts;
 use crate::api::{
-    AssignedPartition, EventBrokerApi, JoinRequest, ResolvedPosition, SubscriptionAssignment,
+    AssignedPartition, EventBrokerApi, JoinRequest, Position, SubscriptionAssignment,
 };
 use crate::api::{
     BarrierMode, ControlCode, Filter, PartitionPosition, SeekPosition,
@@ -35,12 +35,13 @@ use crate::consumer::{
 use crate::consumer::{CommitOffsetInTx, TxCommitHandle, TxConsumerHandler};
 use crate::error::EventBrokerError;
 use crate::ids::{ConsumerGroupId, SubscriptionId, TopicId};
+use crate::sequence::Sequence;
 
 /// Per-partition in-memory cursor for the contiguous processed frontier.
 #[derive(Default)]
 pub(crate) struct PartitionCursor {
     frontier: Option<PartitionFrontier>,
-    committed: i64, // the last offset actually committed to CommitOffset
+    committed: Sequence, // the last offset actually committed to CommitOffset
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -120,15 +121,15 @@ pub(crate) struct SlowConsumerSignal {
     pub reason: SlowConsumerReason,
     pub buffered_count: usize,
     pub consecutive_slow_handlers: u16,
-    pub latest_observed_offset: Option<i64>,
-    pub last_delivered_offset: Option<i64>,
+    pub latest_observed_offset: Option<Sequence>,
+    pub last_delivered_offset: Option<Sequence>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PartitionSlowState {
     buffered_count: usize,
-    latest_observed_offset: Option<i64>,
-    last_delivered_offset: Option<i64>,
+    latest_observed_offset: Option<Sequence>,
+    last_delivered_offset: Option<Sequence>,
     consecutive_slow_handlers: u16,
     slow_detected: bool,
 }
@@ -156,7 +157,7 @@ impl PartitionSlowState {
     pub(crate) fn observe_enqueue(
         &mut self,
         buffered_count: usize,
-        latest_observed_offset: i64,
+        latest_observed_offset: Sequence,
         high_watermark: usize,
     ) -> Option<SlowConsumerSignal> {
         self.buffered_count = buffered_count;
@@ -173,7 +174,7 @@ impl PartitionSlowState {
         elapsed: Duration,
         handler_latency: Duration,
         handler_strikes: u16,
-        last_delivered_offset: i64,
+        last_delivered_offset: Sequence,
     ) -> Option<SlowConsumerSignal> {
         self.last_delivered_offset = Some(last_delivered_offset);
         if elapsed >= handler_latency {
@@ -269,7 +270,7 @@ pub(crate) async fn emit_runtime_event_to(
     }
 }
 
-fn partition_progress(key: &TopicPartitionKey, offset: i64) -> PartitionProgress {
+fn partition_progress(key: &TopicPartitionKey, offset: Sequence) -> PartitionProgress {
     PartitionProgress {
         topic_id: key.topic_id,
         topic: key.topic.clone(),
@@ -279,14 +280,14 @@ fn partition_progress(key: &TopicPartitionKey, offset: i64) -> PartitionProgress
 }
 
 impl PartitionCursor {
-    pub(crate) fn latest_offset(&self) -> i64 {
+    pub(crate) fn latest_offset(&self) -> Sequence {
         self.frontier
             .as_ref()
             .map(PartitionFrontier::committed)
             .unwrap_or(self.committed)
     }
 
-    pub(crate) fn advance_through_delivered_prefix(&mut self, events: &[RawEvent]) -> i64 {
+    pub(crate) fn advance_through_delivered_prefix(&mut self, events: &[RawEvent]) -> Sequence {
         let Some(last) = events.last() else {
             return self.latest_offset();
         };
@@ -658,7 +659,7 @@ where
             subject_type: wire.subject_type,
             partition: wire.partition,
             sequence: wire.sequence,
-            offset: wire.offset,
+            offset: wire.sequence,
             occurred_at: wire.occurred_at,
             sequence_time: wire.sequence_time,
             trace_parent: wire.trace_parent,
@@ -683,7 +684,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.offset,
+                wire.sequence,
                 active,
             )
             .await
@@ -926,7 +927,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         buffered_count: usize,
-        latest_observed_offset: i64,
+        latest_observed_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;
@@ -964,7 +965,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         elapsed: Duration,
-        last_delivered_offset: i64,
+        last_delivered_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;
@@ -1085,8 +1086,8 @@ where
             trace!(
                 topic = p.topic.as_ref(),
                 partition = p.partition,
-                offset = p.offset,
-                last_examined = p.last_examined,
+                offset = %p.offset,
+                last_examined = %p.last_examined,
                 "transactional position observed without out-of-tx commit"
             );
         }
@@ -1312,7 +1313,7 @@ where
                                         &[SeekPosition {
                                             topic: key.topic.clone(),
                                             partition: key.partition,
-                                            value: ResolvedPosition::Exact(latest_offset),
+                                            value: Position::Exact(latest_offset),
                                         }],
                                     ).await;
                                 }
@@ -1555,7 +1556,7 @@ where
             subject_type: wire.subject_type,
             partition: wire.partition,
             sequence: wire.sequence,
-            offset: wire.offset,
+            offset: wire.sequence,
             occurred_at: wire.occurred_at,
             sequence_time: wire.sequence_time,
             trace_parent: wire.trace_parent,
@@ -1580,7 +1581,7 @@ where
                 state,
                 key.clone(),
                 enqueued.buffered_count,
-                wire.offset,
+                wire.sequence,
                 active,
             )
             .await
@@ -1802,7 +1803,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         buffered_count: usize,
-        latest_observed_offset: i64,
+        latest_observed_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;
@@ -1840,7 +1841,7 @@ where
         state: DispatchState<'_>,
         key: TopicPartitionKey,
         elapsed: Duration,
-        last_delivered_offset: i64,
+        last_delivered_offset: Sequence,
         active: ActiveSubscription<'_>,
     ) -> bool {
         let mut guard = state.slow_states.write().await;

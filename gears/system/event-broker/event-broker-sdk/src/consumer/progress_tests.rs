@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use chrono::Utc;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
@@ -15,8 +16,8 @@ fn event_with_offset(offset: i64) -> RawEvent {
         subject: format!("event-{offset}"),
         subject_type: "test".to_owned(),
         partition: 0,
-        sequence: offset,
-        offset,
+        sequence: Sequence::assigned(offset),
+        offset: Sequence::assigned(offset),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -32,9 +33,13 @@ fn delivered_sparse_batch() -> Vec<RawEvent> {
 fn advance_through_counts_delivered_prefix_for_sparse_offsets() {
     let events = delivered_sparse_batch();
 
-    let processed =
-        processed_count_from_outcome(&BatchHandlerOutcome::AdvanceThrough { offset: 17 }, &events)
-            .expect("handled offset is in delivered batch");
+    let processed = processed_count_from_outcome(
+        &BatchHandlerOutcome::AdvanceThrough {
+            offset: Sequence::assigned(17),
+        },
+        &events,
+    )
+    .expect("handled offset is in delivered batch");
 
     assert_eq!(processed, Some(2));
 }
@@ -53,9 +58,13 @@ fn full_batch_success_counts_all_delivered_events() {
 fn invalid_advance_through_offset_is_rejected_without_progress_count() {
     let events = delivered_sparse_batch();
 
-    let err =
-        processed_count_from_outcome(&BatchHandlerOutcome::AdvanceThrough { offset: 11 }, &events)
-            .expect_err("offset not delivered in this batch must be rejected");
+    let err = processed_count_from_outcome(
+        &BatchHandlerOutcome::AdvanceThrough {
+            offset: Sequence::assigned(11),
+        },
+        &events,
+    )
+    .expect_err("offset not delivered in this batch must be rejected");
 
     assert!(err.to_string().contains("not present in delivered offsets"));
 }
@@ -80,21 +89,25 @@ fn cursor_advances_to_delivered_offset_not_first_offset_plus_count() {
     let events = delivered_sparse_batch();
     let mut cursor = PartitionCursor::default();
 
-    let processed =
-        processed_count_from_outcome(&BatchHandlerOutcome::AdvanceThrough { offset: 17 }, &events)
-            .expect("handled offset is in delivered batch")
-            .expect("partial outcome has progress");
+    let processed = processed_count_from_outcome(
+        &BatchHandlerOutcome::AdvanceThrough {
+            offset: Sequence::assigned(17),
+        },
+        &events,
+    )
+    .expect("handled offset is in delivered batch")
+    .expect("partial outcome has progress");
     let frontier = cursor.advance_through_delivered_prefix(&events[..processed]);
 
-    assert_eq!(frontier, 17);
-    assert_eq!(cursor.latest_offset(), 17);
+    assert_eq!(frontier, Sequence::assigned(17));
+    assert_eq!(cursor.latest_offset(), Sequence::assigned(17));
 }
 
 #[test]
 fn tx_committed_offset_counts_delivered_prefix_for_sparse_offsets() {
     let events = delivered_sparse_batch();
 
-    let processed = processed_count_from_delivered_offset(17, &events)
+    let processed = processed_count_from_delivered_offset(Sequence::assigned(17), &events)
         .expect("tx committed offset is in delivered batch");
 
     assert_eq!(processed, 2);
@@ -104,7 +117,7 @@ fn tx_committed_offset_counts_delivered_prefix_for_sparse_offsets() {
 fn tx_committed_offset_rejects_offsets_outside_delivered_batch() {
     let events = delivered_sparse_batch();
 
-    let err = processed_count_from_delivered_offset(20, &events)
+    let err = processed_count_from_delivered_offset(Sequence::assigned(20), &events)
         .expect_err("tx committed offset must be delivered in the current batch");
 
     assert!(err.to_string().contains("not present in delivered offsets"));

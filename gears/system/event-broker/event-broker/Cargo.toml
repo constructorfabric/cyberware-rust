@@ -11,8 +11,14 @@ keywords = ["constructorfabric", "cf-gears", "event-broker"]
 categories = ["asynchronous"]
 metadata.docs.rs.all-features = true
 
+autobins = false
+
 [lib]
 name = "event_broker"
+
+[[bin]]
+name = "cf-gears-event-broker-server"
+path = "src/bin/server.rs"
 
 [lints]
 workspace = true
@@ -23,7 +29,11 @@ workspace = true
 # the resolved type schema from `types-registry-sdk`, and the DTO shapes the API
 # reports from its own SDK - projecting a schema onto one of those shapes is
 # broker-side work and lives here.
-event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.2.1", path = "../event-broker-sdk" }
+# `types-registry-sdk` is also what `infra/specification.rs`'s
+# `TypesRegistrySpecificationManager` resolves through, and `event-broker-sdk`'s
+# `gts` module is where the GTS base-type constants live rather than duplicated
+# `gts_id!(...)` literals.
+event-broker-sdk = { workspace = true }
 gts = { workspace = true }
 types-registry-sdk = { workspace = true }
 
@@ -36,16 +46,114 @@ axum = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["clock", "serde"] }
+rand = { workspace = true }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+jsonschema = { workspace = true }
+toolkit-stable-hash = { workspace = true }
+base64 = { workspace = true }
+http-body-util = { workspace = true }
 
-toolkit = { workspace = true }
+# `bootstrap` feature: `toolkit::bootstrap::{AppConfig, run_server}`, used
+# only by `src/bin/server.rs` (eb-single-process-implementation D7) -
+# the library target itself doesn't need it, but Cargo features are
+# crate-wide, matching how `apps/cf-gears-example-server` depends on it.
+toolkit = { workspace = true, features = ["bootstrap"] }
 toolkit-security = { workspace = true }
 # `Iso8601Duration`, to parse a resolved retention trait into a real duration
 # rather than passing a string through to the API.
 toolkit-utils = { workspace = true, features = ["serde", "schemars"] }
+toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-macros = { workspace = true }
+utoipa = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+authz-resolver = { workspace = true }
+types-registry = { workspace = true }
+# `domain/authz.rs`'s `TOPIC_RESOURCE`/`EVENT_TYPE_RESOURCE` consts invoke
+# `gts_id!(...)` for real (unlike `api/rest/error.rs`'s
+# `#[resource_error(gts_id!(...))]`, which never macro-expands its inner
+# `gts_id!(...)` token - the outer attribute macro parses it as a literal
+# pattern directly) - a real invocation needs `toolkit_gts` resolvable from
+# this crate directly, so this can no longer be dev-only.
+toolkit-gts = { workspace = true }
+# `domain/ingest.rs`'s `subject_type_allowed`/`domain/specification.rs`'s
+# `validate_allowed_subject_types` need `GtsIdPattern`/`GtsId::matches_pattern`
+# directly - `toolkit-gts` re-exports `GtsId`/`GtsInstanceId`/`GtsSchema` but
+
+# Minimal Pingora use: `connectors::http::v1::Connector` (pooled outbound
+# HTTP/1 client) called from ordinary axum handlers - not `pingora-proxy`'s
+# full session-owning engine (design.md D7). Crate-local, matching `oagw`'s
+# per-crate Pingora dependency convention - not a shared workspace dependency.
+pingora-core = { version = "0.8" }
+pingora-http = { version = "0.8" }
+
+# Database - SeaORM (driver features come from toolkit-db), for the
+# SpecificationManager cache, Storage's durable namespaces, and the SQLite
+# EventBrokerBackend (eb-single-process-implementation). All DB access goes
+# through SecureORM (`toolkit_db::secure`); raw connections are never held by
+# gear code. `toolkit_db::outbox` (same crate) backs the ingest-side
+# transactional outbox (design.md D5) - the same generic library the SDK's
+# client-side `ProducerOutbox` already uses, here on the opposite
+# (server-enqueue) side.
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+toolkit-db-macros = { workspace = true }
+
+# CLI for the standalone binary (src/bin/server.rs), mirroring
+# apps/cf-gears-example-server's Cli shape.
+clap = { workspace = true }
+
+# `src/bin/server.rs`-only: linked so their `inventory::submit!` gear/plugin
+# registrations are present in the binary. `event_broker` itself needs
+# `cluster`/`authz-resolver`/`types-registry` (already deps above) at
+# compile time for its own domain code; `api-gateway`/`authn-resolver` are
+# needed only for the binary's AuthN pipeline (decision log entry 29) and
+# have no compile-time API surface this crate's library code calls, so they
+# (and the concrete plugins) are declared here but only ever referenced from
+# `src/bin/server.rs`, never from `src/`.
+api-gateway = { workspace = true }
+authn-resolver = { workspace = true }
+static-authn-plugin = { workspace = true }
+static-authz-plugin = { workspace = true }
+standalone-cluster-plugin = { workspace = true }
+# The SQLite storage backend, injected at wiring as a provider (`module.rs`),
+# the same way the cluster gear injects its cache providers. The gear links it
+# but knows only the `EventBrokerBackend` trait behind it.
+sqlite-event-broker-plugin = { workspace = true }
+
+[[bench]]
+name = "partition_cache"
+harness = false
+
+[[bench]]
+name = "delivery"
+harness = false
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+# `benches/partition_cache.rs` - the two hot paths of the per-partition cache
+# were each once wrong in a way only a curve over a swept parameter reveals.
+criterion = { workspace = true, features = ["html_reports"] }
+tokio = { workspace = true, features = ["macros", "rt", "process"] }
+tower = { workspace = true }
+http = { workspace = true }
+tracing-test = { workspace = true }
+# `tests/standalone_integration_tests.rs` (design.md D8, task group 10) -
+# spawns the real `[[bin]]` as a subprocess and drives it over real HTTP,
+# rather than in-process mocks.
+reqwest = { workspace = true, features = ["json", "stream"] }
+tempfile = { workspace = true }
+# `types_registry_sdk::testing::MockTypesRegistryClient` - the SDK's own
+# ready-made in-memory test double, reused rather than hand-rolled
+# (`eb-gts-type-registration`).
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# `cf-gears-standalone-cluster-plugin` moved to [dependencies] above (also
+# needed by src/bin/server.rs); regular dependencies are available to tests
+# too, so no separate dev-dependency entry is needed here anymore.

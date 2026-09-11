@@ -9,6 +9,19 @@ use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+/// The problem body a caller would actually receive for `err`, with the
+/// per-request fields fixed so a test can assert the whole thing.
+///
+/// The mock is the reference implementation of this REST API, so what a
+/// scenario documents is a body rather than an error variant; matching on the
+/// variant would pass while the body said something else entirely.
+pub fn problem_json(err: impl Into<toolkit_canonical_errors::CanonicalError>) -> serde_json::Value {
+    let problem = toolkit_canonical_errors::Problem::from(err.into())
+        .with_instance("/v1/subscriptions/test:seek")
+        .with_trace_id("trace-123");
+    serde_json::to_value(problem).expect("a problem body serializes")
+}
+
 // -- GTS identifier constants used across all mock tests ----------------------
 
 pub const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.mock.broker.audit.v1");
@@ -64,8 +77,6 @@ pub fn wire_event(type_id: &str, tenant_id: Uuid) -> Event {
         partition: None,
         sequence: None,
         sequence_time: None,
-        offset: None,
-        offset_time: None,
         meta: None,
     }
 }
@@ -118,7 +129,7 @@ pub async fn seek_all_earliest(
     broker: &MockBroker,
     sub: &SubscriptionAssignment,
 ) {
-    use crate::ResolvedPosition;
+    use crate::Position;
     use crate::api::SeekPosition;
     let positions: Vec<SeekPosition> = sub
         .assigned
@@ -126,7 +137,7 @@ pub async fn seek_all_earliest(
         .map(|a| SeekPosition {
             topic: a.topic.clone(),
             partition: a.partition,
-            value: ResolvedPosition::Earliest,
+            value: Position::Earliest,
         })
         .collect();
     if !positions.is_empty() {

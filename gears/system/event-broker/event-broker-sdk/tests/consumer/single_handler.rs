@@ -24,7 +24,7 @@ impl SingleEventHandler for SingleEventProjector {
         _attempts: u16,
     ) -> Result<HandlerOutcome, ConsumerError> {
         self.partitions.lock().unwrap().push(event.partition);
-        self.offsets.lock().unwrap().push(event.offset);
+        self.offsets.lock().unwrap().push(event.offset.as_i64());
         Ok(HandlerOutcome::Success)
     }
 }

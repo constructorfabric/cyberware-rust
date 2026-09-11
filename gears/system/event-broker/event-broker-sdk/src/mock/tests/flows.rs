@@ -1,9 +1,10 @@
 //! Mirrors scenarios/flows/. Tests migrated per mock-reference-alignment.
-#[cfg(test)]
 use super::helpers::*;
+#[cfg(test)]
+use crate::sequence::Sequence;
 
 use super::helpers::{broker_with_topic, ctx, join_group, make_group, wire_event};
-use crate::ResolvedPosition;
+use crate::Position;
 use crate::api::{EventBrokerApi, IngestOutcome, SeekPosition, WireFrame};
 use futures_util::StreamExt;
 
@@ -13,11 +14,11 @@ use futures_util::StreamExt;
 /// earliest → stream the three events in strict offset order → ack via SEEK →
 /// re-JOIN on the same group resumes past the ack (no redelivery).
 ///
-/// The reference fixes RF=100 so offsets are 100/101/102; the in-process mock
-/// has no retention floor (offsets start at 0), so this asserts the *shape* of
+/// The reference fixes RF=100 so sequences are 100/101/102; the in-process mock
+/// has no retention floor (sequences start at 0), so this asserts the *shape* of
 /// the journey - three in-order events, an advancing group cursor, and a
 /// re-JOIN that resumes from the committed cursor - rather than the literal
-/// 100-based offsets.
+/// 100-based sequences.
 #[tokio::test]
 async fn s1_01_flow_publish_subscribe_consume() {
     // 4 partitions; all helper events hash to the tenant's partition (single
@@ -64,18 +65,18 @@ async fn s1_01_flow_publish_subscribe_consume() {
     super::helpers::seek_all_earliest(&c, &broker, &sub).await;
     assert_eq!(
         h.cursor(&gid, TOPIC, partition).await,
-        Some(0),
+        Some(Sequence::assigned(0)),
         "Earliest resolves to 0 in the mock for the populated partition"
     );
 
     // -- Exchange 7: open the stream and read the three events in order. ---------
     let mut stream = broker.stream(&c, sub.subscription_id).await.unwrap();
-    let mut offsets = Vec::new();
+    let mut sequences = Vec::new();
     for _ in 0..12 {
         match tokio::time::timeout(std::time::Duration::from_millis(50), stream.next()).await {
             Ok(Some(Ok(WireFrame::Event(we)))) => {
-                offsets.push(we.offset);
-                if offsets.len() == 3 {
+                sequences.push(we.sequence.as_i64());
+                if sequences.len() == 3 {
                     break;
                 }
             }
@@ -85,7 +86,7 @@ async fn s1_01_flow_publish_subscribe_consume() {
     }
     drop(stream); // release the stream so SEEK is not "streaming_in_progress".
     assert_eq!(
-        offsets,
+        sequences,
         vec![1, 2, 3],
         "events delivered in strict offset order (1-based)"
     );
@@ -98,14 +99,14 @@ async fn s1_01_flow_publish_subscribe_consume() {
             &[SeekPosition {
                 topic: TOPIC.to_owned(),
                 partition,
-                value: ResolvedPosition::Exact(2),
+                value: Position::Exact(Sequence::assigned(2)),
             }],
         )
         .await
         .unwrap();
     assert_eq!(
         h.cursor(&gid, TOPIC, partition).await,
-        Some(2),
+        Some(Sequence::assigned(2)),
         "group cursor advances to the acked offset"
     );
 
@@ -114,7 +115,7 @@ async fn s1_01_flow_publish_subscribe_consume() {
     let _sub2 = join_group(&c, &broker, &gid, TOPIC).await;
     assert_eq!(
         h.cursor(&gid, TOPIC, partition).await,
-        Some(2),
+        Some(Sequence::assigned(2)),
         "re-JOIN carries the committed cursor (no redelivery of 0-2)"
     );
 }

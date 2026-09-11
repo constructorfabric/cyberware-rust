@@ -7,14 +7,15 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::OnConflict}
 #[cfg(feature = "db")]
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
 
-use crate::api::ResolvedPosition;
+use crate::api::Position;
 use crate::error::OffsetManagerError;
 use crate::ids::{ConsumerGroupId, TopicId};
+use crate::sequence::Sequence;
 
 type OffsetKey = (ConsumerGroupId, TopicId, u32);
 type PartitionOffsetKey = (TopicId, u32);
-type CommittedOffsets = HashMap<OffsetKey, i64>;
-type SeedOffsets = HashMap<PartitionOffsetKey, i64>;
+type CommittedOffsets = HashMap<OffsetKey, Sequence>;
+type SeedOffsets = HashMap<PartitionOffsetKey, Sequence>;
 
 #[cfg(feature = "db")]
 mod offset_row {
@@ -74,11 +75,11 @@ pub enum Fallback {
     Latest,
 }
 
-impl From<Fallback> for ResolvedPosition {
+impl From<Fallback> for Position {
     fn from(f: Fallback) -> Self {
         match f {
-            Fallback::Earliest => ResolvedPosition::Earliest,
-            Fallback::Latest => ResolvedPosition::Latest,
+            Fallback::Earliest => Position::Earliest,
+            Fallback::Latest => Position::Latest,
         }
     }
 }
@@ -118,7 +119,7 @@ pub trait OffsetStore: Send + Sync {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError>;
+    ) -> Result<Position, OffsetManagerError>;
 }
 
 /// Eventual / batched commit of a processed offset to the client store
@@ -131,7 +132,7 @@ pub trait CommitOffset: OffsetStore {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     ) -> Result<(), OffsetManagerError>;
 }
 
@@ -148,7 +149,7 @@ pub trait CommitOffsetInTx: OffsetStore {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     ) -> Result<(), OffsetManagerError>
     where
         TX: toolkit_db::secure::DBRunner + Sync;
@@ -181,7 +182,7 @@ impl LocalDbOffsetManager {
     /// Per-partition seed offsets, consulted only when the DB has no row.
     pub fn with_overrides(
         mut self,
-        overrides: impl IntoIterator<Item = (PartitionOffsetKey, i64)>,
+        overrides: impl IntoIterator<Item = (PartitionOffsetKey, Sequence)>,
     ) -> Self {
         self.overrides.extend(overrides);
         self
@@ -196,7 +197,7 @@ impl OffsetStore for LocalDbOffsetManager {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
+    ) -> Result<Position, OffsetManagerError> {
         let conn = self.db.conn().map_err(|err| {
             OffsetManagerError::load_failed("open offset DB connection", err.to_string(), err)
         })?;
@@ -214,11 +215,11 @@ impl OffsetStore for LocalDbOffsetManager {
             })?;
 
         if let Some(row) = row {
-            return Ok(ResolvedPosition::Exact(row.offset));
+            return Ok(Position::Exact(Sequence::assigned(row.offset)));
         }
 
         if let Some(&off) = self.overrides.get(&(*topic, partition)) {
-            return Ok(ResolvedPosition::Exact(off));
+            return Ok(Position::Exact(off));
         }
         Ok(self.fallback.into())
     }
@@ -233,7 +234,7 @@ impl CommitOffsetInTx for LocalDbOffsetManager {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     ) -> Result<(), OffsetManagerError>
     where
         TX: toolkit_db::secure::DBRunner + Sync,
@@ -242,7 +243,7 @@ impl CommitOffsetInTx for LocalDbOffsetManager {
             consumer_group_id: Set(group.as_uuid()),
             topic_id: Set(topic.as_uuid()),
             partition: Set(partition_to_i32(partition)?),
-            offset: Set(offset),
+            offset: Set(offset.as_i64()),
             updated_at: Set(chrono::Utc::now()),
         };
 
@@ -296,7 +297,7 @@ impl InMemoryOffsetManager {
 
     pub fn with_overrides(
         mut self,
-        overrides: impl IntoIterator<Item = (PartitionOffsetKey, i64)>,
+        overrides: impl IntoIterator<Item = (PartitionOffsetKey, Sequence)>,
     ) -> Self {
         self.overrides.extend(overrides);
         self
@@ -310,17 +311,17 @@ impl OffsetStore for InMemoryOffsetManager {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
+    ) -> Result<Position, OffsetManagerError> {
         let guard = self
             .inner
             .lock()
             .map_err(|_| OffsetManagerError::Internal("mutex poisoned".into()))?;
         if let Some(&stored) = guard.get(&(*group, *topic, partition)) {
-            return Ok(ResolvedPosition::Exact(stored));
+            return Ok(Position::Exact(stored));
         }
         drop(guard);
         if let Some(&off) = self.overrides.get(&(*topic, partition)) {
-            return Ok(ResolvedPosition::Exact(off));
+            return Ok(Position::Exact(off));
         }
         Ok(self.fallback.into())
     }
@@ -333,13 +334,15 @@ impl CommitOffset for InMemoryOffsetManager {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         let mut guard = self
             .inner
             .lock()
             .map_err(|_| OffsetManagerError::Internal("mutex poisoned".into()))?;
-        let entry = guard.entry((*group, *topic, partition)).or_insert(0);
+        let entry = guard
+            .entry((*group, *topic, partition))
+            .or_insert(Sequence::NONE);
         *entry = (*entry).max(offset);
         Ok(())
     }

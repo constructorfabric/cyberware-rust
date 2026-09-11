@@ -3,6 +3,12 @@
 
 pub mod cluster;
 pub mod dispatcher;
+pub mod loader;
+pub mod partition_cache;
+pub mod specification;
 pub mod storage;
-pub mod type_provisioning;
+pub mod wiring;
 pub mod workers;
+
+#[cfg(test)]
+mod wiring_tests;

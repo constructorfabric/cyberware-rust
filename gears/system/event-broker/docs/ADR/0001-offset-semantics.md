@@ -27,7 +27,7 @@ Accepted
 
 The event broker exposes consumer-visible **sequences** (also called offsets) to events through the storage backend boundary. The design describes public sequences as monotonically increasing within a `(topic, partition)` but did not originally specify the floor — whether they start at 0 or 1. This gap has consequences for every component that reasons about cursors, valid SEEK ranges, or offset types.
 
-The **cursor** model used throughout the broker is **last-processed-offset**: a consumer stores the sequence of the last event it successfully processed, and the broker delivers the next event from `cursor + 1`. For a consumer that has never processed any event, a special "nothing processed yet" cursor value is needed. That value is `cursor = RF - 1`, where RF is the retention floor (the sequence of the oldest available event).
+The **cursor** model used throughout the broker is **last-processed-offset**: a consumer stores the sequence of the last event it successfully processed, and the broker delivers the events stored strictly above that cursor - `cursor + 1` is where scanning resumes, not necessarily where the next event is, because the space is populated sparsely. For a consumer that has never processed any event, a special "nothing processed yet" cursor value is needed. That value is `cursor = RF - 1`, where RF is the retention floor (the sequence of the oldest available event).
 
 The decision needs to keep three things aligned:
 
@@ -38,7 +38,7 @@ The decision needs to keep three things aligned:
 ## Decision Drivers
 
 - Keep consumer-visible offsets non-negative across wire, database, and SDK surfaces.
-- Preserve the last-processed cursor model where the broker delivers from `cursor + 1`.
+- Preserve the last-processed cursor model where the broker delivers what is stored strictly above the cursor.
 - Avoid backend-specific offset floors leaking into broker APIs.
 - Make the fresh-topic and retention-floor cases mechanically obvious.
 
@@ -71,7 +71,7 @@ With sequences starting at 1, the retention floor RF ≥ 1 always. Therefore:
 cursor ∈ {0, 1, 2, ...}
 
 cursor = 0  →  "nothing processed yet; broker emits from RF"
-cursor = N  →  "last processed event had sequence N; broker emits from N + 1"
+cursor = N  →  "last processed event had sequence N; broker emits the next event stored above N"
 ```
 
 **Valid SEEK range is always non-negative.**

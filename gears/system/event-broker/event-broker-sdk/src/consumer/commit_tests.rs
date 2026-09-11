@@ -7,10 +7,10 @@ mod tx {
 
     use super::super::commit::TxCommitHandleParts;
     use crate::consumer::{
-        CommitOffsetInTx, Fallback, OffsetManagerError, OffsetStore, ResolvedPosition,
-        TxCommitHandle,
+        CommitOffsetInTx, Fallback, OffsetManagerError, OffsetStore, Position, TxCommitHandle,
     };
     use crate::ids::{ConsumerGroupId, TopicId};
+    use crate::sequence::Sequence;
 
     type RecordedCommit = (ConsumerGroupId, TopicId, u32, i64);
     type RecordedCommits = Mutex<Vec<RecordedCommit>>;
@@ -27,7 +27,7 @@ mod tx {
             _group: &ConsumerGroupId,
             _topic: &TopicId,
             _partition: u32,
-        ) -> Result<ResolvedPosition, OffsetManagerError> {
+        ) -> Result<Position, OffsetManagerError> {
             Ok(Fallback::Earliest.into())
         }
     }
@@ -40,15 +40,17 @@ mod tx {
             group: &ConsumerGroupId,
             topic: &TopicId,
             partition: u32,
-            offset: i64,
+            offset: Sequence,
         ) -> Result<(), OffsetManagerError>
         where
             TX: toolkit_db::secure::DBRunner + Sync,
         {
-            self.calls
-                .lock()
-                .expect("recording mutex")
-                .push((*group, *topic, partition, offset));
+            self.calls.lock().expect("recording mutex").push((
+                *group,
+                *topic,
+                partition,
+                offset.as_i64(),
+            ));
             Ok(())
         }
     }
@@ -70,7 +72,7 @@ mod tx {
         let topic = TopicId::new(Uuid::new_v4());
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
-            offsets: vec![123],
+            offsets: vec![Sequence::assigned(123)],
             offset_manager: manager.clone(),
             group,
             topic,
@@ -81,7 +83,7 @@ mod tx {
         db.transaction_ref(move |tx| {
             Box::pin(async move {
                 handle
-                    .commit_offset_in_tx(tx, 123)
+                    .commit_offset_in_tx(tx, Sequence::assigned(123))
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Ok(())
@@ -90,7 +92,10 @@ mod tx {
         .await
         .expect("transaction");
 
-        assert_eq!(*committed.lock().expect("commit state mutex"), Some(123));
+        assert_eq!(
+            *committed.lock().expect("commit state mutex"),
+            Some(Sequence::assigned(123))
+        );
         assert_eq!(
             manager.calls.lock().expect("recording mutex").as_slice(),
             &[(group, topic, 5, 123)]
@@ -114,7 +119,11 @@ mod tx {
         let topic = TopicId::new(Uuid::new_v4());
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
-            offsets: vec![10, 11, 12],
+            offsets: vec![
+                Sequence::assigned(10),
+                Sequence::assigned(11),
+                Sequence::assigned(12),
+            ],
             offset_manager: manager.clone(),
             group,
             topic,
@@ -124,7 +133,7 @@ mod tx {
         db.transaction_ref(move |tx| {
             Box::pin(async move {
                 handle
-                    .commit_offset_in_tx(tx, 12)
+                    .commit_offset_in_tx(tx, Sequence::assigned(12))
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Ok(())
@@ -137,7 +146,10 @@ mod tx {
             manager.calls.lock().expect("recording mutex").as_slice(),
             &[(group, topic, 5, 12)]
         );
-        assert_eq!(*committed.lock().expect("commit state mutex"), Some(12));
+        assert_eq!(
+            *committed.lock().expect("commit state mutex"),
+            Some(Sequence::assigned(12))
+        );
     }
 
     #[tokio::test]
@@ -157,7 +169,11 @@ mod tx {
         let topic = TopicId::new(Uuid::new_v4());
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
-            offsets: vec![10, 17, 19],
+            offsets: vec![
+                Sequence::assigned(10),
+                Sequence::assigned(17),
+                Sequence::assigned(19),
+            ],
             offset_manager: manager.clone(),
             group,
             topic,
@@ -167,7 +183,7 @@ mod tx {
         db.transaction_ref(move |tx| {
             Box::pin(async move {
                 handle
-                    .commit_offset_in_tx(tx, 17)
+                    .commit_offset_in_tx(tx, Sequence::assigned(17))
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Ok(())
@@ -180,7 +196,10 @@ mod tx {
             manager.calls.lock().expect("recording mutex").as_slice(),
             &[(group, topic, 5, 17)]
         );
-        assert_eq!(*committed.lock().expect("commit state mutex"), Some(17));
+        assert_eq!(
+            *committed.lock().expect("commit state mutex"),
+            Some(Sequence::assigned(17))
+        );
     }
 
     #[tokio::test]
@@ -200,7 +219,11 @@ mod tx {
         let topic = TopicId::new(Uuid::new_v4());
         let handle = TxCommitHandle::new(TxCommitHandleParts {
             partition: 5,
-            offsets: vec![10, 11, 12],
+            offsets: vec![
+                Sequence::assigned(10),
+                Sequence::assigned(11),
+                Sequence::assigned(12),
+            ],
             offset_manager: manager.clone(),
             group,
             topic,
@@ -211,7 +234,7 @@ mod tx {
             .transaction_ref(move |tx| {
                 Box::pin(async move {
                     handle
-                        .commit_offset_in_tx(tx, 20)
+                        .commit_offset_in_tx(tx, Sequence::assigned(20))
                         .await
                         .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                     Ok(())

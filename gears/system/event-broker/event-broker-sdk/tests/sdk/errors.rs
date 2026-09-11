@@ -4,8 +4,8 @@ use std::error::Error;
 
 use event_broker_sdk::error::{reasons, resources};
 use event_broker_sdk::{
-    ConsumerError, ConsumerGroupId, EventBrokerError, OffsetManagerError, ProducerId,
-    StorageBackendError, SubscriptionId,
+    ConsumerError, ConsumerGroupId, EventBrokerError, OffsetManagerError, OutOfRange,
+    PositionViolation, ProducerId, Sequence, StorageBackendError, SubscriptionId,
 };
 use serde_json::{Value, json};
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -257,6 +257,54 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                         "reason": reasons::INVALID_EVENT_FIELD
                     }],
                     "resource_type": resources::EVENT
+                }
+            }),
+        ),
+        (
+            EventBrokerError::InvalidTextField {
+                field: "description",
+                detail: "must contain only printable ASCII (0x20-0x7E)".into(),
+                reason: reasons::ASCII_ONLY,
+                instance: "ignored".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                "title": "Invalid Argument",
+                "status": 400,
+                "detail": "Request validation failed",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "field_violations": [{
+                        "field": "description",
+                        "description": "must contain only printable ASCII (0x20-0x7E)",
+                        "reason": reasons::ASCII_ONLY
+                    }],
+                    "resource_type": resources::REQUEST
+                }
+            }),
+        ),
+        (
+            EventBrokerError::InvalidTextField {
+                field: "client_agent",
+                detail: "must be 1-256 bytes, got 257".into(),
+                reason: reasons::FIELD_TOO_LONG,
+                instance: "ignored".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                "title": "Invalid Argument",
+                "status": 400,
+                "detail": "Request validation failed",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "field_violations": [{
+                        "field": "client_agent",
+                        "description": "must be 1-256 bytes, got 257",
+                        "reason": reasons::FIELD_TOO_LONG
+                    }],
+                    "resource_type": resources::REQUEST
                 }
             }),
         ),
@@ -543,28 +591,46 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
             }),
         ),
         (
+            // Two offenders, one below its partition's floor and one above
+            // its ceiling: both are reported, each with the range it missed
+            // and no part of the value that was submitted.
             EventBrokerError::InvalidInitialPosition {
-                topic: "orders".into(),
-                partition: 7,
-                requested: "before-retention".into(),
-                detail: "initial position out of range".into(),
+                violations: vec![
+                    PositionViolation::builder(0)
+                        .floor(Sequence::assigned(99))
+                        .ceiling(Sequence::assigned(5000))
+                        .breached(OutOfRange::BelowFloor)
+                        .build(),
+                    PositionViolation::builder(2)
+                        .floor(Sequence::NONE)
+                        .ceiling(Sequence::assigned(12))
+                        .breached(OutOfRange::AboveCeiling)
+                        .build(),
+                ],
+                detail: "Request validation failed".into(),
                 instance: "ignored".into(),
             },
             json!({
-                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~",
-                "title": "Out of Range",
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+                "title": "Invalid Argument",
                 "status": 400,
-                "detail": "initial position out of range",
+                "detail": "Request validation failed",
                 "instance": "/v1/event-broker/test",
                 "trace_id": "trace-123",
                 "context": {
-                    "field_violations": [{
-                        "field": "initial_position",
-                        "description": "initial position out of range; requested=before-retention",
-                        "reason": "invalid_initial_position"
-                    }],
-                    "resource_type": resources::PARTITION,
-                    "resource_name": "orders:7"
+                    "field_violations": [
+                        {
+                            "field": "partition_positions[0].value",
+                            "description": "the position is below the valid range [99, 5000]",
+                            "reason": reasons::BELOW_RETENTION_FLOOR
+                        },
+                        {
+                            "field": "partition_positions[2].value",
+                            "description": "the position is above the valid range [0, 12]",
+                            "reason": reasons::ABOVE_HIGH_WATER_MARK
+                        }
+                    ],
+                    "resource_type": resources::REQUEST
                 }
             }),
         ),
@@ -719,23 +785,24 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
         ),
         (
             StorageBackendError::OffsetOutOfRange {
-                requested: 10,
-                oldest: 20,
-                detail: "offset too old".into(),
+                floor: Sequence::assigned(20),
+                ceiling: Sequence::assigned(90),
+                breached: OutOfRange::BelowFloor,
+                detail: "valid positions are [20, 90]".into(),
                 instance: "ignored".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.out_of_range.v1~",
                 "title": "Out of Range",
                 "status": 400,
-                "detail": "offset too old",
+                "detail": "valid positions are [20, 90]",
                 "instance": "/v1/event-broker/test",
                 "trace_id": "trace-123",
                 "context": {
                     "field_violations": [{
                         "field": "offset",
-                        "description": "offset too old; requested=10; oldest=20",
-                        "reason": "offset_out_of_range"
+                        "description": "the position is below the valid range [20, 90]",
+                        "reason": reasons::BELOW_RETENTION_FLOOR
                     }],
                     "resource_type": resources::OFFSET
                 }
@@ -926,14 +993,29 @@ fn canonical_to_event_broker_projection_preserves_modeled_and_unmodeled_cases() 
         other => panic!("expected rate-limit projection, got {other:?}"),
     }
 
+    // A modeled not-found now round-trips to its typed variant (the inverse
+    // mapping was completed in the rest-client change).
     let not_found = CanonicalError::from(EventBrokerError::TopicNotFound {
         topic: "orders".into(),
         detail: "topic missing".into(),
         instance: String::new(),
     });
     match EventBrokerError::from(not_found) {
+        EventBrokerError::TopicNotFound { topic, .. } => assert_eq!(topic, "orders"),
+        other => panic!("expected TopicNotFound projection, got {other:?}"),
+    }
+
+    // An unmodeled case (a text-field validation reason the inverse does not
+    // name) still falls through to the catch-all, preserving the canonical error.
+    let text_field = CanonicalError::from(EventBrokerError::InvalidTextField {
+        field: "client_agent",
+        detail: "must be printable ASCII".into(),
+        reason: "ascii_only",
+        instance: String::new(),
+    });
+    match EventBrokerError::from(text_field) {
         EventBrokerError::Other { canonical } => {
-            assert!(matches!(canonical, CanonicalError::NotFound { .. }));
+            assert!(matches!(canonical, CanonicalError::InvalidArgument { .. }));
         }
         other => panic!("expected catch-all projection, got {other:?}"),
     }

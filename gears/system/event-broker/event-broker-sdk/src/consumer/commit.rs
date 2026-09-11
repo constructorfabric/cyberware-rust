@@ -1,5 +1,7 @@
 #[cfg(feature = "db")]
 use crate::error::ConsumerError;
+#[cfg(feature = "db")]
+use crate::sequence::Sequence;
 
 /// Commit handle for tx-capable consumers (`db` feature).
 /// Offers `commit_offset_in_tx`, which writes a delivered offset into the
@@ -11,18 +13,18 @@ use crate::error::ConsumerError;
 #[cfg(feature = "db")]
 pub struct TxCommitHandle<OM: super::CommitOffsetInTx> {
     pub(crate) partition: u32,
-    pub(crate) batch_offsets: Vec<i64>,
+    pub(crate) batch_offsets: Vec<Sequence>,
     pub(crate) offset_manager: std::sync::Arc<OM>,
     pub(crate) group: crate::ids::ConsumerGroupId,
     pub(crate) topic: crate::ids::TopicId,
     /// Offset successfully written inside the user transaction.
-    pub(crate) committed_offset: std::sync::Arc<std::sync::Mutex<Option<i64>>>,
+    pub(crate) committed_offset: std::sync::Arc<std::sync::Mutex<Option<Sequence>>>,
 }
 
 #[cfg(feature = "db")]
 pub(crate) struct TxCommitHandleParts<OM: super::CommitOffsetInTx> {
     pub(crate) partition: u32,
-    pub(crate) offsets: Vec<i64>,
+    pub(crate) offsets: Vec<Sequence>,
     pub(crate) offset_manager: std::sync::Arc<OM>,
     pub(crate) group: crate::ids::ConsumerGroupId,
     pub(crate) topic: crate::ids::TopicId,
@@ -41,7 +43,11 @@ impl<OM: super::CommitOffsetInTx> TxCommitHandle<OM> {
         }
     }
 
-    pub async fn commit_offset_in_tx<TX>(&self, txn: &TX, offset: i64) -> Result<(), ConsumerError>
+    pub async fn commit_offset_in_tx<TX>(
+        &self,
+        txn: &TX,
+        offset: Sequence,
+    ) -> Result<(), ConsumerError>
     where
         TX: toolkit_db::secure::DBRunner + Sync,
     {

@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,7 +9,7 @@ use uuid::Uuid;
 
 use super::{
     CommitOffsetInTx, Fallback, LOCAL_DB_OFFSET_STORE_MIGRATION_SQL, LocalDbOffsetManager,
-    OffsetStore, ResolvedPosition,
+    OffsetStore, Position,
 };
 use crate::ids::{ConsumerGroupId, TopicId};
 
@@ -56,22 +57,22 @@ async fn local_db_load_position_returns_fallback_when_no_row_exists() {
         .await
         .expect("load position");
 
-    assert_eq!(pos, ResolvedPosition::Latest);
+    assert_eq!(pos, Position::Latest);
 }
 
 #[tokio::test]
 async fn local_db_load_position_uses_override_before_fallback() {
     let (_raw, db) = db_with_offsets_table().await;
     let orders = topic("orders");
-    let manager =
-        LocalDbOffsetManager::new(db, Fallback::Earliest).with_overrides([((orders, 2), 41)]);
+    let manager = LocalDbOffsetManager::new(db, Fallback::Earliest)
+        .with_overrides([((orders, 2), Sequence::assigned(41))]);
 
     let pos = manager
         .load_position(&group("billing"), &orders, 2)
         .await
         .expect("load position");
 
-    assert_eq!(pos, ResolvedPosition::Exact(41));
+    assert_eq!(pos, Position::Exact(Sequence::assigned(41)));
 }
 
 #[tokio::test]
@@ -85,7 +86,7 @@ async fn local_db_commit_in_tx_upserts_and_load_reads_committed_row() {
     db.transaction_ref(move |tx| {
         Box::pin(async move {
             tx_manager
-                .commit_in_tx(tx, &group, &topic, 3, 99)
+                .commit_in_tx(tx, &group, &topic, 3, Sequence::assigned(99))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -99,7 +100,7 @@ async fn local_db_commit_in_tx_upserts_and_load_reads_committed_row() {
         .await
         .expect("load committed position");
 
-    assert_eq!(pos, ResolvedPosition::Exact(99));
+    assert_eq!(pos, Position::Exact(Sequence::assigned(99)));
 }
 
 #[tokio::test]
@@ -114,7 +115,7 @@ async fn local_db_commit_in_tx_rollback_does_not_advance_position() {
         .transaction_ref(move |tx| {
             Box::pin(async move {
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, 0, 12)
+                    .commit_in_tx(tx, &group, &topic, 0, Sequence::assigned(12))
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(
@@ -130,7 +131,7 @@ async fn local_db_commit_in_tx_rollback_does_not_advance_position() {
         .await
         .expect("load position after rollback");
 
-    assert_eq!(pos, ResolvedPosition::Earliest);
+    assert_eq!(pos, Position::Earliest);
 }
 
 #[tokio::test]
@@ -146,19 +147,19 @@ async fn local_db_uuid_key_isolates_groups_topics_and_partitions() {
     db.transaction_ref(move |tx| {
         Box::pin(async move {
             tx_manager
-                .commit_in_tx(tx, &group_a, &topic_a, 0, 10)
+                .commit_in_tx(tx, &group_a, &topic_a, 0, Sequence::assigned(10))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             tx_manager
-                .commit_in_tx(tx, &group_a, &topic_a, 1, 11)
+                .commit_in_tx(tx, &group_a, &topic_a, 1, Sequence::assigned(11))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             tx_manager
-                .commit_in_tx(tx, &group_b, &topic_a, 0, 20)
+                .commit_in_tx(tx, &group_b, &topic_a, 0, Sequence::assigned(20))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             tx_manager
-                .commit_in_tx(tx, &group_a, &topic_b, 0, 30)
+                .commit_in_tx(tx, &group_a, &topic_b, 0, Sequence::assigned(30))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -169,19 +170,19 @@ async fn local_db_uuid_key_isolates_groups_topics_and_partitions() {
 
     assert_eq!(
         manager.load_position(&group_a, &topic_a, 0).await.unwrap(),
-        ResolvedPosition::Exact(10)
+        Position::Exact(Sequence::assigned(10))
     );
     assert_eq!(
         manager.load_position(&group_a, &topic_a, 1).await.unwrap(),
-        ResolvedPosition::Exact(11)
+        Position::Exact(Sequence::assigned(11))
     );
     assert_eq!(
         manager.load_position(&group_b, &topic_a, 0).await.unwrap(),
-        ResolvedPosition::Exact(20)
+        Position::Exact(Sequence::assigned(20))
     );
     assert_eq!(
         manager.load_position(&group_a, &topic_b, 0).await.unwrap(),
-        ResolvedPosition::Exact(30)
+        Position::Exact(Sequence::assigned(30))
     );
 }
 

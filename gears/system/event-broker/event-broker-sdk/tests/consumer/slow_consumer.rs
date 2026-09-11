@@ -1,3 +1,4 @@
+use event_broker_sdk::Sequence;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -8,7 +9,7 @@ use event_broker_sdk::{
     BatchHandlerOutcome, CommitOffset, ConnectionDropReason, ConsumerBuffering, ConsumerBuilder,
     ConsumerError, ConsumerGroupId, ConsumerGroupRef, ConsumerHandler, ConsumerRuntimeEvent,
     ConsumerRuntimeListener, EventBatch, EventBrokerApi, Fallback, InMemoryOffsetManager,
-    OffsetManagerError, OffsetStore, ResolvedPosition, TopicId,
+    OffsetManagerError, OffsetStore, Position, TopicId,
 };
 use uuid::Uuid;
 
@@ -44,9 +45,9 @@ impl OffsetStore for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
+    ) -> Result<Position, OffsetManagerError> {
         self.timeline.lock().unwrap().push("load");
-        Ok(ResolvedPosition::Earliest)
+        Ok(Position::Earliest)
     }
 }
 
@@ -57,7 +58,7 @@ impl CommitOffset for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-        _offset: i64,
+        _offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         Ok(())
     }

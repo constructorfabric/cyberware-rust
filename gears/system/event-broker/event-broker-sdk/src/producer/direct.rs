@@ -326,11 +326,13 @@ impl Producer {
             .iter()
             .map(|prepared| prepared.event.clone())
             .collect::<Vec<_>>();
-        let outcomes = self.broker.publish_batch(&self.ctx, &wire_events).await?;
-        for (prepared, outcome) in prepared.iter().zip(outcomes.iter()) {
-            self.advance_after_acceptance(prepared, *outcome).await;
+        // A batch is all-or-nothing: the broker reports one outcome for the
+        // whole batch. Apply it to every prepared event's local chain state.
+        let outcome = self.broker.publish_batch(&self.ctx, &wire_events).await?;
+        for prepared in &prepared {
+            self.advance_after_acceptance(prepared, outcome).await;
         }
-        Ok(outcomes)
+        Ok(vec![outcome; prepared.len()])
     }
 
     pub async fn reset_chain(&self, scope: ResetScope<'_>) -> Result<(), EventBrokerError> {

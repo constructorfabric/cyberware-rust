@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use chrono::Utc;
 use toolkit_gts::gts_id;
 use uuid::Uuid;
@@ -19,8 +20,8 @@ fn raw_event() -> RawEvent {
         subject: "order-1".to_owned(),
         subject_type: "order".to_owned(),
         partition: 7,
-        sequence: 99,
-        offset: 99,
+        sequence: Sequence::assigned(99),
+        offset: Sequence::assigned(99),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -54,7 +55,7 @@ fn dead_letter_envelope_preserves_record_context_and_payload_type_convention() {
     assert_eq!(envelope.subject, "order-1");
     assert_eq!(envelope.subject_type, "order");
     assert_eq!(envelope.partition, 7);
-    assert_eq!(envelope.offset, 99);
+    assert_eq!(envelope.offset, Sequence::assigned(99));
     assert_eq!(envelope.attempts, Some(6));
     assert_eq!(envelope.reason, "permanent validation failure");
     assert_eq!(envelope.payload, raw.data);
@@ -77,7 +78,7 @@ fn dead_letter_envelope_round_trips_from_outbox_payload() {
     assert_eq!(coordinates.subject, "order-1");
     assert_eq!(coordinates.subject_type, "order");
     assert_eq!(coordinates.partition, 7);
-    assert_eq!(coordinates.offset, 99);
+    assert_eq!(coordinates.offset, Sequence::assigned(99));
     assert_eq!(coordinates.event_id, raw.id);
 }
 

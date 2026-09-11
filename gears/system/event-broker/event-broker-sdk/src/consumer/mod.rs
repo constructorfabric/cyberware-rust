@@ -50,7 +50,7 @@ pub use offset_manager::{
 pub use runtime::{Consumer, ConsumerHandle};
 
 pub use crate::api::{
-    BarrierMode, ControlCode, FrameStream, PartitionPosition, ResolvedPosition, SeekPosition,
+    BarrierMode, ControlCode, FrameStream, PartitionPosition, Position, SeekPosition,
     SubscriptionAssignment, TenantTraversalDepth, WireEvent, WireFrame,
 };
 pub use crate::error::OffsetManagerError;

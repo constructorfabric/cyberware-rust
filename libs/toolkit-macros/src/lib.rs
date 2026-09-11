@@ -13,6 +13,7 @@ mod api_dto;
 mod domain_model;
 mod expand_vars;
 mod grpc_client;
+mod temporary;
 mod utils;
 
 /// Configuration parsed from #[gear(...)] attribute
@@ -1277,6 +1278,37 @@ pub fn api_dto(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn domain_model(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as DeriveInput);
     TokenStream::from(domain_model::expand_domain_model(&input))
+}
+
+/// Marks an item as a temporary stand-in, tracked by a follow-up issue.
+///
+/// No-op at runtime: expands to the item unchanged plus an injected `#[doc]`
+/// line, so it's both greppable (`grep -rn "TEMPORARY("`) and visible in
+/// rustdoc/IDE hover. Applies to any item - struct, enum, impl block, fn.
+///
+/// # Usage
+///
+/// ```ignore
+/// use toolkit_macros::temporary;
+///
+/// #[temporary(
+///     tracking = "gears-rust#4347",
+///     reason = "in-memory stand-in until the real storage backend lands"
+/// )]
+/// pub struct InMemoryFooRepo {
+///     // ...
+/// }
+/// ```
+///
+/// Both `tracking` (`<repo>#<issue-number>`, e.g. `gears-rust#4347` or
+/// `cargo-gears#89`) and `reason` are required and fail to compile if
+/// missing, empty, or malformed.
+#[proc_macro_attribute]
+pub fn temporary(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match temporary::expand_temporary(attr.into(), &item.into()) {
+        Ok(tokens) => TokenStream::from(tokens),
+        Err(err) => TokenStream::from(err.to_compile_error()),
+    }
 }
 
 /// Derive macro that implements [`toolkit::var_expand::ExpandVars`].

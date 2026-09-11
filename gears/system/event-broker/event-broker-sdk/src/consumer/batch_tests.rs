@@ -1,3 +1,4 @@
+use crate::sequence::Sequence;
 use chrono::Utc;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -20,8 +21,8 @@ fn raw_event(offset: i64) -> RawEvent {
         subject: format!("order-{offset}"),
         subject_type: "order".to_owned(),
         partition: 7,
-        sequence: offset,
-        offset,
+        sequence: Sequence::assigned(offset),
+        offset: Sequence::assigned(offset),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -47,20 +48,29 @@ fn event_batch_reads_without_mutating_progress() {
     let batch = EventBatch::new(&events);
 
     assert_eq!(batch.len(), 3);
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(10));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(10))
+    );
     assert_eq!(
         batch
             .next_chunk(2)
             .iter()
-            .map(|event| event.offset)
+            .map(|event| event.offset.as_i64())
             .collect::<Vec<_>>(),
         vec![10, 11]
     );
     assert_eq!(
-        batch.iter().map(|event| event.offset).collect::<Vec<_>>(),
+        batch
+            .iter()
+            .map(|event| event.offset.as_i64())
+            .collect::<Vec<_>>(),
         vec![10, 11, 12]
     );
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(10));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(10))
+    );
 }
 
 struct RecordingSingleHandler {
@@ -75,7 +85,7 @@ impl SingleEventHandler for RecordingSingleHandler {
         event: RawEvent,
         _attempts: u16,
     ) -> Result<HandlerOutcome, ConsumerError> {
-        self.calls.lock().unwrap().push(event.offset);
+        self.calls.lock().unwrap().push(event.offset.as_i64());
         Ok(self.outcome.clone())
     }
 }
@@ -95,9 +105,12 @@ async fn single_handler_adapter_reports_one_event_processed_on_success() {
 
     assert!(matches!(
         outcome,
-        BatchHandlerOutcome::AdvanceThrough { offset: 40 }
+        BatchHandlerOutcome::AdvanceThrough { offset } if offset == Sequence::assigned(40)
     ));
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(40));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(40))
+    );
     assert_eq!(*calls.lock().unwrap(), vec![40]);
 }
 
@@ -117,7 +130,10 @@ async fn single_handler_adapter_reports_retry_without_progress() {
     let outcome = adapter.handle_batch(&batch, 1).await.unwrap();
 
     assert!(matches!(outcome, BatchHandlerOutcome::Retry { .. }));
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(41));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(41))
+    );
     assert_eq!(*calls.lock().unwrap(), vec![41]);
 }
 
@@ -139,7 +155,7 @@ impl ConsumerHandler for ChunkingHandler {
         let chunk: Vec<i64> = batch
             .next_chunk(self.chunk)
             .iter()
-            .map(|event| event.offset)
+            .map(|event| event.offset.as_i64())
             .collect();
         self.seen.lock().unwrap().push(chunk);
         Ok(self
@@ -186,7 +202,9 @@ async fn chunk_retry_then_partial_advance_then_success_redelivers_from_front() {
             BatchHandlerOutcome::Retry {
                 reason: "downstream unavailable".to_owned(),
             },
-            BatchHandlerOutcome::AdvanceThrough { offset: 12 },
+            BatchHandlerOutcome::AdvanceThrough {
+                offset: Sequence::assigned(12),
+            },
             BatchHandlerOutcome::Success,
         ]))),
     };
@@ -212,7 +230,9 @@ async fn partial_advance_redelivers_only_unacked_tail() {
         chunk: 8,
         seen: seen.clone(),
         scripted: Arc::new(Mutex::new(VecDeque::from(vec![
-            BatchHandlerOutcome::AdvanceThrough { offset: 21 },
+            BatchHandlerOutcome::AdvanceThrough {
+                offset: Sequence::assigned(21),
+            },
             BatchHandlerOutcome::Success,
         ]))),
     };
@@ -237,5 +257,8 @@ async fn retry_outcome_leaves_frontier_unchanged() {
     assert_eq!(processed, None);
     // Nothing advanced -> the full batch would be redelivered from the front.
     assert_eq!(batch.next_chunk(events.len()).len(), 2);
-    assert_eq!(batch.next_event().map(|event| event.offset), Some(30));
+    assert_eq!(
+        batch.next_event().map(|event| event.offset),
+        Some(Sequence::assigned(30))
+    );
 }

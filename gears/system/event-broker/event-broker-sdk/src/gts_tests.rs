@@ -196,3 +196,57 @@ fn a_topic_missing_a_required_property_is_rejected() {
         "a topic without a description must not validate"
     );
 }
+
+/// A derived event type may only *narrow* its base. An empty payload schema
+/// admits any JSON value, which is wider than the base's `["object", "null"]`,
+/// and `types-registry` refuses the document with "Schema at `$.data` changes
+/// type incompatibly" - which stops the whole gear from booting, since the
+/// registry commits its configuration-seeded entities during `post_init`.
+///
+/// That failure reached a running process once because nothing here covered
+/// this helper at all: every fixture and the mock build their event types
+/// through it, and none of them validates against the base.
+#[test]
+fn an_unconstrained_payload_renders_as_the_bases_own_type_not_as_any() {
+    let base_data =
+        committed("gts.cf.core.events.event.v1~.schema.json")["properties"]["data"]["type"].clone();
+
+    let derived = crate::gts::derived_event_type_schema(
+        "gts.cf.core.events.event.v1~example.eb.narrowing.foo.v1~",
+        "gts.cf.core.events.topic.v1~example.eb.narrowing.topic.v1",
+        serde_json::json!({}),
+        &["gts.example.eb.narrowing.subject.v1~"],
+    );
+
+    let narrowing = &derived["allOf"][1]["properties"]["data"];
+    assert_eq!(
+        narrowing["type"], base_data,
+        "stating no constraints means whatever the base allows, so the member \
+         carries the base's own type rather than an empty schema"
+    );
+    assert_ne!(
+        *narrowing,
+        serde_json::json!({}),
+        "an empty schema here is what registration refuses"
+    );
+}
+
+/// The other half: a payload contract the caller supplies is written through
+/// untouched, since narrowing is exactly what it is for.
+#[test]
+fn a_supplied_payload_contract_is_written_through_unchanged() {
+    let contract = serde_json::json!({
+        "type": "object",
+        "required": ["order_id"],
+        "properties": { "order_id": { "type": "string", "format": "uuid" } },
+    });
+
+    let derived = crate::gts::derived_event_type_schema(
+        "gts.cf.core.events.event.v1~example.eb.narrowing.foo.v1~",
+        "gts.cf.core.events.topic.v1~example.eb.narrowing.topic.v1",
+        contract.clone(),
+        &[],
+    );
+
+    assert_eq!(derived["allOf"][1]["properties"]["data"], contract);
+}

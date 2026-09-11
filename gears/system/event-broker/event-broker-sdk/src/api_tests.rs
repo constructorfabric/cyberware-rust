@@ -7,17 +7,9 @@ fn barrier_mode_default_is_respect() {
     assert_eq!(BarrierMode::default(), BarrierMode::Respect);
 }
 
-#[test]
-fn barrier_mode_serialises_to_snake_case() {
-    assert_eq!(
-        serde_json::to_string(&BarrierMode::Respect).unwrap(),
-        "\"respect\""
-    );
-    assert_eq!(
-        serde_json::to_string(&BarrierMode::Ignore).unwrap(),
-        "\"ignore\""
-    );
-}
+// The snake_case wire form of `BarrierMode` is a property of the wire DTO
+// (`rest::wire::BarrierModeDto`), not of the SDK type, which carries no serde -
+// asserted in the rest wire-DTO tests.
 
 #[test]
 fn subscription_interest_full_construction() {

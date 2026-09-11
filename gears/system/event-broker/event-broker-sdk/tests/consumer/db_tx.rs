@@ -1,3 +1,4 @@
+use event_broker_sdk::Sequence;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,7 +10,7 @@ use event_broker_sdk::dlq::DeadLetterRecord;
 use event_broker_sdk::{
     CommitOffsetInTx, ConsumerBatching, ConsumerBuilder, ConsumerError, ConsumerGroupRef,
     EventBatch, EventBrokerError, Fallback, HandlerOutcome, LocalDbOffsetManager, OffsetStore,
-    RawEvent, ResolvedPosition, TxCommitHandle, TxConsumerHandler, TxSingleEventHandler,
+    Position, RawEvent, TxCommitHandle, TxConsumerHandler, TxSingleEventHandler,
 };
 use sea_orm::{ConnectionTrait, Database, EntityTrait, PaginatorTrait, Set, Statement};
 use toolkit_db::secure::{AccessScope, SecureInsertExt};
@@ -103,7 +104,7 @@ impl TxSingleEventHandler<LocalDbOffsetManager> for TxSingleProjector {
         .await
         .map_err(|err| EventBrokerError::Internal(err.to_string()))?;
 
-        self.committed_offsets.lock().unwrap().push(offset);
+        self.committed_offsets.lock().unwrap().push(offset.as_i64());
         Ok(HandlerOutcome::Success)
     }
 }
@@ -140,7 +141,10 @@ impl TxConsumerHandler<LocalDbOffsetManager> for TxBatchProjector {
         .await
         .map_err(|err| EventBrokerError::Internal(err.to_string()))?;
 
-        self.committed_offsets.lock().unwrap().push(target_offset);
+        self.committed_offsets
+            .lock()
+            .unwrap()
+            .push(target_offset.as_i64());
         Ok(HandlerOutcome::Success)
     }
 }
@@ -198,8 +202,8 @@ fn raw_event_for_dead_letter() -> event_broker_sdk::RawEvent {
         subject: "db-dlq-1".to_owned(),
         subject_type: "test".to_owned(),
         partition: 0,
-        sequence: 42,
-        offset: 42,
+        sequence: Sequence::assigned(42),
+        offset: Sequence::assigned(42),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,
@@ -219,7 +223,7 @@ where
         topic: Set(record.topic.clone()),
         event_type: Set(record.event_type.clone()),
         partition: Set(record.partition as i32),
-        offset: Set(record.offset),
+        offset: Set(record.offset.as_i64()),
         reason: Set(record.reason.clone()),
         payload: Set(record.payload.to_string()),
         occurred_at: Set(record.occurred_at),
@@ -281,7 +285,7 @@ async fn if_i_want_transactional_single_event_handling_i_commit_the_delivered_of
             .load_position(&group, &topic, 0)
             .await
             .unwrap(),
-        ResolvedPosition::Exact(committed)
+        Position::Exact(Sequence::assigned(committed))
     );
 }
 
@@ -332,7 +336,7 @@ async fn if_i_want_transactional_batch_handling_i_commit_the_last_handled_offset
             .load_position(&group, &topic, 0)
             .await
             .unwrap(),
-        ResolvedPosition::Exact(committed)
+        Position::Exact(Sequence::assigned(committed))
     );
 }
 
@@ -349,7 +353,7 @@ async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_to
             // Application business writes should use secure repositories with
             // this same `tx`; the offset save joins that transaction.
             tx_manager
-                .commit_in_tx(tx, &group, &topic, 0, 41)
+                .commit_in_tx(tx, &group, &topic, 0, Sequence::assigned(41))
                 .await
                 .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
             Ok(())
@@ -360,7 +364,7 @@ async fn if_i_want_db_transactional_progress_i_write_business_rows_and_offset_to
 
     assert_eq!(
         manager.load_position(&group, &topic, 0).await.unwrap(),
-        ResolvedPosition::Exact(41)
+        Position::Exact(Sequence::assigned(41))
     );
 }
 
@@ -376,7 +380,7 @@ async fn if_the_business_transaction_rolls_back_the_offset_rolls_back_too() {
         .transaction_ref(move |tx| {
             Box::pin(async move {
                 tx_manager
-                    .commit_in_tx(tx, &group, &topic, 0, 77)
+                    .commit_in_tx(tx, &group, &topic, 0, Sequence::assigned(77))
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;
                 Err(toolkit_db::DbError::InvalidConfig(
@@ -389,7 +393,7 @@ async fn if_the_business_transaction_rolls_back_the_offset_rolls_back_too() {
     assert!(result.is_err());
     assert_eq!(
         manager.load_position(&group, &topic, 0).await.unwrap(),
-        ResolvedPosition::Earliest
+        Position::Earliest
     );
 }
 
@@ -425,7 +429,7 @@ async fn if_i_want_transactional_dlq_i_write_the_record_and_offset_in_one_transa
             .load_position(&group, &topic, event.partition)
             .await
             .unwrap(),
-        ResolvedPosition::Exact(event.offset)
+        Position::Exact(event.offset)
     );
 }
 
@@ -464,6 +468,6 @@ async fn if_the_transactional_dlq_rolls_back_neither_parking_nor_offset_is_durab
             .load_position(&group, &topic, event.partition)
             .await
             .unwrap(),
-        ResolvedPosition::Earliest
+        Position::Earliest
     );
 }

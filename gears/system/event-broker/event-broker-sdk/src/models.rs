@@ -1,10 +1,11 @@
+use crate::sequence::Sequence;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use gts::{GtsInstanceId, GtsTypeId};
 use toolkit_utils::iso8601_duration::Iso8601Duration;
 
+use crate::api::SubscriptionInterest;
 use crate::error::EventBrokerError;
 use crate::ids::ConsumerGroupId;
 
@@ -14,7 +15,7 @@ use crate::ids::ConsumerGroupId;
 /// instance's own data. How many partitions the broker gives the topic and which
 /// backend stores them are the broker's own configuration and are not reported
 /// here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Topic {
     pub id: GtsInstanceId,
     /// Required on the topic instance, so always present on a projected topic.
@@ -27,7 +28,7 @@ pub struct Topic {
 /// Projected from the event type's resolved type schema. `data_schema` is the
 /// payload contract composed out of the schema's `data` narrowings, and
 /// `topic`, `allowed_subject_types` and `partition_key` are resolved traits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct EventType {
     pub id: GtsTypeId,
     pub topic: GtsInstanceId,
@@ -40,27 +41,31 @@ pub struct EventType {
     pub data_schema: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub id: ConsumerGroupId,
     pub tenant_id: Uuid,
-    pub owner_principal_id: String,
+    pub owner_principal_id: Uuid,
     pub kind: ConsumerGroupKind,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsumerGroupKind {
     Named,
     Anonymous,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Subscription {
     pub id: crate::ids::SubscriptionId,
     pub consumer_group: ConsumerGroupId,
+    /// RFC 9110 User-Agent grammar; ASCII 1-256 bytes. Required on the wire
+    /// (subscription schema); informational.
+    pub client_agent: String,
+    /// The member's declared interests, echoed back on the subscription.
+    pub interests: Vec<SubscriptionInterest>,
     pub assigned: Vec<PartitionAssignment>,
     pub topology_version: i64,
     pub expires_at: DateTime<Utc>,
@@ -69,7 +74,7 @@ pub struct Subscription {
 /// One `(topic, partition)` pair a subscription owns. The topic is named rather
 /// than indexed, matching what the subscription's schema declares and what the
 /// `topology` and `control` frames carry, so an assignment is readable on its own.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PartitionAssignment {
     pub topic: GtsInstanceId,
     pub partition: u32,
@@ -84,8 +89,8 @@ pub struct CreateConsumerGroupRequest {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionRange {
-    pub start_offset: Option<i64>,
-    pub end_offset: Option<i64>,
+    pub start_offset: Option<Sequence>,
+    pub end_offset: Option<Sequence>,
     pub limit: u32,
 }
 
@@ -93,10 +98,11 @@ pub struct PartitionRange {
 pub struct TopicSegment {
     pub topic: String,
     pub partition: u32,
-    pub start_sequence: i64,
-    pub end_sequence: i64,
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
+    pub start_sequence: Sequence,
+    pub end_sequence: Sequence,
+    /// Optional on the wire: an empty partition has no span to report.
+    pub start_time: Option<DateTime<Utc>>,
+    pub end_time: Option<DateTime<Utc>>,
     /// Backend-specific per-segment opaque entries. Required in the wire response envelope.
     pub segments: Vec<serde_json::Value>,
 }
@@ -179,8 +185,10 @@ pub enum ResetScope<'a> {
 /// The event envelope. Matches `gts.cf.core.events.event.v1~.schema.json` in the design and is the
 /// parameter/return type on the public [`EventBrokerApi`](crate::api::EventBrokerApi)
 /// (publish/storage side). Broker-stamped fields (`partition`, `sequence`,
-/// `sequence_time`, `offset`, `offset_time`) are `None` on publish payloads; the
-/// broker populates them on receipt.
+/// `sequence_time`) are `None` on publish payloads; the broker populates them on
+/// receipt. `sequence` is the only ordering key the wire carries - there is no
+/// separate `offset` on an event; a consumer's offset is the `sequence` it has
+/// processed.
 ///
 /// This is a plain domain type with no serde derives - construct it via field
 /// init. Wire (de)serialization is the transport's concern: the `outbox` async
@@ -200,10 +208,8 @@ pub struct Event {
 
     // Broker-stamped (readOnly on the wire; absent on publish)
     pub partition: Option<u32>,
-    pub sequence: Option<i64>,
+    pub sequence: Option<Sequence>,
     pub sequence_time: Option<DateTime<Utc>>,
-    pub offset: Option<i64>,
-    pub offset_time: Option<DateTime<Utc>>,
 
     // Publisher-only (writeOnly; stripped on read)
     pub meta: Option<ProducerMeta>,

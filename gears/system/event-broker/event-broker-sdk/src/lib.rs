@@ -19,7 +19,9 @@ pub mod ids;
 pub mod models;
 pub mod producer;
 pub mod sdk;
+pub mod sequence;
 pub mod typed_event;
+pub mod validate;
 
 #[cfg(test)]
 mod api_tests;
@@ -27,13 +29,23 @@ mod api_tests;
 #[cfg(test)]
 mod gts_tests;
 
+#[cfg(test)]
+mod sequence_tests;
+
+#[cfg(test)]
+mod validate_tests;
+
 #[cfg(feature = "test-util")]
 pub mod mock;
 
+#[cfg(feature = "rest-client")]
+pub mod rest;
+
 pub use api::{
-    AssignedPartition, BarrierMode, EventBrokerApi, EventBrokerBackend, IngestOutcome, JoinRequest,
-    PartitionCursor, ProducerCursors, ProducerMode, ResolvedPosition, SeekResult,
-    StorageBackendConfig, SubscriptionAssignment, TenantTraversalDepth, TopicCursors,
+    AssignedPartition, BarrierMode, EventBrokerApi, EventBrokerBackend, EventBrokerBackendProvider,
+    IngestOutcome, JoinRequest, PartitionCursor, Position, ProducerCursors, ProducerMode,
+    RetentionReport, RetentionRequest, RetentionRequestBuilder, SeekResult, StorageBackendConfig,
+    SubscriptionAssignment, TenantTraversalDepth, TopicCursors,
 };
 pub use consumer::{
     BatchHandlerOutcome, CommitOffset, ConnectionDropReason, Consumer, ConsumerBatching,
@@ -52,7 +64,14 @@ pub use consumer::{
     TxSingleEventHandler, WithTx,
 };
 
-pub use error::{ConsumerError, EventBrokerError, OffsetManagerError, StorageBackendError};
+pub use error::{
+    ConsumerError, EventBrokerError, OffsetManagerError, OutOfRange, PositionViolation,
+    StorageBackendError,
+};
+pub use gts::{
+    CONSUMER_GROUP_RESOURCE_TYPE, EVENT_TYPE_RESOURCE_TYPE, PRODUCER_RESOURCE_TYPE,
+    REQUEST_RESOURCE_TYPE, SUBSCRIPTION_RESOURCE_TYPE, TopicV1,
+};
 pub use ids::{ConsumerGroupId, EventTypeId, ProducerId, SubscriptionId, TopicId};
 pub use models::{
     ConsumerGroup, ConsumerGroupKind, ConsumerGroupQuery, CreateConsumerGroupRequest, Event, Page,
@@ -70,4 +89,5 @@ pub use producer::{
 #[cfg(feature = "outbox")]
 pub use producer::{ProducerOutbox, ProducerOutboxHandle, ProducerOutboxQueue};
 pub use sdk::EventBrokerSdk;
+pub use sequence::Sequence;
 pub use typed_event::{EnvelopedEvent, TypedEvent};

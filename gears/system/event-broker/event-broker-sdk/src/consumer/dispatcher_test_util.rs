@@ -1,11 +1,12 @@
 //! Test helpers used exclusively by `#[cfg(feature = "test-util")]` dispatcher integration tests.
 
+use crate::sequence::Sequence;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::{
     BatchHandlerOutcome, CommitOffset, ConsumerHandler, ConsumerRuntimeEvent,
-    ConsumerRuntimeListener, EventBatch, OffsetManagerError, OffsetStore, ResolvedPosition,
+    ConsumerRuntimeListener, EventBatch, OffsetManagerError, OffsetStore, Position,
 };
 use crate::error::ConsumerError;
 use crate::ids::{ConsumerGroupId, TopicId};
@@ -47,7 +48,7 @@ impl ConsumerHandler for SleepingBatchHandler {
         self.calls.lock().unwrap().extend(
             chunk
                 .iter()
-                .map(|event| (event.topic.clone(), event.partition, event.offset)),
+                .map(|event| (event.topic.clone(), event.partition, event.offset.as_i64())),
         );
         Ok(chunk
             .last()
@@ -96,9 +97,9 @@ impl OffsetStore for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
+    ) -> Result<Position, OffsetManagerError> {
         self.timeline.lock().unwrap().push("load");
-        Ok(ResolvedPosition::Earliest)
+        Ok(Position::Earliest)
     }
 }
 
@@ -109,7 +110,7 @@ impl CommitOffset for SequencedOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-        _offset: i64,
+        _offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         Ok(())
     }
@@ -127,8 +128,8 @@ impl OffsetStore for RecordingCommitOffsetManager {
         _group: &ConsumerGroupId,
         _topic: &TopicId,
         _partition: u32,
-    ) -> Result<ResolvedPosition, OffsetManagerError> {
-        Ok(ResolvedPosition::Earliest)
+    ) -> Result<Position, OffsetManagerError> {
+        Ok(Position::Earliest)
     }
 }
 
@@ -139,12 +140,12 @@ impl CommitOffset for RecordingCommitOffsetManager {
         group: &ConsumerGroupId,
         topic: &TopicId,
         partition: u32,
-        offset: i64,
+        offset: Sequence,
     ) -> Result<(), OffsetManagerError> {
         self.commits
             .lock()
             .unwrap()
-            .push((*group, *topic, partition, offset));
+            .push((*group, *topic, partition, offset.as_i64()));
         Ok(())
     }
 }

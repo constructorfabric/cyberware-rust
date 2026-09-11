@@ -1,3 +1,4 @@
+use event_broker_sdk::Sequence;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -29,8 +30,8 @@ fn rejected_event() -> RawEvent {
         subject: "dlq-1".to_owned(),
         subject_type: "test".to_owned(),
         partition: 0,
-        sequence: 1,
-        offset: 1,
+        sequence: Sequence::assigned(1),
+        offset: Sequence::assigned(1),
         occurred_at: Utc::now(),
         sequence_time: Utc::now(),
         trace_parent: None,

@@ -4,6 +4,7 @@ use crate::api::{IngestOutcome, ProducerMode};
 use crate::error::EventBrokerError;
 use crate::ids::ProducerId;
 use crate::models::Event;
+use crate::sequence::Sequence;
 
 use super::core::Core;
 use super::partitioning::partition_for;
@@ -239,10 +240,8 @@ pub(super) fn ingest_one(
     let offset = topic_state.next_offset_for(partition);
     let mut stamped = event.clone();
     stamped.partition = Some(partition);
-    stamped.sequence = Some(offset);
+    stamped.sequence = Some(Sequence::assigned(offset));
     stamped.sequence_time = Some(now);
-    stamped.offset = Some(offset);
-    stamped.offset_time = Some(now);
     // Strip writeOnly publish-input fields from the stored read-projection.
     stamped.meta = None;
     topic_state.append(partition, stamped.clone());

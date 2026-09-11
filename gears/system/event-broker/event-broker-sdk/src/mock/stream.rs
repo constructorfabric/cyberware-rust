@@ -9,6 +9,7 @@ use tokio::time::sleep;
 use crate::api::{ControlCode, FrameStream, PartitionPosition, WireEvent, WireFrame};
 use crate::error::EventBrokerError;
 use crate::ids::SubscriptionId;
+use crate::sequence::Sequence;
 
 use super::core::MockBroker;
 
@@ -95,11 +96,8 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                         let offset = group
                             .and_then(|g| g.cursor.get(&(topic.clone(), *partition)))
                             .map(|c| c.offset)
-                            .unwrap_or(0);
-                        let last_examined = core.topics.get(topic.as_str())
-                            .and_then(|t| t.next_offset.get(partition).copied())
-                            .unwrap_or(0)
-                            .saturating_sub(1);
+                            .unwrap_or(Sequence::NONE);
+                        let last_examined = super::transport::hwm_cursor(&core, topic.as_str(), *partition);
                         PartitionPosition {
                             topic: GtsInstanceId::try_new(topic)
                                 .expect("registration asserts the topic id"),
@@ -165,11 +163,8 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                         let offset = group
                             .and_then(|g| g.cursor.get(&(topic.clone(), *partition)))
                             .map(|c| c.offset)
-                            .unwrap_or(0);
-                        let last_examined = core.topics.get(topic.as_str())
-                            .and_then(|t| t.next_offset.get(partition).copied())
-                            .unwrap_or(0)
-                            .saturating_sub(1);
+                            .unwrap_or(Sequence::NONE);
+                        let last_examined = super::transport::hwm_cursor(&core, topic.as_str(), *partition);
                         PartitionPosition {
                             topic: GtsInstanceId::try_new(topic)
                                 .expect("registration asserts the topic id"),
@@ -233,11 +228,15 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                 for (topic, partition) in &assigned {
                     let sub = core.subscriptions.get(&sub_id).unwrap();
                     let seek_offset = sub.seek.get(&(topic.clone(), *partition)).copied();
-                    let sent_offset = sub.sent.get(&(topic.clone(), *partition)).copied().unwrap_or(0);
-                    let scanned_off = sub.scanned.get(&(topic.clone(), *partition)).copied().unwrap_or(0);
+                    let sent_offset = sub.sent.get(&(topic.clone(), *partition)).copied().unwrap_or(Sequence::NONE);
+                    let scanned_off = sub.scanned.get(&(topic.clone(), *partition)).copied().unwrap_or(Sequence::NONE);
                     // Skip past the seek floor AND whatever we've already scanned (incl.
                     // filtered events) so the scan frontier only moves forward.
-                    let start = seek_offset.unwrap_or(0).max(scanned_off).max(sent_offset).max(0);
+                    let start = seek_offset
+                        .unwrap_or(Sequence::NONE)
+                        .max(scanned_off)
+                        .max(sent_offset)
+                        .max(Sequence::NONE);
                     // Per-interest type-pattern filter for this topic (A5). `"*"` matches all.
                     let patterns: Vec<String> = sub
                         .interests
@@ -255,7 +254,7 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                     let mut last_delivered = sent_offset;
                     let mut round_delivered = 0usize;
                     for stamped in events {
-                        let off = stamped.offset.unwrap_or(0);
+                        let off = stamped.sequence.unwrap_or(Sequence::NONE);
                         frontier = frontier.max(off); // scanned regardless of filter match
                         if !type_matches(&patterns, &stamped.type_id) {
                             continue; // scanned but filtered out - advances the frontier only
@@ -271,8 +270,7 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                             subject: stamped.subject.clone(),
                             subject_type: stamped.subject_type.clone(),
                             partition: stamped.partition.unwrap_or(*partition),
-                            sequence: stamped.sequence.unwrap_or(0),
-                            offset: stamped.offset.unwrap_or(0),
+                            sequence: stamped.sequence.unwrap_or(Sequence::NONE),
                             occurred_at: stamped.occurred_at,
                             sequence_time: stamped.sequence_time.unwrap_or_else(chrono::Utc::now),
                             trace_parent: stamped.trace_parent.clone(),
@@ -299,7 +297,7 @@ pub(super) fn open_stream(broker: MockBroker, sub_id: SubscriptionId) -> FrameSt
                     // delivered this round → a sparse Progress position so the consumer
                     // learns the true frontier without re-scanning on reconnect (R57).
                     if round_delivered == 0 && frontier > last_delivered {
-                        let delivered_pos = seek_offset.unwrap_or(0).max(last_delivered);
+                        let delivered_pos = seek_offset.unwrap_or(Sequence::NONE).max(last_delivered);
                         progress_positions.push(PartitionPosition {
                             topic: GtsInstanceId::try_new(topic)
                                 .expect("registration asserts the topic id"),

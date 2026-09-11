@@ -1,31 +1,33 @@
 {
   "$id": "gts://gts.cf.core.events.topic.v1~",
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "description": "Topic resource. A named logical event stream. Sequencing, offsets, and ordering are scoped to a single (topic, partition), and the partition count is broker configuration rather than a property of the topic.",
-  "type": "object",
   "additionalProperties": false,
+  "description": "Topic resource. A named logical event stream. Sequencing, offsets, and ordering are scoped to a single (topic, partition), and the partition count is broker configuration rather than a property of the topic.",
   "properties": {
+    "description": {
+      "description": "What the stream carries, for a reader deciding whether to subscribe to it. ASCII only.",
+      "maxLength": 1024,
+      "pattern": "^[\\x20-\\x7E]*$",
+      "type": "string"
+    },
     "id": {
       "description": "Full GTS topic identifier (e.g., gts.cf.core.events.topic.v1~vendor.users.v1).",
       "type": "string",
       "x-gts-instance": "gts.cf.core.events.topic.v1~"
     },
-    "description": {
-      "description": "What the stream carries, for a reader deciding whether to subscribe to it.",
-      "type": "string"
-    },
     "retention": {
+      "default": null,
       "description": "ISO 8601 duration events on this topic are retained for. Absent means the broker's configured default.",
+      "format": "duration",
       "type": [
         "string",
         "null"
-      ],
-      "format": "duration",
-      "default": null
+      ]
     }
   },
   "required": [
     "id",
     "description"
-  ]
+  ],
+  "type": "object"
 }

@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use crate::error::ConsumerError;
 use crate::ids::{ConsumerGroupId, TopicId};
+use crate::sequence::Sequence;
 
 use super::DeadLetterRecord;
 
@@ -17,7 +18,7 @@ pub struct DeadLetterEnvelope {
     pub subject: String,
     pub subject_type: String,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
     pub attempts: Option<u16>,
     pub reason: String,
     pub payload: serde_json::Value,
@@ -35,7 +36,7 @@ pub struct DeadLetterSourceCoordinates {
     pub subject: String,
     pub subject_type: String,
     pub partition: u32,
-    pub offset: i64,
+    pub offset: Sequence,
     pub event_id: Uuid,
 }
 
