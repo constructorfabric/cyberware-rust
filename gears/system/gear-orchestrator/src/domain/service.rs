@@ -211,7 +211,7 @@ mod tests {
                 .with_version("2.0.0")
                 .with_grpc_service("ext.Service", Endpoint::http("127.0.0.1", 9001)),
         );
-        manager.register_instance(instance);
+        manager.register_instance(instance).unwrap();
 
         let svc = GearsService::new(&registry, manager);
         let gears = svc.list_gears();
@@ -235,7 +235,7 @@ mod tests {
 
         let instance =
             Arc::new(GearInstance::new("grpc_hub", Uuid::new_v4()).with_version("0.1.0"));
-        manager.register_instance(instance);
+        manager.register_instance(instance).unwrap();
 
         let svc = GearsService::new(&registry, manager);
         let gears = svc.list_gears();
@@ -253,7 +253,7 @@ mod tests {
 
         let instance = Arc::new(GearInstance::new("svc", Uuid::new_v4()));
         // Default state is Registered
-        manager.register_instance(instance);
+        manager.register_instance(instance).unwrap();
 
         let svc = GearsService::new(&registry, manager);
         let gears = svc.list_gears();

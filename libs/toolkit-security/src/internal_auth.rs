@@ -200,6 +200,27 @@ pub struct PeerAuthenticated {
     pub name: String,
 }
 
+/// Runtime signal that "this listener enforces platform-plane auth".
+///
+/// Stamped onto every request handled by an active platform-plane enforcement
+/// layer — the gRPC `InternalAuthGrpcLayer` (before its exempt check, so even
+/// exempt methods carry it) and the HTTP `internal_auth_middleware`. It lets a
+/// handler distinguish two token-less cases that both lack a
+/// [`PlatformSecurityContext`]:
+///
+/// - **Marker present, no context** — an enforcing listener let an *anonymous*
+///   caller through (a permissive or exempt path). A handler that authorizes
+///   per-peer must fail closed here: an unauthenticated caller must not be
+///   treated as more privileged than an honest token holder.
+/// - **Marker absent** — no platform-plane enforcement is installed (Profile 1
+///   / in-process); there is no trust boundary to honour, so handlers fail open.
+///
+/// The marker carries no identity and grants nothing on its own; it only
+/// reports the listener's posture, so a handler never has to read another
+/// component's configuration to learn it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformAuthEnforced;
+
 /// Neutral platform-plane authentication error.
 ///
 /// Intentionally coarse-grained and transport-agnostic: it never carries the

@@ -15,7 +15,9 @@ pub mod shutdown;
 #[cfg(test)]
 mod tests;
 
-pub use gear_manager::{Endpoint, GearInstance, GearManager, InstanceState};
+pub use gear_manager::{
+    Endpoint, GearInstance, GearManager, GrpcServiceNameConflict, InstanceState,
+};
 pub use grpc_installers::{GearInstallers, GrpcInstallerData, GrpcInstallerStore};
 pub use host_runtime::{
     DEFAULT_SHUTDOWN_DEADLINE, DbOptions, HostRuntime, TOOLKIT_DIRECTORY_ENDPOINT_ENV,

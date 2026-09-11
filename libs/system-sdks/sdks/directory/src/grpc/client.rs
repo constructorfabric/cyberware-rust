@@ -9,8 +9,8 @@ use tonic::transport::Channel;
 
 use crate::ProtoInstanceState;
 use crate::api::{
-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, InstanceState, LabelSelector,
-    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryPermissionDenied,
+    InstanceState, LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
 };
 use std::collections::BTreeMap;
 use toolkit_transport_grpc::InternalAuthInterceptor;
@@ -52,14 +52,26 @@ fn lookup_error(resource: &str, status: &tonic::Status) -> anyhow::Error {
 /// Map a mutating RPC's `tonic::Status`, preserving the code in the message.
 ///
 /// A bare `"gRPC call failed"` hides whether the directory was unreachable
-/// (`Unavailable`, transient) or rejected the request (`InvalidArgument`,
-/// permanent). `InvalidArgument` is typed as [`DirectoryInvalidArgument`] so a
-/// caller retrying a mutation (e.g. the presence loop) can distinguish a
-/// permanent rejection — which retrying can never fix — from a transient one.
+/// (transient) or rejected the request permanently. The two permanent classes
+/// are typed so a caller retrying a mutation (e.g. the presence loop) can stop
+/// rather than spin forever:
+/// - `InvalidArgument` → [`DirectoryInvalidArgument`] (malformed request);
+/// - `PermissionDenied` → [`DirectoryPermissionDenied`] (an authorization
+///   decision: peer not authorized, namespace / trust domain not allowlisted,
+///   or a gRPC service name owned by another gear).
+///
+/// Every other code — including `Unauthenticated` — stays an opaque,
+/// transient-by-default error (code kept in the message) and is retried. A
+/// credential failure is not permanent: a stale or rotated token is valid again
+/// on the next attempt, so a retry recovers what the permanent sentinel would
+/// strand.
 fn call_error(op: &str, status: &tonic::Status) -> anyhow::Error {
     match status.code() {
         tonic::Code::InvalidArgument => {
             DirectoryInvalidArgument::new(status.message().to_owned()).into()
+        }
+        tonic::Code::PermissionDenied => {
+            DirectoryPermissionDenied::new(status.message().to_owned()).into()
         }
         code => anyhow::anyhow!("directory {op} failed: gRPC {code:?}: {}", status.message()),
     }
@@ -678,5 +690,52 @@ mod tests {
             proto_state_to_domain(ProtoInstanceState::Healthy as i32),
             InstanceState::Healthy
         );
+    }
+
+    #[test]
+    fn call_error_types_invalid_argument_as_permanent() {
+        let err = call_error(
+            "register_instance",
+            &tonic::Status::invalid_argument("bad label"),
+        );
+        assert!(
+            err.downcast_ref::<DirectoryInvalidArgument>().is_some(),
+            "InvalidArgument must map to the typed permanent DirectoryInvalidArgument"
+        );
+    }
+
+    #[test]
+    fn call_error_types_permission_denied_as_permanent() {
+        // A true authorization decision (peer not authorized, namespace not
+        // allowlisted, or a server-side service-name conflict) is permanent, so
+        // the presence loop stops retrying.
+        let err = call_error(
+            "register_instance",
+            &tonic::Status::permission_denied("peer not authorized"),
+        );
+        assert!(
+            err.downcast_ref::<DirectoryPermissionDenied>().is_some(),
+            "PermissionDenied must map to the typed permanent DirectoryPermissionDenied"
+        );
+    }
+
+    #[test]
+    fn call_error_keeps_transient_codes_opaque() {
+        // Transient codes stay untyped (code preserved in the message) so the
+        // presence loop keeps retrying. `Unauthenticated` is among them — a
+        // stale/rotated credential must not collapse to the permanent sentinel.
+        for status in [
+            tonic::Status::unavailable("connection reset"),
+            tonic::Status::unauthenticated("invalid internal token"),
+        ] {
+            let err = call_error("heartbeat", &status);
+            assert!(err.downcast_ref::<DirectoryInvalidArgument>().is_none());
+            assert!(
+                err.downcast_ref::<DirectoryPermissionDenied>().is_none(),
+                "{:?} must stay transient/retryable, not map to DirectoryPermissionDenied",
+                status.code()
+            );
+            assert!(err.to_string().contains(&format!("{:?}", status.code())));
+        }
     }
 }

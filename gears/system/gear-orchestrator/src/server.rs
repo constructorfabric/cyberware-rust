@@ -4,19 +4,22 @@
 
 use std::sync::Arc;
 
-use tonic::{Request, Response, Status};
+use tonic::{Extensions, Request, Response, Status};
 
 use cf_system_sdks::directory::labels::is_valid_label_segment;
 use cf_system_sdks::directory::{
     DeregisterInstanceRequest, DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound,
-    DirectoryService, DirectoryServiceServer, GetOpenApiSpecRequest, GetOpenApiSpecResponse,
-    HeartbeatRequest, InstanceInfo, InstanceState, LabelSelector, ListAllInstancesRequest,
-    ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse, ProtoInstanceState,
-    RegisterInstanceInfo, RegisterInstanceRequest, ResolveGrpcServiceRequest,
+    DirectoryService, DirectoryServiceNameConflict, DirectoryServiceServer, GetOpenApiSpecRequest,
+    GetOpenApiSpecResponse, HeartbeatRequest, InstanceInfo, InstanceState, LabelSelector,
+    ListAllInstancesRequest, ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse,
+    ProtoInstanceState, RegisterInstanceInfo, RegisterInstanceRequest, ResolveGrpcServiceRequest,
     ResolveGrpcServiceResponse, ResolveRestServiceRequest, ResolveRestServiceResponse,
     ServiceEndpoint, ServiceInstanceInfo,
 };
 use std::collections::BTreeMap;
+use toolkit_security::{PlatformAuthEnforced, PlatformSecurityContext};
+
+use crate::domain::authz::{RegistrationPolicy, registration_authorized};
 
 /// Map a lookup failure onto a gRPC status, keeping "not registered" distinct
 /// from "the lookup itself failed".
@@ -38,23 +41,129 @@ fn lookup_status(err: &anyhow::Error) -> Status {
 
 /// gRPC service implementation of Directory Service.
 ///
-/// Platform-plane (`x-toolkit-internal-token`) enforcement is applied at the
-/// gRPC server boundary by `grpc-hub`'s `InternalAuthGrpcLayer`
+/// Platform-plane (`x-toolkit-internal-token`) *authentication* is applied at
+/// the gRPC server boundary by `grpc-hub`'s `InternalAuthGrpcLayer`
 /// (`cpt-cf-adr-platform-plane-auth`): the token is validated and, on success, a
 /// `PlatformSecurityContext` / `PeerAuthenticated` is placed in the request
 /// extensions before the handler runs.
 ///
-/// This is the authentication half only. Authorizing a peer against the gear
-/// name it claims when registering, deregistering, or heartbeating is deferred.
+/// This type adds the *authorization* half for the registration-mutating RPCs
+/// (`register_instance` / `deregister_instance` / `heartbeat`): each reads the
+/// authenticated peer identity and rejects a caller that has no authority over
+/// the `gear_name` it claims (see [`registration_authorized`]). Without this a
+/// peer holding any valid internal token could tamper with another gear's
+/// registration or inject a rogue instance under its name. A request with no
+/// identity is rejected on an enforcing listener and allowed on a disabled one
+/// (see [`Self::authorize_registration`]).
 #[derive(Clone)]
 pub struct DirectoryServiceImpl {
     api: Arc<dyn DirectoryClient>,
+    policy: Arc<RegistrationPolicy>,
 }
 
 impl DirectoryServiceImpl {
-    /// Create a `DirectoryService` backed by `api`.
+    /// Create a `DirectoryService` backed by `api` with the default (empty)
+    /// authorization policy.
+    ///
+    /// Every authenticated peer may then act only on its own gear; how a
+    /// request with no identity is handled depends on the listener's posture
+    /// (see [`Self::authorize_registration`]).
     pub fn new(api: Arc<dyn DirectoryClient>) -> Self {
-        Self { api }
+        Self {
+            api,
+            policy: Arc::new(RegistrationPolicy::default()),
+        }
+    }
+
+    /// Set the registration-authorization policy.
+    #[must_use]
+    pub fn with_policy(mut self, policy: RegistrationPolicy) -> Self {
+        self.policy = Arc::new(policy);
+        self
+    }
+
+    /// Authorize a registration-mutating RPC against the authenticated peer.
+    ///
+    /// `op` names the attempted operation (`"register"` / `"deregister"` /
+    /// `"heartbeat"`), used in the denial `Status` and log so both reflect what
+    /// was attempted.
+    ///
+    /// Reads the [`PlatformSecurityContext`] the platform-plane layer stamped
+    /// into the request extensions and applies [`registration_authorized`].
+    ///
+    /// When no context was stamped, the [`PlatformAuthEnforced`] marker decides
+    /// (see that type for what present/absent mean):
+    ///
+    /// - **absent** (enforcement disabled, Profile 1 / in-process): authorization
+    ///   is skipped — failing open matches the transport's disabled posture.
+    /// - **present** (an enforcing listener let a context-less caller through — a
+    ///   `Permissive` anonymous caller, or a method exempt from authentication):
+    ///   rejected `unauthenticated`. Otherwise dropping the token or hitting an
+    ///   exempt path would let a caller with no identity act on any gear while an
+    ///   honest per-gear token holder is bound to its own.
+    fn authorize_registration(
+        &self,
+        extensions: &Extensions,
+        gear_name: &str,
+        op: &str,
+    ) -> Result<(), Status> {
+        let Some(ctx) = extensions.get::<PlatformSecurityContext>() else {
+            if extensions.get::<PlatformAuthEnforced>().is_some() {
+                tracing::warn!(
+                    gear_name,
+                    op,
+                    reason = "unauthenticated",
+                    "directory mutation denied: no authenticated platform peer on an enforcing listener"
+                );
+                return Err(Status::unauthenticated(format!(
+                    "{op} requires an authenticated platform peer"
+                )));
+            }
+            return Ok(());
+        };
+        if registration_authorized(ctx.identity(), gear_name, &self.policy) {
+            Ok(())
+        } else {
+            tracing::warn!(
+                peer = ctx.identity().peer_name(),
+                gear_name,
+                op,
+                reason = "unauthorized",
+                "directory mutation denied: peer is not authorized for this gear"
+            );
+            Err(Status::permission_denied(format!(
+                "peer is not authorized to {op} this gear"
+            )))
+        }
+    }
+
+    /// Map a `register_instance` store error onto a gRPC status.
+    ///
+    /// A gRPC-service-name ownership conflict is enforced atomically at the
+    /// store (`GearManager::register_instance`), which resolves the
+    /// check-then-write race the per-entry `DashMap` locks leave open — a name
+    /// resolved across *every* gear (`resolve_grpc_service` /
+    /// `GearManager::pick_service_round_robin` scan all instances) must have a
+    /// single owner or part of its traffic could be routed to the wrong gear.
+    /// The conflict surfaces as the typed [`DirectoryServiceNameConflict`],
+    /// which is mapped to a *static* `permission_denied` (the caller-controlled
+    /// service name and the owning gear are recorded in a server-side
+    /// `tracing::warn!`, never reflected back). Every other store error falls
+    /// through to [`lookup_status`].
+    fn register_status(gear_name: &str, err: &anyhow::Error) -> Status {
+        if let Some(conflict) = err.downcast_ref::<DirectoryServiceNameConflict>() {
+            tracing::warn!(
+                gear_name,
+                service_name = %conflict.service_name,
+                owner = %conflict.owner,
+                reason = "grpc_service_name_conflict",
+                "registration denied: gRPC service name already owned by another gear"
+            );
+            return Status::permission_denied(
+                "a gRPC service name in this registration is already owned by another gear",
+            );
+        }
+        lookup_status(err)
     }
 }
 
@@ -181,9 +290,13 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<RegisterInstanceRequest>,
     ) -> Result<Response<()>, Status> {
-        let req = request.into_inner();
+        let (_metadata, extensions, req) = request.into_parts();
 
         validate_identity(&req.gear_name, &req.instance_id)?;
+        // Authorize the peer over the gear it claims *after* the name is screened
+        // (so the comparison is against a well-formed name) but *before* any
+        // state is written.
+        self.authorize_registration(&extensions, &req.gear_name, "register")?;
         validate_labels(&req.labels)?;
         for (idx, svc) in req.grpc_services.iter().enumerate() {
             // Identify the service by index, never by interpolating the
@@ -211,6 +324,9 @@ impl DirectoryService for DirectoryServiceImpl {
             .map(|svc| (svc.service_name, ServiceEndpoint::new(svc.endpoint_uri)))
             .collect();
 
+        // Retained for the conflict log below, since `gear_name` is moved into
+        // `info`.
+        let gear_name = req.gear_name.clone();
         let mut info = RegisterInstanceInfo::new(req.gear_name, req.instance_id)
             .with_grpc_services(grpc_services)
             .with_labels(req.labels.into_iter().collect());
@@ -224,10 +340,12 @@ impl DirectoryService for DirectoryServiceImpl {
             info = info.with_openapi_spec(spec);
         }
 
+        // The store enforces single-gear gRPC service-name ownership atomically;
+        // a conflict maps to a static `permission_denied` (see `register_status`).
         self.api
             .register_instance(info)
             .await
-            .map_err(|e| lookup_status(&e))?;
+            .map_err(|e| Self::register_status(&gear_name, &e))?;
 
         Ok(Response::new(()))
     }
@@ -236,9 +354,10 @@ impl DirectoryService for DirectoryServiceImpl {
         &self,
         request: Request<DeregisterInstanceRequest>,
     ) -> Result<Response<()>, Status> {
-        let req = request.into_inner();
+        let (_metadata, extensions, req) = request.into_parts();
 
         validate_identity(&req.gear_name, &req.instance_id)?;
+        self.authorize_registration(&extensions, &req.gear_name, "deregister")?;
         self.api
             .deregister_instance(&req.gear_name, &req.instance_id)
             .await
@@ -248,9 +367,10 @@ impl DirectoryService for DirectoryServiceImpl {
     }
 
     async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<Response<()>, Status> {
-        let req = request.into_inner();
+        let (_metadata, extensions, req) = request.into_parts();
 
         validate_identity(&req.gear_name, &req.instance_id)?;
+        self.authorize_registration(&extensions, &req.gear_name, "heartbeat")?;
         self.api
             .send_heartbeat(&req.gear_name, &req.instance_id)
             .await
@@ -451,12 +571,15 @@ fn validate_identity(gear_name: &str, instance_id: &str) -> Result<(), Status> {
 
 /// Create a `DirectoryService` server backed by `api`.
 ///
-/// Platform-plane enforcement is applied at the gRPC server boundary by
-/// `grpc-hub`'s `InternalAuthGrpcLayer`.
+/// Platform-plane *authentication* is applied at the gRPC server boundary by
+/// `grpc-hub`'s `InternalAuthGrpcLayer`; the registration RPCs additionally
+/// *authorize* the authenticated peer against the gear it claims (see
+/// [`RegistrationPolicy`] / [`registration_authorized`]).
 pub fn make_directory_service(
     api: Arc<dyn DirectoryClient>,
+    policy: RegistrationPolicy,
 ) -> DirectoryServiceServer<DirectoryServiceImpl> {
-    DirectoryServiceServer::new(DirectoryServiceImpl::new(api))
+    DirectoryServiceServer::new(DirectoryServiceImpl::new(api).with_policy(policy))
 }
 
 #[cfg(test)]
@@ -470,12 +593,76 @@ mod tests {
     };
     use toolkit::directory::LocalDirectoryClient;
     use toolkit::runtime::GearManager;
+    use toolkit_security::PlatformIdentity;
     use uuid::Uuid;
 
     fn service() -> DirectoryServiceImpl {
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
         DirectoryServiceImpl::new(api)
+    }
+
+    /// A [`RegistrationPolicy`] from `&str` slices.
+    fn policy(trusted: &[&str], namespaces: &[&str], domains: &[&str]) -> RegistrationPolicy {
+        let set = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect();
+        RegistrationPolicy {
+            trusted_registrars: set(trusted),
+            platform_namespaces: set(namespaces),
+            trust_domains: set(domains),
+        }
+    }
+
+    /// A `DirectoryService` with the given authorization policy.
+    fn service_with_policy(policy: RegistrationPolicy) -> DirectoryServiceImpl {
+        let manager = Arc::new(GearManager::new());
+        let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
+        DirectoryServiceImpl::new(api).with_policy(policy)
+    }
+
+    /// A `DirectoryService` whose `trusted_registrars` are `registrars`.
+    fn service_with_registrars(registrars: &[&str]) -> DirectoryServiceImpl {
+        service_with_policy(policy(registrars, &[], &[]))
+    }
+
+    /// A `DirectoryService` that only accepts `ServiceAccount` peers from
+    /// `namespaces`.
+    fn service_with_namespaces(namespaces: &[&str]) -> DirectoryServiceImpl {
+        service_with_policy(policy(&[], namespaces, &[]))
+    }
+
+    /// A per-gear (`ServiceAccount`) platform identity named `name`.
+    fn sa_identity(name: &str) -> PlatformIdentity {
+        PlatformIdentity::KubernetesServiceAccount {
+            namespace: "toolkit".to_owned(),
+            service_account: name.to_owned(),
+            pod: None,
+        }
+    }
+
+    /// Attach a validated [`PlatformSecurityContext`] to a request, as
+    /// `grpc-hub`'s platform-plane layer does on a real inbound call.
+    fn with_identity<T>(mut request: Request<T>, identity: PlatformIdentity) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(PlatformSecurityContext::new(identity));
+        request
+    }
+
+    /// Stamp only the [`PlatformAuthEnforced`] marker — no identity — as the
+    /// platform-plane layer does for an anonymous caller on an enforcing
+    /// (`Permissive`) listener.
+    fn with_auth_enforced<T>(mut request: Request<T>) -> Request<T> {
+        request.extensions_mut().insert(PlatformAuthEnforced);
+        request
+    }
+
+    fn register_req(gear: &str) -> RegisterInstanceRequest {
+        RegisterInstanceRequest {
+            gear_name: gear.to_owned(),
+            instance_id: Uuid::new_v4().to_string(),
+            rest_endpoint_uri: Some(format!("http://{gear}:8080")),
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -792,7 +979,7 @@ mod tests {
         // Directory service backed by an in-memory GearManager.
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
-        let grpc_service = make_directory_service(api);
+        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
 
         // Reserve a free port, then let the tonic server bind it.
         let addr = std::net::TcpListener::bind("127.0.0.1:0")
@@ -896,7 +1083,7 @@ mod tests {
 
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
-        let grpc_service = make_directory_service(api);
+        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
 
         // Required mode: an absent token is rejected.
         let authenticator = DynInternalAuthenticator::new(SharedSecretInternalAuthenticator::new(
@@ -983,6 +1170,61 @@ mod tests {
             "InternalAuthGrpcLayer must populate the PeerAuthenticated extension on the request \
              it forwards to the layers below it"
         );
+
+        server.abort();
+    }
+
+    /// Exempting a method skips *authentication*; it must not grant authority
+    /// over any gear's registration. With the whole `DirectoryService` on the
+    /// exempt allowlist of an enforcing listener, an anonymous (token-less)
+    /// `RegisterInstance` still reaches the handler carrying the
+    /// `PlatformAuthEnforced` posture marker (stamped before the exempt check),
+    /// so `authorize_registration` fails closed with `unauthenticated` rather
+    /// than failing open. Exercises the layer + handler together.
+    #[tokio::test]
+    async fn exempt_registration_fails_closed_end_to_end() {
+        use cf_system_sdks::directory::{DIRECTORY_SERVICE_NAME, DirectoryGrpcClient};
+        use secrecy::SecretString;
+        use tonic::transport::Server;
+        use toolkit_security::{DynInternalAuthenticator, SharedSecretInternalAuthenticator};
+        use toolkit_transport_grpc::InternalAuthGrpcLayer;
+
+        let manager = Arc::new(GearManager::new());
+        let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
+        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
+
+        // Enforcing listener, but the entire DirectoryService is exempted — a
+        // misconfiguration that must not become an "act on any gear" backdoor.
+        let authenticator = DynInternalAuthenticator::new(SharedSecretInternalAuthenticator::new(
+            SecretString::from("dev-internal-token"),
+            "peer".to_owned(),
+        ));
+        let auth_layer = InternalAuthGrpcLayer::new(authenticator)
+            .with_exempt_prefixes(vec![format!("/{DIRECTORY_SERVICE_NAME}/")]);
+
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let server = tokio::spawn(async move {
+            Server::builder()
+                .layer(auth_layer)
+                .add_service(grpc_service)
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+        let uri = format!("http://{addr}");
+
+        // No token on an exempted method: authentication is skipped, but the
+        // registration must still be denied — never silently accepted.
+        let anon = DirectoryGrpcClient::connect(uri).await.unwrap();
+        anon.register_instance(RegisterInstanceInfo::new(
+            "billing",
+            Uuid::new_v4().to_string(),
+        ))
+        .await
+        .expect_err("an exempted, unauthenticated registration must be denied, not fail open");
 
         server.abort();
     }
@@ -1311,7 +1553,7 @@ mod tests {
 
         let manager = Arc::new(GearManager::new());
         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
-        let grpc_service = make_directory_service(api);
+        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
 
         let addr = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -1377,5 +1619,437 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    // ---- Registration authorization ----
+    //
+    // The pure allow/deny predicate ([`registration_authorized`]) and
+    // [`RegistrationPolicy`] are unit-tested in `crate::domain::authz`; the
+    // tests here exercise the gRPC adapter (`DirectoryServiceImpl`) that reads
+    // the peer off the request and calls into that policy.
+
+    /// SA identity whose `peer_name` equals the gear it registers -> allowed.
+    #[tokio::test]
+    async fn register_allows_sa_acting_on_its_own_gear() {
+        let svc = service();
+        svc.register_instance(with_identity(
+            Request::new(register_req("billing")),
+            sa_identity("billing"),
+        ))
+        .await
+        .expect("a gear registering under its own name must be allowed");
+    }
+
+    /// End-to-end: with a namespace allowlist configured, an SA with the right
+    /// name but from a namespace outside the allowlist is denied, while the same
+    /// name from an allowed namespace is accepted.
+    #[tokio::test]
+    async fn register_binds_sa_to_platform_namespace() {
+        let svc = service_with_namespaces(&["toolkit"]);
+
+        // `sa_identity` lives in namespace "toolkit" (allowed) -> accepted.
+        svc.register_instance(with_identity(
+            Request::new(register_req("billing")),
+            sa_identity("billing"),
+        ))
+        .await
+        .expect("an SA named after its gear from an allowed namespace must be accepted");
+
+        // Same SA name, foreign namespace -> denied even though the name matches.
+        let err = svc
+            .register_instance(with_identity(
+                Request::new(register_req("billing")),
+                PlatformIdentity::KubernetesServiceAccount {
+                    namespace: "tenant-x".to_owned(),
+                    service_account: "billing".to_owned(),
+                    pod: None,
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            !err.message().contains("billing") && !err.message().contains("tenant-x"),
+            "the status must not reflect the gear name or peer namespace"
+        );
+    }
+
+    /// SA identity acting on another gear, not a trusted registrar -> denied
+    /// across all three RPCs, and the owner's existing registration survives
+    /// each attempt unchanged. Covers takeover (overwriting the owner's own
+    /// instance) as well as denied deregister / heartbeat against a live entry.
+    #[tokio::test]
+    async fn register_deregister_heartbeat_deny_cross_gear_sa() {
+        let svc = service();
+        let owner_instance = Uuid::new_v4().to_string();
+        let owner_endpoint = "http://billing:8080";
+
+        // The legitimate owner registers first, so the cross-gear attempts below
+        // run against a live entry rather than an empty directory.
+        svc.register_instance(with_identity(
+            Request::new(RegisterInstanceRequest {
+                gear_name: "billing".to_owned(),
+                instance_id: owner_instance.clone(),
+                rest_endpoint_uri: Some(owner_endpoint.to_owned()),
+                ..Default::default()
+            }),
+            sa_identity("billing"),
+        ))
+        .await
+        .expect("the gear registering under its own name must be allowed");
+
+        // Takeover: `catalog` tries to overwrite billing's own instance.
+        let reg = svc
+            .register_instance(with_identity(
+                Request::new(RegisterInstanceRequest {
+                    gear_name: "billing".to_owned(),
+                    instance_id: owner_instance.clone(),
+                    rest_endpoint_uri: Some("http://attacker:8080".to_owned()),
+                    ..Default::default()
+                }),
+                sa_identity("catalog"),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(reg.code(), tonic::Code::PermissionDenied);
+        assert!(
+            !reg.message().contains("billing") && !reg.message().contains("catalog"),
+            "the status must not reflect the gear name or peer identity"
+        );
+
+        let dereg = svc
+            .deregister_instance(with_identity(
+                Request::new(DeregisterInstanceRequest {
+                    gear_name: "billing".to_owned(),
+                    instance_id: owner_instance.clone(),
+                }),
+                sa_identity("catalog"),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(dereg.code(), tonic::Code::PermissionDenied);
+
+        let hb = svc
+            .heartbeat(with_identity(
+                Request::new(HeartbeatRequest {
+                    gear_name: "billing".to_owned(),
+                    instance_id: owner_instance.clone(),
+                }),
+                sa_identity("catalog"),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(hb.code(), tonic::Code::PermissionDenied);
+
+        // The owner's instance is untouched: still the only one, same endpoint,
+        // and still `Registered` — the denied deregister did not remove it, the
+        // denied takeover did not overwrite its endpoint, and the denied
+        // heartbeat did not promote it to `Healthy`.
+        let listed = svc
+            .list_instances(Request::new(ListInstancesRequest {
+                gear_name: "billing".to_owned(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .instances;
+        assert_eq!(
+            listed.len(),
+            1,
+            "the cross-gear attempts must neither add nor remove instances"
+        );
+        assert_eq!(listed[0].instance_id, owner_instance);
+        assert_eq!(
+            listed[0].rest_endpoint_uri.as_deref(),
+            Some(owner_endpoint),
+            "the denied takeover must not overwrite the owner's endpoint"
+        );
+        assert_eq!(
+            listed[0].state,
+            ProtoInstanceState::Registered as i32,
+            "the denied heartbeat must not promote the instance to Healthy"
+        );
+    }
+
+    /// A denied registration must write nothing: authorization runs *before*
+    /// any state mutation, so a rogue-injection attempt leaves the directory
+    /// empty. Inspecting the backing store (not just the status code) is what
+    /// would catch `authorize_registration` being moved after the write.
+    #[tokio::test]
+    async fn denied_register_writes_nothing() {
+        let svc = service();
+
+        let err = svc
+            .register_instance(with_identity(
+                Request::new(RegisterInstanceRequest {
+                    gear_name: "billing".to_owned(),
+                    instance_id: Uuid::new_v4().to_string(),
+                    rest_endpoint_uri: Some("http://attacker:8080".to_owned()),
+                    ..Default::default()
+                }),
+                sa_identity("catalog"),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // The rogue instance was never stored: billing is unresolvable.
+        let resolved = svc
+            .resolve_rest_service(Request::new(ResolveRestServiceRequest {
+                gear_name: "billing".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            resolved.code(),
+            tonic::Code::NotFound,
+            "a denied register must not leave a resolvable instance behind"
+        );
+    }
+
+    /// The *allow* path of `deregister_instance` / `heartbeat` for a gear acting
+    /// on its own name — `register_instance` alone would not catch a wrong
+    /// `gear_name` passed to `authorize_registration` in the other two handlers.
+    #[tokio::test]
+    async fn deregister_and_heartbeat_allow_own_gear() {
+        let svc = service();
+        let instance_id = Uuid::new_v4().to_string();
+
+        svc.register_instance(with_identity(
+            Request::new(RegisterInstanceRequest {
+                gear_name: "billing".to_owned(),
+                instance_id: instance_id.clone(),
+                rest_endpoint_uri: Some("http://billing:8080".to_owned()),
+                ..Default::default()
+            }),
+            sa_identity("billing"),
+        ))
+        .await
+        .expect("own-gear register must be allowed");
+
+        svc.heartbeat(with_identity(
+            Request::new(HeartbeatRequest {
+                gear_name: "billing".to_owned(),
+                instance_id: instance_id.clone(),
+            }),
+            sa_identity("billing"),
+        ))
+        .await
+        .expect("own-gear heartbeat must be allowed");
+
+        svc.deregister_instance(with_identity(
+            Request::new(DeregisterInstanceRequest {
+                gear_name: "billing".to_owned(),
+                instance_id,
+            }),
+            sa_identity("billing"),
+        ))
+        .await
+        .expect("own-gear deregister must be allowed");
+
+        // The allowed deregister actually removed the instance.
+        let resolved = svc
+            .resolve_rest_service(Request::new(ResolveRestServiceRequest {
+                gear_name: "billing".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(resolved.code(), tonic::Code::NotFound);
+    }
+
+    /// The *allow* path of `deregister_instance` / `heartbeat` for a trusted
+    /// registrar acting on another gear's behalf.
+    #[tokio::test]
+    async fn deregister_and_heartbeat_allow_trusted_registrar() {
+        let svc = service_with_registrars(&["flight-control"]);
+        let instance_id = Uuid::new_v4().to_string();
+
+        svc.register_instance(with_identity(
+            Request::new(RegisterInstanceRequest {
+                gear_name: "billing".to_owned(),
+                instance_id: instance_id.clone(),
+                rest_endpoint_uri: Some("http://billing:8080".to_owned()),
+                ..Default::default()
+            }),
+            sa_identity("flight-control"),
+        ))
+        .await
+        .expect("a trusted registrar may register any gear");
+
+        svc.heartbeat(with_identity(
+            Request::new(HeartbeatRequest {
+                gear_name: "billing".to_owned(),
+                instance_id: instance_id.clone(),
+            }),
+            sa_identity("flight-control"),
+        ))
+        .await
+        .expect("a trusted registrar may heartbeat any gear");
+
+        svc.deregister_instance(with_identity(
+            Request::new(DeregisterInstanceRequest {
+                gear_name: "billing".to_owned(),
+                instance_id,
+            }),
+            sa_identity("flight-control"),
+        ))
+        .await
+        .expect("a trusted registrar may deregister any gear");
+    }
+
+    /// An unrecognised ([`PlatformIdentity::Unknown`]) identity fails closed at
+    /// the RPC boundary — not just against the private `registration_authorized`
+    /// predicate — and writes nothing. Guards the fail-closed promise in the
+    /// type docs against a future variant slipping through as authorized.
+    #[tokio::test]
+    async fn register_denies_unknown_identity_and_writes_nothing() {
+        let svc = service();
+
+        let err = svc
+            .register_instance(with_identity(
+                Request::new(register_req("billing")),
+                PlatformIdentity::Unknown,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let resolved = svc
+            .resolve_rest_service(Request::new(ResolveRestServiceRequest {
+                gear_name: "billing".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            resolved.code(),
+            tonic::Code::NotFound,
+            "a denied unknown-identity register must not leave a resolvable instance"
+        );
+    }
+
+    /// A peer listed in `trusted_registrars` may act on any gear.
+    #[tokio::test]
+    async fn register_allows_trusted_registrar_for_any_gear() {
+        let svc = service_with_registrars(&["flight-control"]);
+        svc.register_instance(with_identity(
+            Request::new(register_req("billing")),
+            sa_identity("flight-control"),
+        ))
+        .await
+        .expect("a trusted registrar must be allowed to register any gear");
+    }
+
+    /// A shared-secret identity is always allowed (documented single trust
+    /// boundary), even acting on a gear whose name it does not match.
+    #[tokio::test]
+    async fn register_allows_shared_identity() {
+        let svc = service();
+        svc.register_instance(with_identity(
+            Request::new(register_req("billing")),
+            PlatformIdentity::Shared {
+                name: "toolkit-internal".to_owned(),
+            },
+        ))
+        .await
+        .expect("a shared-secret peer must be allowed (documented trust boundary)");
+    }
+
+    /// Profile 1 / in-process (enforcement disabled, so no
+    /// [`PlatformAuthEnforced`] marker): no identity was stamped, authorization
+    /// is skipped, and behavior is unchanged.
+    #[tokio::test]
+    async fn register_allows_when_no_identity_stamped() {
+        let svc = service();
+        svc.register_instance(Request::new(register_req("billing")))
+            .await
+            .expect("with no platform identity stamped, authorization is a no-op");
+    }
+
+    /// On an enforcing listener (the [`PlatformAuthEnforced`] marker is stamped)
+    /// a request with no stamped identity is rejected rather than failing open —
+    /// closing the `Permissive`-listener inversion where a token-less caller
+    /// could otherwise act on any gear. A properly stamped per-gear identity
+    /// still succeeds.
+    #[tokio::test]
+    async fn register_requires_stamped_identity_when_auth_enforced() {
+        let svc = service();
+
+        let err = svc
+            .register_instance(with_auth_enforced(Request::new(register_req("billing"))))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+        svc.register_instance(with_identity(
+            with_auth_enforced(Request::new(register_req("billing"))),
+            sa_identity("billing"),
+        ))
+        .await
+        .expect("a stamped per-gear identity must still be allowed");
+    }
+
+    /// A registration that advertises a gRPC service name is bound: a second
+    /// gear cannot claim a name already owned by a different gear, but the
+    /// owning gear may re-register (or add another instance under) that name.
+    #[tokio::test]
+    async fn register_binds_grpc_service_name_to_owning_gear() {
+        let svc = service();
+
+        let grpc = |name: &str, uri: &str| {
+            vec![GrpcServiceEndpoint {
+                service_name: name.to_owned(),
+                endpoint_uri: uri.to_owned(),
+            }]
+        };
+
+        // authz-resolver claims its service name first (unowned -> allowed).
+        svc.register_instance(with_identity(
+            Request::new(RegisterInstanceRequest {
+                gear_name: "authz-resolver".to_owned(),
+                instance_id: Uuid::new_v4().to_string(),
+                grpc_services: grpc("cf.authz.v1.AuthzService", "http://authz-resolver:9000"),
+                ..Default::default()
+            }),
+            sa_identity("authz-resolver"),
+        ))
+        .await
+        .expect("a gear claiming an unowned service name must be allowed");
+
+        // A different gear (authorized only for itself) advertising that same
+        // service name is rejected -- otherwise resolve_grpc_service could route
+        // authz traffic to it.
+        let err = svc
+            .register_instance(with_identity(
+                Request::new(RegisterInstanceRequest {
+                    gear_name: "evil".to_owned(),
+                    instance_id: Uuid::new_v4().to_string(),
+                    grpc_services: grpc("cf.authz.v1.AuthzService", "http://evil:9000"),
+                    ..Default::default()
+                }),
+                sa_identity("evil"),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            !err.message().contains("authz-resolver")
+                && !err.message().contains("evil")
+                && !err.message().contains("cf.authz.v1.AuthzService"),
+            "the status must not reflect the service name or gear identity"
+        );
+
+        // The owning gear may register another instance under the same name.
+        svc.register_instance(with_identity(
+            Request::new(RegisterInstanceRequest {
+                gear_name: "authz-resolver".to_owned(),
+                instance_id: Uuid::new_v4().to_string(),
+                grpc_services: grpc("cf.authz.v1.AuthzService", "http://authz-resolver-2:9000"),
+                ..Default::default()
+            }),
+            sa_identity("authz-resolver"),
+        ))
+        .await
+        .expect("the owning gear must be able to add another instance for its own service");
     }
 }

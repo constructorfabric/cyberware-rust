@@ -82,7 +82,7 @@ fn register_provider(mgr: &GearManager, addr: SocketAddr) -> Uuid {
     let id = Uuid::new_v4();
     let inst = GearInstance::new(PROVIDER_GEAR, id)
         .with_rest_endpoint(Endpoint::http(&addr.ip().to_string(), addr.port()));
-    mgr.register_instance(Arc::new(inst));
+    mgr.register_instance(Arc::new(inst)).unwrap();
     // Promote Registered -> Healthy so round-robin prefers it.
     mgr.update_heartbeat(PROVIDER_GEAR, id, Instant::now());
     id

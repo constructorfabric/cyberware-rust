@@ -16,6 +16,8 @@ use toolkit::runtime::GearManager;
 
 use cf_system_sdks::directory::DIRECTORY_SERVICE_NAME;
 
+use crate::config::OrchestratorConfig;
+use crate::domain::authz::RegistrationPolicy;
 use crate::domain::service::GearsService;
 use crate::server;
 
@@ -35,6 +37,7 @@ pub struct GearOrchestrator {
     directory_api: OnceLock<Arc<dyn DirectoryClient>>,
     gear_manager: OnceLock<Arc<GearManager>>,
     gears_service: OnceLock<Arc<GearsService>>,
+    policy: OnceLock<RegistrationPolicy>,
 }
 
 impl Default for GearOrchestrator {
@@ -43,6 +46,7 @@ impl Default for GearOrchestrator {
             directory_api: OnceLock::new(),
             gear_manager: OnceLock::new(),
             gears_service: OnceLock::new(),
+            policy: OnceLock::new(),
         }
     }
 }
@@ -60,27 +64,25 @@ impl SystemCapability for GearOrchestrator {
 #[async_trait]
 impl toolkit::Gear for GearOrchestrator {
     async fn init(&self, ctx: &GearCtx) -> Result<()> {
-        // Migration guard: platform-plane enforcement lives on `grpc-hub` (a
-        // transport-level `InternalAuthGrpcLayer` applied to every inbound
-        // RPC, `cpt-cf-adr-platform-plane-auth`), not here. This gear reads no
-        // config at all, so a leftover `internal_auth` key would silently do
-        // nothing — fail loudly instead of booting the `DirectoryService`
-        // unauthenticated.
-        if let Some(internal_auth) = ctx
-            .config_provider()
-            .get_gear_config(ctx.gear_name())
-            .and_then(|raw| raw.get("config"))
-            .and_then(|config| config.get("internal_auth"))
-        {
-            let provider = internal_auth.get("provider").and_then(|p| p.as_str());
-            let detail = provider.map_or_else(String::new, |p| format!(" (provider = {p:?})"));
-            anyhow::bail!(
-                "gear-orchestrator config still sets `internal_auth`{detail}, which no longer \
-                 has any effect: platform-plane enforcement moved to grpc-hub's own \
-                 `internal_auth` config (cpt-cf-adr-platform-plane-auth). Move this key under \
-                 `gears.grpc-hub.config` instead."
-            );
-        }
+        // Read the (optional) authorization config: which peers may act on any
+        // gear's registration, plus the namespace / trust-domain allowlists.
+        // Absent config yields empty sets, i.e. every gear may act only on its
+        // own name. Whether a *token-less* request is rejected is not configured
+        // here: it is decided per-request from the `PlatformAuthEnforced` marker
+        // the enforcement layer stamps (see `DirectoryServiceImpl`), so it stays
+        // in lockstep with the listener without a drift-prone knob.
+        let cfg: OrchestratorConfig = ctx.config_or_default()?;
+        self.policy
+            .set(RegistrationPolicy {
+                trusted_registrars: cfg.trusted_registrars.into_iter().collect(),
+                platform_namespaces: cfg.platform_namespaces.into_iter().collect(),
+                trust_domains: cfg.trust_domains.into_iter().collect(),
+            })
+            .map_err(|_| anyhow::anyhow!("registration policy already set (init called twice?)"))?;
+
+        // Build the compiled-gear catalog for the gears service.
+        let registry = GearRegistry::discover_and_build()
+            .map_err(|e| anyhow::anyhow!("Failed to build gear registry: {e}"))?;
 
         // Use the injected GearManager to create the DirectoryClient
         let manager = self
@@ -88,6 +90,10 @@ impl toolkit::Gear for GearOrchestrator {
             .get()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("GearManager not wired into GearOrchestrator"))?;
+
+        // Pin gRPC-service-name ownership from config so a name can only be
+        // advertised by its configured owner, regardless of registration order.
+        manager.set_grpc_service_owners(cfg.grpc_service_owners);
 
         let api_impl: Arc<dyn DirectoryClient> =
             Arc::new(LocalDirectoryClient::new(manager.clone()));
@@ -100,9 +106,7 @@ impl toolkit::Gear for GearOrchestrator {
             .set(api_impl)
             .map_err(|_| anyhow::anyhow!("DirectoryClient already set (init called twice?)"))?;
 
-        // Build compiled-gear catalog from inventory and create the GearsService
-        let registry = GearRegistry::discover_and_build()
-            .map_err(|e| anyhow::anyhow!("Failed to build gear registry: {e}"))?;
+        // Create the GearsService from the catalog built above.
         let gears_service = Arc::new(GearsService::new(&registry, manager));
         self.gears_service
             .set(gears_service)
@@ -144,7 +148,13 @@ impl GrpcServiceCapability for GearOrchestrator {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("DirectoryClient not initialized"))?;
 
-        let directory_svc = server::make_directory_service(api);
+        let policy = self
+            .policy
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("registration policy not initialized"))?;
+
+        let directory_svc = server::make_directory_service(api, policy);
 
         Ok(vec![RegisterGrpcServiceFn {
             service_name: DIRECTORY_SERVICE_NAME,
@@ -171,7 +181,9 @@ mod tests {
         }
     }
 
-    async fn init_with_config(config: serde_json::Value) -> Result<()> {
+    /// Run `init` against a config section, returning the gear so tests can
+    /// inspect the policy it built.
+    async fn init_with_config(config: serde_json::Value) -> Result<GearOrchestrator> {
         let mut wrapped = serde_json::Map::new();
         wrapped.insert("config".to_owned(), config);
         let ctx = GearCtx::new(
@@ -186,39 +198,107 @@ mod tests {
         gear.gear_manager
             .set(gear_manager)
             .map_err(|_| anyhow::anyhow!("gear_manager already set"))?;
-        toolkit::Gear::init(&gear, &ctx).await
+        toolkit::Gear::init(&gear, &ctx).await?;
+        Ok(gear)
+    }
+
+    fn string_set(values: &[&str]) -> std::collections::HashSet<String> {
+        values.iter().map(|s| (*s).to_owned()).collect()
     }
 
     #[tokio::test]
-    async fn init_rejects_leftover_internal_auth_config() {
-        let err = init_with_config(serde_json::json!({
-            "internal_auth": { "provider": "shared_secret", "secret": "top-secret-value" }
-        }))
-        .await
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("internal_auth"),
-            "expected a migration error mentioning internal_auth, got {err}"
-        );
-        assert!(
-            msg.contains("grpc-hub"),
-            "expected the error to point at grpc-hub's config, got {err}"
-        );
-        assert!(
-            msg.contains("shared_secret"),
-            "expected the non-sensitive provider tag to be named, got {err}"
-        );
-        assert!(
-            !msg.contains("top-secret-value"),
-            "the error must never leak the secret value, got {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn init_succeeds_without_internal_auth_config() {
+    async fn init_succeeds_with_empty_config() {
         init_with_config(serde_json::json!({}))
             .await
-            .expect("init without a leftover internal_auth key must succeed");
+            .expect("init with an empty config section (all defaults) must succeed");
+    }
+
+    #[tokio::test]
+    async fn init_reads_trusted_registrars_config() {
+        let gear = init_with_config(serde_json::json!({
+            "trusted_registrars": ["flight-control", "platform-host"]
+        }))
+        .await
+        .expect("init with a trusted_registrars config section must succeed");
+
+        let policy = gear.policy.get().expect("init must build the policy");
+        assert_eq!(
+            policy.trusted_registrars,
+            string_set(&["flight-control", "platform-host"]),
+            "both configured registrars must reach the policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_reads_namespace_and_trust_domain_config() {
+        let gear = init_with_config(serde_json::json!({
+            "platform_namespaces": ["toolkit", "platform"],
+            "trust_domains": ["example.org"]
+        }))
+        .await
+        .expect("init with platform_namespaces / trust_domains config must succeed");
+
+        let policy = gear.policy.get().expect("init must build the policy");
+        assert_eq!(
+            policy.platform_namespaces,
+            string_set(&["toolkit", "platform"]),
+            "both configured namespaces must reach the policy"
+        );
+        assert_eq!(
+            policy.trust_domains,
+            string_set(&["example.org"]),
+            "the configured trust domain must reach the policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_installs_configured_grpc_service_owners() {
+        use toolkit::runtime::{Endpoint, GearInstance};
+
+        let service = "cf.authz.v1.AuthzService";
+        let gear = init_with_config(serde_json::json!({
+            "grpc_service_owners": { service: "authz" }
+        }))
+        .await
+        .expect("init with a grpc_service_owners config section must succeed");
+
+        let manager = gear
+            .gear_manager
+            .get()
+            .expect("init must wire the GearManager");
+
+        // A squatter registering first is rejected in favor of the configured
+        // owner; the configured owner is admitted.
+        let conflict = manager
+            .register_instance(Arc::new(
+                GearInstance::new("evil", Uuid::new_v4())
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
+            ))
+            .expect_err("a non-owner must not claim a configured service name");
+        assert_eq!(conflict.owner, "authz");
+        assert!(manager.instances_of("evil").is_empty());
+
+        manager
+            .register_instance(Arc::new(
+                GearInstance::new("authz", Uuid::new_v4())
+                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
+            ))
+            .expect("the configured owner must be admitted");
+    }
+
+    #[tokio::test]
+    async fn init_rejects_unknown_config_key() {
+        // A misspelled key must fail loudly at startup rather than silently
+        // deserialize to an empty set and deny the intended registrar at runtime.
+        let err = init_with_config(serde_json::json!({
+            "trusted_registrar": ["flight-control"]
+        }))
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("trusted_registrar"),
+            "expected the error to name the offending key, got {err}"
+        );
     }
 }

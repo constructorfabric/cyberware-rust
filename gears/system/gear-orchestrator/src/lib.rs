@@ -10,6 +10,7 @@ pub use gear::GearOrchestrator;
 
 // === INTERNAL MODULES (pub for integration tests) ===
 pub mod api;
+mod config;
 pub mod domain;
 mod server;
 
