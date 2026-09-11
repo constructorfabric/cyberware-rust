@@ -84,6 +84,23 @@ impl ScopeError {
 /// the three paths that neither guesses nor depends on wording: the code comes
 /// from the server. See [`crate::db_error`] for why the other two are not
 /// enough on their own.
+///
+/// # Why three tiers, and what would retire each
+///
+/// The two older tiers are not a transitional shim waiting on more coverage in
+/// [`crate::db_error`]; each answers a case the SQLSTATE cannot, and each has a
+/// condition under which it goes away:
+///
+/// * `sql_err()` reads `MySQL`'s vendor error number. `MySQL` reports both a
+///   duplicate key and a failed foreign key as `23000`, so the SQLSTATE alone
+///   cannot tell the two conditions apart — only the vendor number can. This
+///   tier retires when [`crate::db_error`] reads that number itself.
+/// * The message match catches errors re-wrapped as [`DbErr::Custom`] on the
+///   way here, which have no driver error left to read at all. It retires when
+///   no call site can hand these classifiers a re-wrapped error — a property of
+///   the callers, not of this module.
+///
+/// [`DbErr::Custom`]: sea_orm::DbErr::Custom
 fn driver_says(err: &sea_orm::DbErr, violation: crate::db_error::ConstraintViolation) -> bool {
     crate::db_error::driver_refusal(err).and_then(|refusal| refusal.violation()) == Some(violation)
 }

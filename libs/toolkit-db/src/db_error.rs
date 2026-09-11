@@ -25,6 +25,21 @@
 //! — is the gear's decision (`docs/arch/errors/ADR/0004`, which delegates
 //! fine-grained mapping to gears). So this module classifies conditions and
 //! stops there.
+//!
+//! Which leaves the question of where the line falls, since naming the five
+//! conditions below is itself a choice. The test is **whether a caller in this
+//! workspace branches on the distinction**:
+//!
+//! * A code earns a variant when some caller already acts differently on it.
+//!   [`ConstraintViolation`] is `#[non_exhaustive]` so that a sixth one can be
+//!   added the day a caller needs it, rather than in advance.
+//! * Two codes collapse into one variant when no caller would branch between
+//!   them. `23503` and `23001` differ in *when* the foreign key was checked,
+//!   not in what the caller must now do: rows still reference this one.
+//! * A distinction nobody branches on is not discarded, only left unnamed —
+//!   [`DriverRefusal::code`] still returns the code verbatim, so a caller that
+//!   does need to tell immediate `RESTRICT` from deferrable `NO ACTION` can,
+//!   without this module having to guess on its behalf.
 
 use sea_orm::DbErr;
 
