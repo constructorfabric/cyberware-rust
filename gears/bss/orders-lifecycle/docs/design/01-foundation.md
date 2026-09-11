@@ -1143,9 +1143,15 @@ storable: a nullable column cannot participate in a primary key.
 
 **PK**: audit_id
 
-**Constraints**: append-only; `(order_id, sequence)` UNIQUE; `(order_id, sequence)` also serves
-the per-order audit read; a **partial index** on `(created_at) WHERE outcome = 'refused'` serves
-the 90-day refusal purge, which cannot use the primary key and must not scan the committed trail.
+**Constraints**: append-only; `(order_id, sequence)` UNIQUE, which serves the hash chain and the
+per-order **committed** lookup. Three indexes, and the first is the one an earlier version of this
+table omitted: **`(order_id, created_at, audit_id)`** serves the paged audit read, whose cursor is
+`(created_at, audit_id)` — see *Ordering with nullable sequences* below. `(order_id, sequence)`
+**cannot** serve that page, because a refused entry carries a NULL `sequence` and so appears in no
+`sequence` ordering; paging a `created_at`-ordered result through a `sequence` cursor repeats and
+skips rows at page boundaries, silently. A **partial index** on
+`(created_at) WHERE outcome = 'refused'` serves the 90-day refusal purge, which cannot use the
+primary key and must not scan the committed trail.
 FK to `orders_order`. **No UPDATE grant to any role.** DELETE is granted to **one** role — the retention worker — and only for rows
 whose `outcome` is `refused` and whose `created_at` is past the refusal window. The committed trail
 carries no DELETE grant at all.

@@ -244,11 +244,18 @@ to restate the bound in some other duration:
 * **There is no shared clock to measure it against.** The origin instant would be read in this gear and the deadline evaluated in another, with no declared clock source, no skew bound and no way for either side to detect that it disagreed. Both skew directions fail silently: one lets an expired verdict be honoured, the other discards a valid one. The gate's own circuit breaker (§2.2, held open for **10 seconds**) would consume a third of a 30-second window on its own.
 
 **What is actually true, and enforceable.** The order axis is closed, in-transaction, by the index
-named above. On the subscription axis two obligations remain and both are expressible: Subscriptions
-**MUST** close it at the commit that writes `active`, raised as an upstream requirement; and a
-collision that appears at or after activation **MUST** surface as an `overlap-collision` line
-rejection on the failure-acknowledgement path of [`06-workflow-seam`](./06-workflow-seam.md) §4.4,
-with compensation evidence, never as a silent over-provision. The re-check remains valuable as an
+named above. On the subscription axis two obligations remain and both are expressible. Subscriptions
+**MUST** close it at the commit that writes `active`, raised as an upstream requirement. And a
+collision **MUST** surface rather than over-provision silently — but **how** it surfaces depends on
+whether a subscription has committed `active`, and the two cases are different outcomes rather than
+one:
+
+* **Before the `active` commit** — the collision is found by this slice's re-check, or by Subscriptions ahead of its own commit. It is a **per-line rejection** and a **pre-activation abort**: no subscription was ever activated, so the compensation evidence is satisfiable by construction and records only the voided wave-1 drafts ([`06-workflow-seam`](./06-workflow-seam.md) §4.3).
+* **After the `active` commit** — the collision is found once a subscription already exists. It is **not** a line rejection: the subscription is active, and reporting it as rejected would model one subscription as simultaneously active and refused, which no downstream consumer can reconcile. It is a **fulfillment failure**, and the acknowledgement **MUST NOT** be accepted unless its compensation evidence shows every activated subscription rolled back (§4.4 of the seam slice already requires the evidence to assert that no active subscription remains).
+
+`overlap-collision` is the failure reason in both cases; what differs is the outcome it is carried
+on. An earlier version of this section said a collision "at or after activation" was a line
+rejection, which collapsed the two and described the second case wrongly. The re-check remains valuable as an
 **early abort** — it catches collisions that already exist and saves the provisioning work — and it
 is specified as exactly that, with no admission guarantee attached
 ([`../DECISIONS.md`](../DECISIONS.md) D-89).
