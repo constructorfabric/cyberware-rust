@@ -30,7 +30,7 @@ use sea_orm_migration::prelude as mig;
 use sea_orm_migration::prelude::Iden;
 use sea_orm_migration::sea_query;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::secure::{ScopableEntity, secure_insert};
+use toolkit_db::secure::{ScopableEntity, ScopeError, secure_insert};
 use toolkit_db::{DbConnConfig, build_db};
 use toolkit_security::{AccessScope, pep_properties};
 use uuid::Uuid;
@@ -160,6 +160,35 @@ async fn assert_duplicate_insert_is_unique_violation(db: toolkit_db::Db) -> Resu
         err.is_unique_violation(),
         "is_unique_violation() must still recognise a real duplicate-key error \
          after the SeaORM/sqlx upgrade; classifier saw: {err}"
+    );
+
+    // The structured accessor must reach this error too, on every backend the
+    // workspace supports. What the code *means* differs per engine and is
+    // asserted where that difference matters (`db_error`'s SQLite test, and
+    // the PostgreSQL RESTRICT test below); what must hold everywhere is that a
+    // real driver refusal is reachable at all, since a gear classifying
+    // without `sqlx` has nothing else to read.
+    let ScopeError::Db(db_err) = &err else {
+        panic!("a duplicate insert must surface the database error: {err}");
+    };
+    let refusal = toolkit_db::db_error::driver_refusal(db_err)
+        .unwrap_or_else(|| panic!("driver_refusal must reach a real refusal: {err}"));
+    assert!(
+        !refusal.code().is_empty(),
+        "the driver must have reported a code: {refusal:?}"
+    );
+    // `DbBackend` has no `Display`; the name is enough to tell the lanes apart
+    // in a run's output.
+    let backend = match db.backend() {
+        sea_orm::DatabaseBackend::Postgres => "postgres",
+        sea_orm::DatabaseBackend::MySql => "mysql",
+        sea_orm::DatabaseBackend::Sqlite => "sqlite",
+        // `DatabaseBackend` is non-exhaustive.
+        _ => "unknown backend",
+    };
+    println!(
+        "{backend} reported code {} for the duplicate key",
+        refusal.code()
     );
 
     Ok(())
@@ -446,6 +475,104 @@ async fn pg_serialization_failure_is_classified_as_retryable_contention() -> Res
         "is_retryable_contention() must still recognise a real PostgreSQL \
          serialization failure after the SeaORM/sqlx upgrade, otherwise \
          transaction retries silently stop happening; classifier saw: {db_err}"
+    );
+
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════
+// FK / RESTRICT, from a real server
+// ════════════════════════════════════════════════════════════════════
+
+/// Delete a row a `RESTRICT` foreign key still references, on a real server,
+/// and assert what comes back is classified as a foreign-key refusal.
+///
+/// `RESTRICT` rather than `NO ACTION` on purpose: it is the action whose
+/// SQLSTATE `PostgreSQL` 18 changed, and the two are not interchangeable —
+/// `RESTRICT` is checked immediately and cannot be deferred.
+///
+/// The point of a live server rather than a `DbErr` built from a literal: the
+/// code and the wording are the server's to change, and it changed both.
+/// `PostgreSQL` 18 reports this refusal as `23001` (`restrict_violation`)
+/// where 17 and earlier reported `23503`, and reworded the message from
+/// "violates foreign key constraint" to "violates RESTRICT setting of foreign
+/// key constraint". A test shaped `classify("23503") == ForeignKey` cannot
+/// notice either, because the code under test and the test agree on a premise
+/// the server has abandoned (issue #4645).
+///
+/// Three assertions, none of them pinned to one major:
+///
+/// 1. the classifier says foreign-key refusal;
+/// 2. the structured accessor reaches a SQLSTATE, and it is one of the two
+///    codes that name this condition — printed, so a run records what this
+///    server actually sent;
+/// 3. the driver named the constraint, which is what tells two foreign keys on
+///    one table apart.
+#[cfg(feature = "pg")]
+#[tokio::test]
+async fn pg_restrict_delete_is_classified_as_foreign_key_violation() -> Result<()> {
+    use sea_orm::ConnectionTrait as _;
+    use toolkit_db::db_error::{ConstraintViolation, driver_refusal};
+    use toolkit_db::secure::is_foreign_key_violation;
+
+    let dut = common::bring_up_postgres().await?;
+    // A plain connection: the subject is how a driver refusal classifies, not
+    // how toolkit-db wraps a pool, and raw DDL is what sets the FK up.
+    let conn = sea_orm::Database::connect(dut.url.clone()).await?;
+
+    conn.execute_unprepared(
+        "CREATE TABLE restrict_parent (id uuid PRIMARY KEY); \
+         CREATE TABLE restrict_child ( \
+             id uuid PRIMARY KEY, \
+             parent_id uuid NOT NULL, \
+             CONSTRAINT restrict_child_parent_fk \
+                 FOREIGN KEY (parent_id) REFERENCES restrict_parent (id) \
+                 ON DELETE RESTRICT \
+         );",
+    )
+    .await?;
+
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    conn.execute_unprepared(&format!(
+        "INSERT INTO restrict_parent (id) VALUES ('{parent}'); \
+         INSERT INTO restrict_child (id, parent_id) VALUES ('{child}', '{parent}');"
+    ))
+    .await?;
+
+    let err = conn
+        .execute_unprepared(&format!(
+            "DELETE FROM restrict_parent WHERE id = '{parent}'"
+        ))
+        .await
+        .expect_err("a RESTRICT foreign key must refuse this delete");
+
+    assert!(
+        is_foreign_key_violation(&err),
+        "a live RESTRICT refusal must classify as a foreign-key violation: {err}"
+    );
+
+    let refusal = driver_refusal(&err).unwrap_or_else(|| {
+        panic!("the structured accessor must reach the driver's refusal: {err}")
+    });
+    println!(
+        "PostgreSQL reported SQLSTATE {} for the RESTRICT refusal",
+        refusal.code()
+    );
+    assert!(
+        matches!(refusal.code(), "23001" | "23503"),
+        "an FK refusal must arrive as one of the two codes that name it, got {}: {err}",
+        refusal.code()
+    );
+    assert_eq!(
+        refusal.violation(),
+        Some(ConstraintViolation::ForeignKey),
+        "both codes must name one condition"
+    );
+    assert_eq!(
+        refusal.constraint(),
+        Some("restrict_child_parent_fk"),
+        "the driver must name the constraint that refused"
     );
 
     Ok(())
