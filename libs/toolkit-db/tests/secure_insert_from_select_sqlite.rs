@@ -34,6 +34,8 @@ mod link {
 }
 
 impl ScopableEntity for link::Entity {
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
     fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
         None
     }
@@ -45,12 +47,6 @@ impl ScopableEntity for link::Entity {
     }
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
-    }
-    fn resolve_property(_property: &str) -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        Vec::new()
     }
 }
 

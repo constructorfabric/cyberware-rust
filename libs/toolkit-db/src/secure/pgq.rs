@@ -43,7 +43,9 @@ use toolkit_sea_orm_pgq::{EdgeTable, EndpointRef, PropertyGraph as GraphDdl, Ver
 
 use crate::secure::cond::{ColumnAddress, SiblingSupport, build_scope_predicate};
 use crate::secure::select::{Scoped, SecureSelect};
-use crate::secure::{AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeError};
+use crate::secure::{
+    AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeError, ScopeProperties,
+};
 
 /// A property graph the platform declares.
 ///

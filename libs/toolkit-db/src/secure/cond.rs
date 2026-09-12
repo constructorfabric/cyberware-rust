@@ -1,7 +1,7 @@
 use sea_orm::sea_query::{Alias, Query, SelectStatement};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, IdenStatic, sea_query::Expr};
 
-use crate::secure::{AccessScope, ScopableEntity, ScopeError};
+use crate::secure::{AccessScope, ScopableEntity, ScopeError, ScopeProperties};
 use toolkit_security::access_scope::{
     ScopeConstraint, ScopeFilter, ScopeValue, rg_tables, tenant_tables,
 };
@@ -960,6 +960,12 @@ mod tests {
         impl ActiveModelBehavior for ActiveModel {}
 
         impl crate::secure::ScopableEntity for Entity {
+            const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+                (pep_properties::OWNER_TENANT_ID, Column::TenantId),
+                (pep_properties::RESOURCE_ID, Column::Id),
+                ("department_id", Column::DepartmentId),
+            ];
+
             fn tenant_col() -> Option<Column> {
                 Some(Column::TenantId)
             }
@@ -971,17 +977,6 @@ mod tests {
             }
             fn type_col() -> Option<Column> {
                 None
-            }
-            fn resolve_property(property: &str) -> Option<Column> {
-                match property {
-                    p if p == pep_properties::OWNER_TENANT_ID => Some(Column::TenantId),
-                    p if p == pep_properties::RESOURCE_ID => Some(Column::Id),
-                    "department_id" => Some(Column::DepartmentId),
-                    _ => None,
-                }
-            }
-            fn scope_columns() -> Vec<Column> {
-                vec![Column::TenantId, Column::Id, Column::DepartmentId]
             }
         }
     }

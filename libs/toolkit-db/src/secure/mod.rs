@@ -132,7 +132,7 @@ mod tx_error;
 // Public API re-exports
 
 // Core types
-pub use entity_traits::ScopableEntity;
+pub use entity_traits::{ScopableEntity, ScopeProperties};
 pub use error::{ScopeError, is_foreign_key_violation, is_unique_violation};
 
 // Security types from toolkit-security

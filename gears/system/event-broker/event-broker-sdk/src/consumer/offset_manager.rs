@@ -41,6 +41,8 @@ mod offset_row {
     impl toolkit_db::secure::ScopableEntity for Entity {
         const IS_UNRESTRICTED: bool = true;
 
+        const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[];
+
         fn tenant_col() -> Option<Self::Column> {
             None
         }
@@ -55,13 +57,6 @@ mod offset_row {
 
         fn type_col() -> Option<Self::Column> {
             None
-        }
-
-        fn resolve_property(_property: &str) -> Option<Self::Column> {
-            None
-        }
-        fn scope_columns() -> Vec<Self::Column> {
-            Vec::new()
         }
     }
 }
