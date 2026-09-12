@@ -12,7 +12,10 @@ fn descriptor(name: &str, provider: &str) -> ProfileDescriptor {
         name: name.to_owned(),
         cache: CacheDescriptor {
             consistency: WireCacheConsistency::Linearizable,
-            features: WireCacheFeatures { prefix_watch: true },
+            features: WireCacheFeatures {
+                prefix_watch: true,
+                watch: Some(true),
+            },
             provider: provider.to_owned(),
         },
         lock: LockDescriptor {

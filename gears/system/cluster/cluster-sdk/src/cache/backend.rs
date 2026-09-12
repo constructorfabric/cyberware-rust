@@ -166,7 +166,11 @@ pub trait ClusterCacheBackend: Send + Sync {
     /// Watches an exact key.
     ///
     /// # Errors
-    /// Returns [`ClusterError`] if the watch cannot be established.
+    /// Returns [`ClusterError::Unsupported`] with `feature: "watch"` when the
+    /// backend declares no exact-watch support (`features().watch == false`) —
+    /// a backend that cannot serve a watch must say so rather than return a
+    /// channel that never fires — or another [`ClusterError`] if the watch
+    /// cannot be established.
     async fn watch(&self, key: &str) -> Result<CacheWatch, ClusterError>;
 
     /// Watches a key prefix.

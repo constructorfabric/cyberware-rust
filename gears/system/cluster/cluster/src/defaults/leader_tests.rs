@@ -92,6 +92,27 @@ async fn single_candidate_becomes_leader() {
 }
 
 #[tokio::test]
+async fn elects_leader_over_a_watchless_cache() {
+    // A cache that serves no exact watch (features().watch == false, watch()
+    // -> Unsupported) must not fail elect(): the CAS election reconciles off the
+    // renewal timer alone rather than propagating the Unsupported error from the
+    // pre-claim subscribe. Regression for the live redis `watch_mode: disabled`
+    // bug (plan D3).
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedLeaderElectionBackend::new(cache) else {
+        panic!("linearizable cache must construct");
+    };
+    let Ok(mut watch) = backend.elect("primary").await else {
+        panic!("election must join even without a cache watch");
+    };
+    assert!(matches!(
+        watch.changed().await,
+        LeaderWatchEvent::Status(LeaderStatus::Leader)
+    ));
+    assert!(watch.is_leader());
+}
+
+#[tokio::test]
 async fn second_candidate_is_follower() {
     let cache = MemoryCache::linearizable();
     let Ok(a) = CasBasedLeaderElectionBackend::new(Arc::clone(&cache) as _) else {

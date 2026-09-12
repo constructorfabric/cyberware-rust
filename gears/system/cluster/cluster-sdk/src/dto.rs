@@ -120,22 +120,45 @@ impl From<WireCacheConsistency> for CacheConsistency {
     feature = "grpc-client",
     proto_bridge(stub = "crate::grpc::stubs::profile::WireCacheFeatures")
 )]
+// Matches the domain twin `CacheFeatures`: a wire mirror expected to grow fields
+// (this one just gained `watch`) must stay `#[non_exhaustive]` so the next
+// addition is additive for out-of-crate constructors, not a breaking change.
+#[non_exhaustive]
 pub struct WireCacheFeatures {
     /// Whether the backend natively supports prefix watches.
     pub prefix_watch: bool,
+    /// Whether the backend supports exact-key watches. `None` from a peer that
+    /// predates this field (an older server), decoded as `true` — every backend
+    /// served exact watch before the field existed, so absence means "supported"
+    /// rather than the proto3 default of `false`.
+    pub watch: Option<bool>,
 }
 
 impl From<CacheFeatures> for WireCacheFeatures {
     fn from(value: CacheFeatures) -> Self {
         Self {
             prefix_watch: value.prefix_watch,
+            watch: Some(value.watch),
         }
     }
 }
 
 impl From<WireCacheFeatures> for CacheFeatures {
     fn from(value: WireCacheFeatures) -> Self {
-        Self::new(value.prefix_watch)
+        // Absent (`None`) means an old peer that predates the field: it served
+        // exact watch, so decode to `true` rather than the proto3 default.
+        let watch = value.watch.unwrap_or(true);
+        // Enforce the `without_watch()` invariant at the wire trust boundary — a
+        // backend that cannot watch one key cannot watch a family of them — so a
+        // skewed or hand-crafted peer that pairs `watch: Some(false)` with
+        // `prefix_watch: true` is normalized to the honest state rather than
+        // admitted as the impossible one the domain constructors forbid. A
+        // conforming peer never sends it (`CacheFeatures` is constructor-only),
+        // so this only ever narrows a malformed input.
+        Self {
+            watch,
+            prefix_watch: watch && value.prefix_watch,
+        }
     }
 }
 

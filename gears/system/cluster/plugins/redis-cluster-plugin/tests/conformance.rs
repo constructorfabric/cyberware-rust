@@ -136,6 +136,46 @@ async fn cache_conformance() {
     .await;
 }
 
+/// The same `SC-CACHE-*` suite against a `watch_mode: disabled` cache, which
+/// declares `features().watch == false` and answers `Unsupported` from `watch`.
+///
+/// Proves a watchless Redis deployment passes conformance rather than panicking
+/// on `.expect("watch")`: the exact-watch scenarios (010/012/015) are
+/// capability-gated, and SC-CACHE-012 asserts the `Unsupported` contract. This is
+/// the plugin half of the exact-watch fix — the same declaration that lets an
+/// omitted `leader_election`/`lock` degrade instead of failing at first call.
+#[tokio::test]
+async fn cache_conformance_watch_mode_disabled() {
+    use cluster_conformance::run_cache_conformance;
+
+    let (_container, base_config) = common::start_redis().await;
+    let url = base_config.url;
+    let scenario_index = AtomicUsize::new(0);
+
+    Box::pin(run_cache_conformance(
+        || {
+            let url = url.clone();
+            let index = scenario_index.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let config = common::cluster_config_for_scenario(
+                    &url,
+                    "confnowatch",
+                    index,
+                    serde_json::json!({ "watch_mode": "disabled" }),
+                );
+                let handle = RedisClusterPlugin::builder(config)
+                    .build_and_start()
+                    .await
+                    .expect("a fresh per-scenario instance starts against the test container");
+                let cache = handle.cache();
+                ScenarioBackend::with_teardown(cache, async move { handle.stop().await })
+            }
+        },
+        TimeControl::Real,
+    ))
+    .await;
+}
+
 /// Every `SC-LOCK-*` scenario against the **standalone** `RedisLockPlugin`.
 ///
 /// The standalone shape rather than the combined plugin's `handle.lock()`, and

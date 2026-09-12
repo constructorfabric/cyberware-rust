@@ -111,6 +111,10 @@ impl CasBasedLeaderElectionBackend {
     }
 
     fn with_cache(cache: Arc<dyn ClusterCacheBackend>) -> Self {
+        // Tell the operator once, at construction, if this cache cannot serve
+        // exact watch: the election then reconciles off the renewal timer alone
+        // (see `enrol`). Not fatal — the timer path is correct on its own.
+        guard::warn_without_watch(cache.features(), Self::NAME);
         Self {
             leases: Arc::new(CacheLeaseStore::new(cache)),
             shutdown: CancellationToken::new(),
@@ -207,8 +211,18 @@ impl CasBasedLeaderElectionBackend {
             let key = Self::election_key(name);
             let owner = identity::fresh_id();
             // Subscribe before the first claim so a transition between the claim and
-            // the watch establishment cannot be missed.
-            let cache_watch = self.leases.cache().watch(&key).await?;
+            // the watch establishment cannot be missed. A backend with no
+            // exact-watch support (`features().watch == false`) answers
+            // `Unsupported`; there is then no reactive feed, so reconcile off the
+            // renewal timer alone — the same state the task reaches after an
+            // ordinary end-of-stream (`None`). This keeps election working over
+            // e.g. redis `watch_mode: disabled` instead of failing at first
+            // `enrol` (plan D3).
+            let cache_watch = match self.leases.cache().watch(&key).await {
+                Ok(watch) => Some(watch),
+                Err(ClusterError::Unsupported { .. }) => None,
+                Err(err) => return Err(err),
+            };
             let (token, initial, incumbent_lapse) = match self
                 .leases
                 .try_acquire(&key, name, &owner, config.ttl())
@@ -245,11 +259,7 @@ impl CasBasedLeaderElectionBackend {
                 provider: self.provider,
                 metrics: Arc::clone(&self.metrics),
             };
-            self.track(tokio::spawn(task.run(
-                initial,
-                Some(cache_watch),
-                resign_rx,
-            )));
+            self.track(tokio::spawn(task.run(initial, cache_watch, resign_rx)));
             Ok(watch)
         }
         .instrument(span)
@@ -833,6 +843,10 @@ impl ElectionTask {
             return None;
         }
         self.watch_resubscribes = self.watch_resubscribes.saturating_add(1);
+        // A backend that answers `Unsupported` here (it no longer serves exact
+        // watch) is caught by this same arm: it logs and returns `None`, which is
+        // terminal — the task renews off the timer alone and never re-subscribes
+        // again, so giving up is automatic and permanent (plan D3, step 7).
         match self.leases.cache().watch(&self.key).await {
             Ok(watch) => Some(watch),
             Err(err) => {

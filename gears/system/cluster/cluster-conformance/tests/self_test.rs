@@ -36,6 +36,24 @@ async fn cache_suite_passes_against_memcache() {
 }
 
 #[tokio::test]
+async fn cache_suite_passes_against_a_watchless_memcache() {
+    // A watchless fixture (features().watch == false, watch() -> Unsupported)
+    // must satisfy the suite: the exact-watch scenarios (010/012/015) are
+    // capability-gated, and SC-CACHE-012 asserts the Unsupported contract. This
+    // proves a real watchless backend (e.g. redis watch_mode: disabled) passes
+    // cache conformance rather than panicking on `.expect("watch")`.
+    run_cache_conformance(
+        || async {
+            ScenarioBackend::bare(
+                MemCache::linearizable_without_watch() as Arc<dyn ClusterCacheBackend>
+            )
+        },
+        TimeControl::Virtual,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn restart_suite_passes() {
     run_restart_conformance().await;
 }

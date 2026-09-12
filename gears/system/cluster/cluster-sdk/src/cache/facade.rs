@@ -137,7 +137,9 @@ impl ClusterCacheV1 {
     /// retryable terminal close.
     ///
     /// # Errors
-    /// Propagates any [`ClusterError`] from the backend.
+    /// Returns [`ClusterError::Unsupported`] with `feature: "watch"` when the
+    /// backend declares no exact-watch support, or propagates any other
+    /// [`ClusterError`] from the backend.
     pub async fn watch(&self, key: &str) -> Result<CacheWatch, ClusterError> {
         crate::scope::validate_cache_key(key)?;
         let mut watch = self.inner.watch(key).await?;

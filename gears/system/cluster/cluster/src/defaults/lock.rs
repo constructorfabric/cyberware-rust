@@ -9,7 +9,7 @@ use tracing::Instrument;
 
 use crate::defaults::lease::{Acquisition, CacheLeaseStore};
 use crate::defaults::{LOCK_KEY_PREFIX, ShutdownRevoke, guard, identity};
-use cluster_sdk::cache::{CacheWatchEvent, ClusterCacheBackend};
+use cluster_sdk::cache::{CacheWatch, CacheWatchEvent, ClusterCacheBackend};
 use cluster_sdk::error::{ClusterError, ProviderErrorKind};
 use cluster_sdk::lease::LeaseToken;
 use cluster_sdk::lock::{
@@ -60,6 +60,46 @@ const MAX_CONSECUTIVE_WATCH_RESETS: u32 = 8;
 /// rotates its watch faster than this is classified as a busy-spin (the backoff
 /// still prevents CPU spin, but the unusable-watch cap may eventually fire).
 const WATCH_RESUBSCRIBE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// The mean poll cadence a blocking acquisition falls back to when the cache
+/// backend serves no exact watch (`features().watch == false`, e.g. redis
+/// `watch_mode: disabled`): with no event to wake on, it re-attempts the claim
+/// around this interval (jittered by [`watchless_poll_interval`]) instead. Capped
+/// by the caller's remaining budget at the call site, so a tight `timeout` still
+/// fires on time (plan D3).
+const WATCHLESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A jittered watchless poll interval drawn uniformly from
+/// `[WATCHLESS_POLL_INTERVAL, 2 * WATCHLESS_POLL_INTERVAL)` — a floor of one full
+/// interval (so a poll never degenerates into a spin) plus up to one interval of
+/// jitter, so multiple waiters contending the same lock over a watchless cache
+/// desynchronize their claim attempts rather than retrying in lockstep and
+/// hammering the backend with synchronized CAS bursts. Mirrors the leader
+/// backend's `reclaim_jitter`; `ThreadRng` is entropy-seeded, so concurrent
+/// participants diverge with no explicit seeding. The caller clamps the result to
+/// its remaining `wait` budget.
+fn watchless_poll_interval() -> Duration {
+    use rand::RngExt as _;
+    let base_nanos = u64::try_from(WATCHLESS_POLL_INTERVAL.as_nanos()).unwrap_or(u64::MAX);
+    // `base + U(0, base)` == `U(base, 2*base)`. `.max(1)` keeps the range
+    // non-empty for a hypothetical zero base.
+    let jitter = rand::rng().random_range(0..base_nanos.max(1));
+    Duration::from_nanos(base_nanos.saturating_add(jitter))
+}
+
+/// The outcome of one wait step in [`wait_for_lease`](CasBasedDistributedLockBackend::wait_for_lease):
+/// either the watch resolved, or — with no watch — a bounded poll timer did.
+enum WaitStep {
+    /// The `wait` budget elapsed with no actionable event (a watch timeout, or a
+    /// watchless poll that consumed the whole budget).
+    Elapsed,
+    /// A terminal watch close carrying the backend error.
+    Closed(ClusterError),
+    /// A watch event, or a watchless poll tick → re-attempt the claim.
+    Retry,
+    /// The watch stream ended without a terminal close → re-subscribe.
+    StreamEnded,
+}
 
 /// A distributed-lock backend that derives TTL-bounded mutual exclusion from
 /// cache compare-and-swap operations (DESIGN §3.11, ADR-001).
@@ -140,6 +180,10 @@ impl CasBasedDistributedLockBackend {
     }
 
     fn with_cache(cache: Arc<dyn ClusterCacheBackend>) -> Self {
+        // Tell the operator once, at construction, if this cache cannot serve
+        // exact watch: a blocking `lock()` then waits by bounded polling rather
+        // than reactively (see `wait_for_lease`). Not fatal.
+        guard::warn_without_watch(cache.features(), Self::NAME);
         Self {
             leases: Arc::new(CacheLeaseStore::new(cache)),
             shutdown: CancellationToken::new(),
@@ -152,6 +196,23 @@ impl CasBasedDistributedLockBackend {
     /// waits on.
     fn cache(&self) -> &Arc<dyn ClusterCacheBackend> {
         self.leases.cache()
+    }
+
+    /// Subscribes the blocking-acquisition watch, degrading to poll-only
+    /// (`None`) when the backend serves no exact watch.
+    ///
+    /// `Unsupported` is a *permanent* capability answer, not a retryable close,
+    /// so it is not surfaced as an error: the caller falls back to bounded
+    /// polling. Any other error propagates.
+    ///
+    /// # Errors
+    /// Returns a non-`Unsupported` [`ClusterError`] if the subscribe fails.
+    async fn resubscribe(&self, key: &str) -> Result<Option<CacheWatch>, ClusterError> {
+        match self.cache().watch(key).await {
+            Ok(watch) => Ok(Some(watch)),
+            Err(ClusterError::Unsupported { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     /// Sets the `provider` label and metrics sink the backend emits through.
@@ -326,8 +387,11 @@ impl CasBasedDistributedLockBackend {
         let key = Self::lock_key(name);
         let started = tokio::time::Instant::now();
         // Subscribe before the first attempt so a release between a failed claim
-        // and the wait cannot be missed.
-        let mut watch = self.cache().watch(&key).await?;
+        // and the wait cannot be missed. A backend with no exact-watch support
+        // (`features().watch == false`) yields `None`, and the wait falls back to
+        // bounded polling — so a blocking `lock()` still completes over e.g. redis
+        // `watch_mode: disabled` instead of failing at the first wait (plan D3).
+        let mut watch = self.resubscribe(&key).await?;
         // Distinguish a busy-spin from a legitimate stream rotation. A watch that
         // ends (`recv` → `None`) *immediately* on every re-subscribe would spin
         // this loop hot (claim → watch ends → re-subscribe → claim …); a watch
@@ -367,18 +431,41 @@ impl CasBasedDistributedLockBackend {
             // times out on time.
             let wait = lapse_in.map_or(remaining, |lapse| remaining.min(lapse));
             let recv_started = tokio::time::Instant::now();
-            let waited = tokio::select! {
+            // With a watch, wait up to `wait` for its next event. Without one
+            // (the backend serves no exact watch), poll the claim on a bounded,
+            // jittered interval, still capped by `wait` so a tight `timeout`
+            // fires on time.
+            let step = tokio::select! {
                 // Graceful cluster shutdown: abandon the wait promptly with a
                 // terminal `Shutdown` (`cpt-cf-clst-fr-shutdown-revoke`). Held
                 // locks lapse via their deadline; this only resolves an in-flight
                 // wait.
                 () = shutdown.cancelled() => return Err(ClusterError::Shutdown),
-                waited = tokio::time::timeout(wait, watch.recv()) => waited,
+                step = async {
+                    if let Some(w) = watch.as_mut() {
+                        match tokio::time::timeout(wait, w.recv()).await {
+                            Err(_elapsed) => WaitStep::Elapsed,
+                            Ok(Some(CacheWatchEvent::Closed(err))) => WaitStep::Closed(err),
+                            Ok(Some(_)) => WaitStep::Retry,
+                            Ok(None) => WaitStep::StreamEnded,
+                        }
+                    } else {
+                        // Watchless: sleep a jittered, bounded poll interval so
+                        // contending waiters on the same lock desynchronize their
+                        // claims. Clamped to `wait`; if that clamp consumed the
+                        // whole `wait` budget it is an elapse (a real timeout or
+                        // the incumbent's deadline), otherwise it is just a poll
+                        // tick → retry the claim.
+                        let poll = watchless_poll_interval().min(wait);
+                        tokio::time::sleep(poll).await;
+                        if poll == wait { WaitStep::Elapsed } else { WaitStep::Retry }
+                    }
+                } => step,
             };
-            match waited {
+            match step {
                 // The wait budget ran out. If that was the caller's `timeout` it is
                 // a real timeout; if it was the incumbent's deadline, loop and steal.
-                Err(_elapsed) => {
+                WaitStep::Elapsed => {
                     if wait == remaining {
                         return Err(ClusterError::LockTimeout {
                             name: name.to_owned(),
@@ -387,18 +474,19 @@ impl CasBasedDistributedLockBackend {
                     }
                     consecutive_immediate_resets = 0;
                 }
-                Ok(Some(CacheWatchEvent::Closed(err))) => return Err(err),
-                // Any event (release / expiry / lag / reset) → retry the claim.
-                Ok(Some(_)) => consecutive_immediate_resets = 0,
+                WaitStep::Closed(err) => return Err(err),
+                // Any event (release / expiry / lag / reset) or a poll tick →
+                // retry the claim.
+                WaitStep::Retry => consecutive_immediate_resets = 0,
                 // End-of-stream (sender dropped without a terminal `Closed`).
                 // Re-subscribe to keep waiting within the remaining timeout.
-                Ok(None) if recv_started.elapsed() >= WATCH_RESUBSCRIBE_BACKOFF => {
+                WaitStep::StreamEnded if recv_started.elapsed() >= WATCH_RESUBSCRIBE_BACKOFF => {
                     // The watch lived a meaningful interval: a legitimate
                     // rotation, not a busy-spin. Keep waiting.
                     consecutive_immediate_resets = 0;
-                    watch = self.cache().watch(&key).await?;
+                    watch = self.resubscribe(&key).await?;
                 }
-                Ok(None) => {
+                WaitStep::StreamEnded => {
                     // Ended immediately: a busy-spin symptom. Cap consecutive
                     // immediate re-ends so a structurally unusable watch surfaces
                     // instead of spinning, and back off so it cannot burn CPU
@@ -424,7 +512,7 @@ impl CasBasedDistributedLockBackend {
                     // Clamp to the remaining wait so a tight `timeout` is not
                     // overshot by a full backoff interval.
                     tokio::time::sleep(WATCH_RESUBSCRIBE_BACKOFF.min(remaining)).await;
-                    watch = self.cache().watch(&key).await?;
+                    watch = self.resubscribe(&key).await?;
                 }
             }
         }

@@ -109,6 +109,10 @@ enum WatchBehavior {
     /// The watch delivers no events and ends (`recv` → `None`) only after a
     /// meaningful interval — a legitimate stream rotation.
     Rotating,
+    /// The backend serves no exact watch: `features().watch` is `false` and
+    /// `watch` answers [`ClusterError::Unsupported`] with `feature: "watch"` —
+    /// the watchless degradation path (e.g. redis `watch_mode: disabled`).
+    Unsupported,
 }
 
 /// How a fixture's [`watch_prefix`](ClusterCacheBackend::watch_prefix) behaves.
@@ -191,6 +195,18 @@ impl MemoryCache {
             CacheConsistency::Linearizable,
             PrefixWatchBehavior::Native,
             WatchBehavior::Rotating,
+        )
+    }
+
+    /// A linearizable cache that serves no exact watch: `features().watch` is
+    /// `false` and both `watch` and `watch_prefix` return
+    /// [`ClusterError::Unsupported`] — for the watchless leader/lock degradation
+    /// path (a backend that cannot watch one key cannot watch a family either).
+    pub(super) fn linearizable_without_watch() -> Arc<Self> {
+        Self::spawn_with(
+            CacheConsistency::Linearizable,
+            PrefixWatchBehavior::Unsupported,
+            WatchBehavior::Unsupported,
         )
     }
 
@@ -366,6 +382,10 @@ impl ClusterCacheBackend for MemoryCache {
     }
 
     fn features(&self) -> CacheFeatures {
+        if matches!(self.watch_behavior, WatchBehavior::Unsupported) {
+            // No exact watch means no prefix watch either.
+            return CacheFeatures::without_watch();
+        }
         CacheFeatures::new(!matches!(
             self.prefix_watch,
             PrefixWatchBehavior::Unsupported
@@ -564,6 +584,7 @@ impl ClusterCacheBackend for MemoryCache {
                 });
                 Ok(watch)
             }
+            WatchBehavior::Unsupported => Err(ClusterError::Unsupported { feature: "watch" }),
         }
     }
 

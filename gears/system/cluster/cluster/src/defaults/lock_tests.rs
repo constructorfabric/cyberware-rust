@@ -158,6 +158,57 @@ async fn blocking_lock_waits_then_acquires_on_release() {
     assert_eq!(acquired.name(), "ledger");
 }
 
+#[tokio::test]
+async fn blocking_lock_acquires_uncontended_over_a_watchless_cache() {
+    // A cache that serves no exact watch (features().watch == false, watch()
+    // -> Unsupported) must not fail a blocking lock(). The pre-fix code
+    // subscribed *before* the first claim, so even an uncontended acquisition
+    // failed at that `?`. Now the wait degrades to bounded polling. Regression
+    // for the live redis `watch_mode: disabled` bug (plan D3).
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedDistributedLockBackend::new(cache) else {
+        panic!("linearizable cache must construct");
+    };
+    let Ok(guard) = backend
+        .lock("ledger", Duration::from_secs(30), Duration::from_secs(30))
+        .await
+    else {
+        panic!("uncontended blocking lock must acquire without a cache watch");
+    };
+    assert_eq!(guard.name(), "ledger");
+}
+
+#[tokio::test]
+async fn blocking_lock_polls_to_acquire_over_a_watchless_cache() {
+    // Contended: with no watch to wake on, the waiter must poll the claim on the
+    // bounded interval and acquire once the holder releases.
+    let cache = MemoryCache::linearizable_without_watch();
+    let Ok(backend) = CasBasedDistributedLockBackend::new(cache) else {
+        panic!("linearizable cache must construct");
+    };
+    let backend = Arc::new(backend);
+    let Ok(guard) = backend.try_lock("ledger", Duration::from_secs(30)).await else {
+        panic!("first holder acquires");
+    };
+    let waiter_backend = Arc::clone(&backend);
+    let waiter = tokio::spawn(async move {
+        waiter_backend
+            .lock("ledger", Duration::from_secs(30), Duration::from_secs(30))
+            .await
+    });
+    // Let the waiter block (its first claim contends), then release; the waiter
+    // acquires on its next poll rather than on a watch event.
+    settle().await;
+    assert!(guard.release().await.is_ok());
+    let Ok(joined) = waiter.await else {
+        panic!("waiter task must join");
+    };
+    let Ok(acquired) = joined else {
+        panic!("waiter must acquire after release via polling");
+    };
+    assert_eq!(acquired.name(), "ledger");
+}
+
 #[tokio::test(start_paused = true)]
 async fn blocking_lock_on_unusable_watch_fails_fast_without_spinning() {
     // A backend whose `watch` ends immediately on every subscribe would make

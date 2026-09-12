@@ -4,7 +4,7 @@ use toolkit::client_hub::ClientHub;
 
 use crate::binding;
 use crate::cache::facade::ClusterCacheV1;
-use crate::cache::types::{CacheCapability, CacheConsistency};
+use crate::cache::types::{CacheCapability, CacheConsistency, CacheFeatures};
 use crate::dto::CacheDescriptor;
 use crate::error::ClusterError;
 use crate::intern::intern;
@@ -110,6 +110,12 @@ pub fn validate_cache_capabilities_from(
     descriptor: &CacheDescriptor,
     reqs: &[CacheCapability],
 ) -> Result<(), ClusterError> {
+    // Decode the wire mirror once, up front, so every watch-family arm reads the
+    // same normalized view (`From<WireCacheFeatures>` applies the absent-is-
+    // supported default and the `watch ⇒ prefix_watch` invariant). Reading the
+    // raw wire bool in one arm and the decoded value in another would let a
+    // skewed descriptor satisfy `PrefixWatch` yet fail `Watch`.
+    let features = CacheFeatures::from(descriptor.features);
     // Matched exhaustively (no catch-all): although `CacheCapability` is
     // `#[non_exhaustive]`, within this crate every variant must be handled, so
     // adding a future capability fails to compile here rather than being
@@ -129,8 +135,20 @@ pub fn validate_cache_capabilities_from(
                     });
                 }
             }
+            CacheCapability::Watch => {
+                // Reads the decoded `watch` bit (see `features` above) so a
+                // consumer that requires a reactive feed is refused here rather
+                // than at first `watch()` call.
+                if !features.watch {
+                    return Err(ClusterError::CapabilityNotMet {
+                        primitive: "ClusterCacheV1",
+                        capability: "Watch",
+                        provider: intern(&descriptor.provider),
+                    });
+                }
+            }
             CacheCapability::PrefixWatch => {
-                if !descriptor.features.prefix_watch {
+                if !features.prefix_watch {
                     return Err(ClusterError::CapabilityNotMet {
                         primitive: "ClusterCacheV1",
                         capability: "PrefixWatch",

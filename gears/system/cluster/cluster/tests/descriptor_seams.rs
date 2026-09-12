@@ -28,7 +28,7 @@ use cluster_sdk::dto::{
     WireCacheConsistency, WireCacheFeatures, WireLeaderElectionFeatures, WireLockFeatures,
 };
 use cluster_sdk::grpc::stubs::profile as stubs;
-use cluster_sdk::{CacheConsistency, ClusterClient, RemoteClusterClient};
+use cluster_sdk::{CacheConsistency, CacheFeatures, ClusterClient, RemoteClusterClient};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
@@ -42,7 +42,10 @@ fn strong_descriptor() -> ProfileDescriptor {
         name: PROFILE.to_owned(),
         cache: CacheDescriptor {
             consistency: WireCacheConsistency::Linearizable,
-            features: WireCacheFeatures { prefix_watch: true },
+            // `WireCacheFeatures` is `#[non_exhaustive]`, so an out-of-crate
+            // caller builds it through the domain `From` rather than a struct
+            // literal. `new(true)` → exact watch + prefix watch.
+            features: WireCacheFeatures::from(CacheFeatures::new(true)),
             provider: "postgres".to_owned(),
         },
         lock: LockDescriptor {

@@ -305,11 +305,23 @@ pub async fn scenario_cache_009(backend: Arc<dyn ClusterCacheBackend>) {
     );
 }
 
-/// SC-CACHE-010: TTL expiry removes the entry and emits `CacheEvent::Expired` to
-/// watchers.
+/// SC-CACHE-010: TTL expiry removes the entry, and — on a backend with exact
+/// watch — emits `CacheEvent::Expired` to watchers. The finite-TTL removal check
+/// (`get` reads absent after the deadline) runs for *every* backend; only the
+/// watcher subscription and the `Expired` assertion are gated on
+/// `features().watch` (a watchless backend has no watcher to emit to, and the
+/// `watch()` contract itself is asserted by SC-CACHE-012). Expiry is observed
+/// lazily on read, so the removal assertion holds after the elapse without
+/// depending on a background sweep.
 pub async fn scenario_cache_010(backend: Arc<dyn ClusterCacheBackend>, time: TimeControl) {
     time.begin();
-    let mut watch = backend.watch("k").await.expect("watch");
+    // Subscribe before the put so the watcher is guaranteed to see the Expired
+    // emission. Watchless backends skip this and assert removal only.
+    let mut watch = if backend.features().watch {
+        Some(backend.watch("k").await.expect("watch"))
+    } else {
+        None
+    };
     backend
         .put(PutRequest {
             key: "k",
@@ -319,13 +331,15 @@ pub async fn scenario_cache_010(backend: Arc<dyn ClusterCacheBackend>, time: Tim
         .await
         .expect("put with ttl");
     time.elapse(Duration::from_millis(100)).await;
-    // Drain the initial Changed, then wait for the Expired emission. The poll
-    // keeps reading, so under `Real` it tolerates the sweeper reclaim landing a
-    // little after the elapse (caller must set a sweep interval < the elapse).
-    let expired = poll_watch(&mut watch)
-        .until(|event| matches!(event, CacheEvent::Expired { key } if key == "k"))
-        .await;
-    assert!(expired, "SC-CACHE-010: TTL expiry must emit Expired");
+    if let Some(watch) = watch.as_mut() {
+        // Drain the initial Changed, then wait for the Expired emission. The poll
+        // keeps reading, so under `Real` it tolerates the sweeper reclaim landing
+        // a little after the elapse (caller must set a sweep interval < the elapse).
+        let expired = poll_watch(watch)
+            .until(|event| matches!(event, CacheEvent::Expired { key } if key == "k"))
+            .await;
+        assert!(expired, "SC-CACHE-010: TTL expiry must emit Expired");
+    }
     assert!(
         backend.get("k").await.expect("get").is_none(),
         "SC-CACHE-010: expired entry reads as absent"
@@ -334,12 +348,25 @@ pub async fn scenario_cache_010(backend: Arc<dyn ClusterCacheBackend>, time: Tim
 }
 
 /// SC-CACHE-012: exact `watch` yields `Changed`/`Deleted` for the key,
-/// preserving per-key order.
+/// preserving per-key order — and a backend that declares no exact watch
+/// (`features().watch == false`) returns `Unsupported` instead of a channel that
+/// never fires, the exact-watch twin of SC-CACHE-013.
 pub async fn scenario_cache_012(backend: Arc<dyn ClusterCacheBackend>) {
     /// Which of the two ordered events on key `k` a poll selected.
     enum Seen {
         Changed,
         Deleted,
+    }
+
+    if !backend.features().watch {
+        assert!(
+            matches!(
+                backend.watch("k").await,
+                Err(ClusterError::Unsupported { feature: "watch" })
+            ),
+            "SC-CACHE-012: a backend without exact watch must return Unsupported"
+        );
+        return;
     }
 
     let mut watch = backend.watch("k").await.expect("watch");
@@ -479,6 +506,9 @@ pub async fn scenario_cache_014(backend: Arc<dyn ClusterCacheBackend>, time: Tim
 
 /// SC-CACHE-015: watch delivery is at-most-once per mutation — a single `put`
 /// must not cause more than one `Changed` event for the same key on one watch.
+/// Capability-gated on `features().watch`: at-most-once delivery is a watch
+/// property, so a watchless backend (SC-CACHE-012 asserts its `Unsupported`
+/// contract) does not apply.
 pub async fn scenario_cache_015(backend: Arc<dyn ClusterCacheBackend>, time: TimeControl) {
     // The second poll's budget is what makes the duplicate check real, and it
     // must stay a wait rather than a drain of what is already queued: the
@@ -492,6 +522,11 @@ pub async fn scenario_cache_015(backend: Arc<dyn ClusterCacheBackend>, time: Tim
     const FIRST_EVENT_BUDGET: Duration = Duration::from_millis(500);
     const DUPLICATE_BUDGET: Duration = Duration::from_millis(250);
 
+    // Capability-gated on `features().watch` (see the doc): at-most-once delivery
+    // is a watch property, so a watchless backend does not apply.
+    if !backend.features().watch {
+        return;
+    }
     time.begin();
     let mut watch = backend.watch("k").await.expect("watch");
     backend

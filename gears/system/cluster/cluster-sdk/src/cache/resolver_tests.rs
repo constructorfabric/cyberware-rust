@@ -177,6 +177,100 @@ async fn resolve_happy_path_returns_facade() {
     assert_eq!(cache.consistency(), CacheConsistency::Linearizable);
 }
 
+/// A consumer that requires `Watch` against a descriptor declaring no exact watch
+/// (`watch: Some(false)`, e.g. redis `watch_mode: disabled`) is refused at
+/// resolution — naming the operator-facing provider — rather than at the first
+/// `watch()` call. The exact-watch twin of `resolve_rejects_capability_mismatch_at_startup`,
+/// and like it the *descriptor* is authoritative, not the bound backend.
+#[tokio::test]
+async fn resolve_refuses_a_watch_requirement_against_a_watchless_descriptor() {
+    let hub = ClientHub::new();
+    let descriptor = ProfileDescriptor {
+        name: OrdersProfile::NAME.to_owned(),
+        cache: CacheDescriptor {
+            consistency: WireCacheConsistency::Linearizable,
+            features: WireCacheFeatures {
+                prefix_watch: false,
+                watch: Some(false),
+            },
+            provider: "redis".to_owned(),
+        },
+        lock: LockDescriptor {
+            features: WireLockFeatures { linearizable: true },
+            provider: "redis".to_owned(),
+        },
+        leader_election: LeaderElectionDescriptor {
+            features: WireLeaderElectionFeatures { linearizable: true },
+            provider: "redis".to_owned(),
+        },
+        health: ProfileHealth::Serving,
+    };
+    StubClusterClient::for_profile(OrdersProfile::NAME)
+        // The backend can watch; the descriptor says the deployment cannot — and
+        // the descriptor is what a required capability is checked against.
+        .with_cache(Arc::new(linearizable_backend()))
+        .with_descriptor(descriptor)
+        .register(&hub);
+
+    let Err(ClusterError::CapabilityNotMet {
+        capability,
+        provider,
+        ..
+    }) = ClusterCacheV1::resolver(&hub)
+        .profile(OrdersProfile)
+        .require(CacheCapability::Watch)
+        .resolve()
+        .await
+    else {
+        panic!("a Watch requirement must be refused against a watchless descriptor");
+    };
+    assert_eq!(capability, "Watch");
+    // The operator-facing provider name, not `StubBackend`.
+    assert_eq!(provider, "redis");
+}
+
+/// The success path of the same requirement: a descriptor that declares exact
+/// watch resolves (`watch: Some(true)`; an absent bit decodes to supported too,
+/// covered in `dto_tests`).
+#[tokio::test]
+async fn resolve_admits_a_watch_requirement_against_a_watchful_descriptor() {
+    let hub = ClientHub::new();
+    let descriptor = ProfileDescriptor {
+        name: OrdersProfile::NAME.to_owned(),
+        cache: CacheDescriptor {
+            consistency: WireCacheConsistency::Linearizable,
+            features: WireCacheFeatures {
+                prefix_watch: false,
+                watch: Some(true),
+            },
+            provider: "postgres".to_owned(),
+        },
+        lock: LockDescriptor {
+            features: WireLockFeatures { linearizable: true },
+            provider: "postgres".to_owned(),
+        },
+        leader_election: LeaderElectionDescriptor {
+            features: WireLeaderElectionFeatures { linearizable: true },
+            provider: "postgres".to_owned(),
+        },
+        health: ProfileHealth::Serving,
+    };
+    StubClusterClient::for_profile(OrdersProfile::NAME)
+        .with_cache(Arc::new(linearizable_backend()))
+        .with_descriptor(descriptor)
+        .register(&hub);
+
+    let Ok(cache) = ClusterCacheV1::resolver(&hub)
+        .profile(OrdersProfile)
+        .require(CacheCapability::Watch)
+        .resolve()
+        .await
+    else {
+        panic!("a Watch requirement must resolve against a watchful descriptor");
+    };
+    assert!(cache.features().watch);
+}
+
 #[tokio::test]
 async fn resolve_rejects_capability_mismatch_at_startup() {
     let hub = ClientHub::new();
@@ -217,7 +311,10 @@ async fn validation_reads_the_descriptor_rather_than_the_backend() {
         name: OrdersProfile::NAME.to_owned(),
         cache: CacheDescriptor {
             consistency: WireCacheConsistency::EventuallyConsistent,
-            features: WireCacheFeatures { prefix_watch: true },
+            features: WireCacheFeatures {
+                prefix_watch: true,
+                watch: Some(true),
+            },
             provider: "postgres".to_owned(),
         },
         lock: LockDescriptor {

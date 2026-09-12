@@ -205,7 +205,10 @@ impl ClusterClient for StubClient {
             name: profile.to_owned(),
             cache: CacheDescriptor {
                 consistency: WireCacheConsistency::Linearizable,
-                features: WireCacheFeatures { prefix_watch: true },
+                features: WireCacheFeatures {
+                    prefix_watch: true,
+                    watch: Some(true),
+                },
                 provider: "postgres".to_owned(),
             },
             lock: LockDescriptor {

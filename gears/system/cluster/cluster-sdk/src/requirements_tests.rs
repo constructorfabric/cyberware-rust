@@ -38,7 +38,10 @@ fn descriptor(health: ProfileHealth) -> ProfileDescriptor {
         name: PROFILE.to_owned(),
         cache: CacheDescriptor {
             consistency: WireCacheConsistency::Linearizable,
-            features: WireCacheFeatures { prefix_watch: true },
+            features: WireCacheFeatures {
+                prefix_watch: true,
+                watch: Some(true),
+            },
             provider: "standalone".to_owned(),
         },
         lock: LockDescriptor {

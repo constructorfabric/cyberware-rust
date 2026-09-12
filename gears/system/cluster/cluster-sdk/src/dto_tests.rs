@@ -19,7 +19,10 @@ fn descriptor() -> ProfileDescriptor {
         name: "orders".to_owned(),
         cache: CacheDescriptor {
             consistency: WireCacheConsistency::Linearizable,
-            features: WireCacheFeatures { prefix_watch: true },
+            features: WireCacheFeatures {
+                prefix_watch: true,
+                watch: Some(true),
+            },
             provider: "postgres".to_owned(),
         },
         lock: LockDescriptor {
@@ -49,8 +52,11 @@ fn cache_consistency_round_trips_through_its_mirror() {
 
 #[test]
 fn feature_flags_round_trip_through_their_mirrors() {
-    for prefix_watch in [true, false] {
-        let original = CacheFeatures::new(prefix_watch);
+    for original in [
+        CacheFeatures::new(true),
+        CacheFeatures::new(false),
+        CacheFeatures::without_watch(),
+    ] {
         assert_eq!(
             CacheFeatures::from(WireCacheFeatures::from(original)),
             original
@@ -66,6 +72,36 @@ fn feature_flags_round_trip_through_their_mirrors() {
             leader
         );
     }
+}
+
+#[test]
+fn absent_wire_watch_decodes_as_supported() {
+    // D2: an old peer predates the `watch` field, so `None` on the wire must
+    // decode to `watch: true` — every backend served exact watch before the
+    // field existed. An explicit `Some(false)` is the only way to say "no watch".
+    let absent = WireCacheFeatures {
+        prefix_watch: false,
+        watch: None,
+    };
+    assert!(
+        CacheFeatures::from(absent).watch,
+        "an absent wire watch must decode as supported"
+    );
+
+    let disabled = WireCacheFeatures {
+        prefix_watch: false,
+        watch: Some(false),
+    };
+    assert!(
+        !CacheFeatures::from(disabled).watch,
+        "an explicit Some(false) must decode as unsupported"
+    );
+
+    // A local descriptor always sends the bit explicitly, never absent.
+    assert_eq!(
+        WireCacheFeatures::from(CacheFeatures::without_watch()).watch,
+        Some(false)
+    );
 }
 
 #[test]

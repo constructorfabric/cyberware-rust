@@ -118,15 +118,36 @@ impl CacheEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CacheFeatures {
+    /// Whether the backend supports exact-key watches at all. Nearly every
+    /// backend does; a backend answers `false` only when it has an operator mode
+    /// in which no watch can be served (e.g. redis `watch_mode: disabled`), in
+    /// which case [`watch`](crate::cache::ClusterCacheBackend::watch) must return
+    /// [`ClusterError::Unsupported`](crate::ClusterError::Unsupported) with
+    /// `feature: "watch"`.
+    pub watch: bool,
     /// Whether the backend natively supports prefix watches.
     pub prefix_watch: bool,
 }
 
 impl CacheFeatures {
-    /// Creates a features descriptor.
+    /// Exact watch supported; `prefix_watch` as given. The common case, and the
+    /// meaning [`new`](Self::new) has always carried.
     #[must_use]
     pub fn new(prefix_watch: bool) -> Self {
-        Self { prefix_watch }
+        Self {
+            watch: true,
+            prefix_watch,
+        }
+    }
+
+    /// A backend that cannot serve watches at all. `prefix_watch` is forced off
+    /// too — a backend that cannot watch one key cannot watch a family of them.
+    #[must_use]
+    pub fn without_watch() -> Self {
+        Self {
+            watch: false,
+            prefix_watch: false,
+        }
     }
 }
 
@@ -137,6 +158,9 @@ impl CacheFeatures {
 pub enum CacheCapability {
     /// Require the backend's [`CacheConsistency`] to be `Linearizable`.
     Linearizable,
+    /// Require exact-key watch support, so a consumer that needs a reactive feed
+    /// is refused at resolution rather than at first `watch()` call.
+    Watch,
     /// Require native prefix-watch support.
     PrefixWatch,
 }

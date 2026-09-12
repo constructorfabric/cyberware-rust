@@ -331,7 +331,9 @@ impl ClusterCacheBackend for UnboundCacheBackend {
     }
 
     fn features(&self) -> CacheFeatures {
-        CacheFeatures::new(false)
+        // An unbound stub can serve nothing, watch included: the weakest honest
+        // reading, matching `consistency()` above.
+        CacheFeatures::without_watch()
     }
 
     fn provider_name(&self) -> &'static str {

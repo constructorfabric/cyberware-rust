@@ -59,6 +59,25 @@ fn disabled_watch_mode_yields_the_no_publish_sentinel() {
 }
 
 #[test]
+fn a_cache_without_a_watcher_registry_declares_no_exact_watch() {
+    // The live-bug fix: a cache with no watcher registry (which is what
+    // `watch_mode: disabled` builds) answers `Unsupported` from `watch()`, so
+    // `features()` must agree — `watch: false`, and hence `prefix_watch: false`.
+    // Before the fix `features()` reported `watch: true`, so a CAS leader/lock
+    // auto-wired over this cache took a terminal `Unsupported` path at first use.
+    // (`cache_in_mode` builds `watchers: None`, the disabled shape.)
+    let features = cache_in_mode("cluster", WatchMode::Disabled).features();
+    assert!(
+        !features.watch,
+        "a cache with no watcher registry must declare no exact watch"
+    );
+    assert!(
+        !features.prefix_watch,
+        "no exact watch implies no prefix watch"
+    );
+}
+
+#[test]
 fn every_mutation_script_guards_its_publish_on_a_non_empty_channel() {
     // The other half of the sentinel: it only suppresses anything if each script
     // actually checks it. Asserted over the catalog rather than per script so a

@@ -354,7 +354,17 @@ impl ClusterCacheBackend for RedisCache {
     }
 
     fn features(&self) -> CacheFeatures {
-        CacheFeatures::new(self.offers_prefix_watch())
+        if self.watchers.is_some() {
+            // A subscriber registry means exact watch is served (even clustered:
+            // `PUBLISH` reaches a subscriber on any node); prefix watch
+            // additionally requires single-node + `Publish` mode.
+            CacheFeatures::new(self.offers_prefix_watch())
+        } else {
+            // `watch_mode: disabled` — no subscriber at all, so `watch` returns
+            // `Unsupported` and the declaration must say so, matching that gate
+            // (a backend that cannot watch one key cannot watch a family either).
+            CacheFeatures::without_watch()
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Option<CacheEntry>, ClusterError> {

@@ -96,6 +96,7 @@ pub struct MemCache {
     inner: Mutex<Inner>,
     consistency: CacheConsistency,
     prefix_watch: bool,
+    watch: bool,
 }
 
 impl MemCache {
@@ -107,7 +108,7 @@ impl MemCache {
     /// constructor spawns a background TTL sweeper task).
     #[must_use]
     pub fn linearizable() -> Arc<Self> {
-        Self::spawn(CacheConsistency::Linearizable, true)
+        Self::spawn(CacheConsistency::Linearizable, true, true)
     }
 
     /// An eventually-consistent cache, for exercising the suite's capability
@@ -119,7 +120,7 @@ impl MemCache {
     /// constructor spawns a background TTL sweeper task).
     #[must_use]
     pub fn eventually_consistent() -> Arc<Self> {
-        Self::spawn(CacheConsistency::EventuallyConsistent, true)
+        Self::spawn(CacheConsistency::EventuallyConsistent, true, true)
     }
 
     /// A linearizable cache that declares no native prefix watch, so
@@ -131,10 +132,24 @@ impl MemCache {
     /// constructor spawns a background TTL sweeper task).
     #[must_use]
     pub fn linearizable_without_prefix_watch() -> Arc<Self> {
-        Self::spawn(CacheConsistency::Linearizable, false)
+        Self::spawn(CacheConsistency::Linearizable, false, true)
     }
 
-    fn spawn(consistency: CacheConsistency, prefix_watch: bool) -> Arc<Self> {
+    /// A linearizable cache that serves no exact watch, so `features().watch` is
+    /// `false` and both `watch` and `watch_prefix` return
+    /// [`ClusterError::Unsupported`] — for the exact-watch capability gate (a
+    /// backend that cannot watch one key cannot watch a family either). Models a
+    /// real watchless deployment such as redis `watch_mode: disabled`.
+    ///
+    /// # Panics
+    /// Panics if called outside the context of a Tokio runtime (the
+    /// constructor spawns a background TTL sweeper task).
+    #[must_use]
+    pub fn linearizable_without_watch() -> Arc<Self> {
+        Self::spawn(CacheConsistency::Linearizable, false, false)
+    }
+
+    fn spawn(consistency: CacheConsistency, prefix_watch: bool, watch: bool) -> Arc<Self> {
         let cache = Arc::new(Self {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
@@ -143,6 +158,7 @@ impl MemCache {
             }),
             consistency,
             prefix_watch,
+            watch,
         });
         // The sweeper holds only a weak reference, so it self-terminates once
         // the test drops the cache.
@@ -232,7 +248,12 @@ impl ClusterCacheBackend for MemCache {
     }
 
     fn features(&self) -> CacheFeatures {
-        CacheFeatures::new(self.prefix_watch)
+        if self.watch {
+            CacheFeatures::new(self.prefix_watch)
+        } else {
+            // No exact watch implies no prefix watch either.
+            CacheFeatures::without_watch()
+        }
     }
 
     async fn get(&self, key: &str) -> Result<Option<CacheEntry>, ClusterError> {
@@ -410,6 +431,9 @@ impl ClusterCacheBackend for MemCache {
     }
 
     async fn watch(&self, key: &str) -> Result<CacheWatch, ClusterError> {
+        if !self.watch {
+            return Err(ClusterError::Unsupported { feature: "watch" });
+        }
         Ok(self.register_watch(WatchKind::Exact(key.to_owned())))
     }
 

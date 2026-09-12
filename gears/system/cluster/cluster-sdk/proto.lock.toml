@@ -156,6 +156,7 @@ version = 3
 
 [messages.WireCacheFeatures.fields]
 prefix_watch = 1
+watch = 2
 
 [messages.WireCacheWatchEvent.fields]
 dropped = 1

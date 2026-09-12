@@ -12,7 +12,7 @@
 //! - [`warn_weak_consistency`] backs `new_allow_weak_consistency(cache)` — the
 //!   instantiation-time split-brain warning (`inst-cg-weak`/`inst-cg-warn`).
 
-use cluster_sdk::cache::CacheConsistency;
+use cluster_sdk::cache::{CacheConsistency, CacheFeatures};
 use cluster_sdk::error::ClusterError;
 
 /// Rejects an eventually-consistent cache for a consistency-sensitive default
@@ -57,12 +57,32 @@ pub(super) fn warn_weak_consistency(consistency: CacheConsistency, backend: &'st
     );
 }
 
+/// Warns, once at construction, that the bound cache cannot serve exact watches,
+/// so the CAS default named `backend` will reconcile off its renewal/poll timer
+/// alone rather than reactively.
+///
+/// Unlike [`reject_weak_consistency`], this never fails and never has an opt-in
+/// twin: a watchless cache does not threaten the safety guarantee (the timer
+/// path is correct on its own), it only forfeits reactive reconciliation — so
+/// degrading with a warning is strictly better than refusing the config
+/// (plan D3). Silent when the cache supports exact watch.
+pub(super) fn warn_without_watch(features: CacheFeatures, backend: &'static str) {
+    if !features.watch {
+        tracing::warn!(
+            backend,
+            "{backend}: the bound cache declares no exact-watch support \
+             (features().watch == false); reconciling off the timer alone, with no reactive \
+             feed. Elections/locks still work; only reactive reconciliation is lost."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tracing_test::traced_test;
 
-    use super::{reject_weak_consistency, warn_weak_consistency};
-    use cluster_sdk::cache::CacheConsistency;
+    use super::{reject_weak_consistency, warn_weak_consistency, warn_without_watch};
+    use cluster_sdk::cache::{CacheConsistency, CacheFeatures};
     use cluster_sdk::error::ClusterError;
 
     #[test]
@@ -87,5 +107,17 @@ mod tests {
 
         warn_weak_consistency(CacheConsistency::Linearizable, "TestBackend");
         assert!(logs_contain("weak_consistency=false"));
+    }
+
+    #[traced_test]
+    #[test]
+    fn warn_without_watch_warns_only_when_unsupported() {
+        warn_without_watch(CacheFeatures::without_watch(), "WatchlessBackend");
+        assert!(logs_contain("no exact-watch support"));
+        assert!(logs_contain("WatchlessBackend"));
+
+        // A watch-capable cache is silent: the label must not appear.
+        warn_without_watch(CacheFeatures::new(true), "WatchfulBackend");
+        assert!(!logs_contain("WatchfulBackend"));
     }
 }

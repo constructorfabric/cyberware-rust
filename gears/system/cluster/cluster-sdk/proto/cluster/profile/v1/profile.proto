@@ -47,6 +47,7 @@ message ProfileDescriptor {
 
 message WireCacheFeatures {
   bool prefix_watch = 1;
+  optional bool watch = 2;
 }
 
 message WireLeaderElectionFeatures {
