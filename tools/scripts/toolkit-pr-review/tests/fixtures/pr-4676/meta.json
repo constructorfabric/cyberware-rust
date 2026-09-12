@@ -1,0 +1,1 @@
+{"baseRefName":"main","baseRefOid":"53fbda0762dd1309b822f0d0959bf48f359483ed","headRefName":"feature/bound_endpoint","headRefOid":"195f8e73106e8106b2a910a97beb4b5f5cf01c98","isCrossRepository":true,"number":4676,"title":"feat(api-gateway): advertise bound REST endpoint for directory registration"}

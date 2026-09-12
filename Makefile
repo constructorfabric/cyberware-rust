@@ -418,6 +418,21 @@ validate-gear-names: py-env
 	$(call print_target_banner)
 	@$(PYTHON) tools/scripts/validate_gear_names.py
 
+## Check the toolkit-pr-review rule set agrees with the orchestrators, Cargo.toml and the toolchain
+pr-review-lint: py-env
+	$(call print_target_banner)
+	@$(PYTHON) tools/scripts/toolkit-pr-review/lint.py
+
+## Check docs/toolkit-pr-review/agent-rules/ matches the authored rules/
+pr-review-render-check: py-env
+	$(call print_target_banner)
+	@$(PYTHON) tools/scripts/toolkit-pr-review/review.py render-rules --check
+
+## Run the toolkit-pr-review script tests (saved fixtures, no network)
+pr-review-test: py-env
+	$(call print_target_banner)
+	@$(PYTHON) -m unittest discover -s tools/scripts/toolkit-pr-review/tests
+
 ## Validate readme/license-file paths declared by publishable crates exist
 check-packaging-metadata: py-env
 	$(call print_target_banner)

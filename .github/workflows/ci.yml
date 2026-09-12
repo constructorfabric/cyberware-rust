@@ -235,6 +235,15 @@ jobs:
       - name: Validate gear naming conventions
         run: python3 tools/scripts/validate_gear_names.py
 
+      - name: Validate PR-review rule set
+        run: python3 tools/scripts/toolkit-pr-review/lint.py
+
+      - name: PR-review agent rules are up to date
+        run: python3 tools/scripts/toolkit-pr-review/review.py render-rules --check
+
+      - name: PR-review script tests
+        run: python3 -m unittest discover -s tools/scripts/toolkit-pr-review/tests
+
       - name: Validate packaging metadata (readme/license-file paths)
         run: make check-packaging-metadata
 

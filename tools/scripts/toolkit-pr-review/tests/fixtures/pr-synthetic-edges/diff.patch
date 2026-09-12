@@ -1,0 +1,58 @@
+diff --git a/gears/foo/src/gone.rs b/gears/foo/src/gone.rs
+deleted file mode 100644
+index 1111111..0000000
+--- a/gears/foo/src/gone.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+-fn removed_one() {}
+-
+-fn removed_two() {}
+diff --git a/gears/foo/src/added.rs b/gears/foo/src/added.rs
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/gears/foo/src/added.rs
+@@ -0,0 +1,2 @@
++use toolkit_db::Db;
++pub fn hello() {}
+diff --git a/gears/foo/src/old_name.rs b/gears/foo/src/new_name.rs
+similarity index 92%
+rename from gears/foo/src/old_name.rs
+rename to gears/foo/src/new_name.rs
+index 3333333..4444444 100644
+--- a/gears/foo/src/old_name.rs
++++ b/gears/foo/src/new_name.rs
+@@ -1,4 +1,4 @@
+ fn keep_a() {}
+-fn was_here() {}
++fn is_here_now() {}
+ fn keep_b() {}
+ fn keep_c() {}
+diff --git a/assets/logo.png b/assets/logo.png
+index 5555555..6666666 100644
+Binary files a/assets/logo.png and b/assets/logo.png differ
+diff --git a/k8s/values.yaml b/k8s/values.yaml
+index 7777777..8888888 100644
+--- a/k8s/values.yaml
++++ b/k8s/values.yaml
+@@ -1,2 +1,2 @@
+ replicas: 1
+-image: old
++image: new
+diff --git a/Cargo.lock b/Cargo.lock
+index 9999999..aaaaaaa 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10,3 +10,4 @@ name = "foo"
+ version = "0.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ dependencies = []
++checksum = "deadbeef"
+diff --git "a/gears/foo/src/fr\303\274h.rs" "b/gears/foo/src/fr\303\274h.rs"
+index 1111111..2222222 100644
+--- "a/gears/foo/src/fr\303\274h.rs"
++++ "b/gears/foo/src/fr\303\274h.rs"
+@@ -1,2 +1,3 @@
+ fn early() {}
+ 
++fn late() {}

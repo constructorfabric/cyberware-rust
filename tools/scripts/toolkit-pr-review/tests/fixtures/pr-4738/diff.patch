@@ -1,0 +1,3255 @@
+diff --git a/examples/toolkit/api-contracts/api-contracts/tests/resolving_directory.rs b/examples/toolkit/api-contracts/api-contracts/tests/resolving_directory.rs
+index 518f48345b..06d44bfd96 100644
+--- a/examples/toolkit/api-contracts/api-contracts/tests/resolving_directory.rs
++++ b/examples/toolkit/api-contracts/api-contracts/tests/resolving_directory.rs
+@@ -82,7 +82,7 @@ fn register_provider(mgr: &GearManager, addr: SocketAddr) -> Uuid {
+     let id = Uuid::new_v4();
+     let inst = GearInstance::new(PROVIDER_GEAR, id)
+         .with_rest_endpoint(Endpoint::http(&addr.ip().to_string(), addr.port()));
+-    mgr.register_instance(Arc::new(inst));
++    mgr.register_instance(Arc::new(inst)).unwrap();
+     // Promote Registered -> Healthy so round-robin prefers it.
+     mgr.update_heartbeat(PROVIDER_GEAR, id, Instant::now());
+     id
+diff --git a/gears/system/gear-orchestrator/Cargo.toml b/gears/system/gear-orchestrator/Cargo.toml
+index 9f8e2aedb2..aaec9ece08 100644
+--- a/gears/system/gear-orchestrator/Cargo.toml
++++ b/gears/system/gear-orchestrator/Cargo.toml
+@@ -21,6 +21,7 @@ workspace = true
+ cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
+ toolkit = { workspace = true }
+ toolkit-macros = { workspace = true }
++toolkit-security = { workspace = true }
+ tokio = { workspace = true }
+ tonic = { workspace = true, features = ["transport"] }
+ http = { workspace = true }
+@@ -39,6 +40,5 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+ tokio-util = { workspace = true }
+ api_gateway = { path = "../api-gateway", package = "cf-gears-api-gateway" }
+ serde_json = { workspace = true }
+-toolkit-security = { workspace = true }
+ toolkit-transport-grpc = { workspace = true }
+ secrecy = { workspace = true }
+diff --git a/gears/system/gear-orchestrator/README.md b/gears/system/gear-orchestrator/README.md
+index 7906780fee..151f21ec58 100644
+--- a/gears/system/gear-orchestrator/README.md
++++ b/gears/system/gear-orchestrator/README.md
+@@ -12,6 +12,64 @@ It:
+ - Exposes the `DirectoryService` gRPC service (via `grpc-hub`)
+ - Uses the runtime `GearManager` for instance tracking and service resolution
+ 
++## Registration authorization
++
++`RegisterInstance` / `DeregisterInstance` / `Heartbeat` authorize the
++authenticated platform-plane peer against the `gear_name` it claims. Per-gear
++binding applies only to authenticated per-gear identities (SA-per-gear /
++SPIFFE), which may act only on their own gear (or a `trusted_registrars` entry);
++a shared-secret identity (`PlatformIdentity::Shared`) is authorized for any
++gear. See the `DirectoryServiceImpl` docs and `cpt-cf-adr-platform-plane-auth`
++for the mechanism.
++
++A request with no `PlatformSecurityContext` is handled per the listener's auth
++posture, which rides the request itself: the platform-plane enforcement layer
++(`grpc-hub`'s `InternalAuthGrpcLayer`) stamps a `PlatformAuthEnforced` marker on
++every non-exempt request whenever enforcement is active. There is no orchestrator
++knob to keep in sync, and it never reads another gear's config:
++
++- **Marker present** (the hub enforces platform auth and let an anonymous caller
++  through under `Permissive`) — the token-less request is rejected
++  (`unauthenticated`). This prevents a `Permissive` listener from *inverting* the
++  incentive, where an anonymous caller (no token, so no stamped identity) could
++  act on any gear while an honest per-gear token holder is bound to its own.
++- **Marker absent** (Profile 1 / in-process, enforcement disabled) —
++  authorization is skipped (fails open); the process boundary is the trust root.
++
++### `trusted_registrars`
++
++Peers allowed to register on behalf of *other* gears (e.g. a central registrar
++whose `ServiceAccount` name differs from the gears it manages). Empty by
++default — with SA-per-gear / SPIFFE a gear registers under its own name.
++
++### `platform_namespaces` / `trust_domains`
++
++The peer name alone is not sufficient to authorize a per-gear identity: the
++token authenticator has no namespace/trust-domain allowlist, so a `billing`
++`ServiceAccount` in *any* namespace (or a `billing` workload from *any* SPIFFE
++trust domain) would otherwise be authorized for gear `billing`. Configure the
++platform-controlled Kubernetes namespaces (`platform_namespaces`) and/or SPIFFE
++trust domains (`trust_domains`) that per-gear identities must belong to; a peer
++whose qualifier is not in the allowlist is rejected even if its name matches the
++gear. Gears may be spread across several listed namespaces.
++
++Both are empty by default, which **disables** the respective qualifier check and
++silently falls back to unqualified-name authorization. Configure them in any
++deployment where untrusted workloads can mint tokens.
++
++```yaml
++gears:
++  gear-orchestrator:
++    config:
++      trusted_registrars:
++        - flight-control
++      platform_namespaces:
++        - platform-system
++        - platform-gears
++      trust_domains:
++        - platform.example.org
++```
++
+ ## License
+ 
+ Licensed under Apache-2.0.
+diff --git a/gears/system/gear-orchestrator/src/config.rs b/gears/system/gear-orchestrator/src/config.rs
+new file mode 100644
+index 0000000000..e9c017e355
+--- /dev/null
++++ b/gears/system/gear-orchestrator/src/config.rs
+@@ -0,0 +1,37 @@
++//! Operator-facing configuration schema for the gear-orchestrator gear.
++
++use std::collections::HashMap;
++
++/// The gear's config section (`gears.gear-orchestrator.config`).
++///
++/// `deny_unknown_fields` so a misspelled key (e.g. `trusted_registrar`) fails at
++/// startup instead of silently deserializing to an empty set. The
++/// `internal_auth` migration guard in [`GearOrchestrator::init`] runs first, so
++/// it keeps its own targeted error.
++///
++/// [`GearOrchestrator::init`]: crate::gear::GearOrchestrator
++#[derive(Debug, Default, serde::Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct OrchestratorConfig {
++    /// Peer identities permitted to act on any gear's registration (see
++    /// [`crate::server::make_directory_service`]). Empty by default.
++    #[serde(default)]
++    pub trusted_registrars: Vec<String>,
++    /// Platform-controlled Kubernetes namespaces a `ServiceAccount` peer must
++    /// live in to register. Empty disables the namespace check (name-only
++    /// fallback).
++    #[serde(default)]
++    pub platform_namespaces: Vec<String>,
++    /// SPIFFE trust domains a workload peer must belong to. Empty disables the
++    /// trust-domain check.
++    #[serde(default)]
++    pub trust_domains: Vec<String>,
++    /// Authoritative gRPC-service-name -> owning-gear map. Pins which gear may
++    /// advertise a gRPC service name so ownership is decided by this config
++    /// rather than by whichever gear self-registers first (which would let a
++    /// gear squat a name it was never assigned). A listed name may only be
++    /// advertised by the named gear; names absent from the map keep
++    /// first-registration ownership. Empty by default.
++    #[serde(default)]
++    pub grpc_service_owners: HashMap<String, String>,
++}
+diff --git a/gears/system/gear-orchestrator/src/domain/authz.rs b/gears/system/gear-orchestrator/src/domain/authz.rs
+new file mode 100644
+index 0000000000..7d81cadf5b
+--- /dev/null
++++ b/gears/system/gear-orchestrator/src/domain/authz.rs
+@@ -0,0 +1,237 @@
++//! Registration authorization — pure policy for the `DirectoryService`.
++//!
++//! Identity in, allow/deny out: no transport (`tonic`) types. The gRPC adapter
++//! ([`crate::server`]) reads the authenticated peer off the request and calls
++//! [`registration_authorized`] rather than owning the decision itself.
++
++use std::collections::HashSet;
++
++use toolkit_security::PlatformIdentity;
++
++/// Registration-authorization policy for the `DirectoryService`.
++///
++/// All three sets are empty by default. `trusted_registrars` lists peers
++/// allowed to act on *any* gear; `platform_namespaces` / `trust_domains` are the
++/// Kubernetes namespaces / SPIFFE trust domains a per-gear identity must belong
++/// to (empty disables the respective qualifier check — see
++/// [`registration_authorized`]).
++#[derive(Debug, Default, Clone)]
++pub struct RegistrationPolicy {
++    /// Peer names permitted to act on any gear's registration.
++    pub trusted_registrars: HashSet<String>,
++    /// Platform-controlled Kubernetes namespaces a `ServiceAccount` identity
++    /// must live in to register.
++    pub platform_namespaces: HashSet<String>,
++    /// SPIFFE trust domains a workload identity must belong to.
++    pub trust_domains: HashSet<String>,
++}
++
++/// Whether `identity` may register/deregister/heartbeat `gear_name`.
++///
++/// One predicate, correct across every platform-plane provider:
++///
++/// - [`PlatformIdentity::Shared`] (shared secret / bootstrap token): allowed.
++///   A single, deliberately-shared trust boundary — per-gear binding is not
++///   expressible, so this is honest rather than a silent bypass.
++/// - Per-gear identity ([`PlatformIdentity::KubernetesServiceAccount`] with
++///   SA-per-gear, [`PlatformIdentity::Spiffe`]): may act only on its own gear,
++///   or on any gear when listed in `trusted_registrars`. The *unqualified* name
++///   ([`PlatformIdentity::peer_name`]) is not enough on its own: the token
++///   authenticator has no namespace/trust-domain allowlist, so a `billing`
++///   `ServiceAccount` in *any* namespace (or a `billing` workload from *any*
++///   SPIFFE trust domain) would otherwise be authorized for gear `billing`.
++///   The identity's qualifier (K8s `namespace`, SPIFFE `trust_domain`) is
++///   therefore checked against `platform_namespaces` / `trust_domains` first.
++///   When the relevant allowlist is empty the qualifier check is skipped
++///   (backward-compatible fallback), leaving today's name-only behavior.
++/// - [`PlatformIdentity::Unknown`] (a future/unrecognised variant): fails
++///   closed.
++#[must_use]
++pub fn registration_authorized(
++    identity: &PlatformIdentity,
++    gear_name: &str,
++    policy: &RegistrationPolicy,
++) -> bool {
++    // A qualifier (K8s namespace / SPIFFE trust domain) is accepted when its
++    // allowlist is unset (fallback) or explicitly lists it.
++    let qualifier_ok = |allowlist: &HashSet<String>, value: &str| {
++        allowlist.is_empty() || allowlist.contains(value)
++    };
++    // The name component may act on its own gear, or on any gear if a trusted
++    // registrar.
++    let name_ok = |name: &str| name == gear_name || policy.trusted_registrars.contains(name);
++
++    match identity {
++        PlatformIdentity::Shared { .. } => true,
++        PlatformIdentity::KubernetesServiceAccount {
++            namespace,
++            service_account,
++            ..
++        } => qualifier_ok(&policy.platform_namespaces, namespace) && name_ok(service_account),
++        PlatformIdentity::Spiffe {
++            trust_domain, name, ..
++        } => qualifier_ok(&policy.trust_domains, trust_domain) && name_ok(name),
++        // `Unknown` and any future non_exhaustive variant fail closed.
++        _ => false,
++    }
++}
++
++#[cfg(test)]
++#[cfg_attr(coverage_nightly, coverage(off))]
++mod tests {
++    use super::*;
++
++    /// A [`RegistrationPolicy`] from `&str` slices.
++    fn policy(trusted: &[&str], namespaces: &[&str], domains: &[&str]) -> RegistrationPolicy {
++        let set = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect();
++        RegistrationPolicy {
++            trusted_registrars: set(trusted),
++            platform_namespaces: set(namespaces),
++            trust_domains: set(domains),
++        }
++    }
++
++    /// A per-gear (`ServiceAccount`) platform identity named `name`.
++    fn sa_identity(name: &str) -> PlatformIdentity {
++        PlatformIdentity::KubernetesServiceAccount {
++            namespace: "toolkit".to_owned(),
++            service_account: name.to_owned(),
++            pod: None,
++        }
++    }
++
++    fn spiffe_identity(trust_domain: &str, name: &str) -> PlatformIdentity {
++        PlatformIdentity::Spiffe {
++            trust_domain: trust_domain.to_owned(),
++            name: name.to_owned(),
++            version: "1.0.0".to_owned(),
++        }
++    }
++
++    /// The predicate over every platform-plane identity variant, in isolation,
++    /// with no namespace / trust-domain allowlist (the name-only fallback).
++    #[test]
++    fn registration_authorized_covers_every_provider() {
++        let open = policy(&[], &[], &[]);
++        let trusted = policy(&["flight-control"], &[], &[]);
++
++        // Per-gear identity: only its own gear, unless a trusted registrar.
++        assert!(registration_authorized(
++            &sa_identity("billing"),
++            "billing",
++            &open
++        ));
++        assert!(!registration_authorized(
++            &sa_identity("billing"),
++            "catalog",
++            &open
++        ));
++        assert!(registration_authorized(
++            &sa_identity("flight-control"),
++            "billing",
++            &trusted
++        ));
++
++        // SPIFFE workload name is the gear name -> strict with zero config.
++        let spiffe = spiffe_identity("example.org", "billing");
++        assert!(registration_authorized(&spiffe, "billing", &open));
++        assert!(!registration_authorized(&spiffe, "catalog", &open));
++
++        // Shared secret: one deliberately-shared trust boundary -> always allowed.
++        let shared = PlatformIdentity::Shared {
++            name: "toolkit-internal".to_owned(),
++        };
++        assert!(registration_authorized(&shared, "anything", &open));
++
++        // Unknown / future variant fails closed.
++        assert!(!registration_authorized(
++            &PlatformIdentity::Unknown,
++            "billing",
++            &open
++        ));
++    }
++
++    /// With an allowlist configured, the identity's qualifier (K8s namespace /
++    /// SPIFFE trust domain) must match — a same-named `ServiceAccount` in a
++    /// foreign namespace (or workload in a foreign trust domain) is rejected
++    /// even though the name matches the gear.
++    #[test]
++    fn registration_authorized_enforces_qualifier_when_configured() {
++        let ns = policy(&[], &["platform"], &[]);
++        let td = policy(&[], &[], &["platform.example"]);
++
++        let sa = |namespace: &str, gear: &str| PlatformIdentity::KubernetesServiceAccount {
++            namespace: namespace.to_owned(),
++            service_account: gear.to_owned(),
++            pod: None,
++        };
++
++        // Right name in the platform namespace -> allowed; foreign namespace ->
++        // rejected (the vuln this closes).
++        assert!(registration_authorized(
++            &sa("platform", "billing"),
++            "billing",
++            &ns
++        ));
++        assert!(!registration_authorized(
++            &sa("tenant-x", "billing"),
++            "billing",
++            &ns
++        ));
++
++        // SPIFFE: same rule on the trust domain.
++        assert!(registration_authorized(
++            &spiffe_identity("platform.example", "billing"),
++            "billing",
++            &td,
++        ));
++        assert!(!registration_authorized(
++            &spiffe_identity("evil.example", "billing"),
++            "billing",
++            &td,
++        ));
++    }
++
++    /// A trusted registrar is still bound by the qualifier allowlist: the rule
++    /// is `qualifier_ok && name_ok`, so "trusted" grants *cross-gear* authority,
++    /// not a bypass of the namespace / trust-domain check. Guards against a
++    /// regression to "trusted means skip the qualifier", which would let an SA
++    /// named `flight-control` in *any* namespace own every gear.
++    #[test]
++    fn trusted_registrar_is_still_bound_by_the_qualifier_allowlist() {
++        let sa = |namespace: &str, gear: &str| PlatformIdentity::KubernetesServiceAccount {
++            namespace: namespace.to_owned(),
++            service_account: gear.to_owned(),
++            pod: None,
++        };
++
++        // Both sets populated: `flight-control` may act on any gear, but only
++        // from the `platform` namespace / `platform.example` trust domain.
++        let pol = policy(&["flight-control"], &["platform"], &["platform.example"]);
++
++        // Trusted registrar in an allowed qualifier, acting cross-gear -> allowed.
++        assert!(registration_authorized(
++            &sa("platform", "flight-control"),
++            "billing",
++            &pol
++        ));
++        assert!(registration_authorized(
++            &spiffe_identity("platform.example", "flight-control"),
++            "billing",
++            &pol
++        ));
++
++        // Same trusted registrar from a foreign qualifier -> denied. Trusted
++        // does not skip the namespace / trust-domain check.
++        assert!(!registration_authorized(
++            &sa("tenant-x", "flight-control"),
++            "billing",
++            &pol
++        ));
++        assert!(!registration_authorized(
++            &spiffe_identity("evil.example", "flight-control"),
++            "billing",
++            &pol
++        ));
++    }
++}
+diff --git a/gears/system/gear-orchestrator/src/domain/mod.rs b/gears/system/gear-orchestrator/src/domain/mod.rs
+index 908db95411..df5d13f15d 100644
+--- a/gears/system/gear-orchestrator/src/domain/mod.rs
++++ b/gears/system/gear-orchestrator/src/domain/mod.rs
+@@ -1,2 +1,3 @@
++pub mod authz;
+ pub mod model;
+ pub mod service;
+diff --git a/gears/system/gear-orchestrator/src/domain/service.rs b/gears/system/gear-orchestrator/src/domain/service.rs
+index 0484bfc24c..78913b3c91 100644
+--- a/gears/system/gear-orchestrator/src/domain/service.rs
++++ b/gears/system/gear-orchestrator/src/domain/service.rs
+@@ -211,7 +211,7 @@ mod tests {
+                 .with_version("2.0.0")
+                 .with_grpc_service("ext.Service", Endpoint::http("127.0.0.1", 9001)),
+         );
+-        manager.register_instance(instance);
++        manager.register_instance(instance).unwrap();
+ 
+         let svc = GearsService::new(&registry, manager);
+         let gears = svc.list_gears();
+@@ -235,7 +235,7 @@ mod tests {
+ 
+         let instance =
+             Arc::new(GearInstance::new("grpc_hub", Uuid::new_v4()).with_version("0.1.0"));
+-        manager.register_instance(instance);
++        manager.register_instance(instance).unwrap();
+ 
+         let svc = GearsService::new(&registry, manager);
+         let gears = svc.list_gears();
+@@ -253,7 +253,7 @@ mod tests {
+ 
+         let instance = Arc::new(GearInstance::new("svc", Uuid::new_v4()));
+         // Default state is Registered
+-        manager.register_instance(instance);
++        manager.register_instance(instance).unwrap();
+ 
+         let svc = GearsService::new(&registry, manager);
+         let gears = svc.list_gears();
+diff --git a/gears/system/gear-orchestrator/src/gear.rs b/gears/system/gear-orchestrator/src/gear.rs
+index aab9f02933..5d5de71bd6 100644
+--- a/gears/system/gear-orchestrator/src/gear.rs
++++ b/gears/system/gear-orchestrator/src/gear.rs
+@@ -16,6 +16,8 @@ use toolkit::runtime::GearManager;
+ 
+ use cf_system_sdks::directory::DIRECTORY_SERVICE_NAME;
+ 
++use crate::config::OrchestratorConfig;
++use crate::domain::authz::RegistrationPolicy;
+ use crate::domain::service::GearsService;
+ use crate::server;
+ 
+@@ -35,6 +37,7 @@ pub struct GearOrchestrator {
+     directory_api: OnceLock<Arc<dyn DirectoryClient>>,
+     gear_manager: OnceLock<Arc<GearManager>>,
+     gears_service: OnceLock<Arc<GearsService>>,
++    policy: OnceLock<RegistrationPolicy>,
+ }
+ 
+ impl Default for GearOrchestrator {
+@@ -43,6 +46,7 @@ impl Default for GearOrchestrator {
+             directory_api: OnceLock::new(),
+             gear_manager: OnceLock::new(),
+             gears_service: OnceLock::new(),
++            policy: OnceLock::new(),
+         }
+     }
+ }
+@@ -60,27 +64,25 @@ impl SystemCapability for GearOrchestrator {
+ #[async_trait]
+ impl toolkit::Gear for GearOrchestrator {
+     async fn init(&self, ctx: &GearCtx) -> Result<()> {
+-        // Migration guard: platform-plane enforcement lives on `grpc-hub` (a
+-        // transport-level `InternalAuthGrpcLayer` applied to every inbound
+-        // RPC, `cpt-cf-adr-platform-plane-auth`), not here. This gear reads no
+-        // config at all, so a leftover `internal_auth` key would silently do
+-        // nothing — fail loudly instead of booting the `DirectoryService`
+-        // unauthenticated.
+-        if let Some(internal_auth) = ctx
+-            .config_provider()
+-            .get_gear_config(ctx.gear_name())
+-            .and_then(|raw| raw.get("config"))
+-            .and_then(|config| config.get("internal_auth"))
+-        {
+-            let provider = internal_auth.get("provider").and_then(|p| p.as_str());
+-            let detail = provider.map_or_else(String::new, |p| format!(" (provider = {p:?})"));
+-            anyhow::bail!(
+-                "gear-orchestrator config still sets `internal_auth`{detail}, which no longer \
+-                 has any effect: platform-plane enforcement moved to grpc-hub's own \
+-                 `internal_auth` config (cpt-cf-adr-platform-plane-auth). Move this key under \
+-                 `gears.grpc-hub.config` instead."
+-            );
+-        }
++        // Read the (optional) authorization config: which peers may act on any
++        // gear's registration, plus the namespace / trust-domain allowlists.
++        // Absent config yields empty sets, i.e. every gear may act only on its
++        // own name. Whether a *token-less* request is rejected is not configured
++        // here: it is decided per-request from the `PlatformAuthEnforced` marker
++        // the enforcement layer stamps (see `DirectoryServiceImpl`), so it stays
++        // in lockstep with the listener without a drift-prone knob.
++        let cfg: OrchestratorConfig = ctx.config_or_default()?;
++        self.policy
++            .set(RegistrationPolicy {
++                trusted_registrars: cfg.trusted_registrars.into_iter().collect(),
++                platform_namespaces: cfg.platform_namespaces.into_iter().collect(),
++                trust_domains: cfg.trust_domains.into_iter().collect(),
++            })
++            .map_err(|_| anyhow::anyhow!("registration policy already set (init called twice?)"))?;
++
++        // Build the compiled-gear catalog for the gears service.
++        let registry = GearRegistry::discover_and_build()
++            .map_err(|e| anyhow::anyhow!("Failed to build gear registry: {e}"))?;
+ 
+         // Use the injected GearManager to create the DirectoryClient
+         let manager = self
+@@ -89,6 +91,10 @@ impl toolkit::Gear for GearOrchestrator {
+             .cloned()
+             .ok_or_else(|| anyhow::anyhow!("GearManager not wired into GearOrchestrator"))?;
+ 
++        // Pin gRPC-service-name ownership from config so a name can only be
++        // advertised by its configured owner, regardless of registration order.
++        manager.set_grpc_service_owners(cfg.grpc_service_owners);
++
+         let api_impl: Arc<dyn DirectoryClient> =
+             Arc::new(LocalDirectoryClient::new(manager.clone()));
+ 
+@@ -100,9 +106,7 @@ impl toolkit::Gear for GearOrchestrator {
+             .set(api_impl)
+             .map_err(|_| anyhow::anyhow!("DirectoryClient already set (init called twice?)"))?;
+ 
+-        // Build compiled-gear catalog from inventory and create the GearsService
+-        let registry = GearRegistry::discover_and_build()
+-            .map_err(|e| anyhow::anyhow!("Failed to build gear registry: {e}"))?;
++        // Create the GearsService from the catalog built above.
+         let gears_service = Arc::new(GearsService::new(&registry, manager));
+         self.gears_service
+             .set(gears_service)
+@@ -144,7 +148,13 @@ impl GrpcServiceCapability for GearOrchestrator {
+             .cloned()
+             .ok_or_else(|| anyhow::anyhow!("DirectoryClient not initialized"))?;
+ 
+-        let directory_svc = server::make_directory_service(api);
++        let policy = self
++            .policy
++            .get()
++            .cloned()
++            .ok_or_else(|| anyhow::anyhow!("registration policy not initialized"))?;
++
++        let directory_svc = server::make_directory_service(api, policy);
+ 
+         Ok(vec![RegisterGrpcServiceFn {
+             service_name: DIRECTORY_SERVICE_NAME,
+@@ -171,7 +181,9 @@ mod tests {
+         }
+     }
+ 
+-    async fn init_with_config(config: serde_json::Value) -> Result<()> {
++    /// Run `init` against a config section, returning the gear so tests can
++    /// inspect the policy it built.
++    async fn init_with_config(config: serde_json::Value) -> Result<GearOrchestrator> {
+         let mut wrapped = serde_json::Map::new();
+         wrapped.insert("config".to_owned(), config);
+         let ctx = GearCtx::new(
+@@ -186,39 +198,107 @@ mod tests {
+         gear.gear_manager
+             .set(gear_manager)
+             .map_err(|_| anyhow::anyhow!("gear_manager already set"))?;
+-        toolkit::Gear::init(&gear, &ctx).await
++        toolkit::Gear::init(&gear, &ctx).await?;
++        Ok(gear)
++    }
++
++    fn string_set(values: &[&str]) -> std::collections::HashSet<String> {
++        values.iter().map(|s| (*s).to_owned()).collect()
+     }
+ 
+     #[tokio::test]
+-    async fn init_rejects_leftover_internal_auth_config() {
+-        let err = init_with_config(serde_json::json!({
+-            "internal_auth": { "provider": "shared_secret", "secret": "top-secret-value" }
++    async fn init_succeeds_with_empty_config() {
++        init_with_config(serde_json::json!({}))
++            .await
++            .expect("init with an empty config section (all defaults) must succeed");
++    }
++
++    #[tokio::test]
++    async fn init_reads_trusted_registrars_config() {
++        let gear = init_with_config(serde_json::json!({
++            "trusted_registrars": ["flight-control", "platform-host"]
+         }))
+         .await
+-        .unwrap_err();
+-        let msg = err.to_string();
+-        assert!(
+-            msg.contains("internal_auth"),
+-            "expected a migration error mentioning internal_auth, got {err}"
+-        );
+-        assert!(
+-            msg.contains("grpc-hub"),
+-            "expected the error to point at grpc-hub's config, got {err}"
++        .expect("init with a trusted_registrars config section must succeed");
++
++        let policy = gear.policy.get().expect("init must build the policy");
++        assert_eq!(
++            policy.trusted_registrars,
++            string_set(&["flight-control", "platform-host"]),
++            "both configured registrars must reach the policy"
+         );
+-        assert!(
+-            msg.contains("shared_secret"),
+-            "expected the non-sensitive provider tag to be named, got {err}"
++    }
++
++    #[tokio::test]
++    async fn init_reads_namespace_and_trust_domain_config() {
++        let gear = init_with_config(serde_json::json!({
++            "platform_namespaces": ["toolkit", "platform"],
++            "trust_domains": ["example.org"]
++        }))
++        .await
++        .expect("init with platform_namespaces / trust_domains config must succeed");
++
++        let policy = gear.policy.get().expect("init must build the policy");
++        assert_eq!(
++            policy.platform_namespaces,
++            string_set(&["toolkit", "platform"]),
++            "both configured namespaces must reach the policy"
+         );
+-        assert!(
+-            !msg.contains("top-secret-value"),
+-            "the error must never leak the secret value, got {err}"
++        assert_eq!(
++            policy.trust_domains,
++            string_set(&["example.org"]),
++            "the configured trust domain must reach the policy"
+         );
+     }
+ 
+     #[tokio::test]
+-    async fn init_succeeds_without_internal_auth_config() {
+-        init_with_config(serde_json::json!({}))
+-            .await
+-            .expect("init without a leftover internal_auth key must succeed");
++    async fn init_installs_configured_grpc_service_owners() {
++        use toolkit::runtime::{Endpoint, GearInstance};
++
++        let service = "cf.authz.v1.AuthzService";
++        let gear = init_with_config(serde_json::json!({
++            "grpc_service_owners": { service: "authz" }
++        }))
++        .await
++        .expect("init with a grpc_service_owners config section must succeed");
++
++        let manager = gear
++            .gear_manager
++            .get()
++            .expect("init must wire the GearManager");
++
++        // A squatter registering first is rejected in favor of the configured
++        // owner; the configured owner is admitted.
++        let conflict = manager
++            .register_instance(Arc::new(
++                GearInstance::new("evil", Uuid::new_v4())
++                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
++            ))
++            .expect_err("a non-owner must not claim a configured service name");
++        assert_eq!(conflict.owner, "authz");
++        assert!(manager.instances_of("evil").is_empty());
++
++        manager
++            .register_instance(Arc::new(
++                GearInstance::new("authz", Uuid::new_v4())
++                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
++            ))
++            .expect("the configured owner must be admitted");
++    }
++
++    #[tokio::test]
++    async fn init_rejects_unknown_config_key() {
++        // A misspelled key must fail loudly at startup rather than silently
++        // deserialize to an empty set and deny the intended registrar at runtime.
++        let err = init_with_config(serde_json::json!({
++            "trusted_registrar": ["flight-control"]
++        }))
++        .await
++        .map(|_| ())
++        .unwrap_err();
++        assert!(
++            err.to_string().contains("trusted_registrar"),
++            "expected the error to name the offending key, got {err}"
++        );
+     }
+ }
+diff --git a/gears/system/gear-orchestrator/src/lib.rs b/gears/system/gear-orchestrator/src/lib.rs
+index f200b99ece..83f2180f9f 100644
+--- a/gears/system/gear-orchestrator/src/lib.rs
++++ b/gears/system/gear-orchestrator/src/lib.rs
+@@ -10,6 +10,7 @@ pub use gear::GearOrchestrator;
+ 
+ // === INTERNAL MODULES (pub for integration tests) ===
+ pub mod api;
++mod config;
+ pub mod domain;
+ mod server;
+ 
+diff --git a/gears/system/gear-orchestrator/src/server.rs b/gears/system/gear-orchestrator/src/server.rs
+index a3ab1e0e47..260bc2e215 100644
+--- a/gears/system/gear-orchestrator/src/server.rs
++++ b/gears/system/gear-orchestrator/src/server.rs
+@@ -4,19 +4,22 @@
+ 
+ use std::sync::Arc;
+ 
+-use tonic::{Request, Response, Status};
++use tonic::{Extensions, Request, Response, Status};
+ 
+ use cf_system_sdks::directory::labels::is_valid_label_segment;
+ use cf_system_sdks::directory::{
+     DeregisterInstanceRequest, DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound,
+-    DirectoryService, DirectoryServiceServer, GetOpenApiSpecRequest, GetOpenApiSpecResponse,
+-    HeartbeatRequest, InstanceInfo, InstanceState, LabelSelector, ListAllInstancesRequest,
+-    ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse, ProtoInstanceState,
+-    RegisterInstanceInfo, RegisterInstanceRequest, ResolveGrpcServiceRequest,
++    DirectoryService, DirectoryServiceNameConflict, DirectoryServiceServer, GetOpenApiSpecRequest,
++    GetOpenApiSpecResponse, HeartbeatRequest, InstanceInfo, InstanceState, LabelSelector,
++    ListAllInstancesRequest, ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse,
++    ProtoInstanceState, RegisterInstanceInfo, RegisterInstanceRequest, ResolveGrpcServiceRequest,
+     ResolveGrpcServiceResponse, ResolveRestServiceRequest, ResolveRestServiceResponse,
+     ServiceEndpoint, ServiceInstanceInfo,
+ };
+ use std::collections::BTreeMap;
++use toolkit_security::{PlatformAuthEnforced, PlatformSecurityContext};
++
++use crate::domain::authz::{RegistrationPolicy, registration_authorized};
+ 
+ /// Map a lookup failure onto a gRPC status, keeping "not registered" distinct
+ /// from "the lookup itself failed".
+@@ -38,23 +41,129 @@ fn lookup_status(err: &anyhow::Error) -> Status {
+ 
+ /// gRPC service implementation of Directory Service.
+ ///
+-/// Platform-plane (`x-toolkit-internal-token`) enforcement is applied at the
+-/// gRPC server boundary by `grpc-hub`'s `InternalAuthGrpcLayer`
++/// Platform-plane (`x-toolkit-internal-token`) *authentication* is applied at
++/// the gRPC server boundary by `grpc-hub`'s `InternalAuthGrpcLayer`
+ /// (`cpt-cf-adr-platform-plane-auth`): the token is validated and, on success, a
+ /// `PlatformSecurityContext` / `PeerAuthenticated` is placed in the request
+ /// extensions before the handler runs.
+ ///
+-/// This is the authentication half only. Authorizing a peer against the gear
+-/// name it claims when registering, deregistering, or heartbeating is deferred.
++/// This type adds the *authorization* half for the registration-mutating RPCs
++/// (`register_instance` / `deregister_instance` / `heartbeat`): each reads the
++/// authenticated peer identity and rejects a caller that has no authority over
++/// the `gear_name` it claims (see [`registration_authorized`]). Without this a
++/// peer holding any valid internal token could tamper with another gear's
++/// registration or inject a rogue instance under its name. A request with no
++/// identity is rejected on an enforcing listener and allowed on a disabled one
++/// (see [`Self::authorize_registration`]).
+ #[derive(Clone)]
+ pub struct DirectoryServiceImpl {
+     api: Arc<dyn DirectoryClient>,
++    policy: Arc<RegistrationPolicy>,
+ }
+ 
+ impl DirectoryServiceImpl {
+-    /// Create a `DirectoryService` backed by `api`.
++    /// Create a `DirectoryService` backed by `api` with the default (empty)
++    /// authorization policy.
++    ///
++    /// Every authenticated peer may then act only on its own gear; how a
++    /// request with no identity is handled depends on the listener's posture
++    /// (see [`Self::authorize_registration`]).
+     pub fn new(api: Arc<dyn DirectoryClient>) -> Self {
+-        Self { api }
++        Self {
++            api,
++            policy: Arc::new(RegistrationPolicy::default()),
++        }
++    }
++
++    /// Set the registration-authorization policy.
++    #[must_use]
++    pub fn with_policy(mut self, policy: RegistrationPolicy) -> Self {
++        self.policy = Arc::new(policy);
++        self
++    }
++
++    /// Authorize a registration-mutating RPC against the authenticated peer.
++    ///
++    /// `op` names the attempted operation (`"register"` / `"deregister"` /
++    /// `"heartbeat"`), used in the denial `Status` and log so both reflect what
++    /// was attempted.
++    ///
++    /// Reads the [`PlatformSecurityContext`] the platform-plane layer stamped
++    /// into the request extensions and applies [`registration_authorized`].
++    ///
++    /// When no context was stamped, the [`PlatformAuthEnforced`] marker decides
++    /// (see that type for what present/absent mean):
++    ///
++    /// - **absent** (enforcement disabled, Profile 1 / in-process): authorization
++    ///   is skipped — failing open matches the transport's disabled posture.
++    /// - **present** (an enforcing listener let a context-less caller through — a
++    ///   `Permissive` anonymous caller, or a method exempt from authentication):
++    ///   rejected `unauthenticated`. Otherwise dropping the token or hitting an
++    ///   exempt path would let a caller with no identity act on any gear while an
++    ///   honest per-gear token holder is bound to its own.
++    fn authorize_registration(
++        &self,
++        extensions: &Extensions,
++        gear_name: &str,
++        op: &str,
++    ) -> Result<(), Status> {
++        let Some(ctx) = extensions.get::<PlatformSecurityContext>() else {
++            if extensions.get::<PlatformAuthEnforced>().is_some() {
++                tracing::warn!(
++                    gear_name,
++                    op,
++                    reason = "unauthenticated",
++                    "directory mutation denied: no authenticated platform peer on an enforcing listener"
++                );
++                return Err(Status::unauthenticated(format!(
++                    "{op} requires an authenticated platform peer"
++                )));
++            }
++            return Ok(());
++        };
++        if registration_authorized(ctx.identity(), gear_name, &self.policy) {
++            Ok(())
++        } else {
++            tracing::warn!(
++                peer = ctx.identity().peer_name(),
++                gear_name,
++                op,
++                reason = "unauthorized",
++                "directory mutation denied: peer is not authorized for this gear"
++            );
++            Err(Status::permission_denied(format!(
++                "peer is not authorized to {op} this gear"
++            )))
++        }
++    }
++
++    /// Map a `register_instance` store error onto a gRPC status.
++    ///
++    /// A gRPC-service-name ownership conflict is enforced atomically at the
++    /// store (`GearManager::register_instance`), which resolves the
++    /// check-then-write race the per-entry `DashMap` locks leave open — a name
++    /// resolved across *every* gear (`resolve_grpc_service` /
++    /// `GearManager::pick_service_round_robin` scan all instances) must have a
++    /// single owner or part of its traffic could be routed to the wrong gear.
++    /// The conflict surfaces as the typed [`DirectoryServiceNameConflict`],
++    /// which is mapped to a *static* `permission_denied` (the caller-controlled
++    /// service name and the owning gear are recorded in a server-side
++    /// `tracing::warn!`, never reflected back). Every other store error falls
++    /// through to [`lookup_status`].
++    fn register_status(gear_name: &str, err: &anyhow::Error) -> Status {
++        if let Some(conflict) = err.downcast_ref::<DirectoryServiceNameConflict>() {
++            tracing::warn!(
++                gear_name,
++                service_name = %conflict.service_name,
++                owner = %conflict.owner,
++                reason = "grpc_service_name_conflict",
++                "registration denied: gRPC service name already owned by another gear"
++            );
++            return Status::permission_denied(
++                "a gRPC service name in this registration is already owned by another gear",
++            );
++        }
++        lookup_status(err)
+     }
+ }
+ 
+@@ -181,9 +290,13 @@ impl DirectoryService for DirectoryServiceImpl {
+         &self,
+         request: Request<RegisterInstanceRequest>,
+     ) -> Result<Response<()>, Status> {
+-        let req = request.into_inner();
++        let (_metadata, extensions, req) = request.into_parts();
+ 
+         validate_identity(&req.gear_name, &req.instance_id)?;
++        // Authorize the peer over the gear it claims *after* the name is screened
++        // (so the comparison is against a well-formed name) but *before* any
++        // state is written.
++        self.authorize_registration(&extensions, &req.gear_name, "register")?;
+         validate_labels(&req.labels)?;
+         for (idx, svc) in req.grpc_services.iter().enumerate() {
+             // Identify the service by index, never by interpolating the
+@@ -211,6 +324,9 @@ impl DirectoryService for DirectoryServiceImpl {
+             .map(|svc| (svc.service_name, ServiceEndpoint::new(svc.endpoint_uri)))
+             .collect();
+ 
++        // Retained for the conflict log below, since `gear_name` is moved into
++        // `info`.
++        let gear_name = req.gear_name.clone();
+         let mut info = RegisterInstanceInfo::new(req.gear_name, req.instance_id)
+             .with_grpc_services(grpc_services)
+             .with_labels(req.labels.into_iter().collect());
+@@ -224,10 +340,12 @@ impl DirectoryService for DirectoryServiceImpl {
+             info = info.with_openapi_spec(spec);
+         }
+ 
++        // The store enforces single-gear gRPC service-name ownership atomically;
++        // a conflict maps to a static `permission_denied` (see `register_status`).
+         self.api
+             .register_instance(info)
+             .await
+-            .map_err(|e| lookup_status(&e))?;
++            .map_err(|e| Self::register_status(&gear_name, &e))?;
+ 
+         Ok(Response::new(()))
+     }
+@@ -236,9 +354,10 @@ impl DirectoryService for DirectoryServiceImpl {
+         &self,
+         request: Request<DeregisterInstanceRequest>,
+     ) -> Result<Response<()>, Status> {
+-        let req = request.into_inner();
++        let (_metadata, extensions, req) = request.into_parts();
+ 
+         validate_identity(&req.gear_name, &req.instance_id)?;
++        self.authorize_registration(&extensions, &req.gear_name, "deregister")?;
+         self.api
+             .deregister_instance(&req.gear_name, &req.instance_id)
+             .await
+@@ -248,9 +367,10 @@ impl DirectoryService for DirectoryServiceImpl {
+     }
+ 
+     async fn heartbeat(&self, request: Request<HeartbeatRequest>) -> Result<Response<()>, Status> {
+-        let req = request.into_inner();
++        let (_metadata, extensions, req) = request.into_parts();
+ 
+         validate_identity(&req.gear_name, &req.instance_id)?;
++        self.authorize_registration(&extensions, &req.gear_name, "heartbeat")?;
+         self.api
+             .send_heartbeat(&req.gear_name, &req.instance_id)
+             .await
+@@ -451,12 +571,15 @@ fn validate_identity(gear_name: &str, instance_id: &str) -> Result<(), Status> {
+ 
+ /// Create a `DirectoryService` server backed by `api`.
+ ///
+-/// Platform-plane enforcement is applied at the gRPC server boundary by
+-/// `grpc-hub`'s `InternalAuthGrpcLayer`.
++/// Platform-plane *authentication* is applied at the gRPC server boundary by
++/// `grpc-hub`'s `InternalAuthGrpcLayer`; the registration RPCs additionally
++/// *authorize* the authenticated peer against the gear it claims (see
++/// [`RegistrationPolicy`] / [`registration_authorized`]).
+ pub fn make_directory_service(
+     api: Arc<dyn DirectoryClient>,
++    policy: RegistrationPolicy,
+ ) -> DirectoryServiceServer<DirectoryServiceImpl> {
+-    DirectoryServiceServer::new(DirectoryServiceImpl::new(api))
++    DirectoryServiceServer::new(DirectoryServiceImpl::new(api).with_policy(policy))
+ }
+ 
+ #[cfg(test)]
+@@ -470,6 +593,7 @@ mod tests {
+     };
+     use toolkit::directory::LocalDirectoryClient;
+     use toolkit::runtime::GearManager;
++    use toolkit_security::PlatformIdentity;
+     use uuid::Uuid;
+ 
+     fn service() -> DirectoryServiceImpl {
+@@ -478,6 +602,69 @@ mod tests {
+         DirectoryServiceImpl::new(api)
+     }
+ 
++    /// A [`RegistrationPolicy`] from `&str` slices.
++    fn policy(trusted: &[&str], namespaces: &[&str], domains: &[&str]) -> RegistrationPolicy {
++        let set = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect();
++        RegistrationPolicy {
++            trusted_registrars: set(trusted),
++            platform_namespaces: set(namespaces),
++            trust_domains: set(domains),
++        }
++    }
++
++    /// A `DirectoryService` with the given authorization policy.
++    fn service_with_policy(policy: RegistrationPolicy) -> DirectoryServiceImpl {
++        let manager = Arc::new(GearManager::new());
++        let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
++        DirectoryServiceImpl::new(api).with_policy(policy)
++    }
++
++    /// A `DirectoryService` whose `trusted_registrars` are `registrars`.
++    fn service_with_registrars(registrars: &[&str]) -> DirectoryServiceImpl {
++        service_with_policy(policy(registrars, &[], &[]))
++    }
++
++    /// A `DirectoryService` that only accepts `ServiceAccount` peers from
++    /// `namespaces`.
++    fn service_with_namespaces(namespaces: &[&str]) -> DirectoryServiceImpl {
++        service_with_policy(policy(&[], namespaces, &[]))
++    }
++
++    /// A per-gear (`ServiceAccount`) platform identity named `name`.
++    fn sa_identity(name: &str) -> PlatformIdentity {
++        PlatformIdentity::KubernetesServiceAccount {
++            namespace: "toolkit".to_owned(),
++            service_account: name.to_owned(),
++            pod: None,
++        }
++    }
++
++    /// Attach a validated [`PlatformSecurityContext`] to a request, as
++    /// `grpc-hub`'s platform-plane layer does on a real inbound call.
++    fn with_identity<T>(mut request: Request<T>, identity: PlatformIdentity) -> Request<T> {
++        request
++            .extensions_mut()
++            .insert(PlatformSecurityContext::new(identity));
++        request
++    }
++
++    /// Stamp only the [`PlatformAuthEnforced`] marker — no identity — as the
++    /// platform-plane layer does for an anonymous caller on an enforcing
++    /// (`Permissive`) listener.
++    fn with_auth_enforced<T>(mut request: Request<T>) -> Request<T> {
++        request.extensions_mut().insert(PlatformAuthEnforced);
++        request
++    }
++
++    fn register_req(gear: &str) -> RegisterInstanceRequest {
++        RegisterInstanceRequest {
++            gear_name: gear.to_owned(),
++            instance_id: Uuid::new_v4().to_string(),
++            rest_endpoint_uri: Some(format!("http://{gear}:8080")),
++            ..Default::default()
++        }
++    }
++
+     #[tokio::test]
+     async fn register_rejects_oversized_labels() {
+         let svc = service();
+@@ -792,7 +979,7 @@ mod tests {
+         // Directory service backed by an in-memory GearManager.
+         let manager = Arc::new(GearManager::new());
+         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
+-        let grpc_service = make_directory_service(api);
++        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
+ 
+         // Reserve a free port, then let the tonic server bind it.
+         let addr = std::net::TcpListener::bind("127.0.0.1:0")
+@@ -896,7 +1083,7 @@ mod tests {
+ 
+         let manager = Arc::new(GearManager::new());
+         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
+-        let grpc_service = make_directory_service(api);
++        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
+ 
+         // Required mode: an absent token is rejected.
+         let authenticator = DynInternalAuthenticator::new(SharedSecretInternalAuthenticator::new(
+@@ -987,6 +1174,61 @@ mod tests {
+         server.abort();
+     }
+ 
++    /// Exempting a method skips *authentication*; it must not grant authority
++    /// over any gear's registration. With the whole `DirectoryService` on the
++    /// exempt allowlist of an enforcing listener, an anonymous (token-less)
++    /// `RegisterInstance` still reaches the handler carrying the
++    /// `PlatformAuthEnforced` posture marker (stamped before the exempt check),
++    /// so `authorize_registration` fails closed with `unauthenticated` rather
++    /// than failing open. Exercises the layer + handler together.
++    #[tokio::test]
++    async fn exempt_registration_fails_closed_end_to_end() {
++        use cf_system_sdks::directory::{DIRECTORY_SERVICE_NAME, DirectoryGrpcClient};
++        use secrecy::SecretString;
++        use tonic::transport::Server;
++        use toolkit_security::{DynInternalAuthenticator, SharedSecretInternalAuthenticator};
++        use toolkit_transport_grpc::InternalAuthGrpcLayer;
++
++        let manager = Arc::new(GearManager::new());
++        let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
++        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
++
++        // Enforcing listener, but the entire DirectoryService is exempted — a
++        // misconfiguration that must not become an "act on any gear" backdoor.
++        let authenticator = DynInternalAuthenticator::new(SharedSecretInternalAuthenticator::new(
++            SecretString::from("dev-internal-token"),
++            "peer".to_owned(),
++        ));
++        let auth_layer = InternalAuthGrpcLayer::new(authenticator)
++            .with_exempt_prefixes(vec![format!("/{DIRECTORY_SERVICE_NAME}/")]);
++
++        let addr = std::net::TcpListener::bind("127.0.0.1:0")
++            .unwrap()
++            .local_addr()
++            .unwrap();
++        let server = tokio::spawn(async move {
++            Server::builder()
++                .layer(auth_layer)
++                .add_service(grpc_service)
++                .serve(addr)
++                .await
++                .unwrap();
++        });
++        let uri = format!("http://{addr}");
++
++        // No token on an exempted method: authentication is skipped, but the
++        // registration must still be denied — never silently accepted.
++        let anon = DirectoryGrpcClient::connect(uri).await.unwrap();
++        anon.register_instance(RegisterInstanceInfo::new(
++            "billing",
++            Uuid::new_v4().to_string(),
++        ))
++        .await
++        .expect_err("an exempted, unauthenticated registration must be denied, not fail open");
++
++        server.abort();
++    }
++
+     #[test]
+     fn domain_state_maps_to_proto_over_all_variants() {
+         // Each domain state maps to its proto counterpart; Unknown collapses to
+@@ -1311,7 +1553,7 @@ mod tests {
+ 
+         let manager = Arc::new(GearManager::new());
+         let api: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(manager));
+-        let grpc_service = make_directory_service(api);
++        let grpc_service = make_directory_service(api, RegistrationPolicy::default());
+ 
+         let addr = std::net::TcpListener::bind("127.0.0.1:0")
+             .unwrap()
+@@ -1378,4 +1620,436 @@ mod tests {
+ 
+         server.abort();
+     }
++
++    // ---- Registration authorization ----
++    //
++    // The pure allow/deny predicate ([`registration_authorized`]) and
++    // [`RegistrationPolicy`] are unit-tested in `crate::domain::authz`; the
++    // tests here exercise the gRPC adapter (`DirectoryServiceImpl`) that reads
++    // the peer off the request and calls into that policy.
++
++    /// SA identity whose `peer_name` equals the gear it registers -> allowed.
++    #[tokio::test]
++    async fn register_allows_sa_acting_on_its_own_gear() {
++        let svc = service();
++        svc.register_instance(with_identity(
++            Request::new(register_req("billing")),
++            sa_identity("billing"),
++        ))
++        .await
++        .expect("a gear registering under its own name must be allowed");
++    }
++
++    /// End-to-end: with a namespace allowlist configured, an SA with the right
++    /// name but from a namespace outside the allowlist is denied, while the same
++    /// name from an allowed namespace is accepted.
++    #[tokio::test]
++    async fn register_binds_sa_to_platform_namespace() {
++        let svc = service_with_namespaces(&["toolkit"]);
++
++        // `sa_identity` lives in namespace "toolkit" (allowed) -> accepted.
++        svc.register_instance(with_identity(
++            Request::new(register_req("billing")),
++            sa_identity("billing"),
++        ))
++        .await
++        .expect("an SA named after its gear from an allowed namespace must be accepted");
++
++        // Same SA name, foreign namespace -> denied even though the name matches.
++        let err = svc
++            .register_instance(with_identity(
++                Request::new(register_req("billing")),
++                PlatformIdentity::KubernetesServiceAccount {
++                    namespace: "tenant-x".to_owned(),
++                    service_account: "billing".to_owned(),
++                    pod: None,
++                },
++            ))
++            .await
++            .unwrap_err();
++        assert_eq!(err.code(), tonic::Code::PermissionDenied);
++        assert!(
++            !err.message().contains("billing") && !err.message().contains("tenant-x"),
++            "the status must not reflect the gear name or peer namespace"
++        );
++    }
++
++    /// SA identity acting on another gear, not a trusted registrar -> denied
++    /// across all three RPCs, and the owner's existing registration survives
++    /// each attempt unchanged. Covers takeover (overwriting the owner's own
++    /// instance) as well as denied deregister / heartbeat against a live entry.
++    #[tokio::test]
++    async fn register_deregister_heartbeat_deny_cross_gear_sa() {
++        let svc = service();
++        let owner_instance = Uuid::new_v4().to_string();
++        let owner_endpoint = "http://billing:8080";
++
++        // The legitimate owner registers first, so the cross-gear attempts below
++        // run against a live entry rather than an empty directory.
++        svc.register_instance(with_identity(
++            Request::new(RegisterInstanceRequest {
++                gear_name: "billing".to_owned(),
++                instance_id: owner_instance.clone(),
++                rest_endpoint_uri: Some(owner_endpoint.to_owned()),
++                ..Default::default()
++            }),
++            sa_identity("billing"),
++        ))
++        .await
++        .expect("the gear registering under its own name must be allowed");
++
++        // Takeover: `catalog` tries to overwrite billing's own instance.
++        let reg = svc
++            .register_instance(with_identity(
++                Request::new(RegisterInstanceRequest {
++                    gear_name: "billing".to_owned(),
++                    instance_id: owner_instance.clone(),
++                    rest_endpoint_uri: Some("http://attacker:8080".to_owned()),
++                    ..Default::default()
++                }),
++                sa_identity("catalog"),
++            ))
++            .await
++            .unwrap_err();
++        assert_eq!(reg.code(), tonic::Code::PermissionDenied);
++        assert!(
++            !reg.message().contains("billing") && !reg.message().contains("catalog"),
++            "the status must not reflect the gear name or peer identity"
++        );
++
++        let dereg = svc
++            .deregister_instance(with_identity(
++                Request::new(DeregisterInstanceRequest {
++                    gear_name: "billing".to_owned(),
++                    instance_id: owner_instance.clone(),
++                }),
++                sa_identity("catalog"),
++            ))
++            .await
++            .unwrap_err();
++        assert_eq!(dereg.code(), tonic::Code::PermissionDenied);
++
++        let hb = svc
++            .heartbeat(with_identity(
++                Request::new(HeartbeatRequest {
++                    gear_name: "billing".to_owned(),
++                    instance_id: owner_instance.clone(),
++                }),
++                sa_identity("catalog"),
++            ))
++            .await
++            .unwrap_err();
++        assert_eq!(hb.code(), tonic::Code::PermissionDenied);
++
++        // The owner's instance is untouched: still the only one, same endpoint,
++        // and still `Registered` — the denied deregister did not remove it, the
++        // denied takeover did not overwrite its endpoint, and the denied
++        // heartbeat did not promote it to `Healthy`.
++        let listed = svc
++            .list_instances(Request::new(ListInstancesRequest {
++                gear_name: "billing".to_owned(),
++                ..Default::default()
++            }))
++            .await
++            .unwrap()
++            .into_inner()
++            .instances;
++        assert_eq!(
++            listed.len(),
++            1,
++            "the cross-gear attempts must neither add nor remove instances"
++        );
++        assert_eq!(listed[0].instance_id, owner_instance);
++        assert_eq!(
++            listed[0].rest_endpoint_uri.as_deref(),
++            Some(owner_endpoint),
++            "the denied takeover must not overwrite the owner's endpoint"
++        );
++        assert_eq!(
++            listed[0].state,
++            ProtoInstanceState::Registered as i32,
++            "the denied heartbeat must not promote the instance to Healthy"
++        );
++    }
++
++    /// A denied registration must write nothing: authorization runs *before*
++    /// any state mutation, so a rogue-injection attempt leaves the directory
++    /// empty. Inspecting the backing store (not just the status code) is what
++    /// would catch `authorize_registration` being moved after the write.
++    #[tokio::test]
++    async fn denied_register_writes_nothing() {
++        let svc = service();
++
++        let err = svc
++            .register_instance(with_identity(
++                Request::new(RegisterInstanceRequest {
++                    gear_name: "billing".to_owned(),
++                    instance_id: Uuid::new_v4().to_string(),
++                    rest_endpoint_uri: Some("http://attacker:8080".to_owned()),
++                    ..Default::default()
++                }),
++                sa_identity("catalog"),
++            ))
++            .await
++            .unwrap_err();
++        assert_eq!(err.code(), tonic::Code::PermissionDenied);
++
++        // The rogue instance was never stored: billing is unresolvable.
++        let resolved = svc
++            .resolve_rest_service(Request::new(ResolveRestServiceRequest {
++                gear_name: "billing".to_owned(),
++            }))
++            .await
++            .unwrap_err();
++        assert_eq!(
++            resolved.code(),
++            tonic::Code::NotFound,
++            "a denied register must not leave a resolvable instance behind"
++        );
++    }
++
++    /// The *allow* path of `deregister_instance` / `heartbeat` for a gear acting
++    /// on its own name — `register_instance` alone would not catch a wrong
++    /// `gear_name` passed to `authorize_registration` in the other two handlers.
++    #[tokio::test]
++    async fn deregister_and_heartbeat_allow_own_gear() {
++        let svc = service();
++        let instance_id = Uuid::new_v4().to_string();
++
++        svc.register_instance(with_identity(
++            Request::new(RegisterInstanceRequest {
++                gear_name: "billing".to_owned(),
++                instance_id: instance_id.clone(),
++                rest_endpoint_uri: Some("http://billing:8080".to_owned()),
++                ..Default::default()
++            }),
++            sa_identity("billing"),
++        ))
++        .await
++        .expect("own-gear register must be allowed");
++
++        svc.heartbeat(with_identity(
++            Request::new(HeartbeatRequest {
++                gear_name: "billing".to_owned(),
++                instance_id: instance_id.clone(),
++            }),
++            sa_identity("billing"),
++        ))
++        .await
++        .expect("own-gear heartbeat must be allowed");
++
++        svc.deregister_instance(with_identity(
++            Request::new(DeregisterInstanceRequest {
++                gear_name: "billing".to_owned(),
++                instance_id,
++            }),
++            sa_identity("billing"),
++        ))
++        .await
++        .expect("own-gear deregister must be allowed");
++
++        // The allowed deregister actually removed the instance.
++        let resolved = svc
++            .resolve_rest_service(Request::new(ResolveRestServiceRequest {
++                gear_name: "billing".to_owned(),
++            }))
++            .await
++            .unwrap_err();
++        assert_eq!(resolved.code(), tonic::Code::NotFound);
++    }
++
++    /// The *allow* path of `deregister_instance` / `heartbeat` for a trusted
++    /// registrar acting on another gear's behalf.
++    #[tokio::test]
++    async fn deregister_and_heartbeat_allow_trusted_registrar() {
++        let svc = service_with_registrars(&["flight-control"]);
++        let instance_id = Uuid::new_v4().to_string();
++
++        svc.register_instance(with_identity(
++            Request::new(RegisterInstanceRequest {
++                gear_name: "billing".to_owned(),
++                instance_id: instance_id.clone(),
++                rest_endpoint_uri: Some("http://billing:8080".to_owned()),
++                ..Default::default()
++            }),
++            sa_identity("flight-control"),
++        ))
++        .await
++        .expect("a trusted registrar may register any gear");
++
++        svc.heartbeat(with_identity(
++            Request::new(HeartbeatRequest {
++                gear_name: "billing".to_owned(),
++                instance_id: instance_id.clone(),
++            }),
++            sa_identity("flight-control"),
++        ))
++        .await
++        .expect("a trusted registrar may heartbeat any gear");
++
++        svc.deregister_instance(with_identity(
++            Request::new(DeregisterInstanceRequest {
++                gear_name: "billing".to_owned(),
++                instance_id,
++            }),
++            sa_identity("flight-control"),
++        ))
++        .await
++        .expect("a trusted registrar may deregister any gear");
++    }
++
++    /// An unrecognised ([`PlatformIdentity::Unknown`]) identity fails closed at
++    /// the RPC boundary — not just against the private `registration_authorized`
++    /// predicate — and writes nothing. Guards the fail-closed promise in the
++    /// type docs against a future variant slipping through as authorized.
++    #[tokio::test]
++    async fn register_denies_unknown_identity_and_writes_nothing() {
++        let svc = service();
++
++        let err = svc
++            .register_instance(with_identity(
++                Request::new(register_req("billing")),
++                PlatformIdentity::Unknown,
++            ))
++            .await
++            .unwrap_err();
++        assert_eq!(err.code(), tonic::Code::PermissionDenied);
++
++        let resolved = svc
++            .resolve_rest_service(Request::new(ResolveRestServiceRequest {
++                gear_name: "billing".to_owned(),
++            }))
++            .await
++            .unwrap_err();
++        assert_eq!(
++            resolved.code(),
++            tonic::Code::NotFound,
++            "a denied unknown-identity register must not leave a resolvable instance"
++        );
++    }
++
++    /// A peer listed in `trusted_registrars` may act on any gear.
++    #[tokio::test]
++    async fn register_allows_trusted_registrar_for_any_gear() {
++        let svc = service_with_registrars(&["flight-control"]);
++        svc.register_instance(with_identity(
++            Request::new(register_req("billing")),
++            sa_identity("flight-control"),
++        ))
++        .await
++        .expect("a trusted registrar must be allowed to register any gear");
++    }
++
++    /// A shared-secret identity is always allowed (documented single trust
++    /// boundary), even acting on a gear whose name it does not match.
++    #[tokio::test]
++    async fn register_allows_shared_identity() {
++        let svc = service();
++        svc.register_instance(with_identity(
++            Request::new(register_req("billing")),
++            PlatformIdentity::Shared {
++                name: "toolkit-internal".to_owned(),
++            },
++        ))
++        .await
++        .expect("a shared-secret peer must be allowed (documented trust boundary)");
++    }
++
++    /// Profile 1 / in-process (enforcement disabled, so no
++    /// [`PlatformAuthEnforced`] marker): no identity was stamped, authorization
++    /// is skipped, and behavior is unchanged.
++    #[tokio::test]
++    async fn register_allows_when_no_identity_stamped() {
++        let svc = service();
++        svc.register_instance(Request::new(register_req("billing")))
++            .await
++            .expect("with no platform identity stamped, authorization is a no-op");
++    }
++
++    /// On an enforcing listener (the [`PlatformAuthEnforced`] marker is stamped)
++    /// a request with no stamped identity is rejected rather than failing open —
++    /// closing the `Permissive`-listener inversion where a token-less caller
++    /// could otherwise act on any gear. A properly stamped per-gear identity
++    /// still succeeds.
++    #[tokio::test]
++    async fn register_requires_stamped_identity_when_auth_enforced() {
++        let svc = service();
++
++        let err = svc
++            .register_instance(with_auth_enforced(Request::new(register_req("billing"))))
++            .await
++            .unwrap_err();
++        assert_eq!(err.code(), tonic::Code::Unauthenticated);
++
++        svc.register_instance(with_identity(
++            with_auth_enforced(Request::new(register_req("billing"))),
++            sa_identity("billing"),
++        ))
++        .await
++        .expect("a stamped per-gear identity must still be allowed");
++    }
++
++    /// A registration that advertises a gRPC service name is bound: a second
++    /// gear cannot claim a name already owned by a different gear, but the
++    /// owning gear may re-register (or add another instance under) that name.
++    #[tokio::test]
++    async fn register_binds_grpc_service_name_to_owning_gear() {
++        let svc = service();
++
++        let grpc = |name: &str, uri: &str| {
++            vec![GrpcServiceEndpoint {
++                service_name: name.to_owned(),
++                endpoint_uri: uri.to_owned(),
++            }]
++        };
++
++        // authz-resolver claims its service name first (unowned -> allowed).
++        svc.register_instance(with_identity(
++            Request::new(RegisterInstanceRequest {
++                gear_name: "authz-resolver".to_owned(),
++                instance_id: Uuid::new_v4().to_string(),
++                grpc_services: grpc("cf.authz.v1.AuthzService", "http://authz-resolver:9000"),
++                ..Default::default()
++            }),
++            sa_identity("authz-resolver"),
++        ))
++        .await
++        .expect("a gear claiming an unowned service name must be allowed");
++
++        // A different gear (authorized only for itself) advertising that same
++        // service name is rejected -- otherwise resolve_grpc_service could route
++        // authz traffic to it.
++        let err = svc
++            .register_instance(with_identity(
++                Request::new(RegisterInstanceRequest {
++                    gear_name: "evil".to_owned(),
++                    instance_id: Uuid::new_v4().to_string(),
++                    grpc_services: grpc("cf.authz.v1.AuthzService", "http://evil:9000"),
++                    ..Default::default()
++                }),
++                sa_identity("evil"),
++            ))
++            .await
++            .unwrap_err();
++        assert_eq!(err.code(), tonic::Code::PermissionDenied);
++        assert!(
++            !err.message().contains("authz-resolver")
++                && !err.message().contains("evil")
++                && !err.message().contains("cf.authz.v1.AuthzService"),
++            "the status must not reflect the service name or gear identity"
++        );
++
++        // The owning gear may register another instance under the same name.
++        svc.register_instance(with_identity(
++            Request::new(RegisterInstanceRequest {
++                gear_name: "authz-resolver".to_owned(),
++                instance_id: Uuid::new_v4().to_string(),
++                grpc_services: grpc("cf.authz.v1.AuthzService", "http://authz-resolver-2:9000"),
++                ..Default::default()
++            }),
++            sa_identity("authz-resolver"),
++        ))
++        .await
++        .expect("the owning gear must be able to add another instance for its own service");
++    }
+ }
+diff --git a/gears/system/gear-orchestrator/tests/list_gears_e2e.rs b/gears/system/gear-orchestrator/tests/list_gears_e2e.rs
+index 178104fc9c..2e524c5559 100644
+--- a/gears/system/gear-orchestrator/tests/list_gears_e2e.rs
++++ b/gears/system/gear-orchestrator/tests/list_gears_e2e.rs
+@@ -137,7 +137,7 @@ async fn returns_compiled_in_gears_with_capabilities() {
+ async fn dynamic_instances_without_catalog_entry_appear_as_out_of_process() {
+     let manager = Arc::new(GearManager::new());
+     let instance = Arc::new(GearInstance::new("dynamic_svc", Uuid::new_v4()).with_version("0.5.0"));
+-    manager.register_instance(instance);
++    manager.register_instance(instance).unwrap();
+ 
+     let router = build_router_with(&[], manager);
+ 
+@@ -160,7 +160,7 @@ async fn includes_running_instances_with_grpc_services() {
+             .with_version("1.2.3")
+             .with_grpc_service("my.Service", Endpoint::http("127.0.0.1", 9000)),
+     );
+-    manager.register_instance(instance);
++    manager.register_instance(instance).unwrap();
+ 
+     let router = build_router_with(&[("my_gear", &[], false, false)], manager);
+ 
+diff --git a/libs/system-sdks/sdks/directory/src/api.rs b/libs/system-sdks/sdks/directory/src/api.rs
+index e6c0930be3..4be3a1da07 100644
+--- a/libs/system-sdks/sdks/directory/src/api.rs
++++ b/libs/system-sdks/sdks/directory/src/api.rs
+@@ -387,6 +387,82 @@ impl std::fmt::Display for DirectoryInvalidArgument {
+ 
+ impl std::error::Error for DirectoryInvalidArgument {}
+ 
++/// Sentinel error wrapped via `anyhow::Error` to signal "the directory refused
++/// this call on authorization grounds".
++///
++/// It carries the gRPC `PermissionDenied` and `Unauthenticated` codes across the
++/// [`DirectoryClient`] trait boundary (the code is otherwise lost when a
++/// `tonic::Status` is stringified). Like [`DirectoryInvalidArgument`], such a
++/// rejection is **permanent**: retrying the identical request can never turn a
++/// "no" into a "yes". A registrant reaches this because it is not an authorized
++/// peer for the gear it claims, because its `ServiceAccount` namespace / SPIFFE
++/// trust domain is not allowlisted, because an enforcing listener saw no
++/// authenticated peer, or because a gRPC service name in the registration is
++/// already owned by another gear (a server-side
++/// [`DirectoryServiceNameConflict`] mapped to `PermissionDenied`). The presence
++/// loop downcasts to this type to stop retrying and log loudly rather than
++/// spinning at `warn!` forever.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DirectoryPermissionDenied {
++    /// Human-readable description of why the call was refused.
++    pub message: String,
++}
++
++impl DirectoryPermissionDenied {
++    pub fn new(message: impl Into<String>) -> Self {
++        Self {
++            message: message.into(),
++        }
++    }
++}
++
++impl std::fmt::Display for DirectoryPermissionDenied {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(f, "directory: permission denied: {}", self.message)
++    }
++}
++
++impl std::error::Error for DirectoryPermissionDenied {}
++
++/// Sentinel error wrapped via `anyhow::Error` to signal "a gRPC service name in
++/// this registration is already owned by a *different* gear".
++///
++/// Registration enforces single-gear ownership of every advertised gRPC service
++/// name atomically at the store (see `GearManager::register_instance`),
++/// so a name resolved across all gears cannot be split between two owners. The
++/// gRPC server boundary downcasts to this type to return
++/// `Status::permission_denied` (with a static message) and to log the
++/// conflicting `service_name` / `owner` server-side, rather than mislabeling an
++/// ownership conflict as an internal fault.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct DirectoryServiceNameConflict {
++    /// The gRPC service name that is already owned.
++    pub service_name: String,
++    /// The gear that currently owns `service_name`.
++    pub owner: String,
++}
++
++impl DirectoryServiceNameConflict {
++    pub fn new(service_name: impl Into<String>, owner: impl Into<String>) -> Self {
++        Self {
++            service_name: service_name.into(),
++            owner: owner.into(),
++        }
++    }
++}
++
++impl std::fmt::Display for DirectoryServiceNameConflict {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "directory: gRPC service name '{}' already owned by gear '{}'",
++            self.service_name, self.owner
++        )
++    }
++}
++
++impl std::error::Error for DirectoryServiceNameConflict {}
++
+ /// Directory API trait for service discovery and instance management
+ ///
+ /// This trait defines the contract for interacting with the gear directory.
+diff --git a/libs/system-sdks/sdks/directory/src/grpc/client.rs b/libs/system-sdks/sdks/directory/src/grpc/client.rs
+index 72ece02b1f..775c1b6a71 100644
+--- a/libs/system-sdks/sdks/directory/src/grpc/client.rs
++++ b/libs/system-sdks/sdks/directory/src/grpc/client.rs
+@@ -9,8 +9,8 @@ use tonic::transport::Channel;
+ 
+ use crate::ProtoInstanceState;
+ use crate::api::{
+-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, InstanceState, LabelSelector,
+-    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
++    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryPermissionDenied,
++    InstanceState, LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+ };
+ use std::collections::BTreeMap;
+ use toolkit_transport_grpc::InternalAuthInterceptor;
+@@ -52,15 +52,27 @@ fn lookup_error(resource: &str, status: &tonic::Status) -> anyhow::Error {
+ /// Map a mutating RPC's `tonic::Status`, preserving the code in the message.
+ ///
+ /// A bare `"gRPC call failed"` hides whether the directory was unreachable
+-/// (`Unavailable`, transient) or rejected the request (`InvalidArgument`,
+-/// permanent). `InvalidArgument` is typed as [`DirectoryInvalidArgument`] so a
+-/// caller retrying a mutation (e.g. the presence loop) can distinguish a
+-/// permanent rejection — which retrying can never fix — from a transient one.
++/// (transient) or rejected the request permanently. The two permanent classes
++/// are typed so a caller retrying a mutation (e.g. the presence loop) can stop
++/// rather than spin forever:
++/// - `InvalidArgument` → [`DirectoryInvalidArgument`] (malformed request);
++/// - `PermissionDenied` → [`DirectoryPermissionDenied`] (an authorization
++///   decision: peer not authorized, namespace / trust domain not allowlisted,
++///   or a gRPC service name owned by another gear).
++///
++/// Every other code — including `Unauthenticated` — stays an opaque,
++/// transient-by-default error (code kept in the message) and is retried. A
++/// credential failure is not permanent: a stale or rotated token is valid again
++/// on the next attempt, so a retry recovers what the permanent sentinel would
++/// strand.
+ fn call_error(op: &str, status: &tonic::Status) -> anyhow::Error {
+     match status.code() {
+         tonic::Code::InvalidArgument => {
+             DirectoryInvalidArgument::new(status.message().to_owned()).into()
+         }
++        tonic::Code::PermissionDenied => {
++            DirectoryPermissionDenied::new(status.message().to_owned()).into()
++        }
+         code => anyhow::anyhow!("directory {op} failed: gRPC {code:?}: {}", status.message()),
+     }
+ }
+@@ -679,4 +691,51 @@ mod tests {
+             InstanceState::Healthy
+         );
+     }
++
++    #[test]
++    fn call_error_types_invalid_argument_as_permanent() {
++        let err = call_error(
++            "register_instance",
++            &tonic::Status::invalid_argument("bad label"),
++        );
++        assert!(
++            err.downcast_ref::<DirectoryInvalidArgument>().is_some(),
++            "InvalidArgument must map to the typed permanent DirectoryInvalidArgument"
++        );
++    }
++
++    #[test]
++    fn call_error_types_permission_denied_as_permanent() {
++        // A true authorization decision (peer not authorized, namespace not
++        // allowlisted, or a server-side service-name conflict) is permanent, so
++        // the presence loop stops retrying.
++        let err = call_error(
++            "register_instance",
++            &tonic::Status::permission_denied("peer not authorized"),
++        );
++        assert!(
++            err.downcast_ref::<DirectoryPermissionDenied>().is_some(),
++            "PermissionDenied must map to the typed permanent DirectoryPermissionDenied"
++        );
++    }
++
++    #[test]
++    fn call_error_keeps_transient_codes_opaque() {
++        // Transient codes stay untyped (code preserved in the message) so the
++        // presence loop keeps retrying. `Unauthenticated` is among them — a
++        // stale/rotated credential must not collapse to the permanent sentinel.
++        for status in [
++            tonic::Status::unavailable("connection reset"),
++            tonic::Status::unauthenticated("invalid internal token"),
++        ] {
++            let err = call_error("heartbeat", &status);
++            assert!(err.downcast_ref::<DirectoryInvalidArgument>().is_none());
++            assert!(
++                err.downcast_ref::<DirectoryPermissionDenied>().is_none(),
++                "{:?} must stay transient/retryable, not map to DirectoryPermissionDenied",
++                status.code()
++            );
++            assert!(err.to_string().contains(&format!("{:?}", status.code())));
++        }
++    }
+ }
+diff --git a/libs/system-sdks/sdks/directory/src/lib.rs b/libs/system-sdks/sdks/directory/src/lib.rs
+index 53be204a28..07c081f0ea 100644
+--- a/libs/system-sdks/sdks/directory/src/lib.rs
++++ b/libs/system-sdks/sdks/directory/src/lib.rs
+@@ -11,8 +11,9 @@ mod grpc;
+ pub mod labels;
+ 
+ pub use api::{
+-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo, InstanceState,
+-    LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
++    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryPermissionDenied,
++    DirectoryServiceNameConflict, GrpcServiceInfo, InstanceState, LabelSelector,
++    RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+ };
+ #[cfg(feature = "grpc")]
+ pub use grpc::*;
+diff --git a/libs/toolkit-http-middleware/src/auth.rs b/libs/toolkit-http-middleware/src/auth.rs
+index 8ce7d187bd..6cec8aaeaf 100644
+--- a/libs/toolkit-http-middleware/src/auth.rs
++++ b/libs/toolkit-http-middleware/src/auth.rs
+@@ -37,7 +37,7 @@ use axum::{
+ use toolkit_canonical_errors::CanonicalError;
+ use toolkit_security::{
+     AuthNError, BearerAuthenticator, InternalAuthNError, InternalAuthenticator, PeerAuthenticated,
+-    PlatformSecurityContext,
++    PlatformAuthEnforced, PlatformSecurityContext,
+ };
+ 
+ use crate::security::{
+@@ -183,6 +183,11 @@ fn unauthenticated(reason: &str) -> Response {
+ ///   request is **rejected** — so an invalid SA token is turned away before
+ ///   [`security_context_middleware`] (and any handler) runs.
+ ///
++/// Installing the middleware means platform auth is active on the listener, so
++/// it stamps [`PlatformAuthEnforced`] on every request it forwards — the
++/// posture signal a handler uses to fail closed on an anonymous caller (see
++/// that type).
++///
+ /// This sets workload-policy state only; it **never** skips or substitutes for
+ /// tenant-plane JWT validation. Install this layer so it runs **before**
+ /// [`security_context_middleware`] (DESIGN § 3.2).
+@@ -202,6 +207,10 @@ pub async fn internal_auth_middleware<A>(
+ where
+     A: InternalAuthenticator + 'static,
+ {
++    // Stamp the posture marker before token extraction, so it rides every
++    // request this active listener forwards regardless of the token outcome.
++    request.extensions_mut().insert(PlatformAuthEnforced);
++
+     match extract_internal_token_http(request.headers()) {
+         Ok(token) => match authenticator.authenticate(token.expose_secret()).await {
+             Ok(identity) => {
+diff --git a/libs/toolkit-http-middleware/src/auth_tests.rs b/libs/toolkit-http-middleware/src/auth_tests.rs
+index 73219cbb7a..74084e1335 100644
+--- a/libs/toolkit-http-middleware/src/auth_tests.rs
++++ b/libs/toolkit-http-middleware/src/auth_tests.rs
+@@ -118,6 +118,23 @@ fn platform_app() -> Router {
+     Router::new().route("/", get(peer_echo)).route_layer(layer)
+ }
+ 
++/// Handler reporting whether the [`PlatformAuthEnforced`] posture marker is
++/// present (`"1"`) or absent (`"0"`) in the request extensions.
++async fn marker_echo(marker: Option<Extension<PlatformAuthEnforced>>) -> String {
++    if marker.is_some() { "1" } else { "0" }.to_owned()
++}
++
++fn marker_app() -> Router {
++    let authenticator = Arc::new(StubInternalAuthenticator);
++    let layer = axum::middleware::from_fn_with_state(
++        authenticator,
++        internal_auth_middleware::<StubInternalAuthenticator>,
++    );
++    Router::new()
++        .route("/", get(marker_echo))
++        .route_layer(layer)
++}
++
+ /// Stacked app: `internal_auth_middleware` (outermost, runs first) then
+ /// `security_context_middleware`, mirroring the DESIGN § 3.2 middleware order.
+ fn stacked_app() -> Router {
+@@ -241,6 +258,30 @@ async fn internal_no_header_passes_through_permissive() {
+     assert_eq!(body, "none");
+ }
+ 
++#[tokio::test]
++async fn internal_stamps_posture_marker_for_authenticated_request() {
++    let (status, _, body) = send_headers(marker_app(), &[(INTERNAL_HEADER, SA_GOOD)]).await;
++    assert_eq!(status, StatusCode::OK);
++    assert_eq!(
++        body, "1",
++        "an enforcing HTTP listener must stamp the posture marker"
++    );
++}
++
++#[tokio::test]
++async fn internal_stamps_posture_marker_for_anonymous_passthrough() {
++    // The inversion this closes: an anonymous caller on an enforcing HTTP
++    // listener (no token, permissive pass-through) must still carry the marker
++    // so a downstream handler can fail closed rather than treat it as a listener
++    // with no platform plane.
++    let (status, _, body) = send_headers(marker_app(), &[]).await;
++    assert_eq!(status, StatusCode::OK);
++    assert_eq!(
++        body, "1",
++        "anonymous pass-through on an enforcing listener must still carry the marker"
++    );
++}
++
+ #[tokio::test]
+ async fn internal_valid_token_sets_peer_and_platform_context() {
+     let (status, _, body) = send_headers(platform_app(), &[(INTERNAL_HEADER, SA_GOOD)]).await;
+diff --git a/libs/toolkit-security/src/internal_auth.rs b/libs/toolkit-security/src/internal_auth.rs
+index 8e03fa3540..9a77068eef 100644
+--- a/libs/toolkit-security/src/internal_auth.rs
++++ b/libs/toolkit-security/src/internal_auth.rs
+@@ -200,6 +200,27 @@ pub struct PeerAuthenticated {
+     pub name: String,
+ }
+ 
++/// Runtime signal that "this listener enforces platform-plane auth".
++///
++/// Stamped onto every request handled by an active platform-plane enforcement
++/// layer — the gRPC `InternalAuthGrpcLayer` (before its exempt check, so even
++/// exempt methods carry it) and the HTTP `internal_auth_middleware`. It lets a
++/// handler distinguish two token-less cases that both lack a
++/// [`PlatformSecurityContext`]:
++///
++/// - **Marker present, no context** — an enforcing listener let an *anonymous*
++///   caller through (a permissive or exempt path). A handler that authorizes
++///   per-peer must fail closed here: an unauthenticated caller must not be
++///   treated as more privileged than an honest token holder.
++/// - **Marker absent** — no platform-plane enforcement is installed (Profile 1
++///   / in-process); there is no trust boundary to honour, so handlers fail open.
++///
++/// The marker carries no identity and grants nothing on its own; it only
++/// reports the listener's posture, so a handler never has to read another
++/// component's configuration to learn it.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct PlatformAuthEnforced;
++
+ /// Neutral platform-plane authentication error.
+ ///
+ /// Intentionally coarse-grained and transport-agnostic: it never carries the
+diff --git a/libs/toolkit-security/src/lib.rs b/libs/toolkit-security/src/lib.rs
+index b9476160fc..a49a427b87 100644
+--- a/libs/toolkit-security/src/lib.rs
++++ b/libs/toolkit-security/src/lib.rs
+@@ -22,7 +22,7 @@ pub use authenticator::{
+ pub use context::{SecurityContext, SecurityContextBuildError};
+ pub use internal_auth::{
+     InternalAuthNError, InternalAuthenticator, InternalCredential, PeerAuthenticated,
+-    PlatformIdentity, PlatformSecurityContext,
++    PlatformAuthEnforced, PlatformIdentity, PlatformSecurityContext,
+ };
+ #[cfg(feature = "internal-auth-cache")]
+ pub use internal_auth_cache::{
+diff --git a/libs/toolkit-transport-grpc/src/internal_auth_server.rs b/libs/toolkit-transport-grpc/src/internal_auth_server.rs
+index 0ec8c44035..f6d4c25573 100644
+--- a/libs/toolkit-transport-grpc/src/internal_auth_server.rs
++++ b/libs/toolkit-transport-grpc/src/internal_auth_server.rs
+@@ -23,6 +23,12 @@
+ //!   also serve tenant-plane / anonymous RPCs. A **present-but-invalid** token
+ //!   is always rejected regardless of mode.
+ //!
++//! Whenever enforcement is active (either mode), the layer stamps a
++//! [`PlatformAuthEnforced`] marker on every request it handles — before the
++//! exempt check, so exempt methods and `Permissive` anonymous pass-throughs
++//! carry it too. A handler uses it to fail closed on an enforcing listener; see
++//! that type for the full semantics.
++//!
+ //! Disabling enforcement entirely (Profile 1 / in-process: the process
+ //! boundary is the trust root) is a deliberate call —
+ //! [`InternalAuthGrpcLayer::disabled`] — distinct from "no authenticator was
+@@ -36,7 +42,8 @@
+ //! via [`InternalAuthGrpcLayer::with_exempt_prefixes`]. A prefix only matches on
+ //! a method-path segment boundary (see [`prefix_matches_boundary`]) so e.g. the
+ //! reflection prefix cannot be satisfied by an unrelated package that merely
+-//! shares the string prefix.
++//! shares the string prefix. Exemption skips *token validation* only — an
++//! exempt request still carries the posture marker (see Enforcement above).
+ 
+ use std::future::Future;
+ use std::pin::Pin;
+@@ -49,7 +56,7 @@ use tonic::Status;
+ use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
+ use toolkit_security::{
+     DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, PeerAuthenticated,
+-    PlatformSecurityContext,
++    PlatformAuthEnforced, PlatformSecurityContext,
+ };
+ use tower::{Layer, Service};
+ 
+@@ -305,12 +312,19 @@ where
+         let clone = self.inner.clone();
+         let mut inner = std::mem::replace(&mut self.inner, clone);
+ 
+-        // Disabled layer (Profile 1 / in-process): straight pass-through.
++        // Disabled layer (Profile 1 / in-process): straight pass-through with no
++        // posture marker — there is no platform-plane boundary to signal.
+         let AuthMode::Enforced(authenticator) = &self.config.mode else {
+             return Either::Left(inner.call(req));
+         };
+ 
+-        // Infrastructure methods (health, reflection) bypass enforcement.
++        // Enforcement is active. Stamp the posture marker before the exempt
++        // check so exempt methods carry it too and cannot be mistaken for a
++        // disabled listener downstream (see `PlatformAuthEnforced`).
++        req.extensions_mut().insert(PlatformAuthEnforced);
++
++        // Infrastructure methods (health, reflection) bypass token validation;
++        // they still carry the posture marker stamped above.
+         let path = req.uri().path();
+         if self
+             .config
+@@ -397,6 +411,9 @@ mod tests {
+     /// Header reporting whether the inner service still saw the raw internal
+     /// token header (it must not, once the layer has consumed it).
+     const SAW_TOKEN_HEADER: &str = "x-test-saw-token";
++    /// Header reporting whether the request carried the [`PlatformAuthEnforced`]
++    /// posture marker by the time the inner service was called.
++    const MARKER_HEADER: &str = "x-test-marker";
+ 
+     /// Terminal inner service: records what extensions the request carried into
+     /// response headers so tests can assert the middleware populated them.
+@@ -420,6 +437,7 @@ mod tests {
+                 .map(|p| p.name.clone())
+                 .unwrap_or_default();
+             let saw_token = req.headers().get(INTERNAL_TOKEN_HEADER).is_some();
++            let marker = req.extensions().get::<PlatformAuthEnforced>().is_some();
+             let mut resp = http::Response::new(());
+             resp.headers_mut().insert(
+                 HAD_CTX_HEADER,
+@@ -433,6 +451,10 @@ mod tests {
+                 SAW_TOKEN_HEADER,
+                 if saw_token { "1" } else { "0" }.parse().unwrap(),
+             );
++            resp.headers_mut().insert(
++                MARKER_HEADER,
++                if marker { "1" } else { "0" }.parse().unwrap(),
++            );
+             ready(Ok(resp))
+         }
+     }
+@@ -491,6 +513,11 @@ mod tests {
+         let resp = call(&layer, request("/pkg.Svc/Method", None)).await;
+         assert!(grpc_status(&resp).is_none(), "must not reject");
+         assert_eq!(resp.headers().get(HAD_CTX_HEADER).unwrap(), "0");
++        assert_eq!(
++            resp.headers().get(MARKER_HEADER).unwrap(),
++            "0",
++            "a disabled layer enforces nothing, so it must not stamp the posture marker"
++        );
+     }
+ 
+     #[tokio::test]
+@@ -511,6 +538,11 @@ mod tests {
+             "0",
+             "the handler must never see the raw internal token"
+         );
++        assert_eq!(
++            resp.headers().get(MARKER_HEADER).unwrap(),
++            "1",
++            "an enforced request carries the posture marker alongside the identity"
++        );
+     }
+ 
+     #[tokio::test]
+@@ -572,10 +604,16 @@ mod tests {
+             "permissive must allow anonymous"
+         );
+         assert_eq!(resp.headers().get(HAD_CTX_HEADER).unwrap(), "0");
++        assert_eq!(
++            resp.headers().get(MARKER_HEADER).unwrap(),
++            "1",
++            "an enforcing listener stamps the posture marker even for an anonymous \
++             pass-through, so a downstream handler can fail closed on it"
++        );
+     }
+ 
+     #[tokio::test]
+-    async fn exempt_path_bypasses_enforcement() {
++    async fn exempt_path_bypasses_authentication_but_still_marks_posture() {
+         // Health check with no token is allowed even under Required.
+         let resp = call(
+             &authed_layer(),
+@@ -584,9 +622,18 @@ mod tests {
+         .await;
+         assert!(
+             grpc_status(&resp).is_none(),
+-            "exempt method must pass through"
++            "exempt method must pass through without a token"
+         );
+         assert_eq!(resp.headers().get(HAD_CTX_HEADER).unwrap(), "0");
++        // Exemption skips authentication, not enforcement posture: the marker is
++        // still stamped so a handler can't mistake an exempt request on an
++        // enforcing listener for a disabled-listener (fail-open) one and grant
++        // it authority (e.g. over another gear's registration).
++        assert_eq!(
++            resp.headers().get(MARKER_HEADER).unwrap(),
++            "1",
++            "an exempt method on an enforcing listener must still carry the posture marker"
++        );
+     }
+ 
+     #[tokio::test]
+diff --git a/libs/toolkit/Cargo.toml b/libs/toolkit/Cargo.toml
+index 034143f16c..a617e43554 100644
+--- a/libs/toolkit/Cargo.toml
++++ b/libs/toolkit/Cargo.toml
+@@ -205,6 +205,7 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
+ rustls-cng-crypto = { workspace = true, optional = true }
+ 
+ [dev-dependencies]
++tokio = { workspace = true, features = ["test-util"] }
+ trybuild = { workspace = true }
+ tempfile = { workspace = true }
+ temp-env = { workspace = true }
+diff --git a/libs/toolkit/src/directory.rs b/libs/toolkit/src/directory.rs
+index 09bd195e8b..7240d0f7b6 100644
+--- a/libs/toolkit/src/directory.rs
++++ b/libs/toolkit/src/directory.rs
+@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
+ use std::sync::Arc;
+ use uuid::Uuid;
+ 
+-use crate::runtime::{Endpoint, GearInstance, GearManager};
++use crate::runtime::{Endpoint, GearInstance, GearManager, GrpcServiceNameConflict};
+ 
+ /// Compute a content token for an `OpenAPI` document, used to detect changes.
+ ///
+@@ -32,8 +32,9 @@ fn openapi_spec_hash(spec: &str) -> String {
+ 
+ // Re-export all types from contracts - this is the single source of truth
+ pub use cf_system_sdks::directory::{
+-    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, GrpcServiceInfo, InstanceState,
+-    LabelSelector, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
++    DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound, DirectoryServiceNameConflict,
++    GrpcServiceInfo, InstanceState, LabelSelector, RegisterInstanceInfo, ServiceEndpoint,
++    ServiceInstanceInfo,
+ };
+ 
+ /// Project the live runtime [`crate::runtime::InstanceState`] onto the domain
+@@ -233,8 +234,18 @@ impl DirectoryClient for LocalDirectoryClient {
+             instance = instance.with_labels(info.labels);
+         }
+ 
+-        // Register the instance with the manager
+-        self.mgr.register_instance(Arc::new(instance));
++        // Register the instance, enforcing single-gear ownership of every gRPC
++        // service name it advertises atomically (check + insert under one lock)
++        // so two gears cannot race to claim the same name. A conflict is a typed
++        // sentinel the gRPC boundary maps to `permission_denied`.
++        self.mgr.register_instance(Arc::new(instance)).map_err(
++            |GrpcServiceNameConflict {
++                 service_name,
++                 owner,
++             }| {
++                anyhow::Error::from(DirectoryServiceNameConflict::new(service_name, owner))
++            },
++        )?;
+ 
+         Ok(())
+     }
+@@ -378,7 +389,7 @@ mod tests {
+         let instance_id = Uuid::new_v4();
+         // Register an instance first
+         let inst = Arc::new(GearInstance::new("test_gear", instance_id));
+-        dir.register_instance(inst);
++        dir.register_instance(inst).unwrap();
+ 
+         // Verify it exists
+         assert_eq!(dir.instances_of("test_gear").len(), 1);
+@@ -402,7 +413,7 @@ mod tests {
+         let instance_id = Uuid::new_v4();
+         // Register an instance first
+         let inst = Arc::new(GearInstance::new("test_gear", instance_id));
+-        dir.register_instance(inst);
++        dir.register_instance(inst).unwrap();
+ 
+         // Verify initial state is Registered
+         let instances = dir.instances_of("test_gear");
+diff --git a/libs/toolkit/src/runtime/gear_manager.rs b/libs/toolkit/src/runtime/gear_manager.rs
+index a0bbb2708c..5b07990cbc 100644
+--- a/libs/toolkit/src/runtime/gear_manager.rs
++++ b/libs/toolkit/src/runtime/gear_manager.rs
+@@ -207,15 +207,57 @@ impl GearInstance {
+ 
+ /// Central registry that tracks all running gear instances in the system.
+ /// Provides discovery, health tracking, and round-robin load balancing.
+-#[derive(Clone)]
++///
++/// Always shared as an `Arc<GearManager>` and NOT `Clone`: a by-value clone
++/// would deep-copy the `DashMap` directories while sharing the guards, so the
++/// registration lock would no longer serialize the map it guards.
+ #[must_use]
+ pub struct GearManager {
+     inner: DashMap<String, Vec<Arc<GearInstance>>>,
+     rr_counters: DashMap<String, usize>,
+     hb_ttl: Duration,
+     hb_grace: Duration,
++    /// Serializes gRPC-service-name ownership check + insert in
++    /// [`register_instance`](Self::register_instance) so two
++    /// gears cannot both pass an "unowned" check and then both commit the same
++    /// name. `DashMap` locks per entry, giving no boundary across the
++    /// cross-gear ownership scan and the single-entry write; this gate provides
++    /// it.
++    reg_lock: parking_lot::Mutex<()>,
++    /// Authoritative gRPC-service-name -> owning-gear map. When a name appears
++    /// here, ownership is fixed to the named gear: only that gear may advertise
++    /// it and no other gear can ever claim it, regardless of which registered
++    /// first — the stable ownership source the dynamic registration scan is
++    /// not. Populated by the runtime at startup (see
++    /// [`set_grpc_service_owners`](Self::set_grpc_service_owners)); names absent
++    /// from the map fall back to first-registration ownership.
++    service_owners: parking_lot::RwLock<HashMap<String, String>>,
+ }
+ 
++/// Returned by [`GearManager::register_instance`] when an instance
++/// advertises a gRPC service name already owned by a *different* gear. The
++/// store is left unchanged; the caller maps this onto a permission-denied
++/// response (see `DirectoryServiceNameConflict`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct GrpcServiceNameConflict {
++    /// The gRPC service name that is already owned.
++    pub service_name: String,
++    /// The gear that currently owns `service_name`.
++    pub owner: String,
++}
++
++impl std::fmt::Display for GrpcServiceNameConflict {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        write!(
++            f,
++            "gRPC service name '{}' is already owned by gear '{}'",
++            self.service_name, self.owner
++        )
++    }
++}
++
++impl std::error::Error for GrpcServiceNameConflict {}
++
+ impl std::fmt::Debug for GearManager {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         let gears: Vec<String> = self.inner.iter().map(|e| e.key().clone()).collect();
+@@ -235,6 +277,8 @@ impl GearManager {
+             rr_counters: DashMap::new(),
+             hb_ttl: Duration::from_secs(15),
+             hb_grace: Duration::from_secs(30),
++            reg_lock: parking_lot::Mutex::new(()),
++            service_owners: parking_lot::RwLock::new(HashMap::new()),
+         }
+     }
+ 
+@@ -244,7 +288,44 @@ impl GearManager {
+         self
+     }
+ 
+-    /// Register or update a gear instance
++    /// Install the authoritative gRPC-service-name -> owning-gear map.
++    ///
++    /// Ownership of a listed name is decided by this map, not by registration
++    /// order: [`register_instance`](Self::register_instance) rejects any gear
++    /// other than the declared owner and always admits the declared owner. This
++    /// closes the "squatter" hole where a gear authorized only for its own name
++    /// could claim another gear's service simply by registering first. Names
++    /// not present keep first-registration ownership.
++    ///
++    /// The map is sourced from operator config (see the `gear-orchestrator`
++    /// gear, which installs it alongside its registration policy). Intended to
++    /// be called once at startup, before any gear self-registers; a later call
++    /// replaces the map.
++    pub fn set_grpc_service_owners(&self, owners: HashMap<String, String>) {
++        *self.service_owners.write() = owners;
++    }
++
++    /// Register or update a gear instance, enforcing single-gear ownership of
++    /// every gRPC service name it advertises — atomically.
++    ///
++    /// Ownership is resolved in two tiers:
++    ///
++    /// 1. **Declared (authoritative).** If the name appears in the configured
++    ///    ownership map (see
++    ///    [`set_grpc_service_owners`](Self::set_grpc_service_owners)), only the
++    ///    declared owner may advertise it — any other gear is rejected even if
++    ///    it registers first. This stops a gear from squatting a name it was
++    ///    never assigned.
++    /// 2. **First-registration (fallback).** For names absent from that map, the
++    ///    first gear to register the name owns it; a later, *different* gear is
++    ///    rejected.
++    ///
++    /// The ownership scan and the insert run under one registration lock, so two
++    /// gears cannot both pass an "unowned" check and then both commit the same
++    /// name (a check-then-write race the per-entry `DashMap` locks do not
++    /// prevent). A name already owned by the *same* gear is fine (re-register /
++    /// additional instance); only a *different* owner is rejected, and on
++    /// rejection the store is left untouched.
+     ///
+     /// Re-registering an existing `instance_id` is an idempotent endpoint /
+     /// metadata refresh, NOT a liveness reset: the existing runtime state
+@@ -254,7 +335,56 @@ impl GearManager {
+     /// `oop_registration::presence_loop`) would knock a `Healthy` instance back
+     /// to `Registered`, dropping it out of gRPC round-robin until the next
+     /// heartbeat. It would also race with concurrent `update_heartbeat` calls.
+-    pub fn register_instance(&self, instance: Arc<GearInstance>) {
++    ///
++    /// # Errors
++    /// Returns [`GrpcServiceNameConflict`] if an advertised gRPC service name is
++    /// already owned by another gear.
++    pub fn register_instance(
++        &self,
++        instance: Arc<GearInstance>,
++    ) -> Result<(), GrpcServiceNameConflict> {
++        let _gate = self.reg_lock.lock();
++        let declared = self.service_owners.read();
++
++        // Tier 1: names the config map declares are resolved here; collect the
++        // rest for the tier-2 scan below.
++        let mut undeclared: Vec<&str> = Vec::new();
++        for service_name in instance.grpc_services.keys() {
++            match declared.get(service_name) {
++                Some(owner) if *owner != instance.gear => {
++                    return Err(GrpcServiceNameConflict {
++                        service_name: service_name.clone(),
++                        owner: owner.clone(),
++                    });
++                }
++                Some(_) => {} // declared owner matches → authorized
++                None => undeclared.push(service_name),
++            }
++        }
++        drop(declared);
++
++        // Tier 2: one pass over the directory, checking every undeclared name
++        // per instance visited rather than re-scanning once per name. A name
++        // already held by a *different* gear conflicts.
++        if !undeclared.is_empty() {
++            for entry in &self.inner {
++                if entry.key() == &instance.gear {
++                    continue; // same gear: re-register / additional instance is fine
++                }
++                for existing in entry.value() {
++                    if let Some(&name) = undeclared
++                        .iter()
++                        .find(|&&n| existing.grpc_services.contains_key(n))
++                    {
++                        return Err(GrpcServiceNameConflict {
++                            service_name: name.to_owned(),
++                            owner: entry.key().clone(),
++                        });
++                    }
++                }
++            }
++        }
++
+         let gear = instance.gear.clone();
+         let mut vec = self.inner.entry(gear).or_default();
+         // replace by instance_id if it already exists
+@@ -266,6 +396,7 @@ impl GearManager {
+         } else {
+             vec.push(instance);
+         }
++        Ok(())
+     }
+ 
+     /// Mark an instance as ready
+@@ -498,6 +629,28 @@ impl GearManager {
+             .and_then(|inst| inst.rest_endpoint.clone())
+     }
+ 
++    /// Return a gear that currently advertises the gRPC service `service_name`,
++    /// if any (any instance state counts); in the misconfigured multi-owner case
++    /// the first match in iteration order.
++    ///
++    /// Test-only: [`register_instance`](Self::register_instance) enforces single
++    /// ownership with its own inline scan, so this is not part of the public
++    /// surface — it exists purely to let the tests below assert who owns a name.
++    #[cfg(test)]
++    #[must_use]
++    fn grpc_service_owner(&self, service_name: &str) -> Option<String> {
++        for entry in &self.inner {
++            if entry
++                .value()
++                .iter()
++                .any(|inst| inst.grpc_services.contains_key(service_name))
++            {
++                return Some(entry.key().clone());
++            }
++        }
++        None
++    }
++
+     /// Retrieve the `OpenAPI` spec of a gear, taken from the first registered
+     /// instance that published one.
+     #[must_use]
+@@ -533,7 +686,7 @@ mod tests {
+                 .with_version("1.0.0"),
+         );
+ 
+-        dir.register_instance(instance);
++        seed(&dir, instance);
+ 
+         let instances = dir.instances_of("test_gear");
+         assert_eq!(instances.len(), 1);
+@@ -542,6 +695,15 @@ mod tests {
+         assert_eq!(instances[0].version, Some("1.0.0".to_owned()));
+     }
+ 
++    /// Seed the registry in a test. The fixture is assumed to advertise no
++    /// conflicting gRPC service name, so a conflict is a bug in the test, not
++    /// an expected outcome — surface it loudly rather than swallowing it.
++    #[track_caller]
++    fn seed(mgr: &GearManager, instance: Arc<GearInstance>) {
++        mgr.register_instance(instance)
++            .expect("test fixture must not create a gRPC service-name conflict");
++    }
++
+     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+         pairs
+             .iter()
+@@ -555,15 +717,19 @@ mod tests {
+         let instance_id = Uuid::new_v4();
+ 
+         // Initial registration carries a shard label.
+-        dir.register_instance(Arc::new(
+-            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
+-        ));
++        seed(
++            &dir,
++            Arc::new(
++                GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
++            ),
++        );
+ 
+         // A label-less re-registration (e.g. periodic self-heal / REST
+         // augmentation) must NOT wipe the stored labels.
+-        dir.register_instance(Arc::new(
+-            GearInstance::new("shard-gear", instance_id).with_version("2.0.0"),
+-        ));
++        seed(
++            &dir,
++            Arc::new(GearInstance::new("shard-gear", instance_id).with_version("2.0.0")),
++        );
+ 
+         let registered = dir.instances_of("shard-gear");
+         assert_eq!(registered.len(), 1);
+@@ -580,13 +746,19 @@ mod tests {
+         let dir = GearManager::new();
+         let instance_id = Uuid::new_v4();
+ 
+-        dir.register_instance(Arc::new(
+-            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
+-        ));
++        seed(
++            &dir,
++            Arc::new(
++                GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "7")])),
++            ),
++        );
+         // An explicit non-empty set replaces the stored one wholesale.
+-        dir.register_instance(Arc::new(
+-            GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "8")])),
+-        ));
++        seed(
++            &dir,
++            Arc::new(
++                GearInstance::new("shard-gear", instance_id).with_labels(labels(&[("shard", "8")])),
++            ),
++        );
+ 
+         let registered = dir.instances_of("shard-gear");
+         assert_eq!(registered.len(), 1);
+@@ -602,8 +774,8 @@ mod tests {
+         let instance1 = Arc::new(GearInstance::new("test_gear", id1));
+         let instance2 = Arc::new(GearInstance::new("test_gear", id2));
+ 
+-        dir.register_instance(instance1);
+-        dir.register_instance(instance2);
++        seed(&dir, instance1);
++        seed(&dir, instance2);
+ 
+         let registered = dir.instances_of("test_gear");
+         assert_eq!(registered.len(), 2);
+@@ -620,11 +792,11 @@ mod tests {
+ 
+         let initial_instance =
+             Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0"));
+-        dir.register_instance(initial_instance);
++        seed(&dir, initial_instance);
+ 
+         let updated_instance =
+             Arc::new(GearInstance::new("test_gear", instance_id).with_version("2.0.0"));
+-        dir.register_instance(updated_instance);
++        seed(&dir, updated_instance);
+ 
+         let registered = dir.instances_of("test_gear");
+         assert_eq!(registered.len(), 1, "Should not duplicate instance");
+@@ -637,9 +809,10 @@ mod tests {
+         let instance_id = Uuid::new_v4();
+ 
+         // Register, then heartbeat so the instance is Healthy (routable).
+-        dir.register_instance(Arc::new(
+-            GearInstance::new("test_gear", instance_id).with_version("1.0.0"),
+-        ));
++        seed(
++            &dir,
++            Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0")),
++        );
+         dir.update_heartbeat("test_gear", instance_id, Instant::now());
+         assert!(matches!(
+             dir.instances_of("test_gear")[0].state(),
+@@ -649,9 +822,10 @@ mod tests {
+         // A periodic self-heal re-registration must NOT reset liveness back to
+         // Registered — otherwise the instance drops out of gRPC round-robin
+         // until the next heartbeat (the "split-brain" flap).
+-        dir.register_instance(Arc::new(
+-            GearInstance::new("test_gear", instance_id).with_version("2.0.0"),
+-        ));
++        seed(
++            &dir,
++            Arc::new(GearInstance::new("test_gear", instance_id).with_version("2.0.0")),
++        );
+ 
+         let instances = dir.instances_of("test_gear");
+         assert_eq!(instances.len(), 1);
+@@ -672,7 +846,7 @@ mod tests {
+         let instance_id = Uuid::new_v4();
+ 
+         let initial = Arc::new(GearInstance::new("test_gear", instance_id).with_version("1.0.0"));
+-        dir.register_instance(initial);
++        seed(&dir, initial);
+         dir.update_heartbeat("test_gear", instance_id, Instant::now());
+         assert!(matches!(
+             dir.instances_of("test_gear")[0].state(),
+@@ -698,7 +872,7 @@ mod tests {
+                                 8000u16 + u16::try_from(i % 10).expect("i % 10 fits in u16"),
+                             )),
+                     );
+-                    dir.register_instance(reinst);
++                    seed(&dir, reinst);
+                 }
+             });
+         });
+@@ -721,7 +895,7 @@ mod tests {
+         let instance_id = Uuid::new_v4();
+         let instance = Arc::new(GearInstance::new("test_gear", instance_id));
+ 
+-        dir.register_instance(instance);
++        seed(&dir, instance);
+ 
+         dir.mark_ready("test_gear", instance_id);
+ 
+@@ -737,7 +911,7 @@ mod tests {
+         let instance = Arc::new(GearInstance::new("test_gear", instance_id));
+         let initial_heartbeat = instance.last_heartbeat();
+ 
+-        dir.register_instance(instance);
++        seed(&dir, instance);
+ 
+         // Sleep to ensure time difference
+         sleep(Duration::from_millis(10));
+@@ -758,9 +932,9 @@ mod tests {
+         let instance2 = Arc::new(GearInstance::new("gear_b", Uuid::new_v4()));
+         let instance3 = Arc::new(GearInstance::new("gear_a", Uuid::new_v4()));
+ 
+-        dir.register_instance(instance1);
+-        dir.register_instance(instance2);
+-        dir.register_instance(instance3);
++        seed(&dir, instance1);
++        seed(&dir, instance2);
++        seed(&dir, instance3);
+ 
+         let all = dir.all_instances();
+         assert_eq!(all.len(), 3);
+@@ -779,8 +953,8 @@ mod tests {
+         let instance1 = Arc::new(GearInstance::new("test_gear", id1));
+         let instance2 = Arc::new(GearInstance::new("test_gear", id2));
+ 
+-        dir.register_instance(instance1);
+-        dir.register_instance(instance2);
++        seed(&dir, instance1);
++        seed(&dir, instance2);
+ 
+         // Pick three times to verify round-robin behavior
+         let picked1 = dir.pick_instance_round_robin("test_gear").unwrap();
+@@ -896,7 +1070,7 @@ mod tests {
+             .and_then(|t| t.checked_sub(Duration::from_millis(10)))
+             .expect("test duration subtraction should not underflow");
+ 
+-        dir.register_instance(Arc::new(instance));
++        seed(&dir, Arc::new(instance));
+ 
+         dir.evict_stale(now);
+         let instances = dir.instances_of("test_gear");
+@@ -924,12 +1098,12 @@ mod tests {
+         // Create two instances: one healthy, one quarantined
+         let healthy_id = Uuid::new_v4();
+         let healthy = Arc::new(GearInstance::new("test_gear", healthy_id));
+-        dir.register_instance(healthy);
++        seed(&dir, healthy);
+         dir.update_heartbeat("test_gear", healthy_id, Instant::now());
+ 
+         let quarantined_id = Uuid::new_v4();
+         let quarantined = Arc::new(GearInstance::new("test_gear", quarantined_id));
+-        dir.register_instance(quarantined);
++        seed(&dir, quarantined);
+         dir.mark_quarantined("test_gear", quarantined_id);
+ 
+         // RR should only pick the healthy instance
+@@ -948,7 +1122,7 @@ mod tests {
+                 .with_rest_endpoint(Endpoint::http("billing", 8080))
+                 .with_openapi_spec("{\"openapi\":\"3.1.0\"}"),
+         );
+-        dir.register_instance(instance);
++        seed(&dir, instance);
+ 
+         let rest = dir.pick_rest_endpoint_round_robin("billing").unwrap();
+         assert_eq!(rest.uri, "http://billing:8080");
+@@ -966,7 +1140,7 @@ mod tests {
+             GearInstance::new("grpc_only", id)
+                 .with_grpc_service("some.Service", Endpoint::http("127.0.0.1", 9000)),
+         );
+-        dir.register_instance(instance);
++        seed(&dir, instance);
+ 
+         assert!(dir.pick_rest_endpoint_round_robin("grpc_only").is_none());
+         assert!(dir.openapi_spec_of("grpc_only").is_none());
+@@ -984,8 +1158,8 @@ mod tests {
+         let inst2 = Arc::new(
+             GearInstance::new("web", id2).with_rest_endpoint(Endpoint::http("127.0.0.1", 8002)),
+         );
+-        dir.register_instance(inst1);
+-        dir.register_instance(inst2);
++        seed(&dir, inst1);
++        seed(&dir, inst2);
+         dir.update_heartbeat("web", id1, Instant::now());
+         dir.update_heartbeat("web", id2, Instant::now());
+ 
+@@ -1013,8 +1187,8 @@ mod tests {
+                 .with_grpc_service("test.Service", Endpoint::http("127.0.0.1", 8002)),
+         );
+ 
+-        dir.register_instance(inst1);
+-        dir.register_instance(inst2);
++        seed(&dir, inst1);
++        seed(&dir, inst2);
+ 
+         // Mark both as healthy
+         dir.update_heartbeat("test_gear", id1, Instant::now());
+@@ -1048,10 +1222,13 @@ mod tests {
+         // instance pickers' not-ready fallback rather than failing closed.
+         let dir = GearManager::new();
+         let id = Uuid::new_v4();
+-        dir.register_instance(Arc::new(
+-            GearInstance::new("worker", id)
+-                .with_grpc_service("worker.Svc", Endpoint::http("127.0.0.1", 9000)),
+-        ));
++        seed(
++            &dir,
++            Arc::new(
++                GearInstance::new("worker", id)
++                    .with_grpc_service("worker.Svc", Endpoint::http("127.0.0.1", 9000)),
++            ),
++        );
+         // No heartbeat: the instance stays Registered (not serving).
+         assert!(matches!(
+             dir.instances_of("worker")[0].state(),
+@@ -1068,6 +1245,128 @@ mod tests {
+         assert_eq!(ep, Endpoint::http("127.0.0.1", 9000));
+     }
+ 
++    #[test]
++    fn grpc_service_owner_reports_owning_gear_regardless_of_health() {
++        let dir = GearManager::new();
++
++        // A freshly-registered (not-yet-serving) instance still owns its name.
++        seed(
++            &dir,
++            Arc::new(
++                GearInstance::new("authz-resolver", Uuid::new_v4()).with_grpc_service(
++                    "cf.authz.v1.AuthzService",
++                    Endpoint::http("127.0.0.1", 9000),
++                ),
++            ),
++        );
++
++        assert_eq!(
++            dir.grpc_service_owner("cf.authz.v1.AuthzService")
++                .as_deref(),
++            Some("authz-resolver"),
++            "the advertising gear owns the name even while only Registered"
++        );
++        assert!(
++            dir.grpc_service_owner("unowned.Service").is_none(),
++            "an unadvertised name has no owner"
++        );
++    }
++
++    #[test]
++    fn deregister_releases_grpc_service_name_to_another_gear() {
++        let dir = GearManager::new();
++        let service = "cf.authz.v1.AuthzService";
++        let owner_id = Uuid::new_v4();
++
++        seed(
++            &dir,
++            Arc::new(
++                GearInstance::new("authz-resolver", owner_id)
++                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
++            ),
++        );
++
++        // While the owner is registered, a different gear cannot claim the name.
++        dir.register_instance(Arc::new(
++            GearInstance::new("successor", Uuid::new_v4())
++                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
++        ))
++        .unwrap_err();
++
++        // Deregistering the owner releases the name...
++        dir.deregister("authz-resolver", owner_id);
++        assert!(
++            dir.grpc_service_owner(service).is_none(),
++            "the name is unowned once its owner deregisters"
++        );
++
++        // ...so a different gear may now claim it.
++        dir.register_instance(Arc::new(
++            GearInstance::new("successor", Uuid::new_v4())
++                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
++        ))
++        .expect("a released gRPC service name must be claimable by another gear");
++        assert_eq!(
++            dir.grpc_service_owner(service).as_deref(),
++            Some("successor")
++        );
++    }
++
++    #[test]
++    fn eviction_releases_grpc_service_name_only_after_full_evict() {
++        let ttl = Duration::from_millis(50);
++        let grace = Duration::from_millis(50);
++        let dir = GearManager::new().with_heartbeat_policy(ttl, grace);
++        let service = "cf.authz.v1.AuthzService";
++
++        let now = Instant::now();
++        let owner = GearInstance::new("authz-resolver", Uuid::new_v4())
++            .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000));
++        // Stale from the start so the first eviction pass quarantines it.
++        owner.inner.write().last_heartbeat = now
++            .checked_sub(ttl)
++            .and_then(|t| t.checked_sub(Duration::from_millis(10)))
++            .expect("test duration subtraction should not underflow");
++        seed(&dir, Arc::new(owner));
++
++        // First pass only *quarantines* the dead gear — it is not yet evicted,
++        // so it still owns the name and a successor is rejected. A dead gear
++        // keeps blocking its gRPC name (regardless of health) until fully
++        // evicted, i.e. for hb_ttl + hb_grace.
++        dir.evict_stale(now);
++        assert!(matches!(
++            dir.instances_of("authz-resolver")[0].state(),
++            InstanceState::Quarantined
++        ));
++        let conflict = dir
++            .register_instance(Arc::new(
++                GearInstance::new("successor", Uuid::new_v4())
++                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
++            ))
++            .unwrap_err();
++        assert_eq!(
++            conflict.owner, "authz-resolver",
++            "a quarantined-but-not-evicted owner still holds the name"
++        );
++
++        // Second pass past the grace period fully evicts it, releasing the name
++        // so another gear may take it over.
++        dir.evict_stale(now + grace + Duration::from_millis(10));
++        assert!(
++            dir.grpc_service_owner(service).is_none(),
++            "eviction hands the name back once the grace period lapses"
++        );
++        dir.register_instance(Arc::new(
++            GearInstance::new("successor", Uuid::new_v4())
++                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9002)),
++        ))
++        .expect("an evicted owner's gRPC name must be claimable by another gear");
++        assert_eq!(
++            dir.grpc_service_owner(service).as_deref(),
++            Some("successor")
++        );
++    }
++
+     #[test]
+     fn test_deregister_clears_rr_counters() {
+         let dir = GearManager::new();
+@@ -1075,7 +1374,7 @@ mod tests {
+         let instance = Arc::new(
+             GearInstance::new("web", id).with_rest_endpoint(Endpoint::http("127.0.0.1", 8001)),
+         );
+-        dir.register_instance(instance);
++        seed(&dir, instance);
+         dir.update_heartbeat("web", id, Instant::now());
+ 
+         // Exercise both round-robin counters so the keys are created.
+@@ -1108,7 +1407,7 @@ mod tests {
+             .and_then(|t| t.checked_sub(Duration::from_millis(10)))
+             .expect("test duration subtraction should not underflow");
+ 
+-        dir.register_instance(instance);
++        seed(&dir, instance);
+         assert!(dir.pick_rest_endpoint_round_robin("web").is_some());
+ 
+         assert!(dir.rr_counters.contains_key("rest:web"));
+@@ -1127,4 +1426,169 @@ mod tests {
+         assert!(!dir.rr_counters.contains_key("web"));
+         assert!(!dir.rr_counters.contains_key("rest:web"));
+     }
++
++    #[test]
++    fn register_instance_rejects_cross_gear_grpc_name() {
++        let mgr = GearManager::new();
++        let service = "cf.authz.v1.AuthzService";
++
++        mgr.register_instance(Arc::new(
++            GearInstance::new("authz-resolver", Uuid::new_v4())
++                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
++        ))
++        .expect("claiming an unowned service name must succeed");
++
++        // A different gear claiming the same name is rejected, store untouched.
++        let conflict = mgr
++            .register_instance(Arc::new(
++                GearInstance::new("evil", Uuid::new_v4())
++                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
++            ))
++            .unwrap_err();
++        assert_eq!(conflict.service_name, service);
++        assert_eq!(conflict.owner, "authz-resolver");
++        assert!(mgr.instances_of("evil").is_empty());
++
++        // The owning gear may add another instance under the same name.
++        mgr.register_instance(Arc::new(
++            GearInstance::new("authz-resolver", Uuid::new_v4())
++                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9002)),
++        ))
++        .expect("the owning gear may add another instance for its own service");
++    }
++
++    #[test]
++    fn declared_ownership_beats_registration_order() {
++        let mgr = GearManager::new();
++        let service = "cf.authz.v1.AuthzService";
++
++        // Config declares the name is owned by `authz`.
++        mgr.set_grpc_service_owners(HashMap::from([(service.to_owned(), "authz".to_owned())]));
++
++        // A squatter registering *first* cannot claim a declared name; it is
++        // rejected with the declared owner, and the store is untouched.
++        let conflict = mgr
++            .register_instance(Arc::new(
++                GearInstance::new("evil", Uuid::new_v4())
++                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
++            ))
++            .unwrap_err();
++        assert_eq!(conflict.service_name, service);
++        assert_eq!(conflict.owner, "authz");
++        assert!(mgr.instances_of("evil").is_empty());
++
++        // The declared owner is always admitted, even coming in second.
++        mgr.register_instance(Arc::new(
++            GearInstance::new("authz", Uuid::new_v4())
++                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
++        ))
++        .expect("the declared owner must be admitted");
++        assert_eq!(mgr.grpc_service_owner(service).as_deref(), Some("authz"));
++    }
++
++    #[test]
++    fn names_absent_from_declared_map_keep_first_registration_ownership() {
++        let mgr = GearManager::new();
++        // The map declares one name but says nothing about `worker.Svc`.
++        mgr.set_grpc_service_owners(HashMap::from([(
++            "cf.authz.v1.AuthzService".to_owned(),
++            "authz".to_owned(),
++        )]));
++        let service = "worker.Svc";
++
++        mgr.register_instance(Arc::new(
++            GearInstance::new("worker-a", Uuid::new_v4())
++                .with_grpc_service(service, Endpoint::http("127.0.0.1", 9000)),
++        ))
++        .expect("claiming an undeclared, unowned name must succeed");
++
++        let conflict = mgr
++            .register_instance(Arc::new(
++                GearInstance::new("worker-b", Uuid::new_v4())
++                    .with_grpc_service(service, Endpoint::http("127.0.0.1", 9001)),
++            ))
++            .unwrap_err();
++        assert_eq!(conflict.owner, "worker-a");
++    }
++
++    /// Under contention, the atomic check+insert admits exactly one owner for a
++    /// gRPC service name: N gears race to claim the same unowned name and only
++    /// one commits, closing the check-then-write race the per-entry `DashMap`
++    /// locks leave open.
++    #[test]
++    fn concurrent_register_admits_exactly_one_owner() {
++        use std::sync::Barrier;
++
++        let mgr = Arc::new(GearManager::new());
++        let service = "cf.authz.v1.AuthzService";
++        let racers = 16;
++        let barrier = Arc::new(Barrier::new(racers));
++
++        #[expect(
++            clippy::needless_collect,
++            reason = "a lazy iterator would join before all racers spawn, deadlocking the Barrier"
++        )]
++        let handles: Vec<_> = (0..racers)
++            .map(|i| {
++                let mgr = Arc::clone(&mgr);
++                let barrier = Arc::clone(&barrier);
++                std::thread::spawn(move || {
++                    let gear = format!("gear-{i}");
++                    let instance = Arc::new(
++                        GearInstance::new(gear.clone(), Uuid::new_v4()).with_grpc_service(
++                            service,
++                            Endpoint::http("127.0.0.1", 9000 + u16::try_from(i).unwrap()),
++                        ),
++                    );
++                    // Release all threads at once to maximise contention.
++                    barrier.wait();
++                    (gear, mgr.register_instance(instance))
++                })
++            })
++            .collect();
++
++        let results: Vec<(String, Result<(), GrpcServiceNameConflict>)> = handles
++            .into_iter()
++            .map(|h| h.join().expect("registration thread must not panic"))
++            .collect();
++
++        // Exactly one gear wins the race.
++        let winners: Vec<&str> = results
++            .iter()
++            .filter(|(_, r)| r.is_ok())
++            .map(|(gear, _)| gear.as_str())
++            .collect();
++        assert_eq!(
++            winners.len(),
++            1,
++            "exactly one competing registration must win"
++        );
++        let winner = winners[0];
++
++        // Every loser is rejected with a conflict naming the winning gear — the
++        // `owner` surfaced in the server-side warn log and the operator's
++        // remediation hint, so it must be the gear that actually committed, not
++        // just any error.
++        for (gear, result) in &results {
++            if gear == winner {
++                continue;
++            }
++            let conflict = result
++                .as_ref()
++                .expect_err("a losing registration must be rejected, not silently dropped");
++            assert_eq!(conflict.service_name, service);
++            assert_eq!(
++                conflict.owner.as_str(),
++                winner,
++                "every loser's conflict must name the single winning gear as owner"
++            );
++        }
++
++        // ...and the store resolves the contested name to exactly that winner.
++        assert_eq!(
++            mgr.grpc_service_owner(service).as_deref(),
++            Some(winner),
++            "the contested name must resolve to the one gear that won"
++        );
++    }
+ }
+diff --git a/libs/toolkit/src/runtime/mod.rs b/libs/toolkit/src/runtime/mod.rs
+index 9b745d39e9..642c4ee2c4 100644
+--- a/libs/toolkit/src/runtime/mod.rs
++++ b/libs/toolkit/src/runtime/mod.rs
+@@ -15,7 +15,9 @@ pub mod shutdown;
+ #[cfg(test)]
+ mod tests;
+ 
+-pub use gear_manager::{Endpoint, GearInstance, GearManager, InstanceState};
++pub use gear_manager::{
++    Endpoint, GearInstance, GearManager, GrpcServiceNameConflict, InstanceState,
++};
+ pub use grpc_installers::{GearInstallers, GrpcInstallerData, GrpcInstallerStore};
+ pub use host_runtime::{
+     DEFAULT_SHUTDOWN_DEADLINE, DbOptions, HostRuntime, TOOLKIT_DIRECTORY_ENDPOINT_ENV,
+diff --git a/libs/toolkit/src/runtime/oop_registration.rs b/libs/toolkit/src/runtime/oop_registration.rs
+index 3c309b5a27..f6d7108669 100644
+--- a/libs/toolkit/src/runtime/oop_registration.rs
++++ b/libs/toolkit/src/runtime/oop_registration.rs
+@@ -23,7 +23,9 @@ use std::time::Duration;
+ 
+ use tokio_util::sync::CancellationToken;
+ 
+-use cf_system_sdks::directory::{DirectoryClient, DirectoryInvalidArgument, RegisterInstanceInfo};
++use cf_system_sdks::directory::{
++    DirectoryClient, DirectoryInvalidArgument, DirectoryPermissionDenied, RegisterInstanceInfo,
++};
+ 
+ /// Initial retry backoff for registration and dependency polling.
+ const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+@@ -46,17 +48,35 @@ async fn sleep_or_cancel(dur: Duration, cancel: &CancellationToken) -> bool {
+     }
+ }
+ 
++/// Operator-facing guidance for a *permanent* registration rejection, or `None`
++/// if `err` is transient and should be retried.
++///
++/// A permanent rejection can never succeed on retry, so the caller stops the
++/// backoff retry and logs loudly instead of spinning forever at `warn!`. The
++/// rejection *category* is already carried by the sentinel's `Display` (logged
++/// in the structured `error` field), so this returns only the "what to check"
++/// remediation hint.
++fn permanent_rejection_guidance(err: &anyhow::Error) -> Option<&'static str> {
++    if err.is::<DirectoryInvalidArgument>() {
++        return Some("Check its configured labels and endpoint URIs");
++    }
++    if err.is::<DirectoryPermissionDenied>() {
++        return Some(
++            "Check that this peer is authorized to register this gear (its ServiceAccount \
++             namespace / trust domain allowlist) and that none of its gRPC service names are \
++             already owned by another gear",
++        );
++    }
++    None
++}
++
+ /// Register `info` with the directory, retrying with exponential backoff.
+ ///
+ /// Returns `true` if the presence loop should keep running (the directory
+-/// accepted the registration, or permanently rejected it), and `false` only if
+-/// the task was cancelled.
+-///
+-/// A [`DirectoryInvalidArgument`] rejection (e.g. a mis-configured label or
+-/// endpoint URI) is permanent: retrying it can never succeed, so the backoff
+-/// retry stops with a loud `error!` rather than spinning forever at `warn!`.
+-/// It still returns `true`, so the caller keeps the presence loop alive; see
+-/// [`presence_loop`]. All other errors are treated as transient and retried.
++/// accepted the registration, or [permanently rejected](permanent_rejection_guidance)
++/// it), and `false` only if the task was cancelled. A permanent rejection still
++/// returns `true`, so the caller keeps the presence loop alive; see
++/// [`presence_loop`].
+ async fn register_once_with_backoff(
+     directory: &Arc<dyn DirectoryClient>,
+     info: &RegisterInstanceInfo,
+@@ -73,14 +93,14 @@ async fn register_once_with_backoff(
+                 return true;
+             }
+             Err(e) => {
+-                if let Some(invalid) = e.downcast_ref::<DirectoryInvalidArgument>() {
++                if let Some(guidance) = permanent_rejection_guidance(&e) {
+                     tracing::error!(
+                         gear = %info.gear,
+                         instance = %info.instance_id,
+-                        error = %invalid,
+-                        "registration permanently rejected by the directory (invalid \
+-                         argument); this instance may not be discoverable. Check its \
+-                         configured labels and endpoint URIs"
++                        error = %e,
++                        guidance,
++                        "registration permanently rejected by the directory; this instance \
++                         may not be discoverable"
+                     );
+                     return true;
+                 }
+@@ -117,12 +137,13 @@ async fn register_once_with_backoff(
+ /// Registering *before* the first heartbeat is deliberate: a heartbeat for an
+ /// unregistered instance is a no-op on the directory.
+ ///
+-/// A permanent invalid-argument rejection never tears the presence loop down:
+-/// the rejection is logged loudly at every attempt, but the loop keeps sending
+-/// heartbeats (so an already-registered instance is not evicted by a transient
+-/// directory-side validation change) and keeps retrying the idempotent
+-/// re-registration (so it self-heals if the directory later accepts it). Only
+-/// cancellation stops the loop.
++/// A [permanent rejection](permanent_rejection_guidance) never tears the
++/// presence loop down: it is logged loudly at every attempt, but the loop keeps
++/// sending heartbeats (so an already-registered instance is not evicted by a
++/// transient directory-side policy / validation change) and keeps retrying the
++/// idempotent re-registration (so it self-heals if the directory later accepts
++/// it — e.g. once a conflicting owner deregisters). Only cancellation stops the
++/// loop.
+ pub(super) async fn presence_loop(
+     directory: Arc<dyn DirectoryClient>,
+     info: RegisterInstanceInfo,
+diff --git a/libs/toolkit/src/runtime/oop_registration_tests.rs b/libs/toolkit/src/runtime/oop_registration_tests.rs
+index a2686a8852..c278833d94 100644
+--- a/libs/toolkit/src/runtime/oop_registration_tests.rs
++++ b/libs/toolkit/src/runtime/oop_registration_tests.rs
+@@ -1,21 +1,35 @@
+ //! Tests for `OoP` self-registration and dependency resolution.
+ 
+ use super::*;
+-use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ 
+ use async_trait::async_trait;
+-use cf_system_sdks::directory::{DirectoryInvalidArgument, ServiceEndpoint, ServiceInstanceInfo};
++use cf_system_sdks::directory::{
++    DirectoryInvalidArgument, DirectoryPermissionDenied, ServiceEndpoint, ServiceInstanceInfo,
++};
++
++/// The permanent rejection a [`StubDirectory`] returns from `register`.
++#[derive(Clone, Copy)]
++enum Rejection {
++    /// A mis-configured label / endpoint URI (gRPC `InvalidArgument`).
++    InvalidArgument,
++    /// An authorization denial or gRPC service-name conflict (gRPC
++    /// `PermissionDenied` / `Unauthenticated`).
++    PermissionDenied,
++}
+ 
+ /// Stub directory: fails `register`/`resolve` a configurable number of times,
+-/// then succeeds; records register calls and heartbeats. When
+-/// `reject_register` is set, `register` always returns a permanent
+-/// [`DirectoryInvalidArgument`] rejection.
++/// then succeeds; records register calls and heartbeats. While `rejecting` is
++/// set, `register` always returns the permanent `reject_kind` rejection;
++/// [`stop_rejecting`](StubDirectory::stop_rejecting) clears it to model the
++/// conflict later resolving.
+ struct StubDirectory {
+     fail_register: AtomicUsize,
+     register_calls: AtomicUsize,
+     heartbeats: AtomicUsize,
+     fail_resolve: AtomicUsize,
+-    reject_register: bool,
++    reject_kind: Option<Rejection>,
++    rejecting: AtomicBool,
+ }
+ 
+ impl StubDirectory {
+@@ -25,18 +39,27 @@ impl StubDirectory {
+             register_calls: AtomicUsize::new(0),
+             heartbeats: AtomicUsize::new(0),
+             fail_resolve: AtomicUsize::new(fail_resolve),
+-            reject_register: false,
++            reject_kind: None,
++            rejecting: AtomicBool::new(false),
+         }
+     }
+ 
+-    /// A directory that permanently rejects every registration (as the gRPC
+-    /// front-end does for a mis-configured label / endpoint URI).
+-    fn rejecting() -> Self {
++    /// A directory that permanently rejects every registration with `kind` (as
++    /// the gRPC front-end does for a mis-configured label / endpoint URI, or an
++    /// authorization denial / service-name conflict).
++    fn rejecting(kind: Rejection) -> Self {
+         Self {
+-            reject_register: true,
++            reject_kind: Some(kind),
++            rejecting: AtomicBool::new(true),
+             ..Self::new(0, 0)
+         }
+     }
++
++    /// Stop rejecting: subsequent registrations succeed, modelling the
++    /// conflicting owner deregistering (or an authz fix landing).
++    fn stop_rejecting(&self) {
++        self.rejecting.store(false, Ordering::SeqCst);
++    }
+ }
+ 
+ #[async_trait]
+@@ -67,8 +90,16 @@ impl DirectoryClient for StubDirectory {
+ 
+     async fn register_instance(&self, _info: RegisterInstanceInfo) -> anyhow::Result<()> {
+         self.register_calls.fetch_add(1, Ordering::SeqCst);
+-        if self.reject_register {
+-            return Err(DirectoryInvalidArgument::new("bad label").into());
++        if self.rejecting.load(Ordering::SeqCst) {
++            match self.reject_kind {
++                Some(Rejection::InvalidArgument) => {
++                    return Err(DirectoryInvalidArgument::new("bad label").into());
++                }
++                Some(Rejection::PermissionDenied) => {
++                    return Err(DirectoryPermissionDenied::new("peer not authorized").into());
++                }
++                None => {}
++            }
+         }
+         if self.fail_register.load(Ordering::SeqCst) > 0 {
+             self.fail_register.fetch_sub(1, Ordering::SeqCst);
+@@ -121,7 +152,7 @@ async fn registration_keeps_loop_alive_on_permanent_rejection() {
+     // A DirectoryInvalidArgument is permanent: the backoff retry must give up
+     // after a single attempt rather than retrying a request that can never
+     // succeed, yet still return `true` so the presence loop keeps running.
+-    let stub = Arc::new(StubDirectory::rejecting());
++    let stub = Arc::new(StubDirectory::rejecting(Rejection::InvalidArgument));
+     let directory: Arc<dyn DirectoryClient> = stub.clone();
+     let cancel = CancellationToken::new();
+     let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
+@@ -133,6 +164,26 @@ async fn registration_keeps_loop_alive_on_permanent_rejection() {
+     );
+ }
+ 
++#[tokio::test]
++async fn registration_does_not_retry_permission_denied() {
++    // A DirectoryPermissionDenied (authorization denial / service-name conflict)
++    // is just as permanent as an invalid argument: retrying the identical
++    // request can never turn the "no" into a "yes", so the backoff retry must
++    // give up after a single attempt (regression: it previously fell into the
++    // generic transient branch and retried forever at `warn!`), yet still keep
++    // the presence loop alive.
++    let stub = Arc::new(StubDirectory::rejecting(Rejection::PermissionDenied));
++    let directory: Arc<dyn DirectoryClient> = stub.clone();
++    let cancel = CancellationToken::new();
++    let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
++    assert!(ok, "a permanent rejection must not stop the presence loop");
++    assert_eq!(
++        stub.register_calls.load(Ordering::SeqCst),
++        1,
++        "a permission-denied rejection must not be retried"
++    );
++}
++
+ #[tokio::test]
+ async fn registration_returns_false_when_cancelled() {
+     let directory: Arc<dyn DirectoryClient> = Arc::new(StubDirectory::new(1000, 0));
+@@ -178,7 +229,7 @@ async fn presence_loop_survives_permanent_rejection() {
+     // A permanent DirectoryInvalidArgument must NOT tear the presence loop down:
+     // it keeps heartbeating and periodically retrying re-registration. Only
+     // cancellation stops it.
+-    let stub = Arc::new(StubDirectory::rejecting());
++    let stub = Arc::new(StubDirectory::rejecting(Rejection::InvalidArgument));
+     let directory: Arc<dyn DirectoryClient> = stub.clone();
+     let cancel = CancellationToken::new();
+ 
+@@ -204,6 +255,59 @@ async fn presence_loop_survives_permanent_rejection() {
+     task.await.unwrap();
+ }
+ 
++#[tokio::test(start_paused = true)]
++async fn presence_loop_recovers_when_rejection_clears() {
++    // A gear denied on a gRPC service-name conflict keeps its presence loop
++    // alive and re-registers every RE_REGISTER_INTERVAL. Once the conflict
++    // clears (the owning gear deregisters) the next re-registration succeeds, so
++    // the instance becomes discoverable without a restart. Driven on virtual
++    // time so the 30s interval costs no wall clock.
++    let stub = Arc::new(StubDirectory::rejecting(Rejection::PermissionDenied));
++    let directory: Arc<dyn DirectoryClient> = stub.clone();
++    let cancel = CancellationToken::new();
++
++    let task = tokio::spawn(presence_loop(
++        Arc::clone(&directory),
++        info(),
++        Duration::from_secs(1),
++        cancel.clone(),
++    ));
++
++    // Let the initial (rejected) registration run and the loop park on its
++    // timers. No time has advanced, so only the one attempt has happened.
++    for _ in 0..10 {
++        if stub.register_calls.load(Ordering::SeqCst) >= 1 {
++            break;
++        }
++        tokio::task::yield_now().await;
++    }
++    assert_eq!(
++        stub.register_calls.load(Ordering::SeqCst),
++        1,
++        "the initial registration is rejected but the loop stays alive"
++    );
++
++    // The conflicting owner deregisters; the directory now accepts.
++    stub.stop_rejecting();
++
++    // Advance past the re-registration interval so the periodic re-register
++    // fires — this time it succeeds.
++    tokio::time::advance(RE_REGISTER_INTERVAL + Duration::from_secs(1)).await;
++    for _ in 0..10 {
++        if stub.register_calls.load(Ordering::SeqCst) >= 2 {
++            break;
++        }
++        tokio::task::yield_now().await;
++    }
++    assert!(
++        stub.register_calls.load(Ordering::SeqCst) >= 2,
++        "the loop must re-register after the interval and recover once the conflict clears"
++    );
++
++    cancel.cancel();
++    task.await.unwrap();
++}
++
+ // Dependency resolution moved to the proxy-wiring phase (typed
+ // `#[toolkit::consumes]` clients feeding the shared `DependencyChecker`); the
+ // former `resolve_one_dep`/`resolve_deps`/`ResolvedRestEndpoints` stopgap and

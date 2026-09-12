@@ -1,0 +1,240 @@
+# Rule module: Test Quality
+
+This file is a rule module. Exactly one agent reads it, and that agent reads no other
+module. See `docs/toolkit-pr-review/agents/subject.md` for how that agent works,
+`docs/toolkit-pr-review/review-conventions.md` for severity and marker
+conventions, and `docs/toolkit-pr-review/comment-style.md` for how a finding is worded.
+
+## Scope of this module
+
+Two different scopes apply, and both are evaluated over every changed file in the PR.
+
+- **`RUST-TEST-001`** — look at the **production** code added or changed in this PR and ask
+  whether tests exist for it. Anchor the finding on the added or changed production line itself
+  (a new function's signature line is the natural choice); that line is in `ranges.right`, so it
+  is a normal line-anchored comment. Absence of a test file is not a reason to skip the finding.
+  You can see every changed file, so check for a test beside the code before reporting its
+  absence; a test may live in a file you have not opened yet.
+- **`TEST-QUALITY-1` through `TEST-QUALITY-10`** — look at test code anywhere in the PR. Tests live in
+  any `.rs` file, not only under `tests/`: a `#[cfg(test)] mod tests` block at the bottom of a
+  production file counts. If the PR has no test code, these produce nothing, which is correct.
+
+Test indicators: `#[test]`, `#[tokio::test]`, `#[cfg(test)] mod tests { ... }`, assertions added to
+test files or test modules, integration tests under `tests/`, test helper functions used by tests.
+
+A `TEST-QUALITY-9` finding about a deleted test in a file that still exists anchors on the removed
+line itself: set `"side": "LEFT"` and take `line` from that file's `ranges.left` in `context.json`.
+If the file's `status` is `deleted` it has no line on either side that survives as a comment target,
+so omit `line` and `side` entirely rather than guessing.
+
+## Check IDs to Apply
+
+Apply **only** these specific check IDs. The two scopes above still hold and they are not the same:
+`RUST-TEST-001` reads the **production** code the PR changed and asks whether a test exists for it,
+so it fires on a file with no test code in it at all; `TEST-QUALITY-1` through `TEST-QUALITY-10`
+apply only to test functions and test modules visible in the diff.
+
+### RUST-TEST-001 — Test Coverage
+**Severity**: HIGH
+
+Tests must exercise the actual behavior of the code, not just "it compiles" or "the happy path works."
+
+- Tests must verify results or side effects, not just call functions.
+- Tests must include edge cases and error paths, not only happy paths.
+- Complex logic must have multiple tests covering different scenarios.
+- A function added or changed with no tests, **where the risk justifies it**
+  why: do not require exhaustive testing for a trivial refactor or a rename. That turns this
+       rule into a false-positive engine on refactor PRs.
+- Do flag missing tests for **bug fixes, parsing, state transitions, retries, concurrency-sensitive code and boundary conditions**. Those are where absence of a test actually costs something.
+- Tests verify **observable behavior, not internal implementation details**. A test coupled to a private field or call order breaks on every refactor without catching a defect.
+- Tests are **deterministic and readable**. Flag time-dependent, order-dependent or otherwise flaky tests — nothing else in this review covers them.
+- Identify missing tests for **invariants, state transitions and interaction contracts**, not only error paths and edge cases.
+- Point out fake coverage inflation where applicable: a test that raises the coverage number without raising confidence.
+- **A regression test that does not exercise the failure path the PR claims to fix**
+  why: when the change says it fixes a specific bug, check that a new test reproduces *that*
+       path. A test covering an adjacent surface, the same subsystem in the same degraded mode
+       but not the operation that actually broke, leaves the bug unguarded. One of the
+       highest-value findings here.
+- **A new tunable, threshold or interval with no test pinning the behavior it guards**
+  why: a constant like a poll interval or a retry floor is what keeps a loop from degenerating.
+       Without a test, changing it silently changes runtime behavior and nothing fails.
+- New parser, validator or serde-roundtrip code with point examples only and no property test
+  why: `proptest`/`quickcheck` cover what examples cannot — no panic on arbitrary input, and
+       roundtrip identity.
+- A test needing live services or network access placed in the unit tier
+  why: it belongs under `tests/integration` or `tests/e2e` with the tier stated, so the default
+       suite stays runnable without external dependencies.
+
+### TEST-QUALITY-1 — Constructor Echo
+**Severity**: MEDIUM
+
+**Anti-pattern**: The test constructs an object and immediately asserts that a property equals the value passed to the constructor.
+
+```rust
+#[test]
+fn test_user_name() {
+    let user = User::new("Alice");
+    assert_eq!(user.name(), "Alice");  // ← This just echoes the constructor input
+}
+```
+
+**Problem**: This test only verifies that the constructor stores the parameter — it does not exercise any logic.
+
+**Finding**: If a test does nothing but construct and read back the same value, flag it as TEST-QUALITY-1. This includes the constructor-less shape — a struct literal followed by a public field read (`let s = MyStruct { x: 42 }; assert_eq!(s.x, 42);`) — not only `new()` plus an accessor.
+
+### TEST-QUALITY-2 — Tautology
+**Severity**: MEDIUM
+
+**Anti-pattern**: The test asserts something that is mathematically always true.
+
+```rust
+#[test]
+fn test_addition() {
+    assert_eq!(2 + 2, 4);  // ← Tautology: compiler guarantees this
+}
+```
+
+**Problem**: The test adds no value — it tests the Rust standard library or language semantics, not the code under test.
+
+**Finding**: If a test asserts something **true by definition** — `assert!(true)`, constant arithmetic, two identical literals compared — flag it as TEST-QUALITY-2. A test that exercises a real standard-library behavior belongs to TEST-QUALITY-3 instead; keep the two disjoint so the same snippet does not get a different ID on each run.
+
+### TEST-QUALITY-3 — Language Semantics Tests
+**Severity**: MEDIUM
+
+**Anti-pattern**: Tests that verify Rust language behavior instead of application logic.
+
+```rust
+#[test]
+fn test_vec_push() {
+    let mut v = vec![];
+    v.push(1);
+    assert_eq!(v.len(), 1);  // ← Tests Vec, not our code
+}
+```
+
+**Problem**: These tests waste time verifying the standard library or language features — they do not test the application.
+
+**Finding**: If a test verifies a **language or standard-library guarantee** rather than project logic, flag it as TEST-QUALITY-3. Note this applies even when a project type is involved: asserting that a project enum is `Copy`, or that its derived `PartialEq` works, still tests the compiler rather than your logic.
+
+### TEST-QUALITY-4 — No-op Tests
+**Severity**: MEDIUM
+
+**Anti-pattern**: The test runs code that has no observable effect.
+
+```rust
+#[test]
+fn test_config() {
+    let cfg = Config::load();
+    // ← No assertions, no side effect checks
+}
+```
+
+**Problem**: The test does not verify anything — it just runs the code.
+
+**Finding**: If a test makes **no meaningful assertion**, flag it as TEST-QUALITY-4. This includes the
+conditional form: a test or conformance scenario that **early-returns on some backend, feature flag
+or configuration and asserts nothing on that path** still reports as passing, so the suite claims
+coverage for a configuration it never exercised. Look for `if !supported { return; }`,
+`return Ok(())` guards, and skip branches that leave no assertion behind. The bar is meaningfulness, not count — one junk assertion does not rescue the test. A genuine side-effect check (logging verification, file modification, state change) does.
+
+### TEST-QUALITY-5 — Redundant or Duplicate Tests
+**Severity**: LOW
+
+**Anti-pattern**: Multiple tests verify the same scenario or behavior.
+
+**Problem**: Duplicate tests waste maintenance effort and hide the real test coverage.
+
+**Finding**: If tests in the diff cover **effectively the same** setup and assertion as another test, adding no new behavioral coverage, flag it as TEST-QUALITY-5. "Effectively" is the bar: a copy-paste test with one constant changed still adds nothing and still qualifies.
+
+### TEST-QUALITY-6 — Mock-Only / Side-Effect Blindness
+**Severity**: MEDIUM
+
+**Anti-pattern**: Tests mock all dependencies and never verify real behavior or side effects.
+
+**Problem**: Mocked tests can pass when real code fails, especially if the mock does not verify the actual contract.
+
+**Finding**: If a test **uses mocks** and does not verify the actual externally visible effect, flag it as TEST-QUALITY-6. Mocking *all* dependencies is not required — a partial mock that asserts nothing observable qualifies. The effects that count include state change, **emitted event, persisted data, log record, metric**, file I/O, HTTP calls and database state. In this codebase the commonly missed ones are SSE emission and `tracing` output.
+
+### TEST-QUALITY-7 — Happy-Path Only
+**Severity**: MEDIUM
+
+**Anti-pattern**: Tests only cover the success case, not error paths or edge cases.
+
+**Problem**: Error handling logic is untested and may be broken.
+
+**Finding**: If tests cover only successful execution while ignoring invalid input, errors, **boundary conditions** and edge cases, flag it as TEST-QUALITY-7. This covers `Option`-returning code too — the `None` path needs a test, and a function with no error path at all can still have real boundaries (saturating arithmetic, clamping, pagination offsets).
+
+### TEST-QUALITY-8 — Snapshot Abuse
+**Severity**: MEDIUM
+
+**Anti-pattern**: Tests use snapshot assertions instead of explicit assertions on specific properties.
+
+**Problem**: Snapshot tests obscure the expected behavior — reviewers and maintainers cannot see what the test is actually checking. Snapshots can silently pass when they should fail.
+
+**Finding**: Treat **any formatting-only assertion** with suspicion unless formatting itself is the contract, and flag it as TEST-QUALITY-8. One additional real assertion does not buy immunity — a test carrying both a genuine check and a `{:?}` snapshot still has the fragile half, and the redaction and audit-log cases where this matters most are exactly the ones that tend to carry a second assertion.
+
+The other shape to catch is an assertion on a `Debug` rendering:
+
+```rust
+assert_eq!(format!("{:?}", cfg), "Config { path: \"/tmp/x\" }");
+```
+
+`Debug` output is not a stable format, and Rust 1.98 escapes more characters than earlier
+versions, so this can start failing with no change to the code under test. Assert on the data, or
+on an owned `render_*()` method whose format the type actually promises. The risk is highest in
+audit-log and redaction tests, where the assertion is often the only thing checking that a secret
+stays masked.
+
+### TEST-QUALITY-9 — Suppressed or Deleted Failing Test
+**Severity**: HIGH
+
+**Anti-pattern**: A previously-failing test is deleted, weakened (assertion loosened or removed), or marked `#[ignore]` in the diff, with no linked follow-up issue or clear justification.
+
+**Problem**: This hides a real regression instead of fixing it — the diff makes CI pass by silencing the signal, not by correcting the underlying bug.
+
+**Finding**: If the diff removes, weakens, or `#[ignore]`s a test that would otherwise fail, and there is **neither a linked follow-up issue nor a clear written justification**, flag it as TEST-QUALITY-9. Either one is acceptable on its own; a well-reasoned in-code justification with no ticket is not a finding. Two anchor cases:
+- The test was removed from a file that still exists — anchor on the removed line itself with `"side": "LEFT"` and a `line` from that file's `ranges.left`.
+- The **entire file** containing the test was deleted. Emit the finding with no `line` field at all
+  why: such a file is listed in `deleted_files` and its pre-deletion content is in
+       `files/<repo/path>`, fetched from the base commit. It has no line on either side.
+
+Do not omit either case for lack of a line — see Scope Rules and Output Contract.
+
+### TEST-QUALITY-10 — Assertion-Macro Temporaries
+**Severity**: MEDIUM
+
+**Anti-pattern**: A guard, lock, or `RefCell` borrow created inline inside `assert_eq!` / `assert_ne!` instead of being bound to a `let` first.
+
+```rust
+assert_eq!(shared.lock().unwrap().len(), 1);
+```
+
+**Problem**: Rust 1.98 added a temporary scope to these macros, so the temporary now drops at the end of the assertion rather than the end of the statement. That changes borrow-checker outcomes: a test that compiled before can stop compiling, and a lock-held-too-long bug the old code exposed can be masked.
+
+**Finding**: Flag as TEST-QUALITY-10 and ask for the value to be read inside a short block, with the assertion on the copy:
+
+```rust
+let len = { shared.lock().unwrap().len() };
+assert_eq!(len, 1);
+```
+
+Do not ask for a bare `let guard = shared.lock().unwrap();` at statement level: that holds the lock
+for the rest of the scope, and any later `shared.lock()` in the same test deadlocks on a
+non-reentrant `std::sync::Mutex`. A guard should outlive the block only when several reads must be
+atomic, and then it should be scoped explicitly. Applies only on Rust >= 1.98 — check the toolchain
+pin before flagging.
+
+---
+
+## Review principles
+
+- **If a test does not fail when the production logic is broken, say so explicitly.** This is the
+  sharpest question to ask of any test, and it subsumes most of the anti-patterns above: a
+  constructor echo, a tautology, a language-semantics test and a no-op test all pass unchanged when
+  the code under test is wrong.
+- Do not treat a test as meaningful coverage just because it compiles or raises the coverage number.
+- Snapshots, constructor checks and compiler-guaranteed behavior are not coverage unless they
+  validate an actual contract.
+- Prefer behavioral verification over line coverage.
+- Be strict and concrete. Say what the test fails to catch, not that it is "weak".
+- Explain why a flagged test is low-value, and say how to rewrite it so it verifies real behavior.
