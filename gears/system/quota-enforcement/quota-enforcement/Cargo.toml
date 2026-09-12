@@ -1,0 +1,87 @@
+[package]
+name = "cf-gears-quota-enforcement"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Quota Enforcement gear: PDP-gated admission, plugin binding, fail-closed bootstrap, and the REST surface mounted into api-gateway"
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "quota"]
+categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "quota_enforcement"
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-shear]
+# Referenced only by the `api_dto` macro expansion.
+ignored = ["utoipa"]
+
+[features]
+# Forwarding feature for the deployed profile (cluster DESIGN section 3.17.7):
+# the image that runs quota-enforcement without a co-located cluster gear
+# enables it, so the cluster SDK reaches the cluster pod over gRPC. The
+# embedded binary leaves it off and links the `cluster` gear, a provider
+# plugin, and `grpc-hub` itself.
+grpc-client = ["cluster-sdk/grpc-client"]
+
+[dependencies]
+quota-enforcement-sdk = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+authz-resolver = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+# Sweeper leader election on the platform cluster gear (ADR-0006). The SDK only:
+# no `deps = [cluster]` edge and no cluster gear dependency.
+cluster-sdk = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-canonical-errors = { workspace = true, features = ["axum"] }
+# `api_dto` DTOs derive `utoipa::ToSchema` for the OpenAPI registry.
+utoipa = { workspace = true }
+gts = { workspace = true }
+# Contract envelopes are validated against JSON Schema documents compiled once
+# at bootstrap (projection-contracts feature, ADR-0007).
+jsonschema = { workspace = true }
+
+axum = { workspace = true }
+# Repeated list query parameters (`id=a&id=b`) and their OpenAPI declaration.
+toolkit-contract = { workspace = true, features = ["rest-server"] }
+anyhow = { workspace = true }
+# One server clock reading per read response and the gauge refresh timing.
+time = { workspace = true }
+# The lifecycle-gauge sample cell read by observable-gauge callbacks.
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+# Instruments are declared on a scoped `Meter` from ToolKit's global
+# `SdkMeterProvider` (OTLP push; no gear-local exporter).
+opentelemetry = { workspace = true }
+
+# Required by the toolkit::gear macro.
+inventory = { workspace = true }
+
+[dev-dependencies]
+quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+# A real cluster over the standalone backend for the adapter and gear tests.
+cluster = { package = "cf-gears-cluster", path = "../../cluster/cluster" }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../cluster/plugins/standalone-cluster-plugin" }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+# Router round trips in the REST tests.
+tower = { workspace = true, features = ["util"] }

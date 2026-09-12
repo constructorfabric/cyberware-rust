@@ -1,0 +1,29 @@
+{
+  "$id": "gts://gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked owner example (ADR-0007): a resource projection describing the model a call targets. Descriptive input for resource-aware selection only; not part of the P1 counter key.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.qe.res.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "model_family": {
+              "type": "string",
+              "description": "Family of the targeted model."
+            }
+          },
+          "required": [
+            "model_family"
+          ]
+        }
+      }
+    }
+  ]
+}

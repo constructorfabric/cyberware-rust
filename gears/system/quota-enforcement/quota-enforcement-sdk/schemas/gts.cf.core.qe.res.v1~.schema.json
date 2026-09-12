@@ -1,0 +1,28 @@
+{
+  "$id": "gts://gts.cf.core.qe.res.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Abstract base for resource projections (ADR-0007). Completes the request contract for resource-aware selection; descriptive input only, and not part of the P1 counter key.",
+  "x-gts-abstract": true,
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "format": "gts-type-id",
+      "x-gts-ref": "gts.cf.core.qe.res.v1~",
+      "description": "The concrete owner-declared resource projection."
+    },
+    "id": {
+      "type": "string",
+      "description": "Optional resource identity: the contract may describe a resource class or a concrete resource."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Schematized resource properties, refined by the derived type. Required on the wire per the base contract rule."
+    }
+  },
+  "required": [
+    "type",
+    "metadata"
+  ]
+}

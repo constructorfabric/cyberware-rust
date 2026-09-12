@@ -1,0 +1,49 @@
+[package]
+name = "cf-gears-quota-enforcement-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for the quota-enforcement gear: storage plugin contract, domain types, closed error enums, and GTS plugin spec"
+repository.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "quota"]
+categories = ["api-bindings"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "quota_enforcement_sdk"
+
+[lints]
+workspace = true
+
+[features]
+# Exposes `pub mod testing`: a complete in-memory double of the storage plugin
+# contract. Test-only; never enable in a production build.
+test-util = ["dep:parking_lot"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+time = { workspace = true }
+
+# GTS types. `inventory` carries the QE-owned GTS definitions into the
+# process-wide registry seed (`toolkit_gts::InventoryTypeSchema`).
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+inventory = { workspace = true }
+
+# `AccessScope` and `SecurityContext` on the plugin contract signatures.
+toolkit-security = { workspace = true }
+# `QuotaEnforcementError` is the platform canonical error (DESIGN section 3.3).
+toolkit-canonical-errors = { workspace = true }
+
+parking_lot = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

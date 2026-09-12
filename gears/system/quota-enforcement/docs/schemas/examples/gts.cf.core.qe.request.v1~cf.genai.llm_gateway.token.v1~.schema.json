@@ -1,0 +1,37 @@
+{
+  "$id": "gts://gts.cf.core.qe.request.v1~cf.genai.llm_gateway.token.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked owner example (ADR-0007): one operation request contract for the llm-gateway token metric, shared by all callers and subject scopes.",
+  "x-gts-traits": {
+    "metric": "gts.cf.qe.metric.type.v1~cf.qe.metric.ai_tokens_input.v1",
+    "constraint_contract": "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~"
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.qe.request.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "region": {
+              "type": "string",
+              "description": "Deployment region of the operation; paired with arbitration.regions."
+            },
+            "model": {
+              "type": "string",
+              "description": "Model requested. Optional: adding an optional property is non-breaking."
+            }
+          },
+          "required": [
+            "region"
+          ]
+        }
+      }
+    }
+  ]
+}

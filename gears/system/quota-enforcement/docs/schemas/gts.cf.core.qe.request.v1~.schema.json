@@ -1,0 +1,46 @@
+{
+  "$id": "gts://gts.cf.core.qe.request.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Abstract base for a metric owner's operation request contract (ADR-0007). One concrete contract is published per metric and validates the operation-level metadata object shared by every subject scope and caller.",
+  "x-gts-abstract": true,
+  "x-gts-traits-schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "metric": {
+        "type": "string",
+        "format": "gts-instance-id",
+        "x-gts-ref": "gts.cf.qe.metric.type.v1~",
+        "description": "The single registered metric governed by this request contract."
+      },
+      "constraint_contract": {
+        "type": "string",
+        "format": "gts-type-id",
+        "x-gts-ref": "gts.cf.core.qe.constraint.v1~",
+        "description": "The concrete arbitration-constraint contract attached to this metric request contract."
+      }
+    },
+    "required": [
+      "metric",
+      "constraint_contract"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "format": "gts-type-id",
+      "x-gts-ref": "gts.cf.core.qe.request.v1~",
+      "description": "The concrete owner-published metric request contract selected by QE; consumers do not supply this type."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "The operation-level metadata object refined by the concrete contract and supplied once per evaluation request."
+    }
+  },
+  "required": [
+    "type",
+    "metadata"
+  ]
+}

@@ -2345,6 +2345,7 @@ dependencies = [
  "cf-gears-bss-rate-provider",
  "cf-gears-bss-rate-provider-ecb-plugin",
  "cf-gears-bss-rate-provider-http-json-plugin",
+ "cf-gears-cluster",
  "cf-gears-credstore",
  "cf-gears-file-parser",
  "cf-gears-file-storage",
@@ -2355,6 +2356,8 @@ dependencies = [
  "cf-gears-mini-chat",
  "cf-gears-nodes-registry",
  "cf-gears-oagw",
+ "cf-gears-quota-enforcement",
+ "cf-gears-quota-enforcement-storage-plugin",
  "cf-gears-resource-group",
  "cf-gears-rg-tr-plugin",
  "cf-gears-simple-user-settings",
@@ -2983,6 +2986,94 @@ dependencies = [
  "tokio-retry",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-quota-enforcement"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-cluster",
+ "cf-gears-cluster-sdk",
+ "cf-gears-quota-enforcement-sdk",
+ "cf-gears-standalone-cluster-plugin",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "gts",
+ "inventory",
+ "jsonschema",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-quota-enforcement-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-security",
+ "gts",
+ "inventory",
+ "parking_lot",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-quota-enforcement-storage-plugin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "cf-gears-quota-enforcement-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "gts",
+ "inventory",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 

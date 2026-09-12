@@ -1,0 +1,36 @@
+{
+  "$id": "gts://gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Worked owner example (ADR-0007): the operator-authored constraint contract attached to the llm-gateway metric request contract. Deliberately NOT the request schema: regions is a list against request.region (the CEL validator's operator/cardinality pair check), and weight has no request-side counterpart.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.qe.constraint.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "regions": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Regions this Quota covers; compared with membership (request.region in arbitration.regions), never with ==."
+            },
+            "weight": {
+              "type": "number",
+              "description": "Arbitration weight consumed by Policy expressions; no request-side counterpart."
+            }
+          },
+          "required": [
+            "regions"
+          ]
+        }
+      }
+    }
+  ]
+}
