@@ -119,8 +119,8 @@ jobs:
         run: make e2e-tr-authz
 
       # Self-managed suite (launcher: pytest): starts its own server plus a
-      # TimescaleDB container, so it needs a reachable Docker daemon.
-      - name: Run usage-collector E2E tests (TimescaleDB container)
+      # TimescaleDB or ClickHouse container, so it needs a reachable Docker daemon.
+      - name: Run usage-collector E2E tests (TimescaleDB + ClickHouse containers)
         run: make e2e-usage-collector
 
       - name: Upload E2E logs
