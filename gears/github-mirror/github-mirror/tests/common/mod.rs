@@ -9,7 +9,11 @@ use authz_resolver_sdk::{
     models::{EvaluationRequest, EvaluationResponse, EvaluationResponseContext},
 };
 use github_mirror::domain::error::DomainError;
-use github_mirror::domain::ports::github::{FetchedRepository, GithubPort, ListingCompleteness};
+use github_mirror::domain::ports::github::{
+    ActionsListing, CommitDetail, CommitListing, DeclaredCounts, FetchOptions, FetchedRepository,
+    GithubPort, IssueDetail, IssueDetailWants, IssueListing, Listing, ListingCompleteness,
+    MetadataListing, PullDetail, PullListing,
+};
 use github_mirror::domain::repo::{
     BranchRecord, CheckRunRecord, CommentRecord, CommitCommentRecord, CommitFileRecord,
     CommitRecord, CommitStatusRecord, ContributorRecord, DeploymentRecord, IssueEventRecord,
@@ -18,17 +22,18 @@ use github_mirror::domain::repo::{
     ReviewCommentRecord, ReviewRecord, ReviewThreadRecord, TagRecord, WorkflowJobRecord,
     WorkflowRunRecord,
 };
-use github_mirror::domain::service::{Service, ServiceConfig};
+use github_mirror::domain::service::{Service, ServiceConfig, SyncJob};
 use github_mirror::infra::storage::migrations::Migrator;
 use github_mirror::infra::storage::sea_orm_repo::{
     SeaOrmBranchRepository, SeaOrmCheckRunRepository, SeaOrmCommentRepository,
     SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository, SeaOrmCommitRepository,
     SeaOrmCommitStatusRepository, SeaOrmContributorRepository, SeaOrmDeploymentRepository,
-    SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository, SeaOrmIssueRepository,
-    SeaOrmIssueTimelineRepository, SeaOrmLabelRepository, SeaOrmMilestoneRepository,
-    SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
+    SeaOrmEntityFingerprintRepository, SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository,
+    SeaOrmIssueRepository, SeaOrmIssueTimelineRepository, SeaOrmLabelRepository,
+    SeaOrmMilestoneRepository, SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
     SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
-    SeaOrmReviewCommentRepository, SeaOrmReviewRepository, SeaOrmReviewThreadRepository,
+    SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
+    SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository, SeaOrmSyncWatermarkRepository,
     SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmWorkflowJobRepository,
     SeaOrmWorkflowRunRepository,
 };
@@ -98,19 +103,335 @@ impl AuthZResolverApi for DenyAllAuthZResolver {
     }
 }
 
-/// GitHub fake: serves a pre-baked fetch result, or `NotFound` when empty.
+/// GitHub fake: serves a pre-baked repository, sliced per port call, or
+/// `NotFound` when empty.
 pub struct FakeGithub {
     pub result: Option<FetchedRepository>,
 }
 
+impl FakeGithub {
+    fn fixture(&self) -> Result<&FetchedRepository, DomainError> {
+        self.result.as_ref().ok_or(DomainError::NotFound)
+    }
+}
+
+/// What GitHub's `?since=` does to a listing: keep an entity when its stamp
+/// is at or after the bound. No stamp, or no bound, keeps it.
+fn not_before(stamp: Option<&str>, since: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    let (Some(stamp), Some(since)) = (stamp, since) else {
+        return true;
+    };
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .is_ok_and(|at| at.with_timezone(&chrono::Utc) >= since)
+}
+
+/// The fixture's completeness narrowed to the listings one port method
+/// actually walked, the way the real client reports only its own families.
+fn only(complete: &ListingCompleteness, listings: &[Listing]) -> ListingCompleteness {
+    let mut narrowed = ListingCompleteness::none();
+    for listing in listings {
+        narrowed.set(*listing, complete.is_complete(*listing));
+    }
+    narrowed
+}
+
 #[async_trait]
 impl GithubPort for FakeGithub {
-    async fn fetch_repository(
+    async fn fetch_repository_metadata(
         &self,
         _owner: &str,
         _name: &str,
-    ) -> Result<FetchedRepository, DomainError> {
-        self.result.clone().ok_or(DomainError::NotFound)
+        _options: &FetchOptions,
+    ) -> Result<RepoRecord, DomainError> {
+        Ok(self.fixture()?.repository.clone())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_issues(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+        _page1_etag: Option<&str>,
+        _continue_from: Option<&str>,
+        _options: &FetchOptions,
+    ) -> Result<IssueListing, DomainError> {
+        let f = self.fixture()?;
+        Ok(IssueListing {
+            complete: if updated_after.is_some() {
+                ListingCompleteness::none()
+            } else {
+                only(&f.complete, &[Listing::Issues, Listing::Comments])
+            },
+            issues: f
+                .issues
+                .iter()
+                .filter(|i| not_before(Some(&i.updated_at), updated_after))
+                .cloned()
+                .collect(),
+            comments: f
+                .comments
+                .iter()
+                .filter(|c| not_before(Some(&c.updated_at), updated_after))
+                .cloned()
+                .collect(),
+            issue_events: f.issue_events.clone(),
+            contributors: f.contributors.clone(),
+            page1_etag: None,
+            unchanged: false,
+            swept_to_end: true,
+            next: None,
+        })
+    }
+
+    async fn refine_issue(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        number: i64,
+        wants: IssueDetailWants,
+        _options: &FetchOptions,
+    ) -> Result<IssueDetail, DomainError> {
+        let f = self.fixture()?;
+        Ok(IssueDetail {
+            issue_number: number,
+            reactions: if wants.reactions {
+                f.issue_reactions
+                    .iter()
+                    .filter(|r| r.issue_number == number)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            timeline: if wants.timeline {
+                f.issue_timeline
+                    .iter()
+                    .filter(|e| e.issue_number == number)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    async fn list_pull_requests(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        _page1_etag: Option<&str>,
+        _continue_from: Option<&str>,
+        _options: &FetchOptions,
+    ) -> Result<PullListing, DomainError> {
+        let f = self.fixture()?;
+        Ok(PullListing {
+            complete: only(
+                &f.complete,
+                &[Listing::PullRequests, Listing::ReviewComments],
+            ),
+            pull_requests: f.pull_requests.clone(),
+            review_comments: f.review_comments.clone(),
+            contributors: Vec::new(),
+            page1_etag: None,
+            unchanged: false,
+            swept_to_end: true,
+            next: None,
+        })
+    }
+
+    async fn refine_pull_request(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        number: i64,
+        _options: &FetchOptions,
+    ) -> Result<PullDetail, DomainError> {
+        let f = self.fixture()?;
+        let pull_request = f
+            .pull_requests
+            .iter()
+            .find(|p| p.number == number)
+            .cloned()
+            .ok_or(DomainError::NotFound)?;
+        Ok(PullDetail {
+            pull_request,
+            reviews: f
+                .reviews
+                .iter()
+                .filter(|r| r.pull_number == number)
+                .cloned()
+                .collect(),
+            files: f
+                .pull_request_files
+                .iter()
+                .filter(|r| r.pull_number == number)
+                .cloned()
+                .collect(),
+            commits: f
+                .pull_request_commits
+                .iter()
+                .filter(|r| r.pull_number == number)
+                .cloned()
+                .collect(),
+            review_threads: f
+                .review_threads
+                .iter()
+                .filter(|r| r.pull_number == number)
+                .cloned()
+                .collect(),
+            declared: DeclaredCounts::default(),
+            contributors: Vec::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_commits(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+        _page1_etag: Option<&str>,
+        _continue_from: Option<&str>,
+        _options: &FetchOptions,
+    ) -> Result<CommitListing, DomainError> {
+        let f = self.fixture()?;
+        Ok(CommitListing {
+            complete: if updated_after.is_some() {
+                ListingCompleteness::none()
+            } else {
+                only(&f.complete, &[Listing::Commits])
+            },
+            commits: f
+                .commits
+                .iter()
+                .filter(|c| not_before(c.committed_at.as_deref(), updated_after))
+                .cloned()
+                .collect(),
+            commit_comments: f.commit_comments.clone(),
+            contributors: Vec::new(),
+            page1_etag: None,
+            unchanged: false,
+            swept_to_end: true,
+            next: None,
+        })
+    }
+
+    async fn refine_commit(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        sha: &str,
+        with_ci: bool,
+        _options: &FetchOptions,
+    ) -> Result<CommitDetail, DomainError> {
+        let f = self.fixture()?;
+        let commit = f
+            .commits
+            .iter()
+            .find(|c| c.sha == sha)
+            .cloned()
+            .ok_or(DomainError::NotFound)?;
+        Ok(CommitDetail {
+            commit,
+            files: f
+                .commit_files
+                .iter()
+                .filter(|r| r.commit_sha == sha)
+                .cloned()
+                .collect(),
+            statuses: if with_ci {
+                f.commit_statuses
+                    .iter()
+                    .filter(|r| r.commit_sha == sha)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            check_runs: if with_ci {
+                f.check_runs
+                    .iter()
+                    .filter(|r| r.head_sha == sha)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
+    async fn list_metadata(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        _options: &FetchOptions,
+    ) -> Result<MetadataListing, DomainError> {
+        let f = self.fixture()?;
+        Ok(MetadataListing {
+            complete: only(
+                &f.complete,
+                &[
+                    Listing::Labels,
+                    Listing::Milestones,
+                    Listing::Releases,
+                    Listing::Branches,
+                    Listing::Tags,
+                ],
+            ),
+            labels: f.labels.clone(),
+            milestones: f.milestones.clone(),
+            releases: f.releases.clone(),
+            branches: f.branches.clone(),
+            tags: f.tags.clone(),
+        })
+    }
+
+    async fn list_actions(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        _options: &FetchOptions,
+    ) -> Result<ActionsListing, DomainError> {
+        let f = self.fixture()?;
+        Ok(ActionsListing {
+            workflow_runs: f.workflow_runs.clone(),
+            deployments: f.deployments.clone(),
+        })
+    }
+
+    async fn refine_workflow_run(
+        &self,
+        _owner: &str,
+        _name: &str,
+        _repo_id: i64,
+        run_id: i64,
+        _options: &FetchOptions,
+    ) -> Result<Vec<WorkflowJobRecord>, DomainError> {
+        Ok(self
+            .fixture()?
+            .workflow_jobs
+            .iter()
+            .filter(|j| j.run_id == run_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn clear_cache(
+        &self,
+        _tenant_id: Uuid,
+        _owner: &str,
+        _name: Option<&str>,
+    ) -> Result<u64, DomainError> {
+        Ok(0)
     }
 }
 
@@ -186,11 +507,18 @@ pub fn service_with_enforcer(
         Arc::new(SeaOrmIssueReactionRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmCheckRunRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmIssueTimelineRepository::new(Arc::clone(&db))),
+        Arc::new(SeaOrmSyncSessionRepository::new(Arc::clone(&db))),
+        Arc::new(SeaOrmRepoSyncStatusRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmSyncWriter::new(Arc::clone(&db))),
+        Arc::new(SeaOrmEntityFingerprintRepository::new(Arc::clone(&db))),
+        Arc::new(SeaOrmSyncWatermarkRepository::new(Arc::clone(&db))),
         github,
         policy_enforcer,
         ServiceConfig {
             api_base_url: api_base_url.to_owned(),
+            scope: github_mirror::domain::scope::ScopeConfig::default(),
+            max_concurrent_syncs: 1,
+            max_concurrent_tasks: 1,
         },
     ))
 }
@@ -231,6 +559,58 @@ pub async fn gear_ctx(hub: Arc<ClientHub>, section: Option<serde_json::Value>) -
         tokio_util::sync::CancellationToken::new(),
     )
     .with_db(DBProvider::new(inmem_db().await))
+}
+
+/// Stands in for the gear's background sync worker.
+///
+/// `POST /sync` only queues work now, so a test that wants the sync to have
+/// happened takes the pump once and drains it after each request — the same
+/// `run_sync_job` call the real worker makes, minus the task and the select
+/// loop.
+pub struct SyncPump {
+    rx: tokio::sync::mpsc::Receiver<SyncJob>,
+}
+
+impl SyncPump {
+    /// Claim the job stream. Panics if something already took it.
+    pub async fn take(service: &ConcreteService) -> Self {
+        Self {
+            rx: service
+                .take_sync_receiver()
+                .await
+                .expect("the job receiver must still be available"),
+        }
+    }
+
+    /// Run every job queued so far, in order, and report how many there were.
+    pub async fn drain(&mut self, service: &ConcreteService) -> usize {
+        let mut ran = 0;
+        while let Ok(job) = self.rx.try_recv() {
+            service
+                .run_sync_job(&job, &tokio_util::sync::CancellationToken::new())
+                .await
+                .expect("the session outcome must be recorded");
+            ran += 1;
+        }
+        ran
+    }
+
+    /// Run every queued job under `cancel`, so a test can interrupt a sync.
+    pub async fn drain_under(
+        &mut self,
+        service: &ConcreteService,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> usize {
+        let mut ran = 0;
+        while let Ok(job) = self.rx.try_recv() {
+            service
+                .run_sync_job(&job, cancel)
+                .await
+                .expect("the session outcome must be recorded");
+            ran += 1;
+        }
+        ran
+    }
 }
 
 pub fn caller_in(tenant_id: Uuid) -> SecurityContext {
@@ -558,7 +938,7 @@ pub fn fetched_repository() -> FetchedRepository {
         workflow_jobs: vec![WorkflowJobRecord {
             id: 910,
             repo_id: 42,
-            run_id: 7,
+            run_id: 81,
             run_attempt: 1,
             name: "build".to_owned(),
             status: Some("completed".to_owned()),

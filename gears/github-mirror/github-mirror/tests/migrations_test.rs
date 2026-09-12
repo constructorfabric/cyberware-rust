@@ -40,6 +40,11 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_issue_reactions",
         "gm_check_runs",
         "gm_issue_timeline",
+        "gm_sync_sessions",
+        "gm_sync_watermarks",
+        "gm_entity_fingerprints",
+        "gm_repo_sync_status",
+        "gm_http_cache",
     ] {
         assert!(
             manager.has_table(table).await.unwrap(),
@@ -142,6 +147,11 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_issue_reactions",
         "gm_check_runs",
         "gm_issue_timeline",
+        "gm_sync_sessions",
+        "gm_sync_watermarks",
+        "gm_entity_fingerprints",
+        "gm_repo_sync_status",
+        "gm_http_cache",
     ] {
         assert!(
             !manager.has_table(table).await.unwrap(),

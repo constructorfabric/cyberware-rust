@@ -12,7 +12,9 @@ use github_mirror_sdk::{
     PullRequest, PullRequestCommit, PullRequestFile, Release, ReleaseAsset, Repo, Review,
     ReviewComment, ReviewThread, Tag, WorkflowJob, WorkflowRun, WorkflowStep,
 };
-use github_mirror_sdk::{MirrorStatus, SyncSummary};
+use github_mirror_sdk::{CountDrift, MirrorStatus, SyncSummary};
+
+use crate::domain::repo::{RepoSyncStatusRecord, SyncSessionRecord};
 
 /// Deliberately without `api_base_url`: `/health` is registered
 /// `.anonymous()`, and the configured upstream host is infrastructure detail
@@ -899,6 +901,31 @@ pub struct SyncSummaryDto {
     pub issue_timeline_synced: u64,
     /// Rows hard-deleted because a complete listing no longer contained them.
     pub stale_rows_deleted: u64,
+    /// Count gaps verification could not close after its repair passes.
+    pub accepted_drift: Vec<CountDriftDto>,
+}
+
+/// One count gap verification gave up on, as served in a session's summary.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct CountDriftDto {
+    pub entity_type: String,
+    pub pull_number: i64,
+    pub expected: u64,
+    pub stored: u64,
+    pub passes: u32,
+}
+
+impl From<CountDrift> for CountDriftDto {
+    fn from(d: CountDrift) -> Self {
+        Self {
+            entity_type: d.entity_type,
+            pull_number: d.pull_number,
+            expected: d.expected,
+            stored: d.stored,
+            passes: d.passes,
+        }
+    }
 }
 
 impl From<SyncSummary> for SyncSummaryDto {
@@ -931,6 +958,70 @@ impl From<SyncSummary> for SyncSummaryDto {
             check_runs_synced: s.check_runs_synced,
             issue_timeline_synced: s.issue_timeline_synced,
             stale_rows_deleted: s.stale_rows_deleted,
+            accepted_drift: s.accepted_drift.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Acknowledgement of an accepted sync request.
+///
+/// The work has not started yet — only the session row is durable at this
+/// point. Poll `GET /github-mirror/v1/sessions/{id}` for the outcome.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SyncAcceptedDto {
+    /// Id of the `gm_sync_sessions` row tracking this request.
+    pub session_id: String,
+    /// `owner/name` slug the session will sync.
+    pub repository: String,
+    /// Always `queued` — the status the session starts in.
+    pub status: String,
+}
+
+/// What one cache-clear removed.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct CacheClearedDto {
+    /// The owner, or `owner/name`, whose entries were dropped.
+    pub scope: String,
+    /// How many cached responses went.
+    pub entries_removed: u64,
+}
+
+/// Sessions queued by one resume call.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ResumeAcceptedDto {
+    /// How many repositories were re-queued.
+    pub resumed: usize,
+    /// One session id per re-queued repository, in slug order.
+    pub session_ids: Vec<String>,
+}
+
+/// Per-repository run status: the durable record resume works from.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct RepoSyncStatusDto {
+    /// `owner/name` slug.
+    pub repository: String,
+    /// GitHub repository id, once a run has fetched it.
+    pub repo_id: Option<i64>,
+    /// `in_progress` or `complete`.
+    pub status: String,
+    /// The run that last wrote this row.
+    pub last_session_id: Option<String>,
+    /// RFC3339 time of the last run that completed.
+    pub last_synced_at: Option<String>,
+}
+
+impl From<RepoSyncStatusRecord> for RepoSyncStatusDto {
+    fn from(r: RepoSyncStatusRecord) -> Self {
+        Self {
+            repository: r.repo_full_name,
+            repo_id: r.repo_id,
+            status: r.status,
+            last_session_id: r.last_session_id.map(|id| id.to_string()),
+            last_synced_at: r.last_synced_at,
         }
     }
 }
@@ -1333,4 +1424,64 @@ pub struct AuthenticatedUserDto {
     pub name: Option<String>,
     #[serde(rename = "type")]
     pub user_type: String,
+}
+
+/// One sync session, as served by `/github-mirror/v1/sessions`.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SyncSessionDto {
+    pub id: String,
+    /// `owner/name` slug the session synced.
+    pub repository: String,
+    /// `queued`, `in_progress`, `complete`, `failed`, or `interrupted`.
+    pub status: String,
+    /// 0-100, monotonically non-decreasing while the run works.
+    pub progress_percent: i32,
+    /// Failure detail when `status = failed`.
+    pub error: Option<String>,
+    /// The run's counters, replayed from the stored JSON; absent until the
+    /// session completes.
+    pub summary: Option<SyncSummaryDto>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    /// Re-stamped by every heartbeat, so it is readable mid-run.
+    pub ended_at: Option<String>,
+    /// `ended_at - started_at` in milliseconds, once both are known.
+    pub duration_ms: Option<i64>,
+}
+
+/// Milliseconds between two RFC3339 stamps, when both parse and the span is
+/// not negative.
+fn elapsed_ms(from: Option<&str>, to: Option<&str>) -> Option<i64> {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    let start = OffsetDateTime::parse(from?, &Rfc3339).ok()?;
+    let end = OffsetDateTime::parse(to?, &Rfc3339).ok()?;
+    let millis = (end - start).whole_milliseconds();
+    i64::try_from(millis).ok().filter(|ms| *ms >= 0)
+}
+
+impl From<SyncSessionRecord> for SyncSessionDto {
+    fn from(s: SyncSessionRecord) -> Self {
+        let summary = s
+            .summary_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<SyncSummary>(raw).ok())
+            .map(SyncSummaryDto::from);
+        let duration_ms = elapsed_ms(s.started_at.as_deref(), s.ended_at.as_deref());
+
+        Self {
+            id: s.id.to_string(),
+            repository: s.repo_full_name,
+            status: s.status,
+            progress_percent: s.progress_percent,
+            error: s.error,
+            summary,
+            created_at: s.created_at,
+            started_at: s.started_at,
+            ended_at: s.ended_at,
+            duration_ms,
+        }
+    }
 }

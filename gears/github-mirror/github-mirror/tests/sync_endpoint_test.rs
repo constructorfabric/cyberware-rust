@@ -52,15 +52,54 @@ async fn sync_fills_all_twenty_six_tables_and_reads_serve_them() {
             result: Some(common::fetched_repository()),
         }),
     );
-    let router = router_for(service, ctx);
+    let mut pump = common::SyncPump::take(&service).await;
+    let router = router_for(service.clone(), ctx);
 
     let response = post(
         router.clone(),
-        "/github-mirror/v1/repos/rust-lang/rust/sync",
+        "/github-mirror/v1/repos/rust-lang/rust/sync?timeline_scope=all",
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let summary = body_json(response).await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let accepted = body_json(response).await;
+    let session_id = accepted["session_id"].as_str().expect("session_id");
+    assert_eq!(accepted["status"], "queued");
+    assert_eq!(pump.drain(&service).await, 1, "the worker must run the job");
+
+    let session = body_json(
+        get(
+            router.clone(),
+            &format!("/github-mirror/v1/sessions/{session_id}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(session["status"], "complete");
+    assert_eq!(session["progress_percent"], 100);
+
+    let statuses = body_json(get(router.clone(), "/github-mirror/v1/sync-status").await).await;
+    let repo_status = &statuses["items"][0];
+    assert_eq!(
+        repo_status["status"], "complete",
+        "a completed run clears the repository's in_progress marker"
+    );
+    assert_eq!(repo_status["repository"], "rust-lang/rust");
+    assert!(repo_status["last_synced_at"].is_string());
+
+    let resumed = body_json(
+        post(
+            router.clone(),
+            "/github-mirror/v1/sync/resume?repo=rust-lang/rust",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        resumed["resumed"], 0,
+        "a completed repository has nothing to resume"
+    );
+
+    let summary = session["summary"].clone();
     assert_eq!(summary["repository"], "rust-lang/rust");
     assert_eq!(summary["issues_synced"], 1);
     assert_eq!(summary["pull_requests_synced"], 1);
@@ -230,8 +269,14 @@ async fn sync_fills_all_twenty_six_tables_and_reads_serve_them() {
     assert_eq!(statuses[0]["context"], "ci/build");
     assert_eq!(statuses[0]["creator"]["login"], "judy");
 
-    let jobs =
-        body_json(get(router2.clone(), "/repos/rust-lang/rust/actions/runs/7/jobs").await).await;
+    let jobs = body_json(
+        get(
+            router2.clone(),
+            "/repos/rust-lang/rust/actions/runs/81/jobs",
+        )
+        .await,
+    )
+    .await;
     assert_eq!(jobs["total_count"], 1);
     let jobs = jobs["jobs"].as_array().expect("jobs");
     assert_eq!(jobs.len(), 1);
@@ -272,14 +317,29 @@ async fn sync_fills_all_twenty_six_tables_and_reads_serve_them() {
 }
 
 #[tokio::test]
-async fn sync_of_unknown_repository_returns_404() {
+async fn sync_of_unknown_repository_fails_on_the_session_not_the_request() {
     let ctx = common::caller_in(Uuid::new_v4());
     let service = common::service("https://api.github.com").await;
-    let router = router_for(service, ctx);
+    let mut pump = common::SyncPump::take(&service).await;
+    let router = router_for(service.clone(), ctx);
 
-    let response = post(router, "/github-mirror/v1/repos/acme/nope/sync").await;
+    let response = post(router.clone(), "/github-mirror/v1/repos/acme/nope/sync").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::ACCEPTED,
+        "queueing succeeds even for a repo GitHub will reject"
+    );
+    let session_id = body_json(response).await["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    pump.drain(&service).await;
 
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let session =
+        body_json(get(router, &format!("/github-mirror/v1/sessions/{session_id}")).await).await;
+    assert_eq!(session["status"], "failed");
+    assert!(session["error"].is_string(), "the 404 lands in the session");
+    assert!(session["summary"].is_null());
 }
 
 #[tokio::test]
@@ -293,8 +353,11 @@ async fn sync_is_idempotent() {
             result: Some(common::fetched_repository()),
         }),
     );
-    let router = router_for(service, ctx);
+    let mut pump = common::SyncPump::take(&service).await;
+    let router = router_for(service.clone(), ctx);
 
+    // Drained between the two requests: back-to-back requests would collapse
+    // into one run, which `a_second_sync_of_a_repo_in_flight_reuses_it` covers.
     let listings = [
         "/repos/rust-lang/rust/issues",
         "/repos/rust-lang/rust/pulls",
@@ -312,7 +375,8 @@ async fn sync_is_idempotent() {
         "/github-mirror/v1/repos/rust-lang/rust/sync",
     )
     .await;
-    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    assert_eq!(pump.drain(&service).await, 1);
 
     let mut after_first = Vec::new();
     for path in listings {
@@ -332,7 +396,8 @@ async fn sync_is_idempotent() {
         "/github-mirror/v1/repos/rust-lang/rust/sync",
     )
     .await;
-    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::ACCEPTED);
+    assert_eq!(pump.drain(&service).await, 1, "both jobs must run");
 
     let repos = body_json(get(router.clone(), "/github-mirror/v1/repos").await).await;
     assert_eq!(repos["items"].as_array().expect("items").len(), 1);
@@ -353,7 +418,73 @@ async fn sync_is_idempotent() {
 }
 
 #[tokio::test]
-async fn a_concurrent_sync_for_the_same_repo_is_rejected_with_a_conflict() {
+async fn a_second_sync_of_a_repo_in_flight_reuses_it() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let db = common::inmem_db().await;
+    let service = common::service_with_github(
+        db,
+        "https://api.github.com",
+        Arc::new(common::FakeGithub {
+            result: Some(common::fetched_repository()),
+        }),
+    );
+    let mut pump = common::SyncPump::take(&service).await;
+    let router = router_for(service.clone(), ctx);
+
+    let first = body_json(
+        post(
+            router.clone(),
+            "/github-mirror/v1/repos/rust-lang/rust/sync",
+        )
+        .await,
+    )
+    .await;
+    let second = body_json(
+        post(
+            router.clone(),
+            "/github-mirror/v1/repos/rust-lang/rust/sync",
+        )
+        .await,
+    )
+    .await;
+
+    assert_eq!(
+        first["session_id"], second["session_id"],
+        "a repo already queued must hand back the run that owns it"
+    );
+    assert_eq!(
+        pump.drain(&service).await,
+        1,
+        "the duplicate must not queue a second job"
+    );
+
+    // A different repository is unaffected by the claim.
+    let other = post(
+        router.clone(),
+        "/github-mirror/v1/repos/rust-lang/cargo/sync",
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::ACCEPTED);
+    assert_eq!(pump.drain(&service).await, 1);
+
+    // Once the run is done the claim is gone, so the repo can sync again.
+    let again = body_json(
+        post(
+            router.clone(),
+            "/github-mirror/v1/repos/rust-lang/rust/sync",
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(
+        again["session_id"], first["session_id"],
+        "a finished run must not keep collapsing later requests"
+    );
+    assert_eq!(pump.drain(&service).await, 1);
+}
+
+#[tokio::test]
+async fn a_sync_colliding_with_a_held_repo_lock_fails_its_session() {
     let ctx = common::caller_in(Uuid::new_v4());
     let tenant_id = ctx.subject_tenant_id();
     let db = common::inmem_db().await;
@@ -373,26 +504,19 @@ async fn a_concurrent_sync_for_the_same_repo_is_rejected_with_a_conflict() {
         .await
         .expect("test must be able to hold the sync lock");
 
-    let router = router_for(service, ctx);
+    let mut pump = common::SyncPump::take(&service).await;
+    let router = router_for(service.clone(), ctx);
     let response = post(
         router.clone(),
         "/github-mirror/v1/repos/rust-lang/rust/sync",
     )
     .await;
-    assert_eq!(
-        response.status(),
-        StatusCode::CONFLICT,
-        "the second sync must be told a sync is already running, not race it"
-    );
-
-    // The body is the intended public detail, pinned here so it cannot drift:
-    // the repository is the one the caller itself asked to sync, and it is
-    // told which of the two things went wrong rather than a bare "conflict".
-    let json = body_json(response).await;
-    assert_eq!(
-        json["detail"], "a sync for rust-lang/rust is already running",
-        "the caller must learn a sync is running, and for which repo: {json:?}"
-    );
+    // Queueing always succeeds; the collision is the job's to discover.
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let session_id = body_json(response).await["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
 
     // A different repo is not blocked by this repo's lock.
     let other = post(
@@ -400,13 +524,68 @@ async fn a_concurrent_sync_for_the_same_repo_is_rejected_with_a_conflict() {
         "/github-mirror/v1/repos/rust-lang/cargo/sync",
     )
     .await;
-    assert_eq!(other.status(), StatusCode::OK);
+    assert_eq!(other.status(), StatusCode::ACCEPTED);
+    let other_session = body_json(other).await["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    assert_eq!(pump.drain(&service).await, 2, "both jobs must run");
+
+    let blocked = body_json(
+        get(
+            router.clone(),
+            &format!("/github-mirror/v1/sessions/{session_id}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        blocked["status"], "failed",
+        "a sync must not race another sync of the same repo"
+    );
+    assert!(
+        blocked["error"]
+            .as_str()
+            .expect("error")
+            .contains("already running"),
+        "the session must say why it stopped: {blocked:?}"
+    );
+    let unblocked = body_json(
+        get(
+            router.clone(),
+            &format!("/github-mirror/v1/sessions/{other_session}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        unblocked["status"], "complete",
+        "another repo's sync is unaffected by this repo's lock"
+    );
 
     held.release().await.expect("release must succeed");
 
-    // Once the first sync finishes, the repo can be synced again.
-    let retry = post(router, "/github-mirror/v1/repos/rust-lang/rust/sync").await;
-    assert_eq!(retry.status(), StatusCode::OK);
+    // Once the lock is gone, the repo syncs normally.
+    let retry = post(
+        router.clone(),
+        "/github-mirror/v1/repos/rust-lang/rust/sync",
+    )
+    .await;
+    assert_eq!(retry.status(), StatusCode::ACCEPTED);
+    let retry_session = body_json(retry).await["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    assert_eq!(pump.drain(&service).await, 1);
+    let done = body_json(
+        get(
+            router,
+            &format!("/github-mirror/v1/sessions/{retry_session}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(done["status"], "complete");
 }
 
 /// A repo with exactly the given issues, everything else empty; `issues`
@@ -480,8 +659,14 @@ fn recon_fetched(issue_ids: &[i64], issues_complete: bool) -> FetchedRepository 
     result
 }
 
-/// Run one inline sync of acme/recon against the given upstream state.
-async fn sync_recon(db: toolkit_db::Db, ctx: &SecurityContext, upstream: FetchedRepository) {
+/// Run one sync of acme/recon against the given upstream state, queued and
+/// pumped the way the background worker runs it.
+async fn sync_recon(
+    db: toolkit_db::Db,
+    ctx: &SecurityContext,
+    upstream: FetchedRepository,
+    force: bool,
+) -> String {
     let service = common::service_with_github(
         db,
         "https://api.github.com",
@@ -489,9 +674,80 @@ async fn sync_recon(db: toolkit_db::Db, ctx: &SecurityContext, upstream: Fetched
             result: Some(upstream),
         }),
     );
+    let mut pump = common::SyncPump::take(&service).await;
+    let router = router_for(service.clone(), ctx.clone());
+    let response = post(
+        router,
+        &format!("/github-mirror/v1/repos/acme/recon/sync?timeline_scope=all&force={force}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let session_id = body_json(response).await["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+    assert_eq!(pump.drain(&service).await, 1, "the queued sync must run");
+    session_id
+}
+
+/// `recon_fetched`, with each issue's `updated_at` set by hand so a watermark
+/// from one sync can leave some of them outside the next sync's walk.
+fn recon_fetched_stamped(issues: &[(i64, &str)]) -> FetchedRepository {
+    let ids: Vec<i64> = issues.iter().map(|(id, _)| *id).collect();
+    let mut result = recon_fetched(&ids, true);
+    for (issue, (_, updated_at)) in result.issues.iter_mut().zip(issues) {
+        (*updated_at).clone_into(&mut issue.updated_at);
+    }
+    result
+}
+
+async fn recon_issues_synced(db: toolkit_db::Db, ctx: &SecurityContext, session_id: &str) -> u64 {
+    let service = common::service_with_github(
+        db,
+        "https://api.github.com",
+        Arc::new(common::FakeGithub { result: None }),
+    );
     let router = router_for(service, ctx.clone());
-    let response = post(router, "/github-mirror/v1/repos/acme/recon/sync").await;
-    assert_eq!(response.status(), StatusCode::OK);
+    let session =
+        body_json(get(router, &format!("/github-mirror/v1/sessions/{session_id}")).await).await;
+    session["summary"]["issues_synced"]
+        .as_u64()
+        .expect("issues_synced")
+}
+
+#[tokio::test]
+async fn an_incremental_sync_keeps_the_rows_it_did_not_have_to_look_at() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let db = common::inmem_db().await;
+
+    let first = sync_recon(
+        db.clone(),
+        &ctx,
+        recon_fetched_stamped(&[(11, "2026-08-20T00:00:00Z"), (12, "2026-08-10T00:00:00Z")]),
+        false,
+    )
+    .await;
+    assert_eq!(recon_issues_synced(db.clone(), &ctx, &first).await, 2);
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let second = sync_recon(
+        db.clone(),
+        &ctx,
+        recon_fetched_stamped(&[(11, "2026-08-21T00:00:00Z"), (12, "2026-08-10T00:00:00Z")]),
+        false,
+    )
+    .await;
+
+    assert_eq!(
+        recon_issues_synced(db.clone(), &ctx, &second).await,
+        1,
+        "the first sync's watermark must bound the second, so only the edited issue is listed"
+    );
+    assert_eq!(
+        recon_issue_ids(db.clone(), &ctx).await,
+        vec![11, 12],
+        "issue 12 was outside the bounded walk, which says nothing about whether it still exists"
+    );
 }
 
 async fn recon_issue_ids(db: toolkit_db::Db, ctx: &SecurityContext) -> Vec<i64> {
@@ -515,26 +771,27 @@ async fn reconciliation_deletes_upstream_removals_but_only_from_complete_listing
     let db = common::inmem_db().await;
 
     // Sync 1: issues 11 and 12 exist upstream.
-    sync_recon(db.clone(), &ctx, recon_fetched(&[11, 12], true)).await;
+    sync_recon(db.clone(), &ctx, recon_fetched(&[11, 12], true), false).await;
     assert_eq!(recon_issue_ids(db.clone(), &ctx).await, vec![11, 12]);
 
     // Sync 2: issue 12 vanished upstream, but the listing was truncated —
     // absence proves nothing, so nothing may be deleted.
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    sync_recon(db.clone(), &ctx, recon_fetched(&[11], false)).await;
+    sync_recon(db.clone(), &ctx, recon_fetched(&[11], false), false).await;
     assert_eq!(
         recon_issue_ids(db.clone(), &ctx).await,
         vec![11, 12],
         "a truncated listing must not reconcile deletions"
     );
 
-    // Sync 3: same upstream state, complete listing — now 12 goes.
+    // Sync 3: same upstream state, forced so the watermark does not bound the
+    // walk — now 12 goes.
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    sync_recon(db.clone(), &ctx, recon_fetched(&[11], true)).await;
+    sync_recon(db.clone(), &ctx, recon_fetched(&[11], true), true).await;
     assert_eq!(
         recon_issue_ids(db.clone(), &ctx).await,
         vec![11],
-        "a complete listing reconciles the upstream deletion"
+        "an unbounded, complete listing reconciles the upstream deletion"
     );
 }
 
@@ -566,6 +823,7 @@ async fn derived_contributor_roles_accumulate_across_syncs() {
         db.clone(),
         &ctx,
         contributor_fetched(71, "alice", &["author"], "2026-05-01T00:00:00Z"),
+        false,
     )
     .await;
 
@@ -575,6 +833,7 @@ async fn derived_contributor_roles_accumulate_across_syncs() {
         db.clone(),
         &ctx,
         contributor_fetched(71, "alice", &["reviewer"], "2026-08-01T00:00:00Z"),
+        false,
     )
     .await;
 
@@ -630,6 +889,7 @@ async fn a_shorter_timeline_does_not_leave_the_previous_tail_behind() {
         db.clone(),
         &ctx,
         timeline_fetched(&["labeled", "commented", "assigned", "closed"]),
+        false,
     )
     .await;
 
@@ -639,6 +899,7 @@ async fn a_shorter_timeline_does_not_leave_the_previous_tail_behind() {
         db.clone(),
         &ctx,
         timeline_fetched(&["labeled", "assigned", "closed"]),
+        true,
     )
     .await;
 

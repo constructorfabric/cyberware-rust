@@ -2,8 +2,7 @@
 # CF/Gears Example Server Configuration
 #
 # Database Architecture Overview:
-# ===============================
-#
+# ========================#
 # CF/Gears example server uses a centralized DbManager that:
 # 1. Loads global database server templates from `database.servers`
 # 2. For each gear, merges server template with gear-specific overrides
@@ -471,8 +470,7 @@ opentelemetry:
 # Example configurations for different database scenarios:
 #
 # Example 1: PostgreSQL server with multiple gears
-# ==================================================
-# database:
+# ===========================================# database:
 #   servers:
 #     main_postgres:
 #       host: "localhost"
@@ -498,8 +496,7 @@ opentelemetry:
 #         max_conns: 10                 # Gear-specific pool override
 #
 # Example 2: Mixed database types
-# ===============================
-# database:
+# ========================# database:
 #   servers:
 #     postgres_main:
 #       dsn: "postgres://user:${PG_PASS}@localhost:5432/main"
@@ -515,16 +512,14 @@ opentelemetry:
 #       server: "redis_cache"
 #
 # Example 3: Complete DSN override
-# ================================
-# gears:
+# =========================# gears:
 #   analytics:
 #     database:
 #       dsn: "postgres://analytics:${ANALYTICS_PASSWORD}@analytics-db:5432/metrics?sslmode=require"
 #       # When DSN is specified, server reference is ignored
 #
 # Example 4: No database gear
-# =============================
-# gears:
+# ======================# gears:
 #   static_files:
 #     # No database section - gear won't get database access
 #     config:

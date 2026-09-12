@@ -311,7 +311,7 @@ so the unchecked boxes below read as "not yet", not "abandoned".
 
 - [ ] `p1` - **ID**: `cpt-cf-github-mirror-fr-session-init`
 
-The system **MUST** accept a session configuration struct (provided by the caller) containing: GitHub token (or token pool reference), database connection credentials, telemetry log file path, cache configuration, and synchronization scope. The system **MUST** validate the GitHub token(s) and their scopes where possible, open the selected storage backend, create a synchronization session record, and load previous cursors and failed tasks from prior sessions. The library **MUST NOT** read environment variables or configuration files — all inputs come from the caller (see §5.20).
+The system **MUST** accept a session configuration struct (provided by the caller) containing: GitHub token (or token pool reference), database connection credentials, telemetry log file path, cache configuration, and synchronization scope. The system **MUST** validate the GitHub token(s) and their scopes where possible, open the selected storage backend, create a synchronization session record, and load the repository's watermarks and entity fingerprints from prior runs (see `cpt-cf-github-mirror-fr-session-resume`). The library **MUST NOT** read environment variables or configuration files — all inputs come from the caller (see §5.20).
 
 Multiple synchronization sessions **MUST** be able to run in parallel, each with its own configuration. Sessions that share the same GitHub token **MUST** share rate-limit budgets. The global request semaphore and per-token rate-limit controllers are managed by the engine singleton.
 

@@ -2,6 +2,9 @@ use serde::Deserialize;
 use toolkit_utils::SecretString;
 use toolkit_utils::var_expand::ExpandVarsError;
 
+use crate::domain::scope::ScopeConfig;
+use crate::infra::github::compression::Compression;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GithubMirrorConfig {
     #[serde(default = "default_api_base_url")]
@@ -18,9 +21,69 @@ pub struct GithubMirrorConfig {
     /// leak a literally-configured PAT.
     #[serde(default)]
     pub github_token: Option<SecretString>,
+    /// What a sync collects when the request does not say (PRD §5.4): the
+    /// type's default, which leaves timeline events off until a deployment or
+    /// a request turns them on (PRD §5.2).
+    #[serde(default)]
+    pub scope: ScopeConfig,
+    /// How cached response bodies are stored: `none`, `gzip` or `zstd`
+    /// (PRD §5.6). GitHub JSON gzips to roughly a fifth of its size, so the
+    /// default is on.
+    #[serde(default = "default_compression")]
+    pub cache_compression: String,
+    /// How many repositories the gear syncs at the same time
+    /// (PRD §6.1 "parallel synchronization of multiple repositories").
+    ///
+    /// Zero is read as one: a queue with no worker would accept syncs and
+    /// never run them.
+    #[serde(default = "default_max_concurrent_syncs")]
+    pub max_concurrent_syncs: usize,
+    /// How many tasks one repository's sync runs at the same time: list
+    /// pages being indexed and entities being refined. The reference
+    /// implementation's `--max-concurrent`.
+    #[serde(default = "default_max_concurrent_tasks")]
+    pub max_concurrent_tasks: usize,
+    /// Ceiling on GitHub requests in flight across every running sync.
+    ///
+    /// GitHub's secondary rate limit triggers on concurrency rather than
+    /// volume, and the PRD's threshold is "zero bans with parallelism <= 8"
+    /// (PRD §6.1), so the default sits at that bound. Without this ceiling
+    /// each extra concurrent repository would multiply the request rate.
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+}
+
+/// Repositories synced at once when the config says nothing: enough to keep
+/// the queue moving, low enough that one tenant's backlog is not the whole
+/// gear's work.
+fn default_max_concurrent_syncs() -> usize {
+    4
+}
+
+/// GitHub requests in flight at once when the config says nothing.
+fn default_max_concurrent_requests() -> usize {
+    8
+}
+
+/// Tasks in flight inside one sync when the config says nothing.
+fn default_max_concurrent_tasks() -> usize {
+    4
+}
+
+fn default_compression() -> String {
+    "gzip".to_owned()
 }
 
 impl GithubMirrorConfig {
+    /// The configured compression mode.
+    ///
+    /// # Errors
+    /// `Validation` when the config names a mode that does not exist, so a
+    /// typo fails at startup rather than at the first cache write.
+    pub fn resolved_compression(&self) -> Result<Compression, crate::domain::error::DomainError> {
+        Compression::parse(&self.cache_compression)
+    }
+
     /// The token with any `${VAR}` reference expanded from the environment.
     ///
     /// # Errors
@@ -95,6 +158,11 @@ impl Default for GithubMirrorConfig {
         Self {
             api_base_url: default_api_base_url(),
             github_token: None,
+            scope: ScopeConfig::default(),
+            cache_compression: default_compression(),
+            max_concurrent_syncs: default_max_concurrent_syncs(),
+            max_concurrent_tasks: default_max_concurrent_tasks(),
+            max_concurrent_requests: default_max_concurrent_requests(),
         }
     }
 }

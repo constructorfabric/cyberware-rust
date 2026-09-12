@@ -233,6 +233,13 @@ gears:
     config:
       api_base_url: "https://api.github.com"
       github_token: "${GITHUB_TOKEN}"
+      # Repositories synced at once, and the ceiling on GitHub requests in
+      # flight across all of them (GitHub's secondary rate limit reacts to
+      # concurrency, so raise the second one only with a token pool).
+      max_concurrent_syncs: 4
+      max_concurrent_requests: 4
+      # Tasks (list pages, single entities) in flight inside one sync.
+      max_concurrent_tasks: 4
 
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:

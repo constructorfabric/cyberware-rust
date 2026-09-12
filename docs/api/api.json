@@ -1728,6 +1728,26 @@
         ],
         "type": "object"
       },
+      "CacheClearedDto": {
+        "description": "What one cache-clear removed.",
+        "properties": {
+          "entries_removed": {
+            "description": "How many cached responses went.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "description": "The owner, or `owner/name`, whose entries were dropped.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope",
+          "entries_removed"
+        ],
+        "type": "object"
+      },
       "CapabilitiesDto": {
         "description": "Backend capabilities surface for `GET /storages`.",
         "properties": {
@@ -3171,6 +3191,41 @@
           "OPTIONS"
         ],
         "type": "string"
+      },
+      "CountDriftDto": {
+        "description": "One count gap verification gave up on, as served in a session's summary.",
+        "properties": {
+          "entity_type": {
+            "type": "string"
+          },
+          "expected": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "passes": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pull_number": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "stored": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "entity_type",
+          "pull_number",
+          "expected",
+          "stored",
+          "passes"
+        ],
+        "type": "object"
       },
       "CoverageEndView": {
         "description": "Where a key's coverage stops, as the three-armed answer the domain carries.\n\n`kind` and a nullable instant rather than a bare nullable instant, because\n`null` would have to serve two **opposite** answers: a key covered forever\npasses every horizon predicate and a key covered not at all fails all of them.\nThe read-model payload declares the same shape for the same reason.",
@@ -15116,6 +15171,46 @@
         ],
         "type": "object"
       },
+      "RepoSyncStatusDto": {
+        "description": "Per-repository run status: the durable record resume works from.",
+        "properties": {
+          "last_session_id": {
+            "description": "The run that last wrote this row.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_synced_at": {
+            "description": "RFC3339 time of the last run that completed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repo_id": {
+            "description": "GitHub repository id, once a run has fetched it.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "repository": {
+            "description": "`owner/name` slug.",
+            "type": "string"
+          },
+          "status": {
+            "description": "`in_progress` or `complete`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "repository",
+          "status"
+        ],
+        "type": "object"
+      },
       "RepricingAdjustmentRequest": {
         "description": "What the run does to every selected row's amount.\n\nThe four members are [`OverlayLineRequest`]'s, spelled identically and parsed\nby [`crate::domain::overlay::adjustment_of`] — the same function, not a copy. `inst-mr-api` names the\nadjustment without defining it, and a second vocabulary for \"what to do to a\nprice\" is the hazard the overlay plane's own line parser already exists to\nprevent.\n\n[`OverlayLineRequest`]: crate::api::rest::overlays::OverlayLineRequest",
         "properties": {
@@ -15550,6 +15645,28 @@
         },
         "required": [
           "intent"
+        ],
+        "type": "object"
+      },
+      "ResumeAcceptedDto": {
+        "description": "Sessions queued by one resume call.",
+        "properties": {
+          "resumed": {
+            "description": "How many repositories were re-queued.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_ids": {
+            "description": "One session id per re-queued repository, in slug order.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "resumed",
+          "session_ids"
         ],
         "type": "object"
       },
@@ -17528,9 +17645,110 @@
         ],
         "type": "object"
       },
+      "SyncAcceptedDto": {
+        "description": "Acknowledgement of an accepted sync request.\n\nThe work has not started yet — only the session row is durable at this\npoint. Poll `GET /github-mirror/v1/sessions/{id}` for the outcome.",
+        "properties": {
+          "repository": {
+            "description": "`owner/name` slug the session will sync.",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "Id of the `gm_sync_sessions` row tracking this request.",
+            "type": "string"
+          },
+          "status": {
+            "description": "Always `queued` — the status the session starts in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "repository",
+          "status"
+        ],
+        "type": "object"
+      },
+      "SyncSessionDto": {
+        "description": "One sync session, as served by `/github-mirror/v1/sessions`.",
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "description": "`ended_at - started_at` in milliseconds, once both are known.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ended_at": {
+            "description": "Re-stamped by every heartbeat, so it is readable mid-run.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Failure detail when `status = failed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "progress_percent": {
+            "description": "0-100, monotonically non-decreasing while the run works.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "repository": {
+            "description": "`owner/name` slug the session synced.",
+            "type": "string"
+          },
+          "started_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`queued`, `in_progress`, `complete`, `failed`, or `interrupted`.",
+            "type": "string"
+          },
+          "summary": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SyncSummaryDto",
+                "description": "The run's counters, replayed from the stored JSON; absent until the\nsession completes."
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "repository",
+          "status",
+          "progress_percent",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "SyncSummaryDto": {
         "description": "Result of one sync pass, as served by the extended sync endpoint.",
         "properties": {
+          "accepted_drift": {
+            "description": "Count gaps verification could not close after its repair passes.",
+            "items": {
+              "$ref": "#/components/schemas/CountDriftDto"
+            },
+            "type": "array"
+          },
           "branches_synced": {
             "format": "int64",
             "minimum": 0,
@@ -17693,7 +17911,8 @@
           "issue_reactions_synced",
           "check_runs_synced",
           "issue_timeline_synced",
-          "stale_rows_deleted"
+          "stale_rows_deleted",
+          "accepted_drift"
         ],
         "type": "object"
       },
@@ -43783,6 +44002,93 @@
         ]
       }
     },
+    "/github-mirror/v1/cache": {
+      "delete": {
+        "description": "DESIGN 4's `clear_cache`. Removes raw cached responses so the next sync              re-fetches instead of revalidating; the mirrored rows themselves are left              untouched. Give `repo=owner/name` for one repository or `owner=X` for              everything mirrored under that owner.",
+        "operationId": "github_mirror.v1.clear_cache",
+        "parameters": [
+          {
+            "description": "Clear every repository of this owner",
+            "in": "query",
+            "name": "owner",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Clear only this `owner/name` repository",
+            "in": "query",
+            "name": "repo",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CacheClearedDto"
+                }
+              }
+            },
+            "description": "How many cached responses were removed"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Drop cached GitHub responses for an owner or a repository",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
     "/github-mirror/v1/health": {
       "get": {
         "description": "Reports that the github-mirror gear is loaded and serving requests",
@@ -44295,7 +44601,7 @@
     },
     "/github-mirror/v1/repos/{owner}/{name}/sync": {
       "post": {
-        "description": "Fetches the repository plus the first page of its entities from GitHub and              upserts them into the caller's tenant mirror. First slice of the sync engine:              no pagination, conditional requests, or rate-limit budgeting yet.",
+        "description": "Queues a sync of the repository and answers immediately with a session id.              The background worker fetches the repository plus the first page of its              entities from GitHub and upserts them into the caller's tenant mirror;              poll the session for the outcome. No pagination, conditional requests, or              rate-limit budgeting yet.",
         "operationId": "github_mirror.v1.sync_repository",
         "parameters": [
           {
@@ -44315,6 +44621,138 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Bypass the HTTP cache and re-fetch everything",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated object types to collect, e.g. `issues,pull_requests`",
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`all`, `open` or `none` for CI results",
+            "in": "query",
+            "name": "actions_scope",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`all`, `open` or `none` for reactions",
+            "in": "query",
+            "name": "reactions_scope",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`all`, `open` or `none` for timeline events",
+            "in": "query",
+            "name": "timeline_scope",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncAcceptedDto"
+                }
+              }
+            },
+            "description": "Sync queued; the body carries the session id to poll"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Sync a repository from GitHub into the mirror",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/sessions": {
+      "get": {
+        "operationId": "github_mirror.v1.list_sync_sessions",
+        "parameters": [
+          {
+            "description": "Maximum number of sessions to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -44322,11 +44760,88 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SyncSummaryDto"
+                  "$ref": "#/components/schemas/SyncSessionDto"
                 }
               }
             },
-            "description": "Repo synced into the mirror"
+            "description": "Paginated list of sync sessions"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "List sync sessions, newest first",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/sessions/{id}": {
+      "get": {
+        "operationId": "github_mirror.v1.get_sync_session",
+        "parameters": [
+          {
+            "description": "Session id, as returned by the sync endpoint",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncSessionDto"
+                }
+              }
+            },
+            "description": "The session's current status, progress and duration"
           },
           "400": {
             "content": {
@@ -44394,7 +44909,180 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Sync a repository from GitHub into the mirror",
+        "summary": "One sync session by id",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/sync-status": {
+      "get": {
+        "operationId": "github_mirror.v1.list_repo_sync_status",
+        "parameters": [
+          {
+            "description": "Only `in_progress` or only `complete`",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum number of repositories to return",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RepoSyncStatusDto"
+                }
+              }
+            },
+            "description": "Paginated per-repository run statuses"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Per-repository run status and last-sync time",
+        "tags": [
+          "GitHub Mirror"
+        ]
+      }
+    },
+    "/github-mirror/v1/sync/resume": {
+      "post": {
+        "description": "PRD 5.2's resume operation. Resume is a re-run, not a restore: each              repository still marked `in_progress` is queued for a fresh sync, and the              cache plus change-detection state are what make that cheap. Answers              immediately with one session id per repository. Pass `repo=owner/name`              to resume a single repository; a repository that is not `in_progress`              has nothing to resume and comes back with `resumed: 0`.",
+        "operationId": "github_mirror.v1.resume_syncs",
+        "parameters": [
+          {
+            "description": "Resume only this `owner/name` repository",
+            "in": "query",
+            "name": "repo",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Bypass the HTTP cache and re-fetch everything",
+            "in": "query",
+            "name": "force",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResumeAcceptedDto"
+                }
+              }
+            },
+            "description": "Resume queued; the body carries one session id per repository"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Re-run repositories still marked in_progress",
         "tags": [
           "GitHub Mirror"
         ]

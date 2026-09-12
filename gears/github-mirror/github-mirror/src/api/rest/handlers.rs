@@ -9,26 +9,27 @@ use std::sync::Arc;
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::{Json, extract::Extension};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use toolkit::api::canonical_prelude::*;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
-
-use crate::api::rest::routes::ConcreteService;
-use chrono::{DateTime, Utc};
-
-use crate::domain::error::DomainError;
-use crate::domain::repo::{IssueState, ListingDirection, ListingFilter, ListingSort, PageWindow};
-use crate::domain::validate::{validate_commit_sha, validate_repo_path};
 use url::form_urlencoded;
 
+use crate::api::rest::routes::ConcreteService;
+use crate::domain::error::DomainError;
+use crate::domain::repo::{IssueState, ListingDirection, ListingFilter, ListingSort, PageWindow};
+use crate::domain::scope::{CollectionMode, ScopeConfig, SyncScope};
+use crate::domain::validate::{validate_commit_sha, validate_repo_path};
+
 use super::dto::{
-    AuthenticatedUserDto, BranchDto, CheckRunDto, CheckRunsPageDto, CommentDto, CommitCommentDto,
-    CommitDto, CommitFileDto, CommitStatsDto, CommitStatusDto, ContributorDto, DeploymentDto,
-    GithubMirrorHealthDto, IssueDto, IssueEventDto, IssueReactionDto, IssueTimelineEventDto,
-    LabelDto, MilestoneDto, PullRequestDto, PullRequestFileDto, ReleaseDto, RepoDto,
-    ReviewCommentDto, ReviewDto, ReviewThreadDto, SyncSummaryDto, TagDto, WorkflowJobDto,
-    WorkflowJobsPageDto, WorkflowRunDto, WorkflowRunsPageDto,
+    AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto, CheckRunsPageDto, CommentDto,
+    CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto, CommitStatusDto, ContributorDto,
+    DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto, IssueReactionDto,
+    IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto, PullRequestFileDto, ReleaseDto,
+    RepoDto, RepoSyncStatusDto, ResumeAcceptedDto, ReviewCommentDto, ReviewDto, ReviewThreadDto,
+    SyncAcceptedDto, SyncSessionDto, TagDto, WorkflowJobDto, WorkflowJobsPageDto, WorkflowRunDto,
+    WorkflowRunsPageDto,
 };
 
 const DEFAULT_PER_PAGE: u64 = 30;
@@ -42,8 +43,128 @@ const MAX_PER_PAGE: u64 = 100;
 /// response-header size.
 const MAX_FILTER_VALUE: usize = 64;
 
-/// GitHub-style pagination query (`?page=2&per_page=50`), plus the `state`
-/// filter the issue and pull listings accept.
+/// `?force=true` bypasses the HTTP cache (PRD §5.2 force mode): every request
+/// goes out without its stored validator, so nothing is served from cache.
+///
+/// The remaining fields narrow what the run collects (PRD §5.4, §5.19). Any
+/// field left out keeps the gear's configured default, and `include`
+/// restricts the object types to exactly the ones named.
+#[derive(Debug, Default, Deserialize)]
+pub struct SyncQuery {
+    pub force: Option<bool>,
+    /// Comma-separated object types to collect, e.g.
+    /// `issues,pull_requests,commits`. Omit to collect the configured set.
+    pub include: Option<String>,
+    /// `all` / `open` / `none` for workflow runs and CI checks.
+    pub actions_scope: Option<String>,
+    /// `all` / `open` / `none` for reactions.
+    pub reactions_scope: Option<String>,
+    /// `all` / `open` / `none` for timeline events.
+    pub timeline_scope: Option<String>,
+    /// RFC3339 instant; closed issues and pull requests older than this are
+    /// not collected.
+    pub since: Option<String>,
+}
+
+impl SyncQuery {
+    /// The scope this request asks for, or `None` to use the gear's default.
+    ///
+    /// # Errors
+    /// `Validation` when a mode or an object type does not parse.
+    fn scope(&self, default: ScopeConfig) -> Result<Option<ScopeConfig>, DomainError> {
+        if self.include.is_none()
+            && self.actions_scope.is_none()
+            && self.reactions_scope.is_none()
+            && self.timeline_scope.is_none()
+        {
+            return Ok(None);
+        }
+
+        let mut scope = default;
+        if let Some(include) = self.include.as_deref() {
+            scope.objects = objects_from_include(include)?;
+        }
+        if let Some(mode) = self.actions_scope.as_deref() {
+            scope.collection.actions = CollectionMode::parse(mode)?;
+        }
+        if let Some(mode) = self.reactions_scope.as_deref() {
+            scope.collection.reactions = CollectionMode::parse(mode)?;
+        }
+        if let Some(mode) = self.timeline_scope.as_deref() {
+            scope.collection.timeline = CollectionMode::parse(mode)?;
+        }
+        Ok(Some(scope))
+    }
+
+    /// # Errors
+    /// `Validation` when `since` is not an RFC3339 instant.
+    fn since(&self) -> Result<Option<DateTime<Utc>>, DomainError> {
+        let Some(raw) = self.since.as_deref() else {
+            return Ok(None);
+        };
+        DateTime::parse_from_rfc3339(raw)
+            .map(|at| Some(at.with_timezone(&Utc)))
+            .map_err(|e| DomainError::Validation {
+                field: "since".to_owned(),
+                message: format!("`{raw}` is not an RFC3339 instant: {e}"),
+            })
+    }
+}
+
+/// Build an object scope enabling exactly the comma-separated types named.
+fn objects_from_include(include: &str) -> Result<SyncScope, DomainError> {
+    let mut scope = SyncScope::none();
+    for raw in include.split(',') {
+        let name = raw.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        match name.as_str() {
+            "issues" => scope.issues = true,
+            "pull_requests" | "pulls" => scope.pull_requests = true,
+            "commits" => scope.commits = true,
+            "releases" => scope.releases = true,
+            "branches" => scope.branches = true,
+            "labels" => scope.labels = true,
+            "milestones" => scope.milestones = true,
+            "github_actions" | "actions" => scope.github_actions = true,
+            "contributors" => scope.contributors = true,
+            "security" => scope.security = true,
+            other => {
+                return Err(DomainError::Validation {
+                    field: "include".to_owned(),
+                    message: format!("unknown object type `{other}`"),
+                });
+            }
+        }
+    }
+    Ok(scope)
+}
+
+/// `?owner=X` clears everything mirrored for that owner; `?repo=owner/name`
+/// narrows it to one repository.
+#[derive(Debug, Default, Deserialize)]
+pub struct CacheClearQuery {
+    pub owner: Option<String>,
+    pub repo: Option<String>,
+}
+
+/// `?repo=owner/name` narrows a resume to one repository; omitting it resumes
+/// every repository the caller's tenant left `in_progress`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ResumeQuery {
+    pub repo: Option<String>,
+    pub force: Option<bool>,
+}
+
+/// `?status=in_progress` narrows a run-status listing.
+#[derive(Debug, Default, Deserialize)]
+pub struct RunStatusQuery {
+    pub status: Option<String>,
+}
+
+/// GitHub-style pagination query (`?page=2&per_page=50`), plus the `state`,
+/// `sort`, `direction` and `since` filters the issue and pull listings accept.
 #[derive(Debug, Deserialize)]
 pub struct GithubPageQuery {
     pub page: Option<u64>,
@@ -290,10 +411,29 @@ pub async fn sync_repository(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
     Path((owner, name)): Path<(String, String)>,
-) -> ApiResult<JsonBody<SyncSummaryDto>> {
+    Query(query): Query<SyncQuery>,
+) -> ApiResult<(StatusCode, JsonBody<SyncAcceptedDto>)> {
     validate_repo_path(&owner, &name)?;
-    let summary = svc.sync_repository(&ctx, &owner, &name).await?;
-    Ok(Json(summary.into()))
+    let scope = query.scope(svc.default_scope())?;
+    let since = query.since()?;
+    let session_id = svc
+        .enqueue_sync(
+            &ctx,
+            &owner,
+            &name,
+            scope,
+            query.force.unwrap_or(false),
+            since,
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SyncAcceptedDto {
+            session_id: session_id.to_string(),
+            repository: format!("{owner}/{name}"),
+            status: "queued".to_owned(),
+        }),
+    ))
 }
 
 pub async fn list_issues(
@@ -813,4 +953,84 @@ pub async fn list_user_repos(
     let page = query.normalized()?;
     let items = svc.list_repos_page(&ctx, page.window()).await?;
     Ok(respond(&page, "/user/repos", GithubPage::convert(items)))
+}
+
+pub async fn get_sync_session(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path(id): Path<uuid::Uuid>,
+) -> ApiResult<JsonBody<SyncSessionDto>> {
+    let session = svc.get_session(&ctx, id).await?;
+    Ok(Json(SyncSessionDto::from(session)))
+}
+
+pub async fn list_sync_sessions(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    OData(query): OData,
+) -> ApiResult<JsonPage<SyncSessionDto>> {
+    let page: Page<_> = svc.list_sessions(&ctx, &query).await?;
+    Ok(Json(page.map_items(SyncSessionDto::from)))
+}
+
+pub async fn resume_syncs(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Query(query): Query<ResumeQuery>,
+) -> ApiResult<(StatusCode, JsonBody<ResumeAcceptedDto>)> {
+    let ids = svc
+        .resume_incomplete_syncs(&ctx, query.repo.as_deref(), query.force.unwrap_or(false))
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ResumeAcceptedDto {
+            resumed: ids.len(),
+            session_ids: ids.iter().map(ToString::to_string).collect(),
+        }),
+    ))
+}
+
+pub async fn list_repo_sync_status(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    OData(query): OData,
+    Query(filter): Query<RunStatusQuery>,
+) -> ApiResult<JsonPage<RepoSyncStatusDto>> {
+    let page: Page<_> = svc
+        .list_repo_sync_status(&ctx, &query, filter.status.as_deref())
+        .await?;
+    Ok(Json(page.map_items(RepoSyncStatusDto::from)))
+}
+
+pub async fn clear_cache(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Query(query): Query<CacheClearQuery>,
+) -> ApiResult<JsonBody<CacheClearedDto>> {
+    let (owner, name) = match (&query.repo, &query.owner) {
+        (Some(slug), _) => {
+            let (owner, name) = slug
+                .split_once('/')
+                .ok_or_else(|| DomainError::Validation {
+                    field: "repo".to_owned(),
+                    message: format!("`{slug}` is not an owner/name slug"),
+                })?;
+            (owner.to_owned(), Some(name.to_owned()))
+        }
+        (None, Some(owner)) => (owner.clone(), None),
+        (None, None) => {
+            return Err(DomainError::Validation {
+                field: "owner".to_owned(),
+                message: "give `owner` or `repo`; clearing every tenant's cache is not offered"
+                    .to_owned(),
+            }
+            .into());
+        }
+    };
+
+    let entries_removed = svc.clear_cache(&ctx, &owner, name.as_deref()).await?;
+    Ok(Json(CacheClearedDto {
+        scope: name.map_or_else(|| owner.clone(), |name| format!("{owner}/{name}")),
+        entries_removed,
+    }))
 }

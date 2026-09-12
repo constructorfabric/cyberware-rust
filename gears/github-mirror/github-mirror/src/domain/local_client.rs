@@ -7,7 +7,9 @@ use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
-use crate::domain::service::Service;
+use crate::domain::ports::github::FetchOptions;
+use crate::domain::scope::ScopeConfig;
+use crate::domain::service::{Service, SyncProgress};
 
 #[domain_model]
 pub struct LocalClient {
@@ -45,7 +47,19 @@ impl GithubMirrorClientV1 for LocalClient {
         name: &str,
     ) -> Result<SyncSummary, CanonicalError> {
         self.service
-            .sync_repository(ctx, owner, name)
+            .sync_repository(
+                ctx,
+                owner,
+                name,
+                &FetchOptions {
+                    tenant_id: ctx.subject_tenant_id(),
+                    scope: ScopeConfig::default(),
+                    force: false,
+                    since: None,
+                },
+                &SyncProgress::new(),
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await
             .map_err(CanonicalError::from)
     }

@@ -9,6 +9,10 @@ pub mod commit_statuses_022;
 pub mod commits_004;
 pub mod contributors_012;
 pub mod deployments_020;
+pub mod entity_fingerprints_031;
+pub mod http_cache_033;
+pub mod http_cache_next_page_034;
+pub mod http_cache_rebuild_035;
 pub mod initial_001;
 pub mod issue_events_019;
 pub mod issue_reactions_024;
@@ -22,11 +26,14 @@ pub mod pull_requests_003;
 pub mod pull_requests_refs_028;
 pub mod releases_010;
 pub mod repo_clone_url_027;
+pub mod repo_sync_status_032;
 pub mod review_comments_006;
 pub mod review_comments_diff_anchors_029;
 pub mod review_threads_017;
 pub mod reviews_007;
 pub mod support;
+pub mod sync_sessions_029;
+pub mod sync_watermarks_030;
 pub mod tags_015;
 pub mod workflow_jobs_023;
 pub mod workflow_runs_013;
@@ -75,6 +82,13 @@ impl MigratorTrait for Migrator {
             Box::new(repo_clone_url_027::Migration),
             Box::new(pull_requests_refs_028::Migration),
             Box::new(review_comments_diff_anchors_029::Migration),
+            Box::new(sync_sessions_029::Migration),
+            Box::new(sync_watermarks_030::Migration),
+            Box::new(entity_fingerprints_031::Migration),
+            Box::new(repo_sync_status_032::Migration),
+            Box::new(http_cache_033::Migration),
+            Box::new(http_cache_next_page_034::Migration),
+            Box::new(http_cache_rebuild_035::Migration),
             Box::new(z_extracted_at_030::Migration),
             Box::new(z_contributor_derivation_032::Migration),
             Box::new(z_release_assets_031::Migration),

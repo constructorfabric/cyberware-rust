@@ -37,6 +37,20 @@ impl DomainError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
+
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Database(toolkit_db::DbError::Sea(e)) => [
+                sea_orm::DbBackend::Sqlite,
+                sea_orm::DbBackend::Postgres,
+                sea_orm::DbBackend::MySql,
+            ]
+            .into_iter()
+            .any(|backend| toolkit_db::contention::is_retryable_contention(backend, e)),
+            _ => false,
+        }
+    }
 }
 
 #[allow(unknown_lints, de1302_error_from_to_string)]

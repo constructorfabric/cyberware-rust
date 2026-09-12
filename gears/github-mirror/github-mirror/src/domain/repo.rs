@@ -4,7 +4,7 @@ use github_mirror_sdk::{
     Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
     Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
     PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review, ReviewComment,
-    ReviewThread, SyncSummary, Tag, WorkflowJob, WorkflowRun,
+    ReviewThread, Tag, WorkflowJob, WorkflowRun,
 };
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
@@ -12,7 +12,10 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::error::DomainError;
-use super::ports::github::FetchedRepository;
+use super::ports::github::{
+    ActionsListing, CommitDetail, CommitListing, IssueDetail, IssueListing, ListingCompleteness,
+    MetadataListing, PullDetail, PullListing,
+};
 
 /// Write-side record for a mirrored repository (what sync knows about it).
 #[domain_model]
@@ -1405,13 +1408,255 @@ pub trait IssueTimelineRepository: Send + Sync {
     ) -> Result<u64, DomainError>;
 }
 
+/// Per-repository run status: is this repository mid-sync, and when did a run
+/// last finish it?
+///
+/// Sessions record individual runs; this records the repository. A run that
+/// dies leaves `in_progress` here, and the resume operation re-runs every
+/// repository still marked so (PRD §5.2).
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSyncStatusRecord {
+    pub repo_full_name: String,
+    pub repo_id: Option<i64>,
+    pub status: String,
+    pub last_session_id: Option<Uuid>,
+    pub last_synced_at: Option<String>,
+}
+
 #[async_trait]
-pub trait SyncWriter: Send + Sync {
-    async fn write_sync(
+pub trait RepoSyncStatusRepository: Send + Sync {
+    async fn upsert(
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        fetched: FetchedRepository,
+        record: RepoSyncStatusRecord,
+    ) -> Result<RepoSyncStatusRecord, DomainError>;
+
+    async fn find(
+        &self,
+        scope: &AccessScope,
+        repo_full_name: &str,
+    ) -> Result<Option<RepoSyncStatusRecord>, DomainError>;
+
+    /// Every repository the scope can see, newest slug order, optionally
+    /// narrowed to one status.
+    async fn list(
+        &self,
+        scope: &AccessScope,
+        status: Option<&str>,
+        limit: u64,
+    ) -> Result<Vec<RepoSyncStatusRecord>, DomainError>;
+}
+
+/// Durable face of one sync run. Unlike the mirrored records above, this is
+/// the gear's own vocabulary — GitHub knows nothing about sessions.
+///
+/// `status` holds one of `queued`, `in_progress`, `complete`, `failed`,
+/// `interrupted`; the sync engine owns the transitions (gears-rust#4632).
+/// The middle three come from DESIGN §3.7's `sync_sessions` table; the
+/// other two are additions the background worker needs.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSessionRecord {
+    pub id: Uuid,
+    pub repo_full_name: String,
+    pub repo_id: Option<i64>,
+    pub status: String,
+    pub progress_percent: i32,
+    pub error: Option<String>,
+    pub summary_json: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+}
+
+#[async_trait]
+pub trait SyncSessionRepository: Send + Sync {
+    async fn upsert(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: SyncSessionRecord,
+    ) -> Result<SyncSessionRecord, DomainError>;
+
+    async fn find_by_id(
+        &self,
+        scope: &AccessScope,
+        id: Uuid,
+    ) -> Result<Option<SyncSessionRecord>, DomainError>;
+
+    async fn list_recent(
+        &self,
+        scope: &AccessScope,
+        limit: u64,
+    ) -> Result<Vec<SyncSessionRecord>, DomainError>;
+
+    /// Sessions in any of `statuses`, paired with the tenant that owns them.
+    ///
+    /// The tenant id comes back because the caller needs it to write the row
+    /// again — the record itself does not carry one. Used by the startup
+    /// sweep, which runs across every tenant under an unconstrained scope.
+    async fn list_by_statuses(
+        &self,
+        scope: &AccessScope,
+        statuses: &[&str],
+    ) -> Result<Vec<(Uuid, SyncSessionRecord)>, DomainError>;
+}
+
+/// Incremental-sweep watermark for one `(repository, endpoint family)` pair.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncWatermarkRecord {
+    pub repo_id: i64,
+    pub family: String,
+    pub last_seen_updated_at: Option<String>,
+    pub page1_etag: Option<String>,
+    pub sweep_in_progress: bool,
+    pub candidate_high_water: Option<String>,
+}
+
+#[async_trait]
+pub trait SyncWatermarkRepository: Send + Sync {
+    async fn upsert(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: SyncWatermarkRecord,
+    ) -> Result<SyncWatermarkRecord, DomainError>;
+
+    async fn find(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        family: &str,
+    ) -> Result<Option<SyncWatermarkRecord>, DomainError>;
+}
+
+/// Change-detection fingerprint of one mirrored entity, per family.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityFingerprintRecord {
+    pub repo_id: i64,
+    pub family: String,
+    pub entity_id: String,
+    pub fingerprint: String,
+    pub updated_at: Option<String>,
+    pub node_id: Option<String>,
+    pub child_counts_hash: Option<String>,
+    pub last_refined_at: Option<String>,
+    pub refinement_status: String,
+}
+
+#[async_trait]
+pub trait EntityFingerprintRepository: Send + Sync {
+    async fn upsert(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        record: EntityFingerprintRecord,
+    ) -> Result<EntityFingerprintRecord, DomainError>;
+
+    async fn find(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        family: &str,
+        entity_id: &str,
+    ) -> Result<Option<EntityFingerprintRecord>, DomainError>;
+}
+
+/// The storage side of one sync, one method per task.
+///
+/// Every method is one transaction, so a task either lands whole or not at
+/// all; a sync interrupted between tasks leaves every table internally
+/// consistent, which is what makes re-running it the resume mechanism
+/// (DESIGN §4, ADR-0001). Contributors ride along with the listing or detail
+/// they were seen in and are merged with what earlier syncs already learned.
+#[async_trait]
+pub trait SyncWriter: Send + Sync {
+    async fn write_repository(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        repository: RepoRecord,
+    ) -> Result<Repo, DomainError>;
+
+    async fn write_issue_listing(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        repo_id: i64,
+        listing: IssueListing,
+    ) -> Result<(), DomainError>;
+
+    async fn write_issue_detail(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        repo_id: i64,
+        detail: IssueDetail,
+    ) -> Result<(), DomainError>;
+
+    async fn write_pull_listing(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        repo_id: i64,
+        listing: PullListing,
+    ) -> Result<(), DomainError>;
+
+    async fn write_pull_detail(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        repo_id: i64,
+        detail: PullDetail,
+    ) -> Result<(), DomainError>;
+
+    async fn write_commit_listing(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        repo_id: i64,
+        listing: CommitListing,
+    ) -> Result<(), DomainError>;
+
+    async fn write_commit_detail(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        detail: CommitDetail,
+    ) -> Result<(), DomainError>;
+
+    async fn write_metadata_listing(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        listing: MetadataListing,
+    ) -> Result<(), DomainError>;
+
+    async fn write_actions_listing(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        listing: ActionsListing,
+    ) -> Result<(), DomainError>;
+
+    async fn write_workflow_jobs(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        jobs: Vec<WorkflowJobRecord>,
+    ) -> Result<(), DomainError>;
+
+    /// Hard-delete rows of every complete listing that this sync did not
+    /// touch (`extracted_at` before `watermark`); returns how many went.
+    async fn reconcile_stale(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        complete: &ListingCompleteness,
         watermark: DateTime<Utc>,
-    ) -> Result<SyncSummary, DomainError>;
+    ) -> Result<u64, DomainError>;
 }

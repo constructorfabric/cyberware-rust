@@ -215,9 +215,21 @@ pub struct Commit {
     pub deletions: i64,
 }
 
+/// One count gap verification gave up on: GitHub declared more children for
+/// a pull request than it served, `passes` fetches running.
+#[domain_model]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CountDrift {
+    pub entity_type: String,
+    pub pull_number: i64,
+    pub expected: u64,
+    pub stored: u64,
+    pub passes: u32,
+}
+
 /// Result of one sync pass.
 #[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SyncSummary {
     pub repository: String,
     pub issues_synced: u64,
@@ -247,6 +259,10 @@ pub struct SyncSummary {
     pub issue_timeline_synced: u64,
     /// Rows hard-deleted because a complete listing no longer contained them.
     pub stale_rows_deleted: u64,
+    /// Count gaps verification could not close after its repair passes; empty
+    /// when every declared child count was met (PRD `fr-completeness-check`).
+    #[serde(default)]
+    pub accepted_drift: Vec<CountDrift>,
 }
 
 /// A mirrored GitHub issue/PR comment (read-slice shape).

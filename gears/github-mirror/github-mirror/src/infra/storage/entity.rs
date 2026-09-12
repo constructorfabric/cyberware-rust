@@ -71,6 +71,57 @@ pub mod repositories {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod http_cache {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// One cached GitHub response, keyed by a content hash of the request.
+    ///
+    /// Tenant-partitioned: the design permits sharing public-repository
+    /// responses across tenants, but that needs the visibility tracking and
+    /// access grants of ADR-0002, which do not exist yet, so nothing is shared.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_http_cache")]
+    #[secure(
+        tenant_col = "tenant_id",
+        resource_col = "cache_key",
+        no_owner,
+        no_type
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// Hex SHA-256 of method + URL + `Accept`.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub cache_key: String,
+        /// The URL this entry came from. Also what `clear_cache` matches on
+        /// when a caller drops one repository's entries.
+        pub url: String,
+        /// The HTTP status the body came with (PRD §5.6 metadata).
+        pub status: i32,
+        /// `ETag` to replay as `If-None-Match`.
+        pub etag: Option<String>,
+        /// `Last-Modified` to replay as `If-Modified-Since`.
+        pub last_modified: Option<String>,
+        /// `rel="next"` from the `Link` header, when the list has more pages.
+        /// Kept because a `304` may omit the header.
+        pub next_page: Option<String>,
+        /// The response body, encoded per `compression`.
+        pub body: Vec<u8>,
+        /// `none`, `gzip` or `zstd`.
+        pub compression: String,
+        /// SHA-256 of the **uncompressed** body, so the check is independent
+        /// of the mode in force when the row was written.
+        pub content_hash: String,
+        pub fetched_at: String,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod issue_reactions {
     use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
     use sea_orm::entity::prelude::*;
@@ -770,6 +821,125 @@ pub mod pull_request_files {
     impl ActiveModelBehavior for ActiveModel {}
 }
 
+pub mod repo_sync_status {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Per-repository run status — the durable half of resume-by-rescan
+    /// (DESIGN §2 "recoverability comes from ... per-repo run-status rows").
+    ///
+    /// Keyed by the slug rather than the GitHub id because the row is written
+    /// when a sync is requested, before anything about the repository is
+    /// known. A run that never completes leaves `in_progress` behind, which is
+    /// what the resume operation looks for.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_repo_sync_status")]
+    #[secure(
+        tenant_col = "tenant_id",
+        resource_col = "repo_full_name",
+        no_owner,
+        no_type
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// `owner/name` slug.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub repo_full_name: String,
+        /// GitHub repository id, filled once a run has fetched it.
+        pub repo_id: Option<i64>,
+        /// `in_progress` or `complete` (PRD §5.2).
+        pub status: String,
+        /// The run that last wrote this row.
+        pub last_session_id: Option<Uuid>,
+        /// RFC3339 time of the last run that completed.
+        pub last_synced_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod sync_sessions {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// One sync run of one repository, tenant-scoped. The row is the durable
+    /// face of a session: what was asked, where it stands, how it ended.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_sync_sessions")]
+    #[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// Session id, minted by the gear (not by GitHub).
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        /// `owner/name` slug the session was asked to sync.
+        pub repo_full_name: String,
+        /// GitHub repository id, filled once the repository row exists.
+        pub repo_id: Option<i64>,
+        /// `queued`, `in_progress`, `complete`, `failed`, or `interrupted`.
+        /// The middle three are DESIGN §3.7's vocabulary; `queued` and
+        /// `interrupted` are additions the background worker needs.
+        pub status: String,
+        /// 0-100, monotonically non-decreasing, written by the run's
+        /// heartbeat (DESIGN §4 "Progress").
+        pub progress_percent: i32,
+        /// Failure detail when `status = failed`.
+        pub error: Option<String>,
+        /// The run's `SyncSummary` as raw JSON, when it completed.
+        pub summary_json: Option<String>,
+        /// RFC3339 timestamps kept as text (engine-agnostic), as elsewhere.
+        pub created_at: String,
+        pub started_at: Option<String>,
+        /// Stamped by every heartbeat, so duration is readable mid-run.
+        pub ended_at: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod sync_watermarks {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Incremental-sweep watermark for one `(repository, endpoint family)`
+    /// pair: the promoted high-water mark plus the staged candidate, so an
+    /// interrupted sweep never advances the mark it did not finish earning.
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_sync_watermarks")]
+    #[secure(tenant_col = "tenant_id", resource_col = "repo_id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// Owning repository's GitHub id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub repo_id: i64,
+        /// Endpoint family (`issues`, `pull_requests`, ...).
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub family: String,
+        /// RFC3339 last promoted high-water mark; absent on first run.
+        pub last_seen_updated_at: Option<String>,
+        /// `ETag` of page 1 from the last successful sweep (short-circuit).
+        pub page1_etag: Option<String>,
+        /// Crash-safety flag: a sweep is currently running.
+        pub sweep_in_progress: bool,
+        /// RFC3339 staged high-water, promoted on sweep success.
+        pub candidate_high_water: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
 pub mod tags {
     use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
     use sea_orm::entity::prelude::*;
@@ -920,6 +1090,48 @@ pub mod commit_comments {
         /// deletion-reconciliation watermark; `None` on rows from before
         /// the column existed.
         pub extracted_at: Option<DateTimeUtc>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}
+
+pub mod entity_fingerprints {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    /// Durable change-detection state for one mirrored entity: what the sync
+    /// last saw of it in a list response, so the next sweep can skip
+    /// unchanged rows without fetching their detail (GAPS.md #19).
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_entity_fingerprints")]
+    #[secure(tenant_col = "tenant_id", resource_col = "repo_id", no_owner, no_type)]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        /// Owning repository's GitHub id.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub repo_id: i64,
+        /// Endpoint family the entity came from (`issues`, `pull_requests`, ...).
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub family: String,
+        /// The entity's id within its family, as GitHub prints it.
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub entity_id: String,
+        /// Hex fingerprint of the list-visible fields.
+        pub fingerprint: String,
+        /// RFC3339 `updated_at` from the list row, if the family carries one.
+        pub updated_at: Option<String>,
+        /// GraphQL node id, when a GraphQL leg reported it.
+        pub node_id: Option<String>,
+        /// Hash over child-collection counts (comments/reviews/commits/files).
+        pub child_counts_hash: Option<String>,
+        /// RFC3339 completion time of the last refinement pass.
+        pub last_refined_at: Option<String>,
+        /// `pending` until refinement finishes, then `complete`.
+        pub refinement_status: String,
     }
 
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

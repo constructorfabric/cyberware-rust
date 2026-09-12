@@ -2530,6 +2530,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "cf-gears-authz-resolver",
  "cf-gears-authz-resolver-sdk",
@@ -2543,6 +2544,8 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-toolkit-utils",
  "chrono",
+ "flate2",
+ "hex",
  "httpmock",
  "inventory",
  "reqwest",
@@ -2573,6 +2576,7 @@ dependencies = [
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
  "chrono",
+ "serde",
  "serde_json",
 ]
 
