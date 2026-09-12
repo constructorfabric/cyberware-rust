@@ -420,6 +420,21 @@ data:
           allow_http_upstream: true
 
     opentelemetry:
+      {{- with .Values.observability }}
+      resource:
+        service_name: {{ .resource.serviceName | quote }}
+        {{- if or .resource.environment .resource.version }}
+        attributes:
+          {{- with .resource.environment }}
+          deployment.environment: {{ . | quote }}
+          {{- end }}
+          {{- with .resource.version }}
+          service.version: {{ . | quote }}
+          {{- end }}
+        {{- end }}
+      {{- end }}
+      # The two `enabled` flags and the exporter endpoint are injected as
+      # APP__OPENTELEMETRY__* env vars by the Deployment.
       tracing:
         enabled: false
       metrics:

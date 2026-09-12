@@ -1,0 +1,46 @@
+# OpenTelemetry Collector config for local Datadog-backed development.
+#
+# Gears push traces and metrics here over OTLP; the collector forwards them to
+# Datadog and, for local debugging, also prints them to its own stdout.
+#
+# In a cluster this role is played by the Datadog Agent's own OTLP receiver
+# (DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT=0.0.0.0:4317) and no separate
+# collector is needed.
+#
+# Logs are not sent over OTLP. Gears write JSON to stderr; collect them from the
+# container log stream (the Agent's container log collection, or a filelog
+# receiver).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Datadog's exporter requires batching; it rejects an unbatched pipeline.
+  batch:
+    timeout: 10s
+
+exporters:
+  datadog:
+    api:
+      key: ${env:DD_API_KEY}
+      site: ${env:DD_SITE}
+  # Prints every received span and metric locally. Drop this from the pipelines
+  # once you have confirmed data is flowing — it is noisy.
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [datadog, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [datadog, debug]

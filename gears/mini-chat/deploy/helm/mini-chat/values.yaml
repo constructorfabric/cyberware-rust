@@ -26,6 +26,31 @@ postgres:
   user: "mini_chat"
   password: "REPLACE_ME"
 
+# OpenTelemetry export. Disabled by default, matching the framework defaults.
+#
+# With `endpoint: node`, telemetry is sent to the OTLP receiver of whatever agent
+# runs on the same node (e.g. the Datadog Agent DaemonSet started with
+# DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT=0.0.0.0:4317). Set an explicit
+# URL instead to target a standalone collector Service.
+#
+# Logs are not exported over OTLP: they go to the pod's stderr as JSON and are
+# collected from the container log stream by the node agent.
+observability:
+  traces:
+    enabled: false
+  metrics:
+    enabled: false
+  exporter:
+    kind: otlp_grpc               # otlp_grpc (4317) | otlp_http (4318)
+    # "node" resolves to http://$(HOST_IP):<port>; anything else is used verbatim.
+    endpoint: node
+    port: 4317
+  # Datadog derives service/env/version from these resource attributes.
+  resource:
+    serviceName: mini-chat
+    environment: ""
+    version: ""
+
 resources:
   requests:
     cpu: 100m

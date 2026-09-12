@@ -1,36 +1,41 @@
-````markdown
-# Distributed Tracing Setup
+# Telemetry Setup
 
-This guide walks you through setting up **OpenTelemetry distributed tracing** with **Jaeger** or **Uptrace** for the
-Gears middleware for testing purposes.
+This guide covers the **OpenTelemetry** setup shared by every gear: distributed
+tracing and metrics.
+
+Both signals speak **OTLP only** (gRPC or HTTP/protobuf) and are **pushed** to a
+collector — there is no `/metrics` scrape endpoint and no vendor-specific
+exporter. Any OTLP-compatible backend works: the OpenTelemetry Collector,
+Jaeger, Uptrace, or the Datadog Agent.
+
+**Logs are not exported over OTLP.** They are written to stderr as JSON and
+collected from there — see [Logs](#logs) below.
 
 ## Overview
 
-The Gears middleware includes first-class support for distributed tracing with:
+- **Automatic trace-context extraction** from incoming HTTP requests (W3C Trace Context)
+- **Automatic trace-context injection** into outgoing HTTP requests
+- **OTel metrics** through a global `SdkMeterProvider`; gears only declare instruments
+- **Centralized configuration** in one `opentelemetry:` YAML block
+- **Graceful flush** of both signals on shutdown
+- **Log correlation** — `trace_id`/`span_id` in the JSON log records
 
-- **Automatic trace context extraction** from incoming HTTP requests (W3C Trace Context)
-- **Automatic trace context injection** for outgoing HTTP requests
-- **Centralized configuration** via YAML
-- **HttpClient with OTEL layer** for instrumented HTTP calls
-- **Integration with existing logging**
+> **Config key.** Everything lives under the top-level `opentelemetry:` key.
+> Config structs use `#[serde(deny_unknown_fields)]`, so a misspelled or
+> misplaced key is a hard load error, not a silently ignored setting.
 
-## Quick Start with Jaeger
+---
 
-### 1. Start Jaeger (Local Development)
+## Quick start with Jaeger (traces only)
 
 ```bash
-# Start Jaeger All-in-One with OTLP support
 docker run -d --name jaeger \
-  -p 16686:16686 \    # UI: http://localhost:16686
-  -p 4317:4317 \      # OTLP gRPC
-  -p 4318:4318 \      # OTLP HTTP
+  -p 16686:16686 \
+  -p 4317:4317 \
+  -p 4318:4318 \
   -e COLLECTOR_OTLP_ENABLED=true \
   jaegertracing/all-in-one:latest
-````
-
-### 2. Configure Tracing
-
-Create a configuration file (e.g., `config/with-tracing.yaml`):
+```
 
 ```yaml
 server:
@@ -38,388 +43,349 @@ server:
   host: "127.0.0.1"
   port: 8087
 
-# Enable OpenTelemetry tracing
-tracing:
-  enabled: true
-  service_name: "cf-gears-api"
+opentelemetry:
+  resource:
+    service_name: "cf-gears-api"
+    attributes:
+      service.version: "1.0.0"
+      deployment.environment: "dev"
 
   exporter:
     kind: "otlp_grpc"
     endpoint: "http://127.0.0.1:4317"
     timeout_ms: 5000
 
-  sampler:
-    parent_based_ratio:
-      ratio: 0.1  # Sample 10% of traces
-
-  propagation:
-    w3c_trace_context: true
-
-  resource:
-    service.version: "1.0.0"
-    deployment.environment: "dev"
+  tracing:
+    enabled: true
+    sampler:
+      parent_based_ratio:
+        ratio: 1.0
 
 logging:
   default:
     console_level: "info"
-    file: "logs/cf-gears.log"
 ```
-
-### 3. Run the Server
 
 ```bash
 cargo run --bin cf-gears-server -- --config config/with-tracing.yaml
 ```
 
-### 4. View Traces
-
-Open [http://localhost:16686](http://localhost:16686) and search for service `cf-gears-api`.
+Traces appear at <http://localhost:16686> under service `cf-gears-api`.
 
 ---
 
-## Quick Start with Uptrace
+## Quick start with Datadog
 
-[Uptrace](https://uptrace.dev) is a modern tracing UI that works with OpenTelemetry and ClickHouse/Postgres.
+Datadog ingests OTLP through the **Datadog Agent**, so no gear-side change is
+needed beyond configuration.
 
-### 1. Start Uptrace (Docker Compose)
+### Locally
 
-```yaml
-services:
-  uptrace:
-    image: uptrace/uptrace:2.0.1
-    ports:
-      - "14318:80"     # Web UI: http://localhost:14318
-      - "14317:4317"   # OTLP gRPC
-      - "14319:4318"   # OTLP HTTP
-    volumes:
-      - ./uptrace.yml:/etc/uptrace/config.yml
-    depends_on:
-      - clickhouse
-      - postgres
-      - redis
-
-  clickhouse:
-    image: clickhouse/clickhouse-server:25.8
-    ports: [ "9000:9000" ]
-
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: uptrace
-      POSTGRES_USER: uptrace
-      POSTGRES_PASSWORD: uptrace
-
-  redis:
-    image: redis:8.2
+```bash
+export DD_API_KEY=...
+export DD_SITE=datadoghq.com          # or datadoghq.eu
+docker compose -f testing/docker/docker-compose.observability.yml up -d
 ```
 
-### 2. Configure Tracing with Uptrace DSN
+That starts an OpenTelemetry Collector on `:4317`/`:4318` which forwards traces
+and metrics to Datadog (see `testing/docker/otel-collector-datadog.yaml`).
+
+### In Kubernetes
+
+Enable the OTLP receiver on the Datadog Agent DaemonSet:
+
+```
+DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT=0.0.0.0:4317
+```
+
+and point each pod at its own node:
 
 ```yaml
-tracing:
-  enabled: true
-  service_name: "cf-gears-api"
+env:
+  - name: HOST_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.hostIP
+  - name: APP__OPENTELEMETRY__EXPORTER__ENDPOINT
+    value: "http://$(HOST_IP):4317"
+```
 
+### Unified service tagging
+
+Datadog derives `service`, `env`, and `version` from OTel resource attributes:
+
+| Resource attribute                     | Datadog tag |
+|----------------------------------------|-------------|
+| `resource.service_name`                | `service`   |
+| `attributes.deployment.environment`    | `env`       |
+| `attributes.service.version`           | `version`   |
+
+Set all three — without `env` and `version`, APM, metrics, and logs will not
+correlate into one service view.
+
+---
+
+## Configuration reference
+
+The full surface, with every key shown:
+
+```yaml
+opentelemetry:
+  # Resource identity — attached to all traces and metrics.
+  resource:
+    service_name: "my-service"
+    attributes:
+      service.version: "1.2.3"
+      deployment.environment: "production"
+      service.namespace: "cf-gears"
+      k8s.cluster.name: "prod-cluster"
+
+  # Default exporter, shared by both signals.
+  # A per-signal `exporter` block fully replaces this one.
   exporter:
-    kind: "otlp_grpc"
-    endpoint: "http://127.0.0.1:14317"
+    kind: "otlp_grpc"                 # otlp_grpc (4317) | otlp_http (4318)
+    endpoint: "http://127.0.0.1:4317" # plaintext only for a loopback collector
     timeout_ms: 5000
+    # Backend auth. Credential-bearing headers require an https:// endpoint —
+    # over plaintext OTLP they travel in the clear to anything on the path.
     headers:
-      uptrace-dsn: "http://project1_secret@localhost:14318?grpc=14317"
+      authorization: "Bearer token"
 
-  sampler:
-    always_on: { }
+  tracing:
+    enabled: true
+    sampler:
+      parent_based_ratio:             # parent_based_always_on | parent_based_ratio
+        ratio: 0.1                    # always_on | always_off
+    exporter:                         # optional per-signal override
+      kind: "otlp_grpc"
+      endpoint: "http://127.0.0.1:14317"
 
-  resource:
-    service.version: "1.3.7"
-    deployment.environment: "dev"
-    service.namespace: "cf-gears"
+  metrics:
+    enabled: true
+    cardinality_limit: 2000           # optional; SDK default when omitted
 ```
 
-### 3. Run the Server
+### Samplers
+
+`always_on: {}`, `always_off: {}`, `parent_based_always_on: {}`, or
+`parent_based_ratio: { ratio: 0.1 }`. The default when `sampler` is omitted is
+`parent_based_always_on`; `parent_based_ratio` with no `ratio` defaults to `0.1`.
+
+### Signals are independent
+
+Each of `tracing` and `metrics` has its own `enabled` flag, defaulting to
+**`false`**. A gear with neither enabled emits no telemetry at all and does not
+even install the W3C propagator. Every config shipped in `config/` has them off
+— enable them deliberately.
+
+### Migrating from the old `tracing:` block
+
+Before 2026-03 the settings lived in a top-level `tracing:` section. That form
+is no longer accepted: loading a config that still uses it fails with an error
+naming each key's new home. The same applies to `APP__TRACING__*` environment
+overrides, which are now `APP__OPENTELEMETRY__*`.
+
+| Old | New |
+|---|---|
+| `tracing.enabled` | `opentelemetry.tracing.enabled` |
+| `tracing.service_name` | `opentelemetry.resource.service_name` |
+| `tracing.resource` | `opentelemetry.resource.attributes` |
+| `tracing.metrics` | `opentelemetry.metrics` |
+| `tracing.exporter` | `opentelemetry.exporter`, or `opentelemetry.tracing.exporter` to override it for traces only |
+| `tracing.sampler`, `.propagation`, `.http`, `.logs_correlation` | `opentelemetry.tracing.*` |
+
+### Not yet implemented
+
+`tracing.propagation` and `tracing.http` are accepted by the config parser but
+**read by no code**. W3C propagation is always on when tracing is enabled,
+regardless of `propagation.w3c_trace_context`.
+
+---
+
+## Logs
+
+Logs do **not** travel over OTLP. Each gear writes to stderr and, when a `file:`
+sink is configured, to rotating files — both governed by the `logging:` block,
+which is independent of `opentelemetry:`.
+
+For a collector or agent to pick them up, emit JSON:
+
+```yaml
+logging:
+  default:
+    console_format: "json"     # text (default) | json
+    console_level: info
+```
+
+The Datadog Agent's container log collection, or an OpenTelemetry Collector
+`filelog` receiver, then reads the container's log stream — the runtime captures
+stderr and stdout together, so the console sink is picked up as it is. Nothing
+needs to be enabled inside the process.
+
+### Correlating logs with traces
+
+For a backend to link a log line to the span that produced it, the record has
+to carry the ids. Enable:
+
+```yaml
+opentelemetry:
+  tracing:
+    logs_correlation:
+      inject_trace_ids_into_logs: true
+```
+
+With this on, every JSON record emitted inside a sampled span gains top-level
+`trace_id` and `span_id` fields, in the same lowercase-hex form as the
+`traceparent` header. Records emitted outside a span are unchanged.
+
+The flag costs a context lookup per event, so it is off by default and the
+stock formatter is used unless it is enabled.
+
+## Environment variable overrides
+
+Any key can be overridden through the generic `APP__` figment layer, with `__`
+as the nesting separator:
 
 ```bash
-cargo run --bin cf-gears-server -- --config config/with-tracing.yaml
+export APP__OPENTELEMETRY__TRACING__ENABLED=true
+export APP__OPENTELEMETRY__METRICS__ENABLED=true
+export APP__OPENTELEMETRY__RESOURCE__SERVICE_NAME=cf-gears-prod
+export APP__OPENTELEMETRY__EXPORTER__KIND=otlp_grpc
+export APP__OPENTELEMETRY__EXPORTER__ENDPOINT=http://collector:4317
 ```
 
-### 4. View Traces
-
-Open [http://localhost:14318](http://localhost:14318) and search for service `cf-gears-api`.
+The only standard OpenTelemetry variable honoured is
+**`OTEL_EXPORTER_OTLP_HEADERS`** (`k=v,k2=v2`), merged over any headers from the
+config file. `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, and
+`OTEL_RESOURCE_ATTRIBUTES` are **not** read.
 
 ---
 
-## Configuration Reference
+## Cargo features
 
-### Basic Configuration
+The toolkit enables `otel` by default, so telemetry bootstrap is always present.
+Two features are **not** default and silently remove outbound instrumentation
+when missing:
 
-```yaml
-tracing:
-  enabled: true                    # Enable/disable tracing
-  service_name: "my-service"       # Service name in traces
+```toml
+[dependencies]
+toolkit-http = { workspace = true, features = ["otel"] }      # .with_otel()
+toolkit-contract = { workspace = true, features = ["otel"] }  # generated clients
 ```
 
-### Exporter Configuration
-
-#### OTLP gRPC (Default)
-
-```yaml
-tracing:
-  exporter:
-    kind: "otlp_grpc"
-    endpoint: "http://127.0.0.1:4317"
-    timeout_ms: 5000
-    headers: # Optional auth headers
-      authorization: "Bearer token"
-```
-
-#### OTLP HTTP
-
-```yaml
-tracing:
-  exporter:
-    kind: "otlp_http"
-    endpoint: "http://127.0.0.1:4318/v1/traces"
-    timeout_ms: 5000
-```
+Without `toolkit-http/otel` the `with_otel()` method does not exist and the
+build fails; without `toolkit-contract/otel` generated clients compile fine but
+drop out of the trace.
 
 ---
 
-(rest of your original doc unchanged below)
-
-### Sampling Strategies
-
-#### Always Sample
-
-```yaml
-tracing:
-  sampler:
-    always_on: { }
-```
-
-#### Never Sample
-
-```yaml
-tracing:
-  sampler:
-    always_off: { }
-```
-
-#### Ratio-Based Sampling
-
-```yaml
-tracing:
-  sampler:
-    parent_based_ratio:
-      ratio: 0.1  # Sample 10% of traces
-```
-
-### Resource Attributes
-
-Add metadata to all spans:
-
-```yaml
-tracing:
-  resource:
-    service.version: "1.2.3"
-    deployment.environment: "production"
-    service.namespace: "cf-gears"
-    k8s.cluster.name: "prod-cluster"
-    k8s.namespace.name: "cf-gears-ns"
-```
-
-### HTTP Options
-
-```yaml
-tracing:
-  http:
-    inject_request_id_header: "x-request-id"
-    record_headers:
-      - "user-agent"
-      - "x-forwarded-for"
-      - "authorization"  # Be careful with sensitive headers
-```
-
-## Using HttpClient with OpenTelemetry
-
-> **Important: Feature Gate Required**
->
-> The `.with_otel()` method on `HttpClientBuilder` requires the `otel` feature to be enabled.
-> Add this to your `Cargo.toml`:
->
-> ```toml
-> [dependencies]
-> toolkit-http = { workspace = true, features = ["otel"] }
-> ```
->
-> Without this feature, the `with_otel()` method will not be available, and you'll get
-> a compile error.
-
-### In Your Gear
+## Instrumented HTTP clients
 
 ```rust,ignore
-use toolkit_http::{HttpClient, HttpClientBuilder};
-
-#[async_trait]
-impl MyGear {
-    async fn call_external_api(&self) -> Result<String> {
-        // Build client with OTEL tracing enabled
-        let client = HttpClientBuilder::new()
-            .with_otel()  // Enable OpenTelemetry tracing
-            .build()?;
-
-        // Trace context is automatically injected via W3C traceparent header
-        // RequestBuilder API: chain methods then send
-        let data = client
-            .get("https://api.example.com/data")
-            .send()
-            .await?
-            .checked_bytes()
-            .await?;
-
-        Ok(String::from_utf8_lossy(&data).into_owned())
-    }
-}
-```
-
-### Configuring the toolkit_http::HttpClient
-
-```rust,ignore
-use toolkit_http::{HttpClient, HttpClientBuilder};
+use toolkit_http::HttpClient;
 use std::time::Duration;
 
-// Full configuration example
-let client = HttpClientBuilder::new()
-    .with_otel()                          // Enable OpenTelemetry tracing
-    .timeout(Duration::from_secs(30))     // Request timeout
-    .user_agent("my-service/1.0")         // Custom User-Agent
-    .max_body_size(10 * 1024 * 1024)      // 10MB body limit
+let client = HttpClient::builder()
+    .with_otel()                       // span + W3C traceparent injection
+    .with_metrics("payments")          // http.client.request.duration
+    .timeout(Duration::from_secs(30))
     .build()?;
+
+let data = client
+    .get("https://api.example.com/data")
+    .send()
+    .await?
+    .checked_bytes()
+    .await?;
 ```
 
-## Manual Span Creation
+## Metrics in a gear
 
-Create custom spans for business logic:
+Instruments come from the global provider installed by the bootstrap. A gear
+must **not** build its own exporter or provider, and must not expose a
+`/metrics` endpoint:
 
 ```rust,ignore
-use toolkit_http::HttpClientBuilder;
+let meter = opentelemetry::global::meter_with_scope(scope);
+let counter = meter.u64_counter("my_gear_operation_total").build();
+```
+
+The established pattern is a metrics port in `domain/ports/` with an OTel
+adapter in `infra/metrics.rs`.
+
+## Manual spans
+
+```rust,ignore
 use tracing::{info_span, Instrument, info};
 
-async fn process_user_data(user_id: u64) -> Result<()> {
-    // Create a span for this operation
-    let span = info_span!("process_user", user.id = user_id);
-
+async fn process_user_data(user_id: u64) -> anyhow::Result<()> {
     async {
-        // Your business logic here
-        info!("Processing user {}", user_id);
-
-        // Child operations will be traced automatically with OTEL-enabled client
-        let client = HttpClientBuilder::new()
-            .with_otel()
-            .build()?;
-
-        let url = format!("https://api.example.com/users/{}", user_id);
-        let user_data = client.get(&url).send().await?.checked_bytes().await?;
-
+        info!("Processing user");
+        // …
         Ok(())
-    }.instrument(span).await
+    }
+    .instrument(info_span!("process_user", user.id = user_id))
+    .await
 }
 ```
 
-## Production Deployment
+Or declaratively:
 
-### Docker Compose with Jaeger
-
-```yaml
-  services:
-    jaeger:
-      image: ${REGISTRY:-}jaegertracing/jaeger:${JAEGER_VERSION:-latest}
-      ports:
-        - "16686:16686"
-        - "4317:4317"
-        - "4318:4318"
-      environment:
-        - LOG_LEVEL=debug
-        - COLLECTOR_OTLP_ENABLED=true
-      networks:
-        - jaeger-example
-
-  networks:
-    jaeger-example:
+```rust,ignore
+#[tracing::instrument(skip(self, ctx), fields(user_id = %id))]
+pub async fn get_user(&self, ctx: &SecurityContext, id: Uuid) -> Result<User, DomainError> {
+    tracing::debug!("Getting user by id");
+    // …
+}
 ```
 
-### Environment Variable Overrides
-
-You can override any config via environment variables:
-
-```bash
-# Enable tracing
-export APP__TRACING__ENABLED=true
-export APP__TRACING__SERVICE_NAME=cf-gears-prod
-
-# Configure exporter
-export APP__TRACING__EXPORTER__KIND=otlp_grpc
-export APP__TRACING__EXPORTER__ENDPOINT=http://jaeger:4317
-
-# Configure sampling
-export APP__TRACING__SAMPLER__STRATEGY=parentbased_ratio
-export APP__TRACING__SAMPLER__RATIO=0.01  # 1% sampling in prod
-```
+---
 
 ## Troubleshooting
 
-### No Traces Appearing
+**No data at all.** Check that the relevant `enabled` flag is `true` — both
+default to `false`. On startup the bootstrap emits a `startup_check` span and
+runs a connectivity probe; look for `OpenTelemetry tracing initialized`,
+and `OpenTelemetry metrics initialized successfully`.
 
-1. **Check Jaeger is running**: Visit http://localhost:16686
-2. **Verify endpoint**: Ensure `exporter.endpoint` matches Jaeger's OTLP port
-3. **Check sampling**: Set `sampler.strategy: {always_on: {}}` for testing
-4. **View logs**: Look for "OpenTelemetry tracing initialized" message
+**Traces stop at a service boundary.** Outbound HTTP needs `.with_otel()` and
+the `toolkit-http/otel` feature. Note that **gRPC hops do not propagate trace
+context yet**, so an internal gRPC call currently starts a new, unlinked trace.
 
-### Performance Impact
+**Config file fails to load.** `deny_unknown_fields` rejects any key it does not
+recognise. The block is `opentelemetry:`, not `tracing:`.
 
-1. **Use sampling in production**: Set appropriate `ratio` (0.01 = 1%)
-2. **Monitor resource usage**: Tracing adds some CPU/memory overhead
-3. **Batch export**: The framework uses batched export by default
+**Data missing right after a restart.** Telemetry is flushed by
+`bootstrap::run::tracing_shutdown()` during graceful shutdown. A process killed
+with `SIGKILL` loses whatever is still batched.
 
-### Trace Context Not Propagating
+**Performance.** Use `parent_based_ratio` in production (`0.01` = 1%). Export is
+batched on a background task. Consider `metrics.cardinality_limit` for
+instruments with unbounded attribute values.
 
-1. **Check headers**: Ensure upstream sends `traceparent` header
-2. **Verify propagation**: Set `propagation.w3c_trace_context: true`
-3. **Use HttpClient with OTEL**: Ensure outgoing calls use `HttpClientBuilder::new().with_otel()`
+---
 
-## Observability Best Practices
+## Best practices
 
-### Structured Attributes
-
-Use consistent attribute names:
+Use consistent, low-cardinality attribute names, and keep high-cardinality
+values (ids, keys, names) on spans rather than on metric attributes:
 
 ```rust,ignore
 tracing::info_span!(
     "user_operation",
     user.id = user_id,
-    user.email = %user_email,
     operation.type = "create",
-    operation.result = "success"
-)
+);
 ```
 
-### Error Handling
-
-Mark spans with errors:
+Record failures on the span so the backend can flag it:
 
 ```rust,ignore
-let span = tracing::info_span!("risky_operation");
-let _guard = span.enter();
-
 match risky_operation().await {
-Ok(result) => {
-span.record("operation.result", "success");
-Ok(result)
-}
-Err(e) => {
-span.record("error", true);
-span.record("error.message", % e);
-span.record("operation.result", "error");
-Err(e)
-}
+    Ok(result) => Ok(result),
+    Err(e) => {
+        tracing::error!(error = %e, "risky_operation failed");
+        Err(e)
+    }
 }
 ```

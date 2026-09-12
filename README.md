@@ -223,12 +223,14 @@ gears:
 
 ### Environment Variable Overrides
 
-Configuration supports environment variable overrides with `CF_` prefix:
+Configuration supports environment variable overrides with the `APP__` prefix,
+using `__` to separate nesting levels:
 
 ```bash
-export CF_GEARS_DATABASE_URL="postgres://user:pass@localhost/db"
-export CF_GEARS_API_GATEWAY_BIND_ADDR="0.0.0.0:8080"
-export CF_GEARS_LOGGING_DEFAULT_CONSOLE_LEVEL="debug"
+export APP__SERVER__PORT=8087
+export APP__MODULES__api_gateway__CONFIG__BIND_ADDR="0.0.0.0:8080"
+export APP__LOGGING__DEFAULT__CONSOLE_LEVEL="debug"
+export APP__OPENTELEMETRY__TRACING__ENABLED=true
 ```
 
 ## Testing

@@ -5,6 +5,8 @@
 //!
 //! Configuration types are now in the top-level `config` gear.
 
+#[cfg(feature = "otel")]
+pub(crate) mod log_correlation;
 pub mod logging;
 pub mod panic;
 pub mod paths;

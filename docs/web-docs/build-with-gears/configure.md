@@ -52,13 +52,13 @@ gears:
 - **API gateway** — `bind_addr`, `enable_docs`, `prefix_path`, CORS, rate limits, timeouts.
 - **Deployment shape** — `gears.<name>.runtime.type: local | oop` selects in-process vs
   out-of-process. See [Run a gear out-of-process](../out-of-process/).
-- **Tracing** — a `tracing:` block points at an OTLP backend. See
-  [Add observability](../add-observability/).
+- **Telemetry** — an `opentelemetry:` block points traces and metrics at an OTLP
+  backend. See [Add observability](../add-observability/).
 - **Database** — `database.servers.<name>` connection templates (`engine`, `params`, `pool`) that gears inherit; SQLite, PostgreSQL, and MariaDB engines are supported.
 
 ## Environment overrides
 
-Settings can be overridden by environment variables for production, e.g. `APP__TRACING__EXPORTER__ENDPOINT=...`. Select which config to run with `--app` / `--env` or `GEARS_CONFIG`.
+Settings can be overridden by environment variables for production, e.g. `APP__OPENTELEMETRY__EXPORTER__ENDPOINT=...` (the `APP__` prefix, with `__` between nesting levels). Select which config to run with `--app` / `--env` or `GEARS_CONFIG`.
 
 ## Config and the CLI manifest
 

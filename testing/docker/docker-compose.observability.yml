@@ -1,0 +1,33 @@
+# Local observability backend for gears-rust.
+#
+# Kept separate from `docker-compose.yml` on purpose: that file is what the CI
+# e2e job brings up, and a collector that cannot start without DD_API_KEY would
+# break it.
+#
+# Usage:
+#   export DD_API_KEY=...          # required
+#   export DD_SITE=datadoghq.eu    # or datadoghq.com
+#   docker compose -f testing/docker/docker-compose.observability.yml up -d
+#
+# Then point a gear at it by enabling both signals in its config:
+#
+#   opentelemetry:
+#     exporter: { kind: "otlp_grpc", endpoint: "http://127.0.0.1:4317" }
+#     tracing: { enabled: true }
+#     metrics: { enabled: true }
+
+services:
+  otel-collector:
+    # The Datadog exporter ships in the -contrib distribution only.
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector-datadog.yaml:/etc/otelcol/config.yaml:ro
+    environment:
+      - DD_API_KEY=${DD_API_KEY:?DD_API_KEY must be set}
+      - DD_SITE=${DD_SITE:-datadoghq.com}
+    # Loopback-only: the collector holds a Datadog API key and needs no
+    # reachability beyond the gears running on this host.
+    ports:
+      - "127.0.0.1:4317:4317"   # OTLP gRPC
+      - "127.0.0.1:4318:4318"   # OTLP HTTP

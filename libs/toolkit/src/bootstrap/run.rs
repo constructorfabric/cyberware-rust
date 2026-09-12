@@ -101,7 +101,7 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
 
     // Graceful shutdown - flush remaining telemetry
     #[cfg(feature = "otel")]
-    tracing_shutdown();
+    tracing_shutdown().await;
 
     result
 }
@@ -177,7 +177,7 @@ pub async fn run_migrate(config: AppConfig) -> Result<()> {
 
     // Graceful shutdown - flush remaining telemetry
     #[cfg(feature = "otel")]
-    tracing_shutdown();
+    tracing_shutdown().await;
 
     result?;
 
@@ -312,7 +312,12 @@ pub fn init_procedure(config: &AppConfig) -> Result<()> {
     let otel_layer = None;
 
     // Initialize logging + otel in one Registry
-    init_logging_unified(&config.logging, &config.server.home_dir, otel_layer);
+    init_logging_unified(
+        &config.logging,
+        &config.server.home_dir,
+        otel_layer,
+        config.opentelemetry.inject_trace_ids_into_logs(),
+    );
 
     // Register custom panic hook to reroute panic backtrace into tracing.
     init_panic_tracing();
@@ -351,7 +356,17 @@ pub fn init_procedure(config: &AppConfig) -> Result<()> {
 ///
 /// This delegates to the current telemetry shutdown helpers so callers can use a
 /// single bootstrap-level function during graceful shutdown.
-pub fn tracing_shutdown() {
-    crate::telemetry::init::shutdown_metrics();
-    crate::telemetry::init::shutdown_tracing();
+///
+/// `shutdown_metrics`/`shutdown_tracing` drain the SDK's batch processor, which
+/// blocks on exporting the final batch (real network I/O to the OTLP endpoint).
+/// Run that on a blocking-pool thread so it never stalls a Tokio worker thread.
+pub async fn tracing_shutdown() {
+    if let Err(e) = tokio::task::spawn_blocking(|| {
+        crate::telemetry::init::shutdown_metrics();
+        crate::telemetry::init::shutdown_tracing();
+    })
+    .await
+    {
+        tracing::warn!(error = %e, "Telemetry shutdown task panicked");
+    }
 }

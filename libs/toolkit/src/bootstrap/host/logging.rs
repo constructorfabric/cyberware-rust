@@ -7,6 +7,9 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use tracing_subscriber::{Layer, fmt};
 
+#[cfg(feature = "otel")]
+use super::log_correlation;
+
 // ========== OTEL-agnostic layer type (compiles with/without the feature) ==========
 #[cfg(feature = "otel")]
 pub type OtelLayer = tracing_opentelemetry::OpenTelemetryLayer<
@@ -15,6 +18,35 @@ pub type OtelLayer = tracing_opentelemetry::OpenTelemetryLayer<
 >;
 #[cfg(not(feature = "otel"))]
 pub type OtelLayer = ();
+
+// The JSON event formatter used by the console and file sinks.
+//
+// `fmt::layer().json()` configures the event format through the layer builder,
+// but replacing that format (to add trace ids) discards those settings — so the
+// `Format` is built by `base_json_format()` and installed via `.event_format()`.
+//
+// Generic over the timer so the caller never has to name the (private-ish)
+// `Rfc3339` type behind `UtcTime::rfc_3339()`.
+#[cfg(feature = "otel")]
+type JsonEventFormat<T> = log_correlation::TraceIdJson<T>;
+#[cfg(not(feature = "otel"))]
+type JsonEventFormat<T> = fmt::format::Format<fmt::format::Json, T>;
+
+/// Wrap the JSON format so records carry `trace_id` / `span_id` when enabled.
+#[cfg_attr(not(feature = "otel"), allow(unused_variables))]
+fn json_event_format<T>(
+    base: fmt::format::Format<fmt::format::Json, T>,
+    inject_trace_ids: bool,
+) -> JsonEventFormat<T> {
+    #[cfg(feature = "otel")]
+    {
+        log_correlation::TraceIdJson::new(base, inject_trace_ids)
+    }
+    #[cfg(not(feature = "otel"))]
+    {
+        base
+    }
+}
 
 // ================= level helpers =================
 
@@ -195,7 +227,12 @@ static CONSOLE_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 /// Unified initializer used by both functions above.
 #[allow(unknown_lints, de1301_no_print_macros)] // runs before tracing subscriber is installed
-pub fn init_logging_unified(cfg: &LoggingConfig, base_dir: &Path, otel_layer: Option<OtelLayer>) {
+pub fn init_logging_unified(
+    cfg: &LoggingConfig,
+    base_dir: &Path,
+    otel_layer: Option<OtelLayer>,
+    inject_trace_ids: bool,
+) {
     CONSOLE_GUARD.get_or_init(|| {
         // Bridge `log` → `tracing` *before* installing the subscriber
         if let Err(e) = tracing_log::LogTracer::init() {
@@ -226,6 +263,7 @@ pub fn init_logging_unified(cfg: &LoggingConfig, base_dir: &Path, otel_layer: Op
             file_router,
             console_format,
             otel_layer,
+            inject_trace_ids,
         )
     });
 }
@@ -393,6 +431,7 @@ fn install_subscriber(
     file_router: MultiFileRouter,
     console_format: ConsoleFormat,
     #[cfg_attr(not(feature = "otel"), allow(unused_variables))] otel_layer: Option<OtelLayer>,
+    #[cfg_attr(not(feature = "otel"), allow(unused_variables))] inject_trace_ids: bool,
 ) -> WorkerGuard {
     use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
@@ -402,6 +441,18 @@ fn install_subscriber(
 
     // Console writer (non-blocking stderr)
     let (nb_stderr, guard) = tracing_appender::non_blocking(std::io::stderr());
+
+    // Shared base JSON `Format`, referenced by the doc comment on
+    // `JsonEventFormat` above. Built once here so the console and file JSON
+    // sinks cannot drift from each other.
+    let base_json_format = || {
+        fmt::format()
+            .json()
+            .with_ansi(false)
+            .with_target(true)
+            .with_level(true)
+            .with_timer(fmt::time::UtcTime::rfc_3339())
+    };
 
     // Console fmt layers: text (human-friendly) or JSON (structured).
     // Only one is active at a time; the other is None.
@@ -423,11 +474,8 @@ fn install_subscriber(
             Some(
                 fmt::layer()
                     .json()
+                    .event_format(json_event_format(base_json_format(), inject_trace_ids))
                     .with_writer(nb_stderr)
-                    .with_ansi(false)
-                    .with_target(true)
-                    .with_level(true)
-                    .with_timer(fmt::time::UtcTime::rfc_3339())
                     .with_filter(console_targets.clone()),
             ),
         ),
@@ -440,10 +488,7 @@ fn install_subscriber(
         Some(
             fmt::layer()
                 .json()
-                .with_ansi(false)
-                .with_target(true)
-                .with_level(true)
-                .with_timer(fmt::time::UtcTime::rfc_3339())
+                .event_format(json_event_format(base_json_format(), inject_trace_ids))
                 .with_writer(file_router)
                 .with_filter(file_targets.clone()),
         )
@@ -479,6 +524,10 @@ fn install_subscriber(
 }
 // de1301_no_print_macros: same rationale as install_subscriber above.
 #[allow(unknown_lints, de1301_no_print_macros)]
+/// Minimal fallback subscriber: INFO to the console, honouring `RUST_LOG`.
+///
+/// Text output only, so trace-id injection does not apply here — it adds fields
+/// to JSON records.
 fn init_minimal(
     #[cfg_attr(not(feature = "otel"), allow(unused_variables))] otel: Option<OtelLayer>,
 ) -> WorkerGuard {

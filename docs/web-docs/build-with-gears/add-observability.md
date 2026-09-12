@@ -1,42 +1,55 @@
 ---
 title: Add observability
-description: OpenTelemetry tracing, request IDs, health endpoints, and instrumented HTTP clients.
+description: OpenTelemetry traces and metrics, JSON logs, request IDs, health endpoints, and instrumented HTTP clients.
 sidebar:
   label: Add observability
   order: 9
 ---
 
-Gears ship a common operational surface: distributed tracing, request-id propagation, health
-endpoints, and instrumented outbound HTTP — configured centrally, so every gear behaves the
-same. This guide covers the knobs (see `docs/TRACING_SETUP.md` in the framework repo for the
-full reference).
+Gears ship a common operational surface: distributed tracing, metrics, structured
+logs, request-id propagation, health endpoints, and instrumented outbound HTTP —
+configured centrally, so every gear behaves the same. This guide covers the knobs (see
+`docs/TRACING_SETUP.md` in the framework repo for the full reference).
 
-## Configure tracing
+## Configure telemetry
 
-Tracing is configured in a `tracing:` block. Point it at any OTLP-compatible backend
-(Jaeger, Uptrace, Datadog, …):
+Traces and metrics are configured in one `opentelemetry:` block and pushed over
+OTLP. Point it at any OTLP-compatible backend (the OpenTelemetry Collector,
+Jaeger, Uptrace, the Datadog Agent, …). Logs are not sent over OTLP — see
+[Logs](#logs) below:
 
 ```yaml
-tracing:
-  enabled: true
-  service_name: "cf-gears-api"
+opentelemetry:
+  resource:
+    service_name: "cf-gears-api"
+    attributes:
+      service.version: "1.0.0"
+      deployment.environment: "dev"
   exporter:
     kind: "otlp_grpc"            # or "otlp_http"
     endpoint: "http://127.0.0.1:4317"
     timeout_ms: 5000
-  sampler:
-    parent_based_ratio:
-      ratio: 0.1                 # 10% — use always_on in dev, a ratio in prod
-  resource:
-    service.version: "1.0.0"
-    deployment.environment: "dev"
-  propagation:
-    w3c_trace_context: true
+  tracing:
+    enabled: true
+    sampler:
+      parent_based_ratio:
+        ratio: 0.1               # 10% — use always_on in dev, a ratio in prod
+  metrics:
+    enabled: true
 ```
 
-Samplers: `always_on`, `always_off`, or `parent_based_ratio`. Exporters: `otlp_grpc`
-(port 4317) or `otlp_http` (port 4318). Settings can be overridden by environment variables
-for production (e.g. `APP__TRACING__EXPORTER__ENDPOINT=...`).
+Samplers: `always_on`, `always_off`, `parent_based_always_on`, or
+`parent_based_ratio`. Exporters: `otlp_grpc` (port 4317) or `otlp_http`
+(port 4318).
+
+:::caution
+Each signal defaults to **disabled**, and every config shipped in `config/` has
+both off — enable them deliberately. The config structs also use
+`deny_unknown_fields`, so an unrecognised key is a hard load error.
+:::
+
+Settings can be overridden by environment variables using the `APP__` prefix
+with `__` between levels, e.g. `APP__OPENTELEMETRY__EXPORTER__ENDPOINT=...`.
 
 Spin up a local collector to view traces:
 
@@ -45,6 +58,35 @@ docker run -d --name jaeger -p 16686:16686 -p 4317:4317 -p 4318:4318 \
   -e COLLECTOR_OTLP_ENABLED=true jaegertracing/all-in-one:latest
 # UI at http://localhost:16686
 ```
+
+For a Datadog-backed local setup, see
+`testing/docker/docker-compose.observability.yml` in the framework repository.
+
+## Logs
+
+Logs go to stderr, and to rotating files when a `file:` sink is configured —
+both governed by the `logging:` block, which is separate from `opentelemetry:`.
+Emit JSON so a collector or agent can read them off the container's log stream:
+
+```yaml
+logging:
+  default:
+    console_format: "json"     # text (default) | json
+    console_level: info
+```
+
+To let a backend link a log line to the span that produced it, add the trace ids
+to the records:
+
+```yaml
+opentelemetry:
+  tracing:
+    logs_correlation:
+      inject_trace_ids_into_logs: true
+```
+
+Every JSON record emitted inside a sampled span then carries top-level
+`trace_id` and `span_id`.
 
 ## Spans, request IDs, and health — for free
 
@@ -87,7 +129,9 @@ pub async fn get_user(&self, ctx: &SecurityContext, id: Uuid) -> Result<User, Do
 ## Trace outbound HTTP
 
 Build outbound clients through `toolkit-http` with `.with_otel()` (enable the `otel` feature)
-so external calls join the trace and carry the `traceparent` header:
+so external calls join the trace and carry the `traceparent` header. Note that `otel` is
+**not** a default feature of `toolkit-http` or `toolkit-contract` — without it outbound calls
+silently drop out of the trace:
 
 ```rust
 let client = HttpClient::builder()
@@ -99,13 +143,15 @@ let bytes = client.get("https://api.example.com/data").send().await?.checked_byt
 ```
 
 :::note[Initialization]
-Telemetry is initialized by the server bootstrap from the `tracing:` config — a standalone
-server does this in `run_server(config)`. The framework docs describe the config surface in
-full; the exact init entry point is part of the bootstrap, not something gears call directly.
+Telemetry is initialized by the server bootstrap from the `opentelemetry:` config — a
+standalone server does this in `run_server(config)`. The bootstrap also flushes both
+signals on graceful shutdown. The exact init entry point is part of the bootstrap, not
+something gears call directly.
 :::
 
 ## See also
 
 - [Runtime & lifecycle](../../concepts/runtime-and-lifecycle/) — where background work and
   cancellation fit.
-- Full reference: `docs/TRACING_SETUP.md` in the framework repository.
+- Full reference: `docs/TRACING_SETUP.md` in the framework repository — covers both
+  signals, logs, the Datadog setup, and unified service tagging.

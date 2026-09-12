@@ -33,6 +33,18 @@ impl OpenTelemetryConfig {
     pub fn metrics_exporter(&self) -> Option<&Exporter> {
         self.metrics.exporter.as_ref().or(self.exporter.as_ref())
     }
+    /// Whether JSON log records should carry top-level `trace_id` / `span_id`.
+    ///
+    /// Off unless explicitly enabled: resolving the span context costs a lookup
+    /// on every event.
+    #[must_use]
+    pub fn inject_trace_ids_into_logs(&self) -> bool {
+        self.tracing
+            .logs_correlation
+            .as_ref()
+            .and_then(|c| c.inject_trace_ids_into_logs)
+            .unwrap_or(false)
+    }
 }
 
 /// OpenTelemetry resource identity — attached to all traces and metrics.
@@ -100,6 +112,11 @@ pub enum ExporterKind {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Exporter {
+    /// Defaults to `otlp_grpc`, matching `extract_exporter_config`. Without a
+    /// default, overriding only the endpoint (e.g. via
+    /// `APP__OPENTELEMETRY__EXPORTER__ENDPOINT`) would fail to load because
+    /// `kind` would be missing from the partially-built map.
+    #[serde(default)]
     pub kind: ExporterKind,
     pub endpoint: Option<String>,
     pub headers: Option<HashMap<String, String>>,

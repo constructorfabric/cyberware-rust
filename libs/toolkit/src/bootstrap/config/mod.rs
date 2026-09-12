@@ -439,6 +439,45 @@ pub(crate) fn remap_gear_env_key(key: &str) -> String {
     }
 }
 
+/// Reject the pre-2026-03 top-level `tracing:` section with a migration hint.
+///
+/// The section moved under `opentelemetry:` in `8c2187bc4`, which also put
+/// `deny_unknown_fields` on [`AppConfig`] — so an unmigrated config already
+/// fails, but with a bare "unknown field" that says nothing about where the
+/// settings went. This turns that into an actionable error.
+///
+/// One check covers both shapes the old documentation taught: `Env::prefixed`
+/// splits on `__`, so `APP__TRACING__EXPORTER__ENDPOINT` lands on the same
+/// `tracing.*` path as the YAML block.
+///
+/// The nested `opentelemetry.tracing` is untouched — `find_value` resolves from
+/// the root — and `AppConfig::default()` contributes no `tracing` key.
+///
+/// # Errors
+/// Returns an error when a root-level `tracing` key is present.
+fn reject_legacy_tracing_key(figment: &figment::Figment) -> Result<()> {
+    if figment.find_value("tracing").is_err() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "the top-level `tracing:` section was replaced by `opentelemetry:`; \
+         move the settings across:\n\
+         \n\
+         \x20 tracing.enabled       -> opentelemetry.tracing.enabled\n\
+         \x20 tracing.service_name  -> opentelemetry.resource.service_name\n\
+         \x20 tracing.resource      -> opentelemetry.resource.attributes\n\
+         \x20 tracing.metrics       -> opentelemetry.metrics\n\
+         \x20 tracing.exporter      -> opentelemetry.exporter (shared) or \
+         opentelemetry.tracing.exporter\n\
+         \x20 tracing.sampler, .propagation, .http, .logs_correlation \
+         -> opentelemetry.tracing.*\n\
+         \n\
+         Environment overrides use the same path, so APP__TRACING__* becomes \
+         APP__OPENTELEMETRY__*. See docs/TRACING_SETUP.md."
+    );
+}
+
 impl AppConfig {
     /// Load configuration with layered loading: defaults → YAML file → environment variables.
     /// Also normalizes `server.home_dir` into an absolute path and creates the directory.
@@ -453,7 +492,7 @@ impl AppConfig {
 
         // For layered loading, start from AppConfig::default() which provides logging
         // defaults (via default_logging_config()); other optional sections (database,
-        // tracing, gears_dir) remain None unless overridden by YAML/ENV.
+        // opentelemetry, gears_dir) remain None unless overridden by YAML/ENV.
         let figment = Figment::new()
             .merge(Serialized::defaults(AppConfig::default()))
             .merge(StrictYaml::file(config_path))
@@ -463,6 +502,8 @@ impl AppConfig {
                     .split("__")
                     .map(|key| remap_gear_env_key(key.as_str()).into()),
             );
+
+        reject_legacy_tracing_key(&figment)?;
 
         let mut config: AppConfig = figment
             .extract()
@@ -3410,9 +3451,108 @@ vendor: {}
         assert!(config.vendor.is_empty());
     }
 
+    // ========== Legacy `tracing:` section ==========
+
+    /// The pre-2026-03 shape must fail with a migration hint, not a bare
+    /// `unknown field` from `deny_unknown_fields`.
+    // `#[serial]`: sets `APP__TRACING__*` below (via the sibling env-override
+    // test), which lands on the same root-level `tracing` path this test
+    // asserts is absent; serialize against it and the other APP__-mutating tests.
+    #[test]
+    #[serial]
+    fn test_legacy_tracing_section_reports_migration() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_legacy_tracing"
+tracing:
+  enabled: true
+  service_name: "cf-gears-api"
+  exporter:
+    kind: "otlp_grpc"
+    endpoint: "http://127.0.0.1:4317"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        let result = AppConfig::load_layered(&cfg_path);
+        assert!(result.is_err(), "legacy `tracing:` should be rejected");
+        let msg = format!("{:?}", result.unwrap_err());
+
+        for expected in [
+            "opentelemetry",
+            "opentelemetry.resource.service_name",
+            "docs/TRACING_SETUP.md",
+        ] {
+            assert!(msg.contains(expected), "missing {expected:?} in: {msg}");
+        }
+    }
+
+    /// The nested `opentelemetry.tracing` must not trip the root-level guard.
+    // `#[serial]`: see rationale on `test_legacy_tracing_section_reports_migration`.
+    #[test]
+    #[serial]
+    fn test_nested_opentelemetry_tracing_is_accepted() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_nested_tracing"
+opentelemetry:
+  resource:
+    service_name: "cf-gears-api"
+  tracing:
+    enabled: true
+  metrics:
+    enabled: false
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        let config = AppConfig::load_layered(&cfg_path).expect("nested form should load");
+        assert!(config.opentelemetry.tracing.enabled);
+        assert_eq!(config.opentelemetry.resource.service_name, "cf-gears-api");
+    }
+
+    /// `reject_legacy_tracing_key` must also catch the legacy shape when it
+    /// arrives through the `APP__` env layer rather than the YAML file —
+    /// `Env::prefixed` splits `APP__TRACING__ENABLED` onto the same
+    /// `tracing.enabled` path as the old YAML block.
+    // `#[serial]`: mutates the process-global `APP__TRACING__*` var.
+    #[test]
+    #[serial]
+    fn test_legacy_tracing_env_override_reports_migration() {
+        let tmp = tempdir().unwrap();
+        let cfg_path = tmp.path().join("cfg.yaml");
+        let yaml = r#"
+server:
+  home_dir: "~/.test_legacy_tracing_env"
+opentelemetry:
+  resource:
+    service_name: "cf-gears-api"
+"#;
+        fs::write(&cfg_path, yaml).unwrap();
+
+        with_var("APP__TRACING__ENABLED", Some("true"), || {
+            let result = AppConfig::load_layered(&cfg_path);
+            assert!(
+                result.is_err(),
+                "legacy `APP__TRACING__*` override should be rejected"
+            );
+            let msg = format!("{:?}", result.unwrap_err());
+            assert!(
+                msg.contains("opentelemetry"),
+                "missing migration hint in: {msg}"
+            );
+        });
+    }
+
     // ========== Duplicate YAML key rejection tests ==========
 
+    // `#[serial]`: these call `load_layered`, which reads the process-global
+    // `APP__` env layer; serialize against the env-override tests that mutate
+    // `APP__*` vars via `with_var`.
     #[test]
+    #[serial]
     fn test_reject_duplicate_gear_names() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("cfg.yaml");
@@ -3439,6 +3579,7 @@ gears:
     }
 
     #[test]
+    #[serial]
     fn test_reject_duplicate_keys_in_gear_file() {
         let tmp = tempdir().unwrap();
         let gears_dir = tmp.path().join("gears.d");
@@ -3477,6 +3618,7 @@ gears_dir: "{}"
     }
 
     #[test]
+    #[serial]
     fn test_no_false_positive_on_unique_gears() {
         let tmp = tempdir().unwrap();
         let cfg_path = tmp.path().join("cfg.yaml");

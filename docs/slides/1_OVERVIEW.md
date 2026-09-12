@@ -687,7 +687,7 @@ gears:
 
 Build selects compiled-in gears by Cargo feature flags. YAML config supplies each compiled-in gear's `config` and optional gear-owned `database` settings.
 
-Env overrides with `CF_` prefix, e.g. `CF_GEARS_DATABASE_URL=postgres://...`
+Env overrides with `APP__` prefix and `__` between levels, e.g. `APP__SERVER__PORT=8087`
 
 ---
 

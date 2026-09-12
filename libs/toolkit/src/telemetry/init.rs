@@ -8,7 +8,7 @@ use anyhow::Context;
 #[cfg(feature = "otel")]
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
 #[cfg(feature = "otel")]
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::{Protocol, WithExportConfig};
@@ -134,6 +134,18 @@ fn build_grpc_exporter(
 #[cfg(feature = "otel")]
 static INIT_TRACING: Once = Once::new();
 
+/// Handle to the installed tracer provider, kept so `shutdown_tracing()` can
+/// flush the batch processor on graceful shutdown. `global::set_tracer_provider`
+/// consumes the provider and exposes no way to get it back, so without this
+/// handle the last batch of spans is lost on every restart.
+#[cfg(feature = "otel")]
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
+
+/// Handle to the installed meter provider — same rationale as
+/// [`TRACER_PROVIDER`], for the final metrics collection interval.
+#[cfg(feature = "otel")]
+static METER_PROVIDER: OnceLock<opentelemetry_sdk::metrics::SdkMeterProvider> = OnceLock::new();
+
 /// Initialize OpenTelemetry tracing from configuration and return a layer
 /// to be attached to `tracing_subscriber`.
 ///
@@ -183,8 +195,13 @@ pub fn init_tracing(
     let tracer = provider.tracer(service_name);
     let otel_layer = tracing_opentelemetry::OpenTelemetryLayer::new(tracer);
 
-    // Make it global
+    // Make it global. Keep a clone first: `set_tracer_provider` takes ownership
+    // and the global registry offers no accessor, so this is the only chance to
+    // retain a handle for the shutdown flush.
     INIT_TRACING.call_once(|| {
+        if TRACER_PROVIDER.set(provider.clone()).is_err() {
+            tracing::debug!("tracer provider handle already stored");
+        }
         global::set_tracer_provider(provider);
     });
 
@@ -277,13 +294,25 @@ pub(crate) fn build_metadata_from_cfg_and_env(
 
 // ===== shutdown_tracing =======================================================
 
-/// Gracefully shut down OpenTelemetry tracing.
-/// In opentelemetry 0.31 there is no global `shutdown_tracer_provider()`.
-/// Keep a handle to `SdkTracerProvider` in your app state and call `shutdown()`
-/// during graceful shutdown. This function remains a no-op for compatibility.
+/// Gracefully shut down OpenTelemetry tracing, flushing the batch processor.
+///
+/// There is no global `shutdown_tracer_provider()` in opentelemetry 0.32, so
+/// this drains the handle retained by [`init_tracing`]. Without it the spans
+/// still sitting in the batch processor are dropped when the process exits.
+///
+/// Safe to call when tracing was never initialised (no handle — no-op) and
+/// idempotent: a second call hits the SDK's already-shut-down state and is
+/// logged at debug level rather than treated as a failure.
 #[cfg(feature = "otel")]
 pub fn shutdown_tracing() {
-    tracing::info!("Tracing shutdown: no-op (keep a provider handle to call `shutdown()`).");
+    let Some(provider) = TRACER_PROVIDER.get() else {
+        tracing::debug!("Tracing shutdown: no provider installed, nothing to flush");
+        return;
+    };
+    match provider.shutdown() {
+        Ok(()) => tracing::info!("OpenTelemetry tracing flushed and shut down"),
+        Err(e) => tracing::warn!(error = %e, "OpenTelemetry tracing shutdown failed"),
+    }
 }
 
 #[cfg(not(feature = "otel"))]
@@ -291,13 +320,20 @@ pub fn shutdown_tracing() {
     tracing::info!("Tracing shutdown (no-op)");
 }
 
-/// Gracefully shut down OpenTelemetry metrics.
-/// In opentelemetry 0.31 there is no global `shutdown_meter_provider()`.
-/// Keep a handle to `SdkMeterProvider` in your app state and call `shutdown()`
-/// during graceful shutdown. This function remains a no-op for compatibility.
+/// Gracefully shut down OpenTelemetry metrics, exporting the final interval.
+///
+/// Drains the handle retained by [`init_metrics_provider`]; see
+/// [`shutdown_tracing`] for the rationale and the idempotency contract.
 #[cfg(feature = "otel")]
 pub fn shutdown_metrics() {
-    tracing::info!("Metrics shutdown: no-op (keep a provider handle to call `shutdown()`).");
+    let Some(provider) = METER_PROVIDER.get() else {
+        tracing::debug!("Metrics shutdown: no provider installed, nothing to flush");
+        return;
+    };
+    match provider.shutdown() {
+        Ok(()) => tracing::info!("OpenTelemetry metrics flushed and shut down"),
+        Err(e) => tracing::warn!(error = %e, "OpenTelemetry metrics shutdown failed"),
+    }
 }
 
 #[cfg(not(feature = "otel"))]
@@ -403,7 +439,15 @@ fn do_init_metrics_provider(otel_cfg: &OpenTelemetryConfig) -> anyhow::Result<()
 
     let provider = builder.build();
 
-    global::set_meter_provider(provider);
+    // Retain a handle for the shutdown flush, and register *that* handle
+    // globally. `METRICS_INIT` is checked before this function and set after
+    // it, so two concurrent first-callers both reach this point; storing one
+    // provider while registering the other would leave `shutdown_metrics`
+    // flushing an instrument-less provider and losing the live one's final
+    // interval. `get_or_init` makes the winner's provider the only one that is
+    // ever retained or registered; the loser's is dropped unused.
+    let installed = METER_PROVIDER.get_or_init(|| provider);
+    global::set_meter_provider(installed.clone());
     tracing::info!("OpenTelemetry metrics initialized successfully");
 
     Ok(())

@@ -58,6 +58,34 @@ spec:
                 secretKeyRef:
                   name: {{ include "mini-chat.fullname" . }}
                   key: pg-password
+            {{- with .Values.observability }}
+            - name: APP__OPENTELEMETRY__EXPORTER__KIND
+              value: {{ .exporter.kind | quote }}
+            {{- if eq .exporter.endpoint "node" }}
+            # Node IP, so OTLP reaches the agent running on this node.
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: APP__OPENTELEMETRY__EXPORTER__ENDPOINT
+              value: "http://$(HOST_IP):{{ .exporter.port }}"
+            {{- else }}
+            - name: APP__OPENTELEMETRY__EXPORTER__ENDPOINT
+              value: "{{ .exporter.endpoint }}"
+            {{- end }}
+            - name: APP__OPENTELEMETRY__TRACING__ENABLED
+              value: {{ .traces.enabled | quote }}
+            - name: APP__OPENTELEMETRY__METRICS__ENABLED
+              value: {{ .metrics.enabled | quote }}
+            - name: APP__OPENTELEMETRY__RESOURCE__SERVICE_NAME
+              value: {{ .resource.serviceName | quote }}
+            {{- end }}
+            {{- /*
+              resource.attributes are set in the ConfigMap, not here: their keys
+              contain dots ("deployment.environment"), and the APP__ env layer
+              splits on "." as well as "__", so a dotted key would be parsed as
+              a nested map and fail config loading.
+            */}}
           volumeMounts:
             - name: config
               mountPath: /app/config/mini-chat.yaml
