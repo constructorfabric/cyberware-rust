@@ -118,6 +118,23 @@ fn platform_app() -> Router {
     Router::new().route("/", get(peer_echo)).route_layer(layer)
 }
 
+/// Handler reporting whether the [`PlatformAuthEnforced`] posture marker is
+/// present (`"1"`) or absent (`"0"`) in the request extensions.
+async fn marker_echo(marker: Option<Extension<PlatformAuthEnforced>>) -> String {
+    if marker.is_some() { "1" } else { "0" }.to_owned()
+}
+
+fn marker_app() -> Router {
+    let authenticator = Arc::new(StubInternalAuthenticator);
+    let layer = axum::middleware::from_fn_with_state(
+        authenticator,
+        internal_auth_middleware::<StubInternalAuthenticator>,
+    );
+    Router::new()
+        .route("/", get(marker_echo))
+        .route_layer(layer)
+}
+
 /// Stacked app: `internal_auth_middleware` (outermost, runs first) then
 /// `security_context_middleware`, mirroring the DESIGN § 3.2 middleware order.
 fn stacked_app() -> Router {
@@ -239,6 +256,30 @@ async fn internal_no_header_passes_through_permissive() {
     let (status, _, body) = send_headers(platform_app(), &[]).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "none");
+}
+
+#[tokio::test]
+async fn internal_stamps_posture_marker_for_authenticated_request() {
+    let (status, _, body) = send_headers(marker_app(), &[(INTERNAL_HEADER, SA_GOOD)]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "1",
+        "an enforcing HTTP listener must stamp the posture marker"
+    );
+}
+
+#[tokio::test]
+async fn internal_stamps_posture_marker_for_anonymous_passthrough() {
+    // The inversion this closes: an anonymous caller on an enforcing HTTP
+    // listener (no token, permissive pass-through) must still carry the marker
+    // so a downstream handler can fail closed rather than treat it as a listener
+    // with no platform plane.
+    let (status, _, body) = send_headers(marker_app(), &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "1",
+        "anonymous pass-through on an enforcing listener must still carry the marker"
+    );
 }
 
 #[tokio::test]

@@ -137,7 +137,7 @@ async fn returns_compiled_in_gears_with_capabilities() {
 async fn dynamic_instances_without_catalog_entry_appear_as_out_of_process() {
     let manager = Arc::new(GearManager::new());
     let instance = Arc::new(GearInstance::new("dynamic_svc", Uuid::new_v4()).with_version("0.5.0"));
-    manager.register_instance(instance);
+    manager.register_instance(instance).unwrap();
 
     let router = build_router_with(&[], manager);
 
@@ -160,7 +160,7 @@ async fn includes_running_instances_with_grpc_services() {
             .with_version("1.2.3")
             .with_grpc_service("my.Service", Endpoint::http("127.0.0.1", 9000)),
     );
-    manager.register_instance(instance);
+    manager.register_instance(instance).unwrap();
 
     let router = build_router_with(&[("my_gear", &[], false, false)], manager);
 

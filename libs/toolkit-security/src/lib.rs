@@ -22,7 +22,7 @@ pub use authenticator::{
 pub use context::{SecurityContext, SecurityContextBuildError};
 pub use internal_auth::{
     InternalAuthNError, InternalAuthenticator, InternalCredential, PeerAuthenticated,
-    PlatformIdentity, PlatformSecurityContext,
+    PlatformAuthEnforced, PlatformIdentity, PlatformSecurityContext,
 };
 #[cfg(feature = "internal-auth-cache")]
 pub use internal_auth_cache::{

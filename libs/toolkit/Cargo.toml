@@ -205,6 +205,7 @@ nix = { version = "0.31", default-features = false, features = ["signal"] }
 rustls-cng-crypto = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 tempfile = { workspace = true }
 temp-env = { workspace = true }

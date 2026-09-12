@@ -1,21 +1,35 @@
 //! Tests for `OoP` self-registration and dependency resolution.
 
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use cf_system_sdks::directory::{DirectoryInvalidArgument, ServiceEndpoint, ServiceInstanceInfo};
+use cf_system_sdks::directory::{
+    DirectoryInvalidArgument, DirectoryPermissionDenied, ServiceEndpoint, ServiceInstanceInfo,
+};
+
+/// The permanent rejection a [`StubDirectory`] returns from `register`.
+#[derive(Clone, Copy)]
+enum Rejection {
+    /// A mis-configured label / endpoint URI (gRPC `InvalidArgument`).
+    InvalidArgument,
+    /// An authorization denial or gRPC service-name conflict (gRPC
+    /// `PermissionDenied` / `Unauthenticated`).
+    PermissionDenied,
+}
 
 /// Stub directory: fails `register`/`resolve` a configurable number of times,
-/// then succeeds; records register calls and heartbeats. When
-/// `reject_register` is set, `register` always returns a permanent
-/// [`DirectoryInvalidArgument`] rejection.
+/// then succeeds; records register calls and heartbeats. While `rejecting` is
+/// set, `register` always returns the permanent `reject_kind` rejection;
+/// [`stop_rejecting`](StubDirectory::stop_rejecting) clears it to model the
+/// conflict later resolving.
 struct StubDirectory {
     fail_register: AtomicUsize,
     register_calls: AtomicUsize,
     heartbeats: AtomicUsize,
     fail_resolve: AtomicUsize,
-    reject_register: bool,
+    reject_kind: Option<Rejection>,
+    rejecting: AtomicBool,
 }
 
 impl StubDirectory {
@@ -25,17 +39,26 @@ impl StubDirectory {
             register_calls: AtomicUsize::new(0),
             heartbeats: AtomicUsize::new(0),
             fail_resolve: AtomicUsize::new(fail_resolve),
-            reject_register: false,
+            reject_kind: None,
+            rejecting: AtomicBool::new(false),
         }
     }
 
-    /// A directory that permanently rejects every registration (as the gRPC
-    /// front-end does for a mis-configured label / endpoint URI).
-    fn rejecting() -> Self {
+    /// A directory that permanently rejects every registration with `kind` (as
+    /// the gRPC front-end does for a mis-configured label / endpoint URI, or an
+    /// authorization denial / service-name conflict).
+    fn rejecting(kind: Rejection) -> Self {
         Self {
-            reject_register: true,
+            reject_kind: Some(kind),
+            rejecting: AtomicBool::new(true),
             ..Self::new(0, 0)
         }
+    }
+
+    /// Stop rejecting: subsequent registrations succeed, modelling the
+    /// conflicting owner deregistering (or an authz fix landing).
+    fn stop_rejecting(&self) {
+        self.rejecting.store(false, Ordering::SeqCst);
     }
 }
 
@@ -67,8 +90,16 @@ impl DirectoryClient for StubDirectory {
 
     async fn register_instance(&self, _info: RegisterInstanceInfo) -> anyhow::Result<()> {
         self.register_calls.fetch_add(1, Ordering::SeqCst);
-        if self.reject_register {
-            return Err(DirectoryInvalidArgument::new("bad label").into());
+        if self.rejecting.load(Ordering::SeqCst) {
+            match self.reject_kind {
+                Some(Rejection::InvalidArgument) => {
+                    return Err(DirectoryInvalidArgument::new("bad label").into());
+                }
+                Some(Rejection::PermissionDenied) => {
+                    return Err(DirectoryPermissionDenied::new("peer not authorized").into());
+                }
+                None => {}
+            }
         }
         if self.fail_register.load(Ordering::SeqCst) > 0 {
             self.fail_register.fetch_sub(1, Ordering::SeqCst);
@@ -121,7 +152,7 @@ async fn registration_keeps_loop_alive_on_permanent_rejection() {
     // A DirectoryInvalidArgument is permanent: the backoff retry must give up
     // after a single attempt rather than retrying a request that can never
     // succeed, yet still return `true` so the presence loop keeps running.
-    let stub = Arc::new(StubDirectory::rejecting());
+    let stub = Arc::new(StubDirectory::rejecting(Rejection::InvalidArgument));
     let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
     let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
@@ -130,6 +161,26 @@ async fn registration_keeps_loop_alive_on_permanent_rejection() {
         stub.register_calls.load(Ordering::SeqCst),
         1,
         "a permanent rejection must not be retried"
+    );
+}
+
+#[tokio::test]
+async fn registration_does_not_retry_permission_denied() {
+    // A DirectoryPermissionDenied (authorization denial / service-name conflict)
+    // is just as permanent as an invalid argument: retrying the identical
+    // request can never turn the "no" into a "yes", so the backoff retry must
+    // give up after a single attempt (regression: it previously fell into the
+    // generic transient branch and retried forever at `warn!`), yet still keep
+    // the presence loop alive.
+    let stub = Arc::new(StubDirectory::rejecting(Rejection::PermissionDenied));
+    let directory: Arc<dyn DirectoryClient> = stub.clone();
+    let cancel = CancellationToken::new();
+    let ok = register_once_with_backoff(&directory, &info(), &cancel).await;
+    assert!(ok, "a permanent rejection must not stop the presence loop");
+    assert_eq!(
+        stub.register_calls.load(Ordering::SeqCst),
+        1,
+        "a permission-denied rejection must not be retried"
     );
 }
 
@@ -178,7 +229,7 @@ async fn presence_loop_survives_permanent_rejection() {
     // A permanent DirectoryInvalidArgument must NOT tear the presence loop down:
     // it keeps heartbeating and periodically retrying re-registration. Only
     // cancellation stops it.
-    let stub = Arc::new(StubDirectory::rejecting());
+    let stub = Arc::new(StubDirectory::rejecting(Rejection::InvalidArgument));
     let directory: Arc<dyn DirectoryClient> = stub.clone();
     let cancel = CancellationToken::new();
 
@@ -198,6 +249,59 @@ async fn presence_loop_survives_permanent_rejection() {
     assert!(
         stub.heartbeats.load(Ordering::SeqCst) >= 1,
         "the loop must keep heartbeating despite a permanent rejection"
+    );
+
+    cancel.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn presence_loop_recovers_when_rejection_clears() {
+    // A gear denied on a gRPC service-name conflict keeps its presence loop
+    // alive and re-registers every RE_REGISTER_INTERVAL. Once the conflict
+    // clears (the owning gear deregisters) the next re-registration succeeds, so
+    // the instance becomes discoverable without a restart. Driven on virtual
+    // time so the 30s interval costs no wall clock.
+    let stub = Arc::new(StubDirectory::rejecting(Rejection::PermissionDenied));
+    let directory: Arc<dyn DirectoryClient> = stub.clone();
+    let cancel = CancellationToken::new();
+
+    let task = tokio::spawn(presence_loop(
+        Arc::clone(&directory),
+        info(),
+        Duration::from_secs(1),
+        cancel.clone(),
+    ));
+
+    // Let the initial (rejected) registration run and the loop park on its
+    // timers. No time has advanced, so only the one attempt has happened.
+    for _ in 0..10 {
+        if stub.register_calls.load(Ordering::SeqCst) >= 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        stub.register_calls.load(Ordering::SeqCst),
+        1,
+        "the initial registration is rejected but the loop stays alive"
+    );
+
+    // The conflicting owner deregisters; the directory now accepts.
+    stub.stop_rejecting();
+
+    // Advance past the re-registration interval so the periodic re-register
+    // fires — this time it succeeds.
+    tokio::time::advance(RE_REGISTER_INTERVAL + Duration::from_secs(1)).await;
+    for _ in 0..10 {
+        if stub.register_calls.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        stub.register_calls.load(Ordering::SeqCst) >= 2,
+        "the loop must re-register after the interval and recover once the conflict clears"
     );
 
     cancel.cancel();

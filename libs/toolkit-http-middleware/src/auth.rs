@@ -37,7 +37,7 @@ use axum::{
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{
     AuthNError, BearerAuthenticator, InternalAuthNError, InternalAuthenticator, PeerAuthenticated,
-    PlatformSecurityContext,
+    PlatformAuthEnforced, PlatformSecurityContext,
 };
 
 use crate::security::{
@@ -183,6 +183,11 @@ fn unauthenticated(reason: &str) -> Response {
 ///   request is **rejected** — so an invalid SA token is turned away before
 ///   [`security_context_middleware`] (and any handler) runs.
 ///
+/// Installing the middleware means platform auth is active on the listener, so
+/// it stamps [`PlatformAuthEnforced`] on every request it forwards — the
+/// posture signal a handler uses to fail closed on an anonymous caller (see
+/// that type).
+///
 /// This sets workload-policy state only; it **never** skips or substitutes for
 /// tenant-plane JWT validation. Install this layer so it runs **before**
 /// [`security_context_middleware`] (DESIGN § 3.2).
@@ -202,6 +207,10 @@ pub async fn internal_auth_middleware<A>(
 where
     A: InternalAuthenticator + 'static,
 {
+    // Stamp the posture marker before token extraction, so it rides every
+    // request this active listener forwards regardless of the token outcome.
+    request.extensions_mut().insert(PlatformAuthEnforced);
+
     match extract_internal_token_http(request.headers()) {
         Ok(token) => match authenticator.authenticate(token.expose_secret()).await {
             Ok(identity) => {

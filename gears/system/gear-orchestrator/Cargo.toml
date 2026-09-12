@@ -21,6 +21,7 @@ workspace = true
 cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
 toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 http = { workspace = true }
@@ -39,6 +40,5 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 api_gateway = { path = "../api-gateway", package = "cf-gears-api-gateway" }
 serde_json = { workspace = true }
-toolkit-security = { workspace = true }
 toolkit-transport-grpc = { workspace = true }
 secrecy = { workspace = true }

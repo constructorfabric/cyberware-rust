@@ -23,6 +23,12 @@
 //!   also serve tenant-plane / anonymous RPCs. A **present-but-invalid** token
 //!   is always rejected regardless of mode.
 //!
+//! Whenever enforcement is active (either mode), the layer stamps a
+//! [`PlatformAuthEnforced`] marker on every request it handles — before the
+//! exempt check, so exempt methods and `Permissive` anonymous pass-throughs
+//! carry it too. A handler uses it to fail closed on an enforcing listener; see
+//! that type for the full semantics.
+//!
 //! Disabling enforcement entirely (Profile 1 / in-process: the process
 //! boundary is the trust root) is a deliberate call —
 //! [`InternalAuthGrpcLayer::disabled`] — distinct from "no authenticator was
@@ -36,7 +42,8 @@
 //! via [`InternalAuthGrpcLayer::with_exempt_prefixes`]. A prefix only matches on
 //! a method-path segment boundary (see [`prefix_matches_boundary`]) so e.g. the
 //! reflection prefix cannot be satisfied by an unrelated package that merely
-//! shares the string prefix.
+//! shares the string prefix. Exemption skips *token validation* only — an
+//! exempt request still carries the posture marker (see Enforcement above).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -49,7 +56,7 @@ use tonic::Status;
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 use toolkit_security::{
     DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, PeerAuthenticated,
-    PlatformSecurityContext,
+    PlatformAuthEnforced, PlatformSecurityContext,
 };
 use tower::{Layer, Service};
 
@@ -305,12 +312,19 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        // Disabled layer (Profile 1 / in-process): straight pass-through.
+        // Disabled layer (Profile 1 / in-process): straight pass-through with no
+        // posture marker — there is no platform-plane boundary to signal.
         let AuthMode::Enforced(authenticator) = &self.config.mode else {
             return Either::Left(inner.call(req));
         };
 
-        // Infrastructure methods (health, reflection) bypass enforcement.
+        // Enforcement is active. Stamp the posture marker before the exempt
+        // check so exempt methods carry it too and cannot be mistaken for a
+        // disabled listener downstream (see `PlatformAuthEnforced`).
+        req.extensions_mut().insert(PlatformAuthEnforced);
+
+        // Infrastructure methods (health, reflection) bypass token validation;
+        // they still carry the posture marker stamped above.
         let path = req.uri().path();
         if self
             .config
@@ -397,6 +411,9 @@ mod tests {
     /// Header reporting whether the inner service still saw the raw internal
     /// token header (it must not, once the layer has consumed it).
     const SAW_TOKEN_HEADER: &str = "x-test-saw-token";
+    /// Header reporting whether the request carried the [`PlatformAuthEnforced`]
+    /// posture marker by the time the inner service was called.
+    const MARKER_HEADER: &str = "x-test-marker";
 
     /// Terminal inner service: records what extensions the request carried into
     /// response headers so tests can assert the middleware populated them.
@@ -420,6 +437,7 @@ mod tests {
                 .map(|p| p.name.clone())
                 .unwrap_or_default();
             let saw_token = req.headers().get(INTERNAL_TOKEN_HEADER).is_some();
+            let marker = req.extensions().get::<PlatformAuthEnforced>().is_some();
             let mut resp = http::Response::new(());
             resp.headers_mut().insert(
                 HAD_CTX_HEADER,
@@ -432,6 +450,10 @@ mod tests {
             resp.headers_mut().insert(
                 SAW_TOKEN_HEADER,
                 if saw_token { "1" } else { "0" }.parse().unwrap(),
+            );
+            resp.headers_mut().insert(
+                MARKER_HEADER,
+                if marker { "1" } else { "0" }.parse().unwrap(),
             );
             ready(Ok(resp))
         }
@@ -491,6 +513,11 @@ mod tests {
         let resp = call(&layer, request("/pkg.Svc/Method", None)).await;
         assert!(grpc_status(&resp).is_none(), "must not reject");
         assert_eq!(resp.headers().get(HAD_CTX_HEADER).unwrap(), "0");
+        assert_eq!(
+            resp.headers().get(MARKER_HEADER).unwrap(),
+            "0",
+            "a disabled layer enforces nothing, so it must not stamp the posture marker"
+        );
     }
 
     #[tokio::test]
@@ -510,6 +537,11 @@ mod tests {
             resp.headers().get(SAW_TOKEN_HEADER).unwrap(),
             "0",
             "the handler must never see the raw internal token"
+        );
+        assert_eq!(
+            resp.headers().get(MARKER_HEADER).unwrap(),
+            "1",
+            "an enforced request carries the posture marker alongside the identity"
         );
     }
 
@@ -572,10 +604,16 @@ mod tests {
             "permissive must allow anonymous"
         );
         assert_eq!(resp.headers().get(HAD_CTX_HEADER).unwrap(), "0");
+        assert_eq!(
+            resp.headers().get(MARKER_HEADER).unwrap(),
+            "1",
+            "an enforcing listener stamps the posture marker even for an anonymous \
+             pass-through, so a downstream handler can fail closed on it"
+        );
     }
 
     #[tokio::test]
-    async fn exempt_path_bypasses_enforcement() {
+    async fn exempt_path_bypasses_authentication_but_still_marks_posture() {
         // Health check with no token is allowed even under Required.
         let resp = call(
             &authed_layer(),
@@ -584,9 +622,18 @@ mod tests {
         .await;
         assert!(
             grpc_status(&resp).is_none(),
-            "exempt method must pass through"
+            "exempt method must pass through without a token"
         );
         assert_eq!(resp.headers().get(HAD_CTX_HEADER).unwrap(), "0");
+        // Exemption skips authentication, not enforcement posture: the marker is
+        // still stamped so a handler can't mistake an exempt request on an
+        // enforcing listener for a disabled-listener (fail-open) one and grant
+        // it authority (e.g. over another gear's registration).
+        assert_eq!(
+            resp.headers().get(MARKER_HEADER).unwrap(),
+            "1",
+            "an exempt method on an enforcing listener must still carry the posture marker"
+        );
     }
 
     #[tokio::test]

@@ -387,6 +387,82 @@ impl std::fmt::Display for DirectoryInvalidArgument {
 
 impl std::error::Error for DirectoryInvalidArgument {}
 
+/// Sentinel error wrapped via `anyhow::Error` to signal "the directory refused
+/// this call on authorization grounds".
+///
+/// It carries the gRPC `PermissionDenied` and `Unauthenticated` codes across the
+/// [`DirectoryClient`] trait boundary (the code is otherwise lost when a
+/// `tonic::Status` is stringified). Like [`DirectoryInvalidArgument`], such a
+/// rejection is **permanent**: retrying the identical request can never turn a
+/// "no" into a "yes". A registrant reaches this because it is not an authorized
+/// peer for the gear it claims, because its `ServiceAccount` namespace / SPIFFE
+/// trust domain is not allowlisted, because an enforcing listener saw no
+/// authenticated peer, or because a gRPC service name in the registration is
+/// already owned by another gear (a server-side
+/// [`DirectoryServiceNameConflict`] mapped to `PermissionDenied`). The presence
+/// loop downcasts to this type to stop retrying and log loudly rather than
+/// spinning at `warn!` forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryPermissionDenied {
+    /// Human-readable description of why the call was refused.
+    pub message: String,
+}
+
+impl DirectoryPermissionDenied {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DirectoryPermissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "directory: permission denied: {}", self.message)
+    }
+}
+
+impl std::error::Error for DirectoryPermissionDenied {}
+
+/// Sentinel error wrapped via `anyhow::Error` to signal "a gRPC service name in
+/// this registration is already owned by a *different* gear".
+///
+/// Registration enforces single-gear ownership of every advertised gRPC service
+/// name atomically at the store (see `GearManager::register_instance`),
+/// so a name resolved across all gears cannot be split between two owners. The
+/// gRPC server boundary downcasts to this type to return
+/// `Status::permission_denied` (with a static message) and to log the
+/// conflicting `service_name` / `owner` server-side, rather than mislabeling an
+/// ownership conflict as an internal fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryServiceNameConflict {
+    /// The gRPC service name that is already owned.
+    pub service_name: String,
+    /// The gear that currently owns `service_name`.
+    pub owner: String,
+}
+
+impl DirectoryServiceNameConflict {
+    pub fn new(service_name: impl Into<String>, owner: impl Into<String>) -> Self {
+        Self {
+            service_name: service_name.into(),
+            owner: owner.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DirectoryServiceNameConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "directory: gRPC service name '{}' already owned by gear '{}'",
+            self.service_name, self.owner
+        )
+    }
+}
+
+impl std::error::Error for DirectoryServiceNameConflict {}
+
 /// Directory API trait for service discovery and instance management
 ///
 /// This trait defines the contract for interacting with the gear directory.
