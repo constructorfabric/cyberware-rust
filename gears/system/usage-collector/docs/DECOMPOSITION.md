@@ -8,12 +8,12 @@
 
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
-  - [2.1 Gear Foundation & Pluggable Storage ⏳ HIGH](#21-gear-foundation--pluggable-storage--high)
-  - [2.2 Usage Type Catalog & Lifecycle ⏳ HIGH](#22-usage-type-catalog--lifecycle--high)
-  - [2.3 Usage Emission ⏳ HIGH](#23-usage-emission--high)
-  - [2.4 Usage Query ⏳ MEDIUM](#24-usage-query--medium)
-  - [2.5 Event Deactivation ⏳ MEDIUM](#25-event-deactivation--medium)
-  - [2.6 Compensation ⏳ MEDIUM](#26-compensation--medium)
+  - [2.1 Gear Foundation & Pluggable Storage — HIGH](#21-gear-foundation--pluggable-storage--high)
+  - [2.2 Usage Type Catalog & Lifecycle — HIGH](#22-usage-type-catalog--lifecycle--high)
+  - [2.3 Usage Emission — HIGH](#23-usage-emission--high)
+  - [2.4 Usage Query — MEDIUM](#24-usage-query--medium)
+  - [2.5 Event Deactivation — MEDIUM](#25-event-deactivation--medium)
+  - [2.6 Compensation — MEDIUM](#26-compensation--medium)
   - [2.7 Deliberate Omissions](#27-deliberate-omissions)
 - [3. Feature Dependencies](#3-feature-dependencies)
 - [4. Crate Layout & Platform Dependencies](#4-crate-layout--platform-dependencies)
@@ -52,7 +52,7 @@ This shape preserves the DESIGN's tri-surface architecture and fail-closed meter
 
 ## 2. Entries
 
-### 2.1 Gear Foundation & Pluggable Storage ⏳ HIGH
+### 2.1 Gear Foundation & Pluggable Storage — HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-foundation`
 
@@ -124,7 +124,7 @@ This shape preserves the DESIGN's tri-surface architecture and fail-closed meter
   - [ ] `p1` - `cpt-cf-usage-collector-contract-authz-resolver`
   - [ ] `p1` - `cpt-cf-usage-collector-contract-gts-registry`
 
-### 2.2 Usage Type Catalog & Lifecycle ⏳ HIGH
+### 2.2 Usage Type Catalog & Lifecycle — HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-type-lifecycle`
 
@@ -182,7 +182,7 @@ This shape preserves the DESIGN's tri-surface architecture and fail-closed meter
 - **Data**:
   - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
 
-### 2.3 Usage Emission ⏳ HIGH
+### 2.3 Usage Emission — HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-usage-emission`
 
@@ -261,7 +261,7 @@ This shape preserves the DESIGN's tri-surface architecture and fail-closed meter
 - **Data**:
   - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
 
-### 2.4 Usage Query ⏳ MEDIUM
+### 2.4 Usage Query — MEDIUM
 
 - [ ] `p2` - **ID**: `cpt-cf-usage-collector-feature-usage-query`
 
@@ -340,7 +340,7 @@ This shape preserves the DESIGN's tri-surface architecture and fail-closed meter
 - **Contracts**:
   - [ ] `p1` - `cpt-cf-usage-collector-contract-downstream-usage-reader`
 
-### 2.5 Event Deactivation ⏳ MEDIUM
+### 2.5 Event Deactivation — MEDIUM
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-feature-event-deactivation`
 
@@ -401,7 +401,7 @@ This shape preserves the DESIGN's tri-surface architecture and fail-closed meter
 - **Data**:
   - None (durable state is plugin-owned through `cpt-cf-usage-collector-interface-plugin`)
 
-### 2.6 Compensation ⏳ MEDIUM
+### 2.6 Compensation — MEDIUM
 
 - [ ] `p2` - **ID**: `cpt-cf-usage-collector-feature-usage-compensation`
 
@@ -488,7 +488,7 @@ The following `cpt-cf-usage-collector-*` IDs from the element inventory are inte
 - `cpt-cf-usage-collector-actor-tenant-admin`: PRD-side role description for tenant administrators; tenant-scoped read authority is enforced via PDP constraints owned by [§2.4](#24-usage-query-medium) Usage Query and tenant attribution owned by [§2.3](#23-usage-emission-high) Usage Emission.
 - `cpt-cf-usage-collector-actor-usage-consumer`: PRD-side role description for downstream consumers of usage data; the consumer-facing read surface is owned by [§2.4](#24-usage-query-medium) Usage Query via the Query Gateway and the downstream-usage-reader contract.
 - `cpt-cf-usage-collector-actor-usage-source`: PRD-side role description for caller gears emitting usage; the caller-gear write surface is owned by [§2.3](#23-usage-emission-high) Usage Emission.
-- `cpt-cf-usage-collector-design-usage-collector`: Top-level DESIGN.md section anchor; its constituent design elements (components, sequences, principles, entities) are each individually assigned to features [§2.1](#21-gear-foundation-pluggable-storage-high)..[§2.5](#25-event-deactivation-medium).
+- `cpt-cf-usage-collector-design-overview`: Top-level DESIGN.md section anchor; its constituent design elements (components, sequences, principles, entities) are each individually assigned to features [§2.1](#21-gear-foundation-pluggable-storage-high)..[§2.5](#25-event-deactivation-medium).
 - `cpt-cf-usage-collector-design-security-architecture`: DESIGN.md section anchor for the security architecture; constituent principles (`principle-fail-closed`, `principle-pdp-centric-authorization`) and the shared PDP authorization helper definition are owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation.
 - `cpt-cf-usage-collector-design-performance-operations-architecture`: DESIGN.md section anchor for performance/operations architecture; constituent NFRs (throughput, latency, workload-isolation) are owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation and [§2.3](#23-usage-emission-high) Usage Emission. `cpt-cf-usage-collector-nfr-operational-visibility` is **foundation-owned** ([§2.1](#21-gear-foundation-pluggable-storage-high), which owns the meter bootstrap, naming/label-cardinality contract, and PDP-helper + plugin-host instruments) and realized in per-component **shares** by the features that own each operation's emit points: ingestion instruments by [§2.3](#23-usage-emission-high) Usage Emission, query-gateway instruments by [§2.4](#24-usage-query-medium) Usage Query, deactivation-handler instruments by [§2.5](#25-event-deactivation-medium) Event Deactivation, and the UsageType-catalog instruments by [§2.2](#22-usage-type-catalog-lifecycle-high) Usage Type Catalog & Lifecycle. Each such feature DoD references the foundation-owned NFR (a share), and the DESIGN §3.11.5 operational-metric inventory is the authoritative per-component assignment; the shares are cross-feature coverage-by-reference, not duplicated ownership, so they carry no additional §2.2–§2.5 "Requirements Covered" rows.
 - `cpt-cf-usage-collector-design-maintainability-testing-ux-integration`: DESIGN.md section anchor for maintainability/testing/UX/integration architecture; constituent NFRs (developer-operator-experience, documentation-coverage, error-experience) are owned by [§2.1](#21-gear-foundation-pluggable-storage-high) Foundation.

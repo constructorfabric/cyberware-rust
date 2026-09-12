@@ -1,0 +1,183 @@
+{
+  "$id": "gts://gts.cf.core.uc.usage_record.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Usage Collector Usage Record",
+  "description": "Abstract base type for every meter the Usage Collector accepts entries against. It pins two things at once: the structural contract of one accepted ledger entry (the `properties` below), and, through `x-gts-traits-schema`, the declaration attributes a concrete meter must supply. A usage type is not a separate entity - it is a derived type of this base, refining `metadata` and resolving the traits. Declarations are owned by `types-registry`; this gear mints none and holds no catalog. Entry semantics (invalidation invariants, dedup identity, retention arithmetic) live in the gear's domain model and are not restated here.",
+  "type": "object",
+  "x-gts-abstract": true,
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "tenant_id",
+    "resource_ref",
+    "gts_type_id",
+    "entry_type",
+    "quantity",
+    "window_start",
+    "window_end",
+    "idempotency_key",
+    "accepted_at",
+    "acceptance_sequence",
+    "origin"
+  ],
+  "oneOf": [
+    {
+      "title": "record",
+      "description": "A measurement. Carries neither `invalidates` nor `reason_code`.",
+      "properties": {
+        "entry_type": { "const": "record" },
+        "invalidates": false,
+        "reason_code": false
+      }
+    },
+    {
+      "title": "invalidation",
+      "description": "A withdrawal. Carries both `invalidates` and `reason_code`.",
+      "properties": {
+        "entry_type": { "const": "invalidation" }
+      },
+      "required": ["invalidates", "reason_code"]
+    }
+  ],
+  "x-gts-traits-schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["aggregation_fold", "canonical_unit", "retention"],
+    "properties": {
+      "aggregation_fold": {
+        "description": "The single aggregation this meter declares. Not a request parameter: the aggregate path serves this fold and no other. Immutable for the type's lifetime - a persisted quantity carries no fold of its own, so redefining it would silently restate the meaning of every entry already accepted. Only `SUM` yields a chargeable period quantity; a meter whose consumption is naturally a level must be pre-integrated at the emitter into an accrued quantity with an accrued unit (such as `byte-hours`) and declared `SUM`. The gear integrates on no path. The set is closed - adding a fold is an additive change, removing one is breaking.",
+        "type": "string",
+        "enum": ["SUM", "COUNT", "MAX", "MIN", "LATEST"]
+      },
+      "canonical_unit": {
+        "description": "The canonical metering unit bound to this meter. One unit per type, immutable for its lifetime. Quantities persist and travel in this unit; no path converts, scales, or rounds them. The enumeration is the normative published unit list - a declaration naming a unit outside it is rejected at registration rather than at ingestion. Adding a unit is an additive change.",
+        "type": "string",
+        "enum": ["bytes", "byte-hours", "count", "seconds"]
+      },
+      "retention": {
+        "description": "ISO 8601 duration. How long entries of this meter are retained, measured from the covered period rather than from acceptance. It MUST be at least the configured backfill window plus one operational replay horizon. It bounds the idempotency horizon as well as the data: an identity stays visible for at least this span, and ingestion never reaches past it. Honouring it is an operator and storage-plugin deployment obligation, not gear-level enforcement.",
+        "type": "string",
+        "examples": ["P125D", "P400D"]
+      },
+      "nominal_sampling_interval": {
+        "description": "ISO 8601 duration, informational only. The gear exposes it and never acts on it. It lets a consumer detect gaps, choose an integration step, and compare an ingestion watermark against an expected cadence. Optional under every fold.",
+        "type": "string",
+        "examples": ["PT1M", "PT1H"]
+      }
+    }
+  },
+  "properties": {
+    "id": {
+      "description": "Server-derived UUIDv5 over `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`. The derivation reads a canonical byte form of those five inputs - lowercase tenant UUID, byte-exact type reference and key, and fixed-width microsecond UTC bounds - which the identity ADR fixes, so equivalent spellings of one value cannot derive two identifiers. Stable across exact-equality retries and reproducible offline by the emitter, so a correction reference can be computed before submission. `invalidates` is deliberately excluded from the derivation - and so is the `entry_type` derived from it - so one key cannot stand for both a measurement and its withdrawal.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "tenant_id": {
+      "description": "Caller-supplied tenant attribution. Whether the caller may emit or read this tenant scope is a PDP decision.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "resource_ref": {
+      "description": "Caller-supplied resource attribution. Both leaves are mandatory.",
+      "$ref": "#/definitions/ResourceRef"
+    },
+    "subject_ref": {
+      "description": "Optional caller-supplied subject attribution. Never derived from the caller's security context.",
+      "$ref": "#/definitions/SubjectRef"
+    },
+    "gts_type_id": {
+      "description": "The derived type this entry is metered against - a type identifier terminated by `~`, deriving from this base with exactly one further segment. The gear resolves the declaration by it and infers no metering meaning from its shape: fold, canonical unit, and metadata surface come from the declaration alone. Control characters are excluded because the entry identifier derivation concatenates this value with the other dedup-identity inputs under a `0x1F` separator.",
+      "type": "string",
+      "format": "gts-identifier",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^gts\\.cf\\.core\\.uc\\.usage_record\\.v1~[^\\x00-\\x1F\\x7F~]+~$",
+      "examples": [
+        "gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~",
+        "gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~"
+      ]
+    },
+    "entry_type": {
+      "description": "The closed discriminator between a measurement and a withdrawal, derived by the gear from whether the entry carries `invalidates`. It is never submitted: the ingestion shape accepts no discriminator field, so a marker cannot disagree with the payload it marks. An entry is never identified as a correction by the value or sign of its quantity either: zero and negative quantities are ordinary measurements, and an invalidation echoes the quantity it withdraws rather than negating it.",
+      "readOnly": true,
+      "type": "string",
+      "enum": ["record", "invalidation"]
+    },
+    "quantity": {
+      "description": "Finite, signed decimal measurement in the canonical unit bound to this entry's type. Encoded as a string, never a JSON number, so representations cannot round-trip through float and silently lose precision - a `SUM` fold must be bit-exact, which binary floating point cannot guarantee at scale. The sign is never constrained. A quantity carries at most 28 significant decimal digits (leading zeros excluded) and at most 28 digits after the decimal point, so its magnitude is below 10^28 and the smallest non-zero value is 1x10^-28. The pattern bounds the integer and fraction parts separately and cannot express the significant-digit bound, so it is a necessary but not sufficient check: out-of-range values are rejected at ingestion. The published bound is deliberately narrower than the `rust_decimal::Decimal` carrier, which reaches 29 significant digits; where the two disagree, the published bound is normative.",
+      "type": "string",
+      "pattern": "^-?(?:0|[1-9][0-9]{0,27})(?:\\.[0-9]{1,28})?$",
+      "examples": ["42.5", "-3"]
+    },
+    "window_start": {
+      "description": "Inclusive start of the emitter-supplied covered period. The covered period is the only emitter-supplied time attribution an entry carries.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "window_end": {
+      "description": "Exclusive end of the covered period, at or after `window_start`. Equal bounds mark a point event, not an error.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "idempotency_key": {
+      "description": "Caller-supplied dedup key. The dedup identity is the 5-tuple `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`, so submissions differing in period are distinct entries rather than duplicates.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\x00-\\x1F\\x7F]+$"
+    },
+    "accepted_at": {
+      "description": "Server-assigned instant of acceptance. Not settable or overridable by the emitter - an emitter-supplied value would let a skewed emitter hide its own lateness. Late arrival is evaluated as `accepted_at` against `window_end`.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "acceptance_sequence": {
+      "description": "Server-assigned position, strictly monotonic per `(tenant_id, gts_type_id)`. Orders the usage feed and breaks `LATEST` ties. No cross-tenant or cross-type total order is claimed.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "origin": {
+      "description": "Which ingestion path admitted the entry. Server-assigned from the path itself, never caller-supplied, and returned on every read path.",
+      "type": "string",
+      "enum": ["live", "backfill"]
+    },
+    "invalidates": {
+      "description": "The entry this one withdraws. Present exactly when `reason_code` is; its presence is what makes this entry an invalidation, and what `entry_type` is derived from. The target must exist, must itself be a `record`, and must not already be invalidated.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "reason_code": {
+      "description": "Why the withdrawal was issued. Mandatory on an invalidation entry and forbidden on an ordinary record.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "metadata": {
+      "description": "The per-meter extension surface. This base admits any key with a string value; a derived type closes the set by declaring its properties and setting `additionalProperties: false`, and the two constraints intersect to declared-keys-only. Values are strings in v1 irrespective of richer typing a derived schema can express. Every declared property is groupable and equality-filterable on both read paths. Must not carry PII, payment data, regulated health data, or credentials.",
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  },
+  "definitions": {
+    "ResourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["resource_id", "resource_type"],
+      "description": "Caller-supplied resource attribution. The gear validates presence and structural shape only; ownership and caller permission are PDP decisions.",
+      "properties": {
+        "resource_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "resource_type": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
+    "SubjectRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject_id"],
+      "description": "Optional subject attribution. `subject_id` defines whether attribution is present; `subject_type` must not be supplied without it. Subject identifiers are opaque and are not PII within the Usage Collector boundary.",
+      "properties": {
+        "subject_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "subject_type": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    }
+  }
+}

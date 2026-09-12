@@ -1,5 +1,5 @@
 Created:  2026-02-25 by Virtuozzo International GmbH
-Updated:  2026-08-11 by Virtuozzo International GmbH
+Updated:  2026-09-10 by Virtuozzo International GmbH
 
 # Usage Collector — DESIGN
 
@@ -30,74 +30,105 @@ Updated:  2026-08-11 by Virtuozzo International GmbH
 
 <!-- /toc -->
 
-- [ ] `p3` - **ID**: `cpt-cf-usage-collector-design-usage-collector`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-design-overview`
 
 ## 1. Architecture Overview
 
 ### 1.1 Architectural Vision
 
-The Usage Collector is the platform's centralized metering store and query engine. It exposes three independently versioned surfaces — an in-process SDK trait for platform gears, a Plugin SPI for pluggable storage backends, and a REST API for remote callers — that converge on a single internal core enforcing ingestion semantics and idempotency before records reach the active storage plugin.
+The Usage Collector is the platform's **append-only metering ledger**. It accepts attributed measurements over covered periods and never rewrites
+one. It serves them back on three surfaces. These are an in-process SDK trait, a
+Plugin SPI for storage backends, and a REST API for remote callers.
 
-The architecture is contract-first and fail-closed: authentication is owned by the ToolKit gateway upstream; authorization is anchored at the platform PDP (`authz-resolver`); persistence is reached only through the Plugin SPI, with the active backend resolved lazily via the Plugin Host and GTS Registry. No business logic — pricing, billing, quota decisions — lives inside the collector; it is strictly a metering substrate.
+Three properties shape everything below. **The ledger is append-only.** A correction is an appended invalidation entry,
+not an edit or a status flip. No read path can therefore observe a delivered
+entry change. **Typing is not owned here.** GTS type declarations live in `types-registry`.
+This gear resolves and validates against them through a local cache, and holds
+no catalog of its own.
+**The fold is declared, not chosen.** Each meter's aggregation is a property
+of its declaration. One period therefore yields one number per meter, and the
+aggregate request carries no aggregation parameter.
+
+The architecture is contract-first and fail-closed. Authentication is owned by
+the ToolKit gateway upstream. Authorization is anchored at the platform PDP
+(`authz-resolver`). Persistence is reached only through the Plugin SPI. No
+business logic — pricing, rating, billing, quota decisions — lives inside the
+collector.
 
 ### 1.2 Architecture Drivers
-
-Requirements that significantly influence architecture decisions.
 
 #### Functional Drivers
 
 | Requirement | Design Response |
 | --- | --- |
-| `cpt-cf-usage-collector-fr-ingestion` | REST and SDK entry points funnel into a single core path; gateway authenticates and PDP authorizes the attribution tuple before plugin dispatch. |
-| `cpt-cf-usage-collector-fr-idempotency` | Idempotency key is mandatory across SDK and REST. Dedup decisions are delegated to the active plugin: exact-equality retries are silently absorbed; differing canonical fields surface as a fail-closed `idempotency_conflict`. |
-| `cpt-cf-usage-collector-fr-record-metadata` | Optional JSON metadata carried end-to-end. Metadata is closed-shape (`metadata_fields`-declared keys only, `String` values, undeclared keys rejected as `unknown_metadata_key` pre-dispatch). Core enforces a configurable size cap (default 8 KiB). |
-| `cpt-cf-usage-collector-fr-counter-semantics` | Counter vs gauge is read from the UsageType's `kind` field. Accumulation of counter deltas into the signed `SUM` is the plugin's responsibility. |
-| `cpt-cf-usage-collector-fr-gauge-semantics` | Gauges bypass monotonicity enforcement in the core and are stored as-is by the plugin; the kind lookup routes gauges directly to plugin persistence without delta accumulation. |
-| `cpt-cf-usage-collector-fr-tenant-attribution` | Tenant is mandatory and caller-supplied. The gateway performs a defense-in-depth check; the PDP authorizes the caller against the supplied tenant before plugin dispatch. |
-| `cpt-cf-usage-collector-fr-resource-attribution` | `resource_id` and `resource_type` are mandatory ingestion-contract fields, structurally validated by the core and authorized as part of the PDP attribution tuple. |
-| `cpt-cf-usage-collector-fr-subject-attribution` | Subject is optional and caller-supplied; when present, the PDP authorizes the caller against it. The core never derives subject identity from `SecurityContext`. |
-| `cpt-cf-usage-collector-fr-tenant-isolation` | Enforced exclusively through PDP authorization on every read and write; the core applies PDP-returned constraint filters to all queries before plugin dispatch. |
-| `cpt-cf-usage-collector-fr-ingestion-authorization` | Single PDP check per record against the full attribution tuple plus a UsageType-existence lookup (via a `get_usage_type` SPI dispatch against the storage plugin) before any plugin write; failures fail-closed immediately. |
-| `cpt-cf-usage-collector-fr-pluggable-storage` | A dedicated Plugin SPI covers persistence and query. The active backend is resolved lazily on first dispatch via Plugin Host and GTS Registry; `[usage_collector].vendor` (read at `Gear::init`) selects the plugin identity. |
-| `cpt-cf-usage-collector-fr-query-aggregation` | Aggregated query is exposed on SDK and REST. The core enforces the mandatory single-UsageType and time-range filters, runs PDP authorization, and pushes server-side SUM/COUNT/MIN/MAX/AVG and grouping to the plugin. |
-| `cpt-cf-usage-collector-fr-query-raw` | Raw query reuses the aggregated PDP-authorization + constraint-application pattern and returns cursor-paginated record pages. User-supplied filters can only narrow within the authorized scope. |
-| `cpt-cf-usage-collector-fr-event-deactivation` | Status-only transition exposed on SDK and REST. The core authorizes via PDP, validates current status, and dispatches the one-way update to the plugin without altering any other field. |
-| `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics` | Single canonical catalog owned by the plugin. Counter vs gauge is read from the UsageType's `kind` field; every ingest performs the existence + `kind` + `metadata_fields` lookup via a per-record `get_usage_type` SPI dispatch against the storage plugin before plugin write dispatch. |
-| `cpt-cf-usage-collector-fr-usage-type-registration` | Single ingress: REST/SDK call gated by PDP, writing to the plugin-owned catalog via the Plugin SPI. |
-| `cpt-cf-usage-collector-fr-usage-type-deletion` | REST/SDK operator capability gated by PDP. |
-| `cpt-cf-usage-collector-fr-data-classification` | N/A as architecture driver — realized transitively by `cpt-cf-usage-collector-constraint-pii-identity-layer` and the opaque-identifier handling of `RecordMetadata`, `UsageRecord`, and `SubjectRef`. No dedicated classification component. |
+| `cpt-cf-usage-collector-fr-ingestion` | REST, SDK, and backfill entry points funnel into one Ingestion Gateway. The gateway authenticates upstream and authorizes at the PDP before dispatch. |
+| `cpt-cf-usage-collector-fr-idempotency` | Idempotency key mandatory on every entry. The dedup identity is the 5-tuple `(tenant, gts_type, key, window_start, window_end)`. Exact-equality retries are absorbed, divergent same-key writes surface as a fail-closed conflict. The horizon is the type's retention policy, measured from the covered period. |
+| `cpt-cf-usage-collector-fr-record-identity` | `id` is a deterministic UUIDv5 over the same 5-tuple, so it is stable, server-derived, and reproducible offline by the emitter before submission. `entry_type` is deliberately excluded from the derivation. |
+| `cpt-cf-usage-collector-fr-usage-windows` | The covered period `[window_start, window_end)` is the only emitter-supplied time attribution. `accepted_at` and `acceptance_sequence` are server-assigned. The gear stamps `accepted_at`, and the storage plugin assigns `acceptance_sequence` strictly monotonic per `(tenant_id, gts_type_id)`. Query selection reads the period end — `from <= window_end < to` — on every path, so no entry needs a shape-dependent case. |
+| `cpt-cf-usage-collector-fr-live-future-time-bound` | The live path bounds the covered period on both sides. It rejects a period that ends further into the future than a tolerance, 5 minutes by default. It also rejects one that ends further into the past than a second tolerance, 48 hours by default and configurable. Anything older must use the dedicated backfill route, which the rejection names. Both bounds govern every entry the path admits, an invalidation included, over the period it copies. The backfill path carries its own window. All of these are configuration, enforced in the Ingestion Gateway before dispatch. |
+| `cpt-cf-usage-collector-fr-record-quantity` | A finite signed decimal carried as `rust_decimal::Decimal`, wire-encoded as a JSON string, persisted in an exact decimal type. The published range and precision are declared in the OpenAPI contract. The SPI obliges every plugin to round-trip both halves without loss. |
+| `cpt-cf-usage-collector-fr-quantity-semantics` | The relation between quantity and period is carried by the declared fold and resolved per read. The gear never integrates, differentiates, interpolates, re-windows, or synthesizes samples. |
+| `cpt-cf-usage-collector-fr-aggregation-fold` | The fold is read from the resolved declaration, never inferred from the identifier and never accepted as a request parameter. The Query Gateway serves the declared fold and no other. |
+| `cpt-cf-usage-collector-fr-metering-unit-binding` | The unit is a declaration property resolved through the type reference. Ingestion rejects an entry whose type binds no unit. Never carried per entry. |
+| `cpt-cf-usage-collector-fr-canonical-units` | The canonical list is published in the OpenAPI contract. No path converts, scales, or rounds a quantity. |
+| `cpt-cf-usage-collector-fr-record-metadata` | Closed-shape validation against the declaration's schema at the gateway, with a configurable size cap. Declared properties are exactly the groupable and filterable dimensions, computed per request. |
+| `cpt-cf-usage-collector-fr-record-invalidation` | Invalidation rides the ordinary ingestion path as a faithful copy of its target with three closed departures. The Ingestion Gateway enforces the copy, the reference, no-invalidation-of-invalidation, and at-most-one-per-record before persistence. The copied period is bounded by the path, not by the entry kind. |
+| `cpt-cf-usage-collector-fr-invalidation-reason-code` | A non-empty reason code is mandatory on an invalidation and forbidden on an ordinary record. Returned on every read path exposing the correction. |
+| `cpt-cf-usage-collector-fr-usage-type-declaration` | No Usage Collector surface carries a type operation, read or write. Declaration is a `types-registry` operation. |
+| `cpt-cf-usage-collector-fr-usage-type-resolution` | A dedicated Type Resolver component resolves declarations from `types-registry` through a local cache, fail-closed, on both write and read paths. Cached declarations stay usable during a registry outage. A declaration the registry has lost is restored from the mirror table of [§3.7](#37-database-schemas--tables), where a row exists and the registry returns a definite not-found answer. |
+| `cpt-cf-usage-collector-fr-tenant-attribution` | Tenant is mandatory and caller-supplied. The gateway performs a defence-in-depth check. The PDP authorizes the caller against the supplied tenant before dispatch. |
+| `cpt-cf-usage-collector-fr-resource-attribution` | `resource_id` and `resource_type` are mandatory, structurally validated, and part of the PDP attribution tuple. |
+| `cpt-cf-usage-collector-fr-subject-attribution` | Subject is optional and caller-supplied. When present the PDP authorizes against it. The core never derives subject identity from `SecurityContext`. |
+| `cpt-cf-usage-collector-fr-tenant-isolation` | Enforced through the PDP-returned scope on every read and write. The core checks each write's attribution against that scope. It applies the same scope as a filter to each query, before dispatch. |
+| `cpt-cf-usage-collector-fr-ingestion-authorization` | Every entry is authorized against its full attribution tuple, and its type is resolved, both before any plugin write. Failures fail closed immediately. |
+| `cpt-cf-usage-collector-fr-pluggable-storage` | A dedicated Plugin SPI covers persistence, query, and feed reads. The active backend is resolved lazily via Plugin Host and `types-registry`. `[usage_collector].vendor` selects the plugin identity at `Gear::init`. |
+| `cpt-cf-usage-collector-fr-query-aggregation` | The Query Gateway enforces the mandatory single-type and time-range filters, runs PDP authorization, and pushes the declared fold and grouping to the plugin. Withdrawn pairs are excluded from the selected set. |
+| `cpt-cf-usage-collector-fr-query-raw` | Raw query reuses the same authorization and constraint-application pattern and returns cursor-paginated pages. Withdrawn pairs are returned **as persisted**, the invalidation naming its target. |
+| `cpt-cf-usage-collector-fr-billing-usage-feed` | A dedicated Feed Gateway serves per-subscription, cursor-paginated, snapshot-consistent pages ordered by `acceptance_sequence` within each `(tenant, gts_type)` scope, each carrying a watermark. |
+| `cpt-cf-usage-collector-fr-billing-fields-on-read` | Every read path returns the identifier, type reference, covered period, acceptance instant, declared metadata, signed quantity, entry type, the withdrawn-record reference with its reason code, and origin marker — unstripped. |
+| `cpt-cf-usage-collector-fr-billing-retention-floor` | Retention is declared per type, and the plugin reads it from `types-registry` itself. No gear surface carries it. The floor — backfill window plus one replay horizon — is a plugin-readiness condition surfaced at review, not a gear-side sweep. |
+| `cpt-cf-usage-collector-fr-backfill` | A dedicated import path, workload-isolated from live ingestion, applying identical validation and stamping `origin = backfill`. The configured window is a hard bound and no surface reaches past it. It takes **Usage Records** and invalidation entries alike, on REST and on the SDK trait. |
+| `cpt-cf-usage-collector-fr-rate-limiting` | Configurable per-caller and per-(caller, tenant) ingestion quotas across all ingestion paths, rejecting over-quota submissions with an actionable throttle error carrying retry guidance. |
+| `cpt-cf-usage-collector-fr-reconciliation-metadata` | Per-scope counters and three watermarks — acceptance instant, covered-period end, acceptance sequence — exposed on REST at the (tenant, GTS type) granularity. The gear evaluates none of them. |
+| `cpt-cf-usage-collector-fr-reconciliation-caller-scopes` | Deferred beyond v1: the tenant plane carries no calling-gear identity, so no counter can be grouped by caller. See [§4](#4-additional-context). |
+| `cpt-cf-usage-collector-fr-data-classification` | Opaque identifiers, operational telemetry, and caller-supplied metadata are the three classes. The gear interprets none of them and hosts no PII resolution. |
 
 #### NFR Allocation
 
-This table maps non-functional requirements from PRD to specific design/architecture responses, demonstrating how quality attributes are realized.
-
-| NFR ID                                                 | NFR Summary                                                                                                                                                                        | Allocated To                              | Design Response                                                                                                                                                       | Verification Approach                                                                           |
-| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `cpt-cf-usage-collector-nfr-query-latency`             | Aggregation queries over 30-day single-tenant range p95 ≤ 500 ms                                                                                                                   | Plugin SPI + query path                   | Server-side aggregation and grouping pushed into the Plugin SPI so backends use native acceleration (materialized views, columnar indexes).                           | Load test against bound backend with 30-day single-tenant workloads.                            |
-| `cpt-cf-usage-collector-nfr-availability`              | 99.95% monthly availability for ingestion                                                                                                                                          | Gateway + core ingestion path             | Stateless gateway and core behind the platform API gateway; deterministic errors enable idempotent caller retry.                                                      | Synthetic ingestion probes against 99.95% monthly budget.                                       |
-| `cpt-cf-usage-collector-nfr-throughput`                | Sustained ≥ 10,000 records/sec                                                                                                                                                     | Core ingestion path + active plugin       | Plugin SPI accepts batched records to drive native bulk-write paths.                                                       | Sustained load test ≥ 10,000 records/sec against representative backends.                       |
-| `cpt-cf-usage-collector-nfr-ingestion-latency`         | Ingestion p95 ≤ 200 ms under PRD §9 envelope                                                                                                                                       | Gateway + core + Plugin SPI               | PDP and catalog lookup on the synchronous hot path; plugin acknowledges durable acceptance in a single SPI call.                                                      | Latency benchmark under PRD §9 envelope, gateway entry to plugin ack.                           |
-| `cpt-cf-usage-collector-nfr-workload-isolation`        | Query workloads do not degrade ingestion p95                                                                                                                                       | Core scheduling + Plugin SPI              | Ingestion and query use independent SPI methods so plugins can route them to isolated backend pools.                                                                  | Concurrent ingest+query load test confirming ingestion p95 holds.                               |
-| `cpt-cf-usage-collector-nfr-query-freshness`           | Floor: ingestion ack durable and dedup-visible; Query SPI eventually consistent. Ceiling: per-plugin deployment guide.                                                             | Plugin SPI + per-plugin deployment guides | Gear publishes the floor; each plugin's deployment guide publishes its ceiling. Read-after-write uses the ingestion ack. No typed consistency-profile SPI in v1.    | Doc review for floor; per-plugin ceilings reviewed at plugin release readiness.                 |
-| `cpt-cf-usage-collector-nfr-plugin-contract-stability` | SDK trait, Plugin SPI, REST API each stable within a major version                                                                                                                 | Public surface versioning                 | Each surface versions independently; additive-only within a major; at most one prior major supported concurrently.                                                    | Contract compatibility tests per release (compile-time for SDK/SPI; schema-diff for REST).      |
-| `cpt-cf-usage-collector-nfr-throughput-profile`        | Sustained ≥ 10,000 records/sec; burst ≥ 30,000 records/sec for ≤ 5 min/60-min window; ≥ 100 concurrent aggregation queries; ≥ 700,000,000 accepted ingestion calls per 24-hour day | Topology + gateways + Plugin SPI          | Plugin SPI exposes batch ingestion and pushed-down aggregation for native bulk-write paths. | Load test the full envelope over ≥ 30-minute steady-state windows.                              |
-| `cpt-cf-usage-collector-nfr-operational-visibility`    | 7 observable signals; correlation IDs on 100% of API operations; ≥ 30-day log retention; 5 alert categories                                                                        | All user-facing components + plugin host  | Each user-facing component emits the enumerated signals and propagates `SecurityContext.correlation_id`; alert thresholds anchored on the NFR-thresholds constraint.  | Dashboard and alert-threshold review against the 7-signal / 5-alert set on each major release. |
+| NFR ID | NFR Summary | Allocated To | Design Response | Verification |
+| --- | --- | --- | --- | --- |
+| `cpt-cf-usage-collector-nfr-ingestion-latency` | p95 ≤ 200 ms | Ingestion Gateway, Type Resolver, Plugin Host | One PDP decision and one cached type resolution cover each entry. No registry round-trip in the steady state. Budget split in [§3.11.2](#3112-latency-budgets-perf-design-003). | Load test at the throughput-profile envelope. |
+| `cpt-cf-usage-collector-nfr-throughput` | ≥ 10,000 entries/sec | Ingestion Gateway, Plugin SPI | Batch ingestion is a first-class SPI method so each plugin drives its native bulk-write path. | Sustained-rate load test. |
+| `cpt-cf-usage-collector-nfr-throughput-profile` | Sustained / burst / concurrency envelope | whole gear | Stateless gear replicas behind the platform gateway. Capacity is plugin-bound. | Envelope load test. |
+| `cpt-cf-usage-collector-nfr-query-latency` | p95 ≤ 500 ms | Query Gateway, Plugin SPI | Fold and grouping are pushed down. The gear never iterates rows. | Aggregated-query load test. |
+| `cpt-cf-usage-collector-nfr-workload-isolation` | Query load must not degrade ingestion | Plugin SPI, active plugin | Isolated backend pools are a plugin-deployment obligation. The backfill path is isolated from live ingestion at the gear. | Concurrent load test. |
+| `cpt-cf-usage-collector-nfr-availability` | 99.95% monthly | whole gear | Stateless replicas. Fail-closed on dependency loss rather than degraded acceptance. | Availability budget burn. |
+| `cpt-cf-usage-collector-nfr-query-freshness` | Floor-and-ceiling consistency contract | [§3.10](#310-consistency-contract) | Gear publishes the floor. Each plugin publishes its ceiling. Type declarations are explicitly **outside** the floor — their propagation is a property of the resolver cache. | Review of this design and the SPI consistency profile. |
+| `cpt-cf-usage-collector-nfr-aggregate-freshness` | Plugin readiness gate, p95 ≤ 5 min where acted on | active plugin | The aggregate path is a derived view, so materialisation is legitimate. The plugin publishes its lag **and** its invalidation-propagation bound separately. | Plugin release-readiness review. |
+| `cpt-cf-usage-collector-nfr-billing-feed-freshness` | Plugin readiness gate, p95 ≤ 5 min acceptance → feed | Feed Gateway, active plugin | A deployment whose plugin publishes no qualifying ceiling must not feed a charging consumer. | Plugin release-readiness review. |
+| `cpt-cf-usage-collector-nfr-replay-throughput` | 24 h backlog cleared within 6 h | Feed Gateway, active plugin | Subscription scoping bounds the obligation to the meters a consumer actually reads. Required read rate ≥ subscribed arrival rate × (1 + backlog age / recovery time). | Recovery test against the subscription under test. |
+| `cpt-cf-usage-collector-nfr-plugin-contract-stability` | Major-version stability per surface, from 1.0 onward | all three surfaces | Independent versioning, additive-only within a major, one prior major supported. | Contract diff gate, from 1.0 onward. |
+| `cpt-cf-usage-collector-nfr-operational-visibility` | Dashboards and alert routing | [§3.11.5](#3115-operational-metric-inventory-ops-design-002) | Instrument inventory covers ingestion, query, PDP, plugin readiness, **and type-resolution failure and cache staleness**. | Dashboard and alert review. |
 
 #### Key ADRs
 
-| ADR ID                                                                        | Decision Summary                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cpt-cf-usage-collector-adr-pdp-centric-authorization`                        | Anchor authorization at the platform PDP (authz-resolver); the core neither caches PDP decisions nor maintains its own access table.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `cpt-cf-usage-collector-adr-pluggable-storage`                                | Reach persistence and query exclusively through the Plugin SPI for both `usage_records` and the usage-type catalog; operator configuration binds the active backend.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `cpt-cf-usage-collector-adr-caller-supplied-attribution`                      | Tenant, resource, and subject attribution are caller-supplied and PDP-authorized; the calling-gear identity is read from the caller's `SecurityContext`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `cpt-cf-usage-collector-adr-mandatory-idempotency`                            | The ingestion contract requires a client-provided idempotency key on every record across counter and gauge kinds.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `cpt-cf-usage-collector-adr-monotonic-deactivation`                           | Individual event deactivation is a one-way `active → inactive` status transition; no reactivation; no other field mutation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `cpt-cf-usage-collector-adr-contract-stability`                               | REST API, SDK trait, and Plugin SPI each version independently under a major-version stability contract with at most one prior major supported.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `cpt-cf-usage-collector-adr-usage-compensation`                               | Usage compensation primitive: counter-only, append-only, strictly-negative `value` UsageRecord with `corrects_id` set (pointing at the ordinary usage row being offset) on the unified ingestion path; reduces `SUM` without mutating the original; no dedicated compensate endpoint / SDK method / SPI call.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `cpt-cf-usage-collector-adr-consistency-contract`                             | Floor-and-ceiling consistency contract: ingestion `Acknowledged` is durable and dedup-visible; the Query SPI (raw + aggregated + catalog) is eventually consistent with no upper bound at the gear floor; read-after-write flows MUST use the ingestion ack; each plugin's deployment guide MAY advertise a stronger ceiling. No typed `consistency_profile()` SPI method in v1.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference` | The plugin-DB usage-type catalog (managed via SDK/REST) is the sole catalog; usage records reference usage types by `gts_id` (all derived from the reserved base `gts.cf.core.uc.usage_record.v1~`). Catalog rows are flat: counter vs gauge lives in a `kind: UsageKind` column, and `metadata_fields: Vec<String>` declares the allowed keys (all values typed as String); no per-usage-type JSON Schema validator. |
-| `cpt-cf-usage-collector-adr-deterministic-usage-record-id`                   | `UsageRecord.id` is gateway-derived, not caller-supplied: a deterministic UUIDv5 of the dedup key `(tenant_id, gts_id, idempotency_key, created_at)` under the fixed namespace `56313026-863b-4de8-b32b-1f96b67306ed` (`usage_collector_sdk::derive_usage_record_id`). The create request carries no identity field; a stray `id` is rejected `400`. Guarantees identity uniqueness by construction and eliminates false idempotency conflicts on exact retries; `created_at` is part of the identity (ADR-0014). |
-| `cpt-cf-usage-collector-adr-created-at-in-dedup-identity`                    | `created_at` is folded into the record identity: `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`, making the dedup key the 4-tuple `(tenant_id, gts_id, idempotency_key, created_at)` and removing `created_at` from the canonical-field comparison set. One 4-tuple ⇒ one `id`, so `get`/`deactivate` address exactly one row and the TimescaleDB plugin's 4-tuple dedup becomes canonical rather than a divergence (amends ADR-0013 and ADR-0004). |
+| ADR ID | Decision Summary | Status against this design |
+| --- | --- | --- |
+| `cpt-cf-usage-collector-adr-pdp-centric-authorization` | Every operation is authorized at the platform PDP. The gear keeps no access table and no decision cache. | Current. |
+| `cpt-cf-usage-collector-adr-pluggable-storage` | Persistence and query are reached only through the Plugin SPI. The operator selects the backend, and the host binds it lazily. | Current. |
+| `cpt-cf-usage-collector-adr-caller-supplied-attribution` | Attribution is caller-supplied and PDP-authorized. The gear never derives tenant, resource, or subject from the caller's identity. | Current. |
+| `cpt-cf-usage-collector-adr-mandatory-idempotency` | Every entry carries an idempotency key. The gear absorbs an exact-equality retry and rejects any divergent canonical field fail-closed. | Current. |
+| `cpt-cf-usage-collector-adr-contract-stability` | REST, SDK, and Plugin SPI version independently. From 1.0 onward, only additive changes ship within a major, and one prior major stays supported. | Current. |
+| `cpt-cf-usage-collector-adr-consistency-contract` | Floor-and-ceiling split. The gear publishes an eventual floor with no upper bound, and each plugin publishes its own ceiling. | Current. |
+| `cpt-cf-usage-collector-adr-record-identity-derivation` | The identifier is a UUIDv5 over the dedup identity, which is tenant, type, key, and both covered-period bounds. | Current. |
+| `cpt-cf-usage-collector-adr-registry-owned-typing` | `types-registry` owns every type declaration. The gear resolves through a cache, holds no catalog, and fails closed on an unresolvable reference. | Current, amended by `cpt-cf-usage-collector-adr-declaration-rehydration` for the recovery mirror. |
+| `cpt-cf-usage-collector-adr-declared-fold` | Each type declares one immutable fold from `SUM`, `COUNT`, `MAX`, `MIN`, `LATEST`. The aggregate request carries no aggregation parameter. | Current. |
+| `cpt-cf-usage-collector-adr-append-only-invalidation` | Invalidation is the single correction primitive. A faithful-copy invalidation entry travels the ordinary ingestion path and withdraws exactly one entry. | Current. |
+| `cpt-cf-usage-collector-adr-feed-aggregate-split` | A charging consumer reads the entry feed. The aggregate path is a derived view a plugin may materialise. | Current. |
+| `cpt-cf-usage-collector-adr-backfill-isolation` | Historical import runs on a dedicated origin-marked route, isolated from live ingestion. The path bounds the covered period, so a withdrawal of closed history travels the same route as an import. | Current. |
+| `cpt-cf-usage-collector-adr-quantity-precision` | A quantity is an exact signed decimal in a published range. Every plugin round-trips that full range, including its negative half. | Current. |
+| `cpt-cf-usage-collector-adr-window-end-selection` | A time range selects an entry by the end of its covered period. One predicate replaces interval overlap and its point-event case. | Current. |
+| `cpt-cf-usage-collector-adr-declaration-rehydration` | The gateway mirrors each declaration it resolves and restores one the registry has lost. The plugin reads declared retention from `types-registry` itself. | Current. The mirror and the restore are **temporary** and retire when persistent storage reaches this gear's resolution path. The retention rule is permanent. |
 
 ### 1.3 Architecture Layers
 
@@ -110,62 +141,128 @@ flowchart TB
     end
     subgraph Application["Application"]
         Gateway["Platform API Gateway"]
-        AuthGate["PDP Authorization Gate (per-component PDP helper)<br/>(authz-resolver)"]
-        IngestPath["Ingestion Path<br/>(idempotency, semantics enforcement)"]
-        QueryPath["Query Path<br/>(aggregation, raw, constraint application)"]
-        Lifecycle["UsageType Lifecycle and Deactivation"]
+        AuthGate["PDP Authorization Gate (per-component helper)<br/>(authz-resolver)"]
+        IngestPath["Ingestion Path<br/>(identity, idempotency, invalidation rules, quotas)"]
+        Backfill["Backfill Path<br/>(isolated, origin-marked)"]
+        QueryPath["Query Path<br/>(declared fold, raw, constraint application)"]
+        FeedPath["Feed Path<br/>(subscription, cursor, watermark)"]
     end
     subgraph Domain["Domain"]
-        Catalog["UsageType Catalog (plugin-owned, single canonical)<br/>(gts_id, kind, metadata_fields)"]
-        Records["Usage Record Model<br/>(tenant, resource, subject, value, metadata, gts_id)"]
+        Resolver["Type Resolver<br/>(cache over types-registry declarations)"]
+        Records["Ledger Entry Model<br/>(attribution, period, quantity, entry type, linkage)"]
     end
-    subgraph Infrastructure["Infrastructure (Storage Plugins)"]
-        Binding["Plugin Binding<br/>(Plugin Host (the host gear's own Service) + GTS Registry)"]
-        Plugins["Active Storage Plugin<br/>(ClickHouse / TimescaleDB / ...)"]
+    subgraph Infrastructure["Infrastructure"]
+        Registry[("types-registry<br/>(declaration SoR)")]
+        Binding["Plugin Binding<br/>(Plugin Host + types-registry)"]
+        Plugins["Active Storage Plugin<br/>(TimescaleDB / ClickHouse / ...)"]
     end
     REST --> Gateway
     SDK --> AuthGate
     Gateway --> AuthGate
     AuthGate --> IngestPath
+    AuthGate --> Backfill
     AuthGate --> QueryPath
-    AuthGate --> Lifecycle
-    IngestPath --> Catalog
-    QueryPath --> Catalog
+    AuthGate --> FeedPath
+    IngestPath --> Resolver
+    Backfill --> Resolver
+    QueryPath --> Resolver
+    FeedPath --> Records
+    Resolver -.->|cache miss| Registry
     IngestPath --> Records
     QueryPath --> Records
-    Lifecycle --> Catalog
     Records --> SPI
-    Catalog --> SPI
     SPI --> Binding
     Binding --> Plugins
 ```
 
 - [ ] `p3` - **ID**: `cpt-cf-usage-collector-tech-stack`
 
-| Layer          | Responsibility                                                                                                  | Technology                                                                                                                            | Maintainability                                                                              |
-| -------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Presentation   | REST API, SDK trait, and Plugin SPI surfaces for usage submit/query/deactivate and UsageType lifecycle.         | Axum + ToolKit `OperationBuilder` (OpenAPI in `usage-collector-v1.yaml`); Rust async traits registered in ClientHub.                   | Gear team; OpenAPI + trait diff gates.                                                     |
-| Application    | PDP authorization, idempotency, semantics enforcement, orchestration of ingest / query / deactivation flows.    | ToolKit gateway (upstream AuthN + `SecurityContext`); `authz-resolver` PDP; in-process Rust orchestration.                             | Co-owned with platform identity-services team; contract-test gate on `authz-resolver`.       |
-| Domain         | UsageType and UsageRecord types; counter/gauge derived from `UsageTypeGtsId` prefix at lookup.                  | In-process Rust domain types; plugin-owned catalog read per call via Plugin SPI.                                                      | Gear team; catalog SoR lives in the plugin.                                                |
-| Infrastructure | Persists and queries records and catalog via the Plugin SPI; backend bound lazily via Plugin Host + GTS Registry. | Plugin Host + GTS Registry binding; pluggable backends (ClickHouse, TimescaleDB) selected by `[usage_collector].vendor` at `Gear::init`. | Co-owned by gear team (SPI) + each active plugin's team; SPI major-version policy.        |
+| Layer | Responsibility | Technology | Maintainability |
+| --- | --- | --- | --- |
+| Presentation | REST, SDK, and SPI surfaces for ingestion, query, feed, and reconciliation. | Axum + ToolKit `OperationBuilder` (OpenAPI in `usage-collector-v1.yaml`). Rust async traits in ClientHub. | Gear team. OpenAPI + trait diff gates. |
+| Application | PDP authorization, identity derivation, idempotency, invalidation rules, quotas, and orchestration of ingest / query / feed / backfill. | ToolKit gateway (upstream AuthN + `SecurityContext`). `authz-resolver` PDP. In-process Rust orchestration. | Co-owned with platform identity-services. Contract-test gate on `authz-resolver`. |
+| Domain | Ledger entry model and the resolved-declaration cache. The fold, unit, metadata surface, and retention are read from declarations, never stored per entry. | In-process Rust domain types. Declaration cache over `types-registry`. | Gear team. Declaration SoR lives in `types-registry`. |
+| Infrastructure | Persists and queries entries via the Plugin SPI. Backend bound lazily via Plugin Host. | Plugin Host binding. Pluggable backends selected by `[usage_collector].vendor` at `Gear::init`. | Co-owned by gear team (SPI) and each plugin's team. SPI major-version policy. |
 
 ## 2. Principles & Constraints
 
 ### 2.1 Design Principles
 
+#### Append-only ledger
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-append-only-ledger`
+
+An accepted entry is never rewritten, retired, or altered, and no operation on
+any surface mutates one. There is no status field and no lifecycle flag. A correction is an appended invalidation entry. It is a faithful copy of its
+target, with three closed departures: its own idempotency key, the target
+reference, and a reason code. The reference is itself the discriminator — there
+is no separate marker a caller could set inconsistently with it. Withdrawal takes effect **in the fold**. Aggregations exclude both entries of
+the pair. Ledger read paths return both as persisted, with linkage in both
+directions.
+
+This is what keeps the feed's snapshot guarantee intact. A status flip on a
+delivered row would be a mutation a paginated scan could observe. An appended
+entry arriving at its own acceptance position cannot be.
+
+**ADRs**: `cpt-cf-usage-collector-adr-append-only-invalidation`
+
+#### Registry-owned typing
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-registry-owned-typing`
+
+GTS type declarations are held by `types-registry`. The Usage Collector mints
+none, exposes no type surface of its own, and maintains no second catalog that
+would have to be kept in step. It resolves declarations through a local cache and validates entries against
+them, fail-closed. An unresolvable reference is rejected rather than admitted
+unvalidated. A registry outage degrades the introduction of new types rather
+than the ingestion of existing ones.
+
+Three attributes give a persisted entry its meaning: fold, unit, and metadata
+surface. All three are immutable in the declaration. That immutability makes
+read-time resolution safe, so the gear need not pin them at acceptance.
+
+**ADRs**: `cpt-cf-usage-collector-adr-registry-owned-typing`
+
+#### Declared fold
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-declared-fold`
+
+Each meter declares exactly one aggregation fold, and the aggregate path serves
+that fold and no other. A caller cannot choose one. The aggregate request therefore carries no
+aggregation parameter, and no class of request is well-formed and semantically
+wrong. The ingestion path never consults the fold:
+no ingestion invariant depends on it, and the sign of a quantity is never
+constrained.
+
+**ADRs**: `cpt-cf-usage-collector-adr-declared-fold`
+
 #### PDP-centric authorization
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-pdp-centric-authorization`
 
-All read and write operations are authorized through the platform Policy Decision Point (`authz-resolver`) against the caller's SecurityContext (which carries the calling-gear identity) and the operation's full attribution tuple (tenant, resource, UsageType, and optionally subject). The Usage Collector neither caches PDP decisions nor maintains its own per-tenant or per-UsageType access table. For queries, PDP-returned constraint filters define the authorization boundary and are applied before any user-supplied filters narrow the result set. This keeps authorization policy in one place, eliminates duplicated access state inside the collector, and lets the platform evolve emit and read permissions without coordinated collector changes.
+All read and write operations are authorized through the platform PDP
+(`authz-resolver`). The check runs against the caller's `SecurityContext`,
+which
+carries the calling-gear identity, and against the operation's full
+attribution tuple (tenant, resource, GTS type, and optionally subject). The gear neither caches PDP
+decisions nor maintains its own access table. The PDP-returned scope defines the
+authorization boundary. On a write, the gear checks the entry's attribution
+against that scope. On a query, the same scope becomes a filter, applied before
+any user-supplied filter narrows the result set.
 
-**ADRs**: `cpt-cf-usage-collector-adr-pdp-centric-authorization`, `cpt-cf-usage-collector-adr-caller-supplied-attribution`
+**ADRs**: `cpt-cf-usage-collector-adr-pdp-centric-authorization`,
+`cpt-cf-usage-collector-adr-caller-supplied-attribution`
 
 #### Fail-closed behavior
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-fail-closed`
 
-Every missing-`SecurityContext`, authorization, validation, and storage failure resolves to immediate rejection with a deterministic error. There is no anonymous bypass, no cached PDP decision, no synthesized identity (the collector never resolves credentials — authentication is owned by the ToolKit gateway upstream), no invented storage binding when the active plugin is unavailable, and no silent discard of denied emissions. Failing closed makes the metering substrate predictable for callers — retry semantics are governed by idempotency, not by recovering from ambiguous partial success — and prevents quiet data-quality regressions in billing-sensitive paths.
+Every missing-`SecurityContext`, authorization, type-resolution, validation, and
+storage failure resolves to immediate rejection with a deterministic error.
+There is no anonymous bypass, no cached PDP decision, no synthesized identity,
+no invented storage binding, and no silent discard of denied emissions. The gear must not relax validation to protect ingestion availability. That
+would convert an availability incident into silent data corruption, which
+surfaces on an invoice weeks later.
 
 **ADRs**: `cpt-cf-usage-collector-adr-pdp-centric-authorization`
 
@@ -173,15 +270,38 @@ Every missing-`SecurityContext`, authorization, validation, and storage failure 
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-idempotency-by-key`
 
-Every usage record carries a client-provided idempotency key, and a same-key submission resolves into exactly one of two outcomes. An exact-equality retry — where all caller-supplied canonical fields (`value`, `resource_ref`, `subject_ref`, and `metadata`) equal the stored record — is silently deduplicated and surfaced as a successful but deduplicated acknowledgement. A same-key submission with any differing canonical field (including a metadata-only difference) is a canonical-field-mismatch Conflict: it is rejected fail-closed (consistent with `cpt-cf-usage-collector-principle-fail-closed`) through the `idempotency_conflict` reason rather than silently dropped, so accidental key reuse with divergent content cannot mask data from billing and downstream consumers. A same-key submission with a different `created_at` is a distinct record (ADR-0014), not a Conflict. This applies uniformly to counter and gauge kinds: counters cannot inflate their accumulated total on retry, and gauges cannot poison downstream rate-of-change or distinct-timestamp signals through duplicates. The idempotency window is unbounded — the key never expires, has no TTL, and is never intentionally reusable — so the `(tenant_id, gts_id, idempotency_key, created_at)` uniqueness is permanent. Idempotency-by-key makes at-least-once delivery safe end-to-end and removes the need for kind-dependent retry strategies in caller gears.
+Every entry carries a client-provided idempotency key. A same-identity
+submission resolves into exactly one of two outcomes. An exact-equality retry
+is silently deduplicated. Any divergent caller-supplied field, including a
+metadata-only difference, is a fail-closed conflict rather than a silent drop.
+The dedup identity is `(tenant, gts_type, key, window_start, window_end)`.
+Submissions that differ in period are therefore distinct entries rather than
+conflicts, and an emitter does not encode the period into the key. The key must
+still distinguish what the identity omits — resource, subject, a second entry in
+one period, and an invalidation from its target — and a retry must repeat its
+submission's key exactly.
 
-**ADRs**: `cpt-cf-usage-collector-adr-mandatory-idempotency`
+The horizon is **per-meter and bounded**. An identity stays visible for at
+least as long as the type's retention policy keeps the entry, measured from
+the covered period. Ingestion never reaches past it: retention is at least the
+backfill window plus one replay horizon
+(`cpt-cf-usage-collector-fr-billing-retention-floor`), so an over-aged covered
+period is refused on the window bound before deduplication is consulted. A
+charging consumer's exactly-once property rests on its own deduplication by
+entry identifier.
+
+**ADRs**: `cpt-cf-usage-collector-adr-mandatory-idempotency`,
+`cpt-cf-usage-collector-adr-record-identity-derivation`
 
 #### Pluggable storage
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-pluggable-storage`
 
-Persistence and query are accessed exclusively through the Plugin SPI; the active backend is resolved lazily on the first dispatch after the `types-registry` is consistent via the Plugin Host (the host gear's own Service) and GTS Registry, and the `[usage_collector].vendor` configuration value read once at `Gear::init` selects which plugin identity is materialized. The core does not directly couple to any backend SQL dialect, schema, or client library, so operators can choose the backend that fits their workload profile and meet the analytical latency and ingestion throughput thresholds via plugin-specific acceleration structures.
+Persistence and query are reached exclusively through the Plugin SPI. The
+active backend is resolved lazily on the first dispatch after `types-registry`
+is consistent. `[usage_collector].vendor`, read once at
+`Gear::init`, selects the plugin identity. The core couples to no backend SQL dialect,
+schema, or client library.
 
 **ADRs**: `cpt-cf-usage-collector-adr-pluggable-storage`
 
@@ -189,29 +309,27 @@ Persistence and query are accessed exclusively through the Plugin SPI; the activ
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-plugin-resolution-via-client-hub`
 
-Storage-plugin binding is resolved through the platform's `PluginV1<P>` GTS base type, `types-registry`, and `ClientHub` scoped registration. The Usage Collector SDK declares a unit-struct GTS spec `UsageCollectorPluginSpecV1` in `usage-collector-sdk/src/gts.rs` with `base = PluginV1` and an empty `properties = ""` (plugin instance metadata — `vendor`, `priority` — is carried by the `PluginV1<P>` base, not by usage-collector-specific spec data). Each plugin's `init()` calls `PluginV1::<UsageCollectorPluginSpecV1>::build_registration(...)`, publishes the instance payload through `TypesRegistryClient`, and registers a scoped `dyn UsageCollectorPluginV1` client in `ClientHub` under `ClientScope::gts_id(&instance_id)`. The host's `cpt-cf-usage-collector-component-plugin-host` holds a `GtsPluginSelector` that lazily resolves the bound plugin instance by querying `types-registry` with `UsageCollectorPluginSpecV1::gts_schema_id()` + configured vendor (lowest priority wins); per-request dispatch is an in-memory `ClientHub::try_get_scoped::<dyn UsageCollectorPluginV1>` lookup. Plugins are compiled in at the workspace level (static linkage), not dynamically loaded; the host crate has no compile-time dependency on any concrete plugin crate, and binding is settled at startup. See [plugin-spi.md §Host-side resolution flow](plugin-spi.md#host-side-resolution-flow) for the resolution flow code shape and [§3.6](#36-interactions-sequences) sequence diagrams for per-operation dispatch.
+Storage-plugin binding is resolved through the platform's `PluginV1<P>` GTS base
+type, `types-registry`, and `ClientHub` scoped registration. Each plugin's
+`init()` publishes a `PluginV1<UsageCollectorPluginSpecV1>` instance and
+registers a scoped `dyn UsageCollectorPluginV1` client. The host's
+`GtsPluginSelector` resolves the bound instance by schema id plus configured
+vendor (lowest priority wins) and caches it for the `Service`'s lifetime.
+Plugins are compiled in at the workspace level. The host crate has no
+compile-time dependency on any concrete plugin crate. The trait shape is in
+[§3.3](#33-api-contracts).
 
 **ADRs**: `cpt-cf-usage-collector-adr-pluggable-storage`
-
-#### Semantics enforcement
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-semantics-enforcement`
-
-The ingestion path enforces semantics-dependent invariants before any record reaches the plugin — counter records with negative deltas are rejected, gauge records bypass monotonicity, and records referencing unknown UsageTypes are rejected outright. Counter vs gauge is read from the resolved UsageType's `kind` field (`UsageKind` enum). Centralizing enforcement in the core keeps the contract minimal while preserving the data-integrity guarantees downstream consumers depend on.
-
-#### Monotonic deactivation
-
-- [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-monotonic-deactivation`
-
-Individual event deactivation is a one-way transition from active to `inactive` on the record's `status` field; the Usage Collector does not provide a reactivation operation and rejects deactivation requests against already-inactive records. No other property of the record is modified. Monotonic deactivation gives storage plugins, query consumers, and aggregation pipelines a first-class lifecycle event to reason about without re-introducing mutable-record semantics into the substrate.
-
-**ADRs**: `cpt-cf-usage-collector-adr-monotonic-deactivation`
 
 #### Contract stability
 
 - [ ] `p2` - **ID**: `cpt-cf-usage-collector-principle-contract-stability`
 
-The three public surfaces — REST API, SDK trait, and Plugin SPI — each version independently under a major-version stability contract: within a major version only additive changes are permitted, and the platform supports at most one prior major version concurrently per surface to give plugin authors, in-process consumers, and remote callers an explicit migration window. Treating contract stability as a first-class principle decouples ecosystem release schedules from the Usage Collector's own release train.
+The three public surfaces version independently under a major-version
+stability contract. The contract starts at the 1.0 release of each surface.
+From then on, only additive changes ship within a major, and at most one prior
+major stays supported. Plugin authors, in-process consumers, and remote callers
+therefore migrate on independent schedules.
 
 **ADRs**: `cpt-cf-usage-collector-adr-contract-stability`
 
@@ -219,133 +337,293 @@ The three public surfaces — REST API, SDK trait, and Plugin SPI — each versi
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-cursor-gateway-ownership`
 
-The Query Gateway owns, issues, decodes, and validates the opaque continuation token (`toolkit_odata::CursorV1`) for raw-record reads. Plugins **MUST NOT** mint, encode, or interpret a wire cursor — they receive the structured `(filter_ast, order_keys, page_after, limit)` tuple and return `(rows, last_keyset)`. This keeps cursor versioning, signing posture, and validation rules at a single platform-owned location. See [§3.3](#33-api-contracts) Cursor & Pagination for the lifecycle and Problem mappings.
+The gateway owns, issues, decodes, and validates every opaque continuation token
+(`toolkit_odata::CursorV1`), on both the raw-query and feed paths. Plugins never
+mint, encode, or interpret a wire cursor — they receive a structured tuple and
+return rows plus a last keyset. This keeps cursor versioning, signing posture,
+and validation at one platform-owned location.
+
+**ADRs**: `cpt-cf-usage-collector-adr-feed-aggregate-split`
 
 #### Canonical error envelope
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-canonical-errors`
 
-The REST surface emits errors using `toolkit_canonical_errors::Problem` plus the platform's registered standard-errors set; the gear **MUST NOT** define a bespoke `Problem` schema. `Problem.context` is a GTS-typed payload whose concrete shape is selected by the discriminator named in `context.reason`. See [§3.3](#33-api-contracts) Error Envelopes for the discriminator vocabulary.
+The REST surface emits errors using `toolkit_canonical_errors::Problem` plus the
+platform's registered standard-errors set. The gear defines no bespoke `Problem`
+schema. `Problem.context` is a GTS-typed payload selected by the discriminator
+in `context.reason`.
 
 #### Canonical page envelope
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-canonical-page`
 
-The Query Gateway's raw-read response uses the canonical `toolkit_odata::Page<UsageRecord>` envelope — `{ items: [UsageRecord], page_info: { next_cursor, prev_cursor, limit } }`. The gear **MUST NOT** define a bespoke paging schema for raw reads. Aggregated reads return a non-paginated typed body (see `cpt-cf-usage-collector-principle-aggregate-asymmetry`).
+Raw-read and feed responses use the canonical `toolkit_odata::Page` envelope. The gear defines no bespoke paging schema. Aggregated reads return a
+non-paginated typed body.
 
 #### Aggregate asymmetry
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-principle-aggregate-asymmetry`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-aggregate-asymmetry`
 
-The collector exposes two read shapes that intentionally differ. `GET /usage-collector/v1/records` is an OData list endpoint with cursor pagination; `POST /usage-collector/v1/records/aggregate` is a body-shaped RPC that returns a non-paginated result set. Toolkit's OData layer does not expose `$apply` (group-by / aggregate transforms), so paginating an aggregate response would add complexity without recovering safety. The asymmetry is the chosen contract.
+The collector exposes read shapes that intentionally differ. Raw and feed reads
+are cursor-paginated list endpoints. The aggregate is a body-shaped RPC
+returning a non-paginated result set. Toolkit's OData layer does not expose `$apply`. The aggregate response is
+bounded by `group_by` cardinality rather than row volume. Pagination would
+therefore add complexity without recovering safety.
+
+**ADRs**: `cpt-cf-usage-collector-adr-feed-aggregate-split`
 
 #### OTLP push emission
 
-- [x] `p2` - **ID**: `cpt-cf-usage-collector-principle-otlp-push-emission`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-principle-otlp-push-emission`
 
-Operational telemetry is pushed via OTLP from ToolKit's global `SdkMeterProvider`. Instruments are constructed via `opentelemetry::global::meter_with_scope("usage_collector", …)` at gear bootstrap. See [§3.11.4](#3114-observability-architecture-applicability-ops-design-002) for the wiring and [§3.11.5](#3115-operational-metric-inventory-ops-design-002) for the instrument inventory.
-
-#### Gateway HTTP server instrument reuse
-
-- [x] `p2` - **ID**: `cpt-cf-usage-collector-principle-gateway-http-server-instrument-reuse`
-
-The platform API gateway middleware in front of every REST handler emits a fixed set of OTel-semantic-conventions `http.server.*` instruments (request duration histogram, active requests gauge) that the gear **MUST NOT** redeclare. These instruments are exported through the same `SdkMeterProvider` and OTLP pipeline as the gear-scoped `uc_*` inventory and count as part of the gear's observability contract alongside the gear-scoped instruments.
+Operational telemetry is pushed via OTLP from ToolKit's global
+`SdkMeterProvider`. Instruments are constructed via
+`opentelemetry::global::meter_with_scope("usage_collector", …)` at bootstrap.
 
 ### 2.2 Constraints
 
 #### Plugin contract stability (major-version)
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-constraint-plugin-contract-stability`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-constraint-plugin-contract-stability`
 
-The Plugin SPI is bound by the platform's major-version stability contract: a plugin built against Plugin SPI version `N` must continue to function unchanged against every minor and patch release of `N.x`, and breaking changes must be expressed as a new major version that coexists with the prior major version for at least one migration window. This constrains the core's evolution of plugin-facing types — additive changes only within a major version — and forces breaking changes through a coordinated multi-major-version release cycle with every plugin implementation.
+From the 1.0 release of the Plugin SPI onward, a plugin built against version
+`N` must keep working unchanged across every `N.x` release. A breaking change
+ships as a new major that coexists with the prior major for one migration
+window. This constrains plugin-facing type evolution to additive changes within
+a major.
 
-**ADRs**: `cpt-cf-usage-collector-adr-pluggable-storage`, `cpt-cf-usage-collector-adr-contract-stability`
+The three public surfaces — REST, SDK trait, and Plugin SPI — version
+independently. Each Rust trait encodes its major version in the `V1` name
+suffix. **Additive** means a new method carrying a default implementation, a
+new optional input field, or a new non-required output variant. Removing or
+renaming anything, narrowing accepted values, changing semantics, adding a
+required input, or dropping a `default` implementation is **breaking**. Adding
+an aggregation fold is additive. Removing one is breaking. A plugin that meets
+a fold it does not implement returns `Internal(detail)` rather than
+substituting another. Anything scheduled for removal is marked `deprecated` in
+the rustdoc at least one minor release before the major bump. These rules bind
+from 1.0, which no surface has reached: until then a breaking change ships in
+place.
+
+**ADRs**: `cpt-cf-usage-collector-adr-pluggable-storage`,
+`cpt-cf-usage-collector-adr-contract-stability`
 
 #### No business logic in collector
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-constraint-no-business-logic`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-constraint-no-business-logic`
 
-Pricing, rating, billing rules, invoice generation, and quota enforcement decisions are explicitly out of scope for the Usage Collector. The gear persists and serves usage data only; downstream consumers (billing, quota enforcement, dashboards) own all business logic and operate on the collector's aggregated and raw query results. This constraint shapes API surface design (no pricing fields, no quota-decision endpoints) and protects the metering substrate from coupling to product-level pricing models.
+Pricing, rating, billing rules, invoice generation, and quota decisions are out
+of scope. The gear persists and serves usage only. Commercial identity is not carried. It covers subscription, SKU, and the payer
+and seller axes. An emitter cannot know it, and downstream consumers resolve
+it from tenant and resource attribution.
+
+#### No type catalog in collector
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-constraint-no-type-catalog`
+
+The gear must not hold a GTS type catalog, expose a type surface of any kind,
+or persist declaration attributes onto entries. Denormalizing fold, unit, or
+metadata surface onto a high-rate stream would create a second place the same
+fact can be read and disagree. This constrains the wire contract (no type
+endpoints at all, read or write), the SPI (no catalog methods), and the entity
+model (declaration attributes resolved, never stored).
+
+**ADRs**: `cpt-cf-usage-collector-adr-registry-owned-typing`
 
 #### NFR thresholds (from PRD §6)
 
 - [ ] `p2` - **ID**: `cpt-cf-usage-collector-constraint-nfr-thresholds`
 
-The architecture must meet the PRD §6 thresholds simultaneously, evaluated against the PRD §9 load envelope: ingestion p95 ≤ 200 ms under the §9 load envelope (sustained ≥ 10,000 records/sec, with the §9 ±10% measurement tolerance), sustained ingestion ≥ 10,000 records/sec, aggregation queries over a 30-day single-tenant range p95 ≤ 500 ms, ingestion p95 unaffected by concurrent query workloads, and 99.95% monthly availability for ingestion endpoints. These thresholds constrain plugin selection (each backend must demonstrate it can satisfy the budget under the §9 envelope), workload isolation between ingestion and query paths, and capacity planning at every deployment.
+The architecture must meet four PRD §6 thresholds at the same time, against
+the throughput-profile envelope:
+
+- ingestion p95 ≤ 200 ms at ≥ 10,000 entries/sec sustained
+- aggregation p95 ≤ 500 ms over a 30-day single-tenant range
+- ingestion p95 unaffected by concurrent query load
+- 99.95% monthly availability
+
+These constrain plugin selection, workload isolation, and capacity planning at
+every deployment.
 
 #### PII handled by identity layer (not collector)
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-constraint-pii-identity-layer`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-constraint-pii-identity-layer`
 
-Subject IDs stored by the Usage Collector are opaque internal platform identifiers issued and managed by the platform identity layer; PII management responsibilities belong to that layer rather than the collector. The Usage Collector treats subject and tenant identifiers as opaque strings throughout the ingestion, persistence, and query paths and does not attempt to interpret, redact, or classify them. This constrains the data model (no PII-sensitive fields in the record schema beyond opaque identifiers) and the operational posture (the Privacy by Design NFR is excluded at the gear boundary; see PRD §5.8 and §6.2).
+Subject and tenant identifiers are opaque platform identifiers. PII management
+belongs to the platform identity layer. The gear does not interpret, redact, or
+classify them.
 
 Per-bullet applicability for downstream privacy controls:
 
-- **Consent management**: Not applicable because handled by the platform identity layer.
-- **Data-subject requests (DSR / GDPR / CCPA)**: Not applicable because handled by the platform identity layer and, for erasure specifically, by the platform legal/governance layer and the active storage plugin's purge mechanism (PRD §5.8 Data Lifecycle Delegation). Deactivation is intentionally not an erasure path: it is a status-only transition that keeps the record queryable. The Usage Collector does not host a gear-local DSR workflow.
-- **Privacy Impact Assessment (PIA)**: Not applicable because handled by the platform identity layer; gear-level PIA is not required given the opaque-identifier-only data model.
-- **Cross-border data transfer**: Not applicable because handled by the platform identity layer and by the active storage plugin's deployment posture (data residency follows the bound plugin's deployment region); see `cpt-cf-usage-collector-adr-pluggable-storage`.
+- **Consent management**: not applicable — platform identity layer.
+- **Data-subject requests (DSR / GDPR / CCPA)**: not applicable — platform
+  identity and legal/governance layers, and the active plugin's purge
+  mechanism. **Invalidation is not an erasure path**: it withdraws a
+  measurement from the fold while both entries stay persisted and readable.
+- **Privacy Impact Assessment**: not applicable given the
+  opaque-identifier-only data model.
+- **Cross-border data transfer**: follows the bound plugin's deployment region.
 
 **ADRs**: `cpt-cf-usage-collector-adr-caller-supplied-attribution`
 
 #### Vendor and licensing pluggability
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-constraint-vendor-pluggable`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-constraint-vendor-pluggable`
 
-Active constraint: no storage-vendor lock-in is permitted inside the gear. Persistence and query MUST be reached exclusively through `cpt-cf-usage-collector-interface-plugin` and `cpt-cf-usage-collector-contract-storage-plugin`; the core MUST NOT contain backend-specific SQL, schema, client libraries, or licensing assumptions. Active-plugin vendor (ClickHouse, TimescaleDB, …) is operator-selected at bootstrap and ships under its own license on an independent release schedule. Any gear change that would introduce a vendor-specific dependency requires a Plugin SPI major-version revision.
+No storage-vendor lock-in inside the gear. Persistence and query must be reached
+exclusively through the Plugin SPI. The core must contain no backend-specific
+SQL, schema, client libraries, or licensing assumptions. Any change introducing
+a vendor-specific dependency requires a Plugin SPI major-version revision.
 
 ## 3. Technical Architecture
 
 ### 3.1 Domain Model
 
-**Technology**: Rust types (SDK models, GTS identifiers for UsageType keys). Field-level schemas live in `domain-model.md`; wire surface is authoritative in `usage-collector-v1.yaml`.
+**Technology**: Rust types in `usage-collector-sdk/src/models.rs`. A
+`gts_type_id` references a type declaration that `types-registry` owns.
+
+**Location**:
+
+- wire shapes — [`usage-collector-v1.yaml`](usage-collector-v1.yaml)
+- GTS base type every meter derives from —
+  [`schemas/usage_record.v1.schema.json`](schemas/usage_record.v1.schema.json)
+- worked derivation —
+  [`schemas/example.stored_volume.v1.schema.json`](schemas/example.stored_volume.v1.schema.json)
+
+#### Modeling conventions
+
+- Field names are snake_case. A Rust implementation can wrap a field in a
+  newtype or an enum. It MUST keep the semantics stated here.
+- `tenant_id`, `resource_id`, `subject_id`, and `gts_type_id` are opaque
+  platform identifiers. The gear stores and compares them. It does not parse
+  them or derive identity from them.
+- All timestamps are UTC instants. A timestamp with no offset is rejected. A
+  non-UTC offset is normalized to UTC.
+- A quantity is a measurement, not money
+  (§2.2 `cpt-cf-usage-collector-constraint-no-business-logic`).
+- The ledger holds **entries**. An entry that carries `invalidates` is an
+  *invalidation entry*. An entry that does not is a *usage record*. Both use
+  the one persisted shape below.
 
 **Core Entities**:
 
-| Entity                                                           | Description                                                                                                                                                          | Schema            |
-| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
-| UsageRecord       | A single attributed measurement of resource consumption: value, timestamp, attribution tuple, idempotency key, status, optional `corrects_id` back-reference, optional metadata. | `domain-model.md` |
-| ResourceRef       | Caller-supplied composite identifying the attributed resource (`resource_id`, `resource_type`); mandatory on every UsageRecord, optional filter on queries.          | `domain-model.md` |
-| SubjectRef         | Caller-supplied subject attribution (mandatory `subject_id`, optional `subject_type`); omitted for system-level consumption, optional filter on queries.             | `domain-model.md` |
-| UsageType           | Platform-global UsageType definition keyed by a GTS identifier under `gts.cf.core.uc.usage_record.v1~`; carries a closed `UsageKind` enum and declared `metadata_fields`. | `domain-model.md` |
-| IdempotencyKey | Caller-supplied opaque identifier that deduplicates retried submissions.                                                                                             | `domain-model.md` |
-| RecordMetadata | Closed-shape JSON object carried on a UsageRecord; keys are constrained to the UsageType's declared `metadata_fields`, values typed as String.                       | `domain-model.md` |
-| UsageRecordStatus | One-way lifecycle marker on a UsageRecord (`active` or `inactive`); monotonic transition only.                                                                       | `domain-model.md` |
-| AggregationQuery | Aggregation request: time range, single-UsageType filter, optional attribution filters, aggregation function (SUM, COUNT, MIN, MAX, AVG), group-by dimensions.       | `domain-model.md` |
-| RawQuery             | Raw-record request: time range, mandatory `gts_id`, optional attribution and declared-dimension filters, cursor-paginated.                                | `domain-model.md` |
-| AggregationResult | Server-side aggregation output: grouped buckets carrying the chosen aggregation values for each dimension combination.                                               | `domain-model.md` |
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-entity-model`
+
+| Entity | Description |
+| --- | --- |
+| `UsageRecord` | One accepted entry on the append-only ledger. It carries the attribution tuple, the covered period, a signed quantity, the dedup key, the acceptance instant and sequence, the origin, and optional metadata. An invalidation entry adds the target reference and a reason code. No operation rewrites an accepted entry. |
+| `CreateUsageRecord` | The identity-free ingestion shape that both entry types share. It is the only input shape on every ingestion path, live and backfill. It carries no `entry_type`: `invalidates` alone decides the kind. |
+| `EntryType` | Closed discriminator, `record` or `invalidation`. Derived from the presence of `invalidates`. Never submitted, and never read from the value or sign of a quantity. |
+| `RecordOrigin` | Closed marker, `live` or `backfill`. The Ingestion Gateway stamps it from the path the entry arrived on. It applies to invalidation entries too. |
+| `ResourceRef` | Caller-supplied `(resource_id, resource_type)`. Both leaves are mandatory on every entry. The gear validates presence and shape only. Ownership is a PDP decision. |
+| `SubjectRef` | Caller-supplied `(subject_id, optional subject_type)`. Absent for system-level consumption. `subject_type` cannot appear without `subject_id`. |
+| `AggregationFold` | Closed set — `SUM`, `COUNT`, `MAX`, `MIN`, `LATEST`. Declared per GTS type, immutable, and read on the aggregate path only. `SUM` is the only fold that yields a chargeable period quantity. |
+| `IdempotencyKey` | Caller-supplied opaque string, required on every entry. One component of the five-part dedup identity. |
+| `RecordMetadata` | Closed-shape key/value map. The GTS type declares the admissible keys. Values are strings in v1. The size cap is per deployment. |
+| `SecurityContext` | `toolkit_security::SecurityContext`, the platform-authenticated caller context. Declared in `libs/toolkit-security`, which is the only normative statement of its shape. Input to authorization only. |
+| `UsageRecordFilterField` | The admissible `$filter` and `group_by` field set: `tenant_id`, `resource_id`, `resource_type`, `subject_id`, `subject_type`, `entry_type`, `origin`, and `invalidates`, plus the queried type's declared metadata keys. Resolved per request. |
+| `Keyset` | The typed last-row sort tuple behind an opaque cursor. Raw reads use `(window_end, id)`, which a caller `$orderby` prefixes rather than replaces. Feed reads use `(acceptance_sequence, id)`. |
+| `AggregationResult` | Grouped buckets. Each carries the dimension values in `group_by` order and the folded quantity as `bigdecimal::BigDecimal` — unbounded, and deliberately not the per-entry `rust_decimal::Decimal`, because a fold is not bounded by the per-entry ceiling. `null` where no entry matched. Neither the fold nor the queried type rides the result: both are inputs to the call. |
+| `FeedSubscription` | The set of GTS types one consumer reads. It bounds that consumer's pages, cursor, and watermark. |
+| `FeedPage` | Entries in acceptance order, an opaque cursor, and an opaque watermark token carrying the completed position in every subscribed scope. |
+| `FeedWatermarkBound` | The typed per-scope positions behind a watermark token, as `Keyset` is the typed tuple behind a cursor. The SPI only ever sees it decoded. |
+| `ReconciliationMetadata` | Per-scope accepted counts, a fold-appropriate quantity summary, and three watermarks: acceptance instant, covered-period end, and sequence. |
+| `ReconciliationScope` | The reporting granularity. v1 admits `(tenant, gts_type)` only. The two caller scopes are reserved — see [§4](#4-additional-context). |
+| *(GTS type declaration)* | **Not an entity of this gear**, and given no shape here. A meter *is* a derived GTS type of `gts.cf.core.uc.usage_record.v1~`, whose trait schema is the only normative statement of what a declaration carries. The gear resolves a declaration. It never owns, mints, or stores one. |
+
+**Field ownership.** Who sets each field is load-bearing: a caller cannot forge
+identity, arrival order, or the entry kind.
+
+| Group | Fields | Set by |
+| --- | --- | --- |
+| Caller-supplied | `tenant_id`, `resource_ref`, `subject_ref`, `gts_type_id`, `quantity`, `window_start`, `window_end`, `idempotency_key`, `invalidates`, `reason_code`, `metadata` | the emitter, on `CreateUsageRecord` |
+| Server-assigned | `id`, `accepted_at`, `origin` | the Ingestion Gateway, at the single choke point |
+| Server-assigned | `acceptance_sequence` | the storage plugin, at persist |
+| Derived on read | `entry_type` | computed from the entry's own `invalidates`, never stored as a flag |
 
 **Relationships**:
 
-- UsageRecord → UsageType: references a registered UsageType by `gts_id`.
-- UsageRecord → IdempotencyKey: carries a mandatory caller-supplied dedup key.
-- UsageRecord → ResourceRef: carries the mandatory resource attribution composite.
-- UsageRecord → SubjectRef: optionally carries the subject attribution composite.
-- UsageRecord → RecordMetadata: optionally carries a per-record JSON object whose keys match the UsageType's `metadata_fields`.
-- UsageRecord → UsageRecordStatus: holds the record's lifecycle status; the deactivation transition cascades depth-1 from an ordinary row to its referencing counter compensations (see `cpt-cf-usage-collector-adr-monotonic-deactivation`).
-- UsageRecord → UsageRecord: a counter compensation row references the ordinary row it offsets via `corrects_id`; depth-1 by construction.
-- AggregationQuery → UsageType: targets exactly one UsageType.
-- AggregationQuery → AggregationResult: produces grouped, aggregated buckets over its filter scope.
-- RawQuery → UsageRecord: returns paginated raw UsageRecords matching its filters.
+- `UsageRecord` → GTS type: references a registry-owned declaration by
+  `gts_type_id`. The fold, the unit, the metadata surface, and the retention
+  resolve through it and are never copied onto the entry.
+- `UsageRecord` → `UsageRecord`: an invalidation entry withdraws exactly one
+  record through `invalidates`. That reference is the only linkage. No read
+  path carries a reverse one.
+- `UsageRecord` → `ResourceRef` / `SubjectRef` / `RecordMetadata`: the
+  attribution composites and the per-type extension surface.
+- `FeedSubscription` → `FeedPage`: bounds which entries, cursor, and watermark
+  one consumer receives.
+
+#### Value Objects and Invariants
+
+Read attributes of a resolved declaration — `aggregation_fold`,
+`canonical_unit`, `metadata_schema`, `retention`, and
+`nominal_sampling_interval` — are defined by the base type's trait schema. The
+gear reads them and does not restate their admissible values. It MUST NOT act
+on `nominal_sampling_interval`.
+
+| Value object / Invariant | Definition | Enforced by |
+| --- | --- | --- |
+| `MeterTypeId` | A GTS identifier derived from the base `gts.cf.core.uc.usage_record.v1~`. An identifier outside that base is rejected. | Type Resolver |
+| Dedup identity | `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`. `resource_ref` and `subject_ref` are compared on a collision but are not part of it. One key shared across two resources over one period is therefore a conflict. | plugin uniqueness constraint |
+| Identity derivation | `id` is the UUIDv5 over the dedup identity. `invalidates` is deliberately excluded, so one key cannot stand for both a measurement and its withdrawal. | Ingestion Gateway |
+| Collision resolution | A collision on the full identity resolves by exact equality of the caller-supplied fields. All equal, the entry is silently deduplicated. Any field differing, including metadata alone, is rejected as a conflict. A second write is never silently dropped. | Ingestion Gateway + plugin |
+| Idempotency horizon | A dedup identity stays visible for at least the declared retention of its type, measured from the covered period. Ingestion cannot reach past it: retention is at least the backfill window plus one replay horizon, so an over-aged covered period is refused on the window bound before deduplication is consulted. | plugin retention (§3.10) + backfill window bound (§3.2) |
+| Append-only invariant | No surface modifies an accepted entry. A correction is an appended invalidation entry. There is no status column, no lifecycle flag, and no row to rewrite. | absence of a mutation operation on REST, SDK, and SPI |
+| Point-event invariant | `window_start <= window_end`. Equal bounds mark a point event, not an error. | Ingestion Gateway |
+| Period-end selection | Every range selects an entry when `from <= window_end < to`, whatever the length of the period. No path matches by overlap or by containment, and no path reads `window_start` to select. | Query Gateway + every plugin (§3.3 contract test) |
+| Quantity fidelity | A quantity read back equals the quantity submitted, digit for digit. No conversion, scaling, rounding, or truncation on any path. The published range is at most 28 significant decimal digits (leading zeros excluded) and at most 28 digits after the decimal point — magnitude below 10^28, smallest non-zero value 1×10^-28 — negative half included. That bound is deliberately narrower than the `rust_decimal::Decimal` carrier, which reaches 29 significant digits; where the two disagree, the published bound is normative. The wire patterns cannot express the significant-digit bound and are a necessary but not sufficient check — the gear enforces it at ingestion. Wire-encoded as a JSON string, never a float, because a `SUM` fold MUST be bit-exact. | plugin exact-decimal storage (§3.3 contract test) |
+| Faithful copy | An invalidation entry repeats every caller-supplied field of its target and departs in exactly three: its own idempotency key, `invalidates`, and `reason_code`. For `subject_ref`, presence against absence is a mismatch. A rejection names the field that differs. | Ingestion Gateway |
+| Echo, not compensation | The copied quantity restates what is withdrawn. It is never negated or adjusted, and no signed compensating entry exists on any surface. | Ingestion Gateway |
+| Both-or-neither | `invalidates` and `reason_code` appear together or not at all. An entry carrying neither is an ordinary record, whatever its other fields. | wire schema + Ingestion Gateway |
+| At most one invalidation | A record carries at most one accepted invalidation. Two concurrent attempts resolve to exactly one. | plugin, atomically against the store |
+| No invalidation of an invalidation | The target MUST itself be a record, carrying no `invalidates` of its own. | Ingestion Gateway |
+| Permanence | An accepted invalidation has no reversal. A correction to a mis-measured quantity is an invalidation, then a fresh emission under a new key with the same attribution and period. | absence of a reversal operation |
+| Withdrawal exclusion | Inside any fold, a withdrawn record and its invalidation each contribute nothing. Both carry one period end, so no range selects one without the other. Ledger read paths return both, as persisted. | Query Gateway + every plugin (§3.3 contract test) |
+| Recomputation | A materialised aggregate MUST recompute over the affected range. A further term cannot reverse `MAX`, `MIN`, or `LATEST`. Append-only is a property of the ledger, not of a derived view. | plugin |
+| Additivity | A consumer reading entries directly sums quantities only where the declared fold is `SUM`, and MUST leave out every withdrawn pair. Under any other fold the quantities are observations and summing them is invalid. | consumer contract |
+| `COUNT` quantity | Under `COUNT` the quantity means nothing: one record is one event. An emitter sends `1`. Ingestion does not enforce this, because it never consults the fold. | consumer contract |
+| `COUNT` exclusion | `COUNT` counts the records in range that no accepted invalidation withdraws. It counts no invalidation entry and no withdrawn record, so a withdrawn pair counts none. | Query Gateway + every plugin (§3.3 contract test) |
+| `LATEST` tie-break | Greatest `window_end`, then greatest `acceptance_sequence`. It terminates because the sequence is monotonic inside the group's scope. `MAX` and `MIN` need no such rule. | plugin (§3.3 contract test) |
+| Acceptance-sequence monotonicity | Strictly monotonic per `(tenant_id, gts_type_id)`. No cross-tenant or cross-type total order is claimed. This is what makes feed order deterministic and `LATEST` tie-breaking terminate. | plugin, at persist |
+| Declaration immutability | The fold, the canonical unit, and the metadata surface are immutable for the life of a GTS type. A meter that must change one is a new type. A persisted quantity carries neither unit nor fold of its own, so an edit in place would silently restate every entry already accepted. | `types-registry` |
+| Fail-closed resolution | An entry whose `gts_type_id` resolves nowhere is rejected and not persisted. The gear never substitutes a default for a declared attribute, and never relaxes validation to protect ingestion availability. Steady-state resolution is served from a local cache, so a registry outage degrades new-type introduction rather than ingestion. A declaration the registry has lost is restored from the mirror table (§3.7), where a row exists and the registry returns a definite not-found answer. | Type Resolver |
+| Closed metadata shape | An undeclared key is rejected before persistence. There is no free-form remainder and no open-extras escape hatch. Admissibility is recomputed per request, so a freshly declared property is usable on the next request. | Ingestion Gateway + Query Gateway |
+| Filter-surface reservation | `gts_type_id` is reserved: it travels as a typed parameter, and any predicate touching it is rejected. The covered period is likewise not filterable — the time range is a first-class parameter. Fixed-field identifiers accept `eq` and `in` only. | Query Gateway |
+| Order admissibility | A caller order on the raw path uses one sort direction and only the keys `RecordOrderKey` names in `usage-collector-v1.yaml`, the single fail-closed definition of the set, which carries its own exclusions. The gateway appends `(window_end, id)` in the caller's direction before dispatch, so the plugin always receives a gap-free, uniform-direction, never-null keyset. Absent `$orderby` that pair is the whole order. The feed admits no caller order. | Query Gateway |
+| Attribution independence | The gear never derives `tenant_id`, `resource_ref`, or `subject_ref` from `SecurityContext`. `SecurityContext.subject_id` describes the **caller**. `SubjectRef.subject_id` describes the **attributed subject**. The two names collide and the values are unrelated. | §3.9.6 |
+| Scope intersection | The compiled PDP scope bounds a read. User filters narrow inside it and never widen it. | §3.9.6 |
+| Plugin-owned lifecycle | Retention, backup, archival, purging, and query acceleration are plugin-owned. Two obligations bind them: the retention floor a charging-consumer meter carries, and that a purge never frees a dedup identity earlier than its horizon. A purge later than the horizon is permitted, which is why the horizon is a floor rather than an exact boundary. | plugin deployment guide (§3.10) |
+| Additive schema evolution | REST, SDK, and Plugin SPI shapes can add optional fields within a major version. Removing a field or changing semantics requires a major-version break. | §2.2 `constraint-plugin-contract-stability` |
 
 ### 3.2 Component Model
 
-The Usage Collector runs in a single process composed of a REST API surface, four domain components (Ingestion Gateway, Query Gateway, Deactivation Handler, UsageType Catalog), and a Plugin Host that lazily binds the active storage backend on first dispatch. Boundaries are drawn by responsibility, not by deployment artifact. Authentication and PDP enforcement are cross-cutting — see [PDP Authorization Posture](#pdp-authorization-posture-cross-cutting-no-separate-component) below.
+The Usage Collector runs in a single process. That process holds a REST
+surface, four domain components (Ingestion Gateway, Query Gateway, Feed
+Gateway, Type Resolver), and a Plugin Host that lazily binds the active
+backend. Boundaries
+are drawn by responsibility, not deployment artifact. PDP enforcement is
+cross-cutting — see [PDP Authorization Posture](#pdp-authorization-posture-cross-cutting-no-separate-component).
+
+There is **no deactivation handler** and **no usage-type catalog component**:
+invalidation rides the Ingestion Gateway, and typing is resolved from
+`types-registry` by the Type Resolver.
 
 ```mermaid
 graph LR
     A[REST API Surface] -->|invokes| B[Ingestion Gateway]
     A -->|invokes| C[Query Gateway]
-    A -->|invokes| D[Deactivation Handler]
-    A -->|invokes| E[UsageType Catalog]
+    A -->|invokes| D[Feed Gateway]
+    B -->|resolve declaration| E[Type Resolver]
+    C -->|resolve declaration| E
     B -->|authorize| F{{authz-resolver}}
     C -->|authorize| F
     D -->|authorize| F
-    E -->|authorize| F
+    E -.->|cache miss| R[(types-registry)]
     B --> G[Plugin Host]
     C --> G
     D --> G
-    E --> G
     G -->|bound via ClientHub| H[(Storage Plugin)]
 ```
 
@@ -355,273 +633,708 @@ graph LR
 
 ##### Why this component exists
 
-Centralizes the synchronous ingestion path so every usage submission — REST or SDK, single or batched — flows through one place that validates attribution, authorizes the caller, enforces counter/gauge semantics against the UsageType Catalog, and dispatches to the active plugin. Without it, those rules would be re-implemented at every entry point.
+Centralizes the synchronous write path. Every submission flows through one
+place, whether it arrives on REST or the SDK, live or backfill, single or
+batched, record or invalidation. That place validates attribution, authorizes
+the caller, and validates against the resolved declaration. It then derives
+identity, enforces the invalidation rules, and dispatches to the active
+plugin.
 
 ##### Responsibility scope
 
-Owns the ingestion contract end-to-end:
-
-- Validates the structural attribution tuple (tenant, resource, optional subject, UsageType `gts_id`).
-- Requires a caller-supplied idempotency key on every record.
-- Applies counter/gauge invariants resolved against the UsageType Catalog — rejects negative counter deltas; accepts gauge values as-is. Counter vs gauge is read from the catalog row's `UsageKind` field.
-- Enforces the configurable RecordMetadata size cap (default 8 KiB) and rejects oversized records with an actionable error.
-- Surfaces deterministic per-record acceptance acknowledgements. Dedup-key collision handling (exact-equality on the caller-supplied canonical fields → `idempotency_conflict`, never a silent drop) is specified in [§3.3](#33-api-contracts).
+- Validates the structural attribution tuple (tenant, resource, optional
+  subject, `gts_type_id`).
+- Requires an idempotency key on every entry and derives `id` as the
+  deterministic UUIDv5 over the 5-tuple.
+- Validates the covered period: `window_start <= window_end`, UTC normalization,
+  rejection of offset-less timestamps, and the live path's two-sided time bound.
+  That bound rejects a period ending further into the future than the configured
+  future tolerance. It also rejects one ending further into the past than the
+  configured past tolerance, and that rejection names the backfill route. Both
+  bounds apply to every entry, an invalidation included, over the period it
+  copies.
+- Validates the quantity against the published range and precision.
+- Resolves the declaration through the Type Resolver and validates the metadata
+  against its closed schema and the configurable size cap. Rejects an entry
+  whose type binds no unit.
+- **Enforces the invalidation rules.** These are the faithful copy of every
+caller-supplied field, the target reference that marks the entry as a
+withdrawal, and a resolvable target with `entry_type = record`. They also
+include at most one invalidation per record and the mandatory reason code. The
+copied period is bounded by period validation above, not by a rule of its own.
+- Applies per-caller and per-(caller, tenant) ingestion quotas, rejecting
+  over-quota submissions with an actionable throttle error carrying retry
+  guidance.
+- Stamps `accepted_at` and `origin`, and surfaces deterministic per-entry
+  acknowledgements.
 
 ##### Responsibility boundaries
 
-Does NOT persist records directly — delegates to the Plugin Host. Does NOT register or mutate UsageTypes — Catalog lookups are read-only from this component. Does NOT interpret RecordMetadata content. Does NOT define authorization policy or authenticate callers — see [PDP Authorization Posture](#pdp-authorization-posture-cross-cutting-no-separate-component). Fails closed on any infrastructure-dependency unavailability.
+Does NOT persist directly — delegates to the Plugin Host. Does NOT consult the
+declared fold: no ingestion invariant depends on it. Does NOT register, amend,
+or withdraw declarations. Does NOT interpret metadata content. Does NOT define
+authorization policy or authenticate callers. Does NOT mutate any accepted
+entry. Fails closed on any dependency unavailability.
+
+The backfill path is the same component under workload isolation: identical
+validation, its own hard window bound in place of the live past tolerance, and
+`origin = backfill`. No surface reaches past that window. It takes invalidation
+entries as well as **Usage Records**, and is reachable on REST and on the SDK
+trait.
 
 ##### Related components (by ID)
 
-- `cpt-cf-usage-collector-contract-authz-resolver` — calls per-record for PDP authorization (see PDP Authorization Posture); covers `cpt-cf-usage-collector-fr-ingestion-authorization`, `cpt-cf-usage-collector-fr-tenant-attribution`, `cpt-cf-usage-collector-fr-resource-attribution`, `cpt-cf-usage-collector-fr-subject-attribution`.
-- `cpt-cf-usage-collector-component-usage-type-catalog` — reads to resolve UsageType existence and counter/gauge semantics on every record; covers `cpt-cf-usage-collector-fr-counter-semantics`, `cpt-cf-usage-collector-fr-gauge-semantics`.
-- `cpt-cf-usage-collector-component-plugin-host` — dispatches each accepted record (with idempotency key and metadata) to the bound storage plugin, which returns the dedup or `idempotency_conflict` outcome; covers `cpt-cf-usage-collector-fr-ingestion`, `cpt-cf-usage-collector-fr-idempotency`, `cpt-cf-usage-collector-fr-record-metadata`.
+- `cpt-cf-usage-collector-contract-authz-resolver` — per-entry PDP
+  authorization. Covers `fr-ingestion-authorization`, `fr-tenant-attribution`,
+  `fr-resource-attribution`, `fr-subject-attribution`.
+- `cpt-cf-usage-collector-component-type-resolver` — resolves the declaration
+  per entry. Covers `fr-usage-type-resolution`, `fr-metering-unit-binding`,
+  `fr-record-metadata`.
+- `cpt-cf-usage-collector-component-plugin-host` — dispatches each accepted
+  entry. Covers `fr-ingestion`, `fr-idempotency`, `fr-record-invalidation`,
+  `fr-backfill`.
+
+#### Type Resolver
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-type-resolver`
+
+##### Why this component exists
+
+Resolution sits on the ingestion hot path, and `types-registry` publishes no
+latency obligation of its own. A per-entry registry call would make this gear's
+ingestion NFRs contingent on a second gear's availability and latency. A local cache of resolved declarations keeps those obligations self-contained.
+For that reason it is a design-level component rather than an implementation
+detail.
+
+##### Responsibility scope
+
+- Resolves a `gts_type_id` to its registered declaration, serving the steady
+  state from cache.
+- Exposes the declaration's fold, canonical unit, metadata schema, and nominal
+  sampling interval to the write and read paths. It does not serve the declared
+  retention. The storage plugin reads that from `types-registry` itself
+  ([§3.3](#33-api-contracts)).
+- Maintains the cache: population on miss, refresh, and staleness accounting.
+  Because declarations are immutable in fold, unit, and metadata surface, a
+  cached entry cannot silently change meaning. Only additions and withdrawals
+  propagate.
+- Mirrors each declaration it resolves, and restores one that `types-registry`
+  has lost. On a cache miss the registry answers, and the resolver writes the
+  row and serves. Where the registry answers not found and a row exists, the
+  resolver registers the stored document back and serves. Where neither has it,
+  resolution fails closed as before. A failed mirror write is counted and does
+  not reject the entry. The restore needs a definite not-found answer. Where
+  the registry answers with an error instead, the resolver cannot tell a
+  forgotten declaration from an unavailable one, and a cold cache fails closed
+  although the row exists. `cpt-cf-usage-collector-fr-usage-type-resolution`
+  carries that case, and the failed-mirror-write case, as stated limits on its
+  guarantee. Temporary, per
+  `cpt-cf-usage-collector-adr-declaration-rehydration`.
+
+##### Responsibility boundaries
+
+Does NOT mint, amend, or withdraw declarations — those are `types-registry`
+operations. A restore re-registers the same document the registry accepted
+before, so it introduces no declaration the platform has not already seen.
+Does NOT substitute a default for any declared attribute. Does NOT relax validation to protect availability. An unresolvable reference
+is rejected fail-closed. Where a declaration no longer resolves, and either no
+mirror row holds it or the registry gave no definite not-found answer, every
+operation that depends on resolving it is rejected. The rejection lasts for as
+long as the
+identifier does not resolve. Entries already accepted under that
+declaration remain persisted and unmodified.
+
+##### Related components (by ID)
+
+- `cpt-cf-usage-collector-contract-types-registry` — the declaration system of
+  record. Consulted on cache miss.
+- `cpt-cf-usage-collector-component-ingestion-gateway`,
+  `cpt-cf-usage-collector-component-query-gateway` — consume resolved
+  declarations.
 
 #### Query Gateway
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-component-query-gateway`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-query-gateway`
 
 ##### Why this component exists
 
-Serves the read side of the metering substrate — aggregated and raw queries — through one component that owns query authorization, filter composition, and dispatch to the active storage plugin. Centralizing the read path keeps PDP constraint application uniform across SDK and REST entry points and prevents user-supplied filters from widening the authorized scope.
+Serves the read side — aggregated and raw — through one component owning query
+authorization, filter composition, and dispatch. Centralizing it keeps PDP
+constraint application uniform across SDK and REST and prevents user filters
+from widening the authorized scope.
 
 ##### Responsibility scope
 
-Owns both query paths:
+- **Aggregation**: mandatory time range and single type. Optional attribution
+  filters and grouping. Serves the **declared fold** resolved from the
+  declaration, pushed down to the plugin. Excludes every withdrawn pair from
+  the selected set.
+- **Raw**: mandatory time range and single type. Optional filters. Cursor-paginated over `(window_end, id)`, which a caller `$orderby` prefixes rather than replaces. Returns withdrawn pairs **as
+  persisted**, the invalidation naming its target.
+- **Point lookup** by entry identifier, returning the exact persisted fact.
 
-- **Aggregation**: mandatory time range and single-UsageType filter; optional tenant / subject / resource filters; server-side SUM / COUNT / MIN / MAX / AVG with grouping (`cpt-cf-usage-collector-fr-query-aggregation`).
-- **Raw**: mandatory time range; optional UsageType / tenant / subject / resource filters; cursor-paginated (`cpt-cf-usage-collector-fr-query-raw`).
-
-For both: validates structural filter requirements, runs PDP authorization, composes returned PdpConstraints with user-supplied filters so the result set can only narrow within the authorized scope, and dispatches the composed query through the Plugin Host. Honors tenant isolation by anchoring every read on the inbound `SecurityContext` and the PDP-returned constraints.
+All three paths do the same four things. They select on the period end. They
+validate that every named
+filter or grouping dimension is either a fixed field or a property the
+resolved schema declares. They run PDP authorization and compose the returned
+constraints with user filters, so the result can only narrow. They then
+dispatch through the Plugin Host.
 
 ##### Responsibility boundaries
 
-Does NOT execute aggregation or scan records itself — server-side aggregation and pagination are pushed into the Plugin SPI so the active backend can use native acceleration structures. Does NOT widen the PDP-authorized scope under any user-supplied filter (filters can only narrow). Does NOT cache query results. Does NOT authenticate callers or define authorization policy — see [PDP Authorization Posture](#pdp-authorization-posture-cross-cutting-no-separate-component).
+Does NOT accept an aggregation parameter. Does NOT apply a fold on the raw path.
+Does NOT mint or interpret storage-level cursors beyond the gateway-owned
+envelope. Does NOT evaluate watermarks or raise stall signals.
 
-##### Related components (by ID)
+#### Feed Gateway
 
-- `cpt-cf-usage-collector-contract-authz-resolver` — calls per query for the PDP decision and PdpConstraint set; covers `cpt-cf-usage-collector-fr-tenant-isolation`.
-- `cpt-cf-usage-collector-component-plugin-host` — executes aggregation and raw-pagination queries against the bound storage plugin; covers `cpt-cf-usage-collector-fr-query-aggregation`, `cpt-cf-usage-collector-fr-query-raw`.
-- `cpt-cf-usage-collector-component-usage-type-catalog` — validates the mandatory single-UsageType filter on aggregation queries before plugin dispatch; covers `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`.
-
-#### UsageType Catalog
-
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-component-usage-type-catalog`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-feed-gateway`
 
 ##### Why this component exists
 
-Holds the platform-global UsageType **type** definitions (GTS type id `gts_id`, declared `metadata_fields`) used to enforce counter/gauge invariants and validate declared dimensions on every ingestion call, validate UsageType existence on every aggregation query, and gate UsageType lifecycle operations. Without a single semantic owner, semantics enforcement and existence checks would have to round-trip to the storage plugin on every record, regressing ingestion latency below the NFR budget — even though the durable rows themselves live in the plugin.
+A charging consumer's inbound path must be replay-safe under concurrent ingest —
+a consumer outage beyond its buffer, a region loss, a bounded re-rating. Without
+snapshot-consistent cursors a scan is silently incomplete or silently
+duplicated. The feed is a distinct component from the Query Gateway for two reasons. It
+orders by arrival rather than by covered period. Its snapshot and watermark
+obligations also have no analogue on the query paths.
 
 ##### Responsibility scope
 
-This component is the **semantic owner** of the catalog surface; the **system of record** is the plugin's backend database. Both surfaces are bound together as follows:
-
-- **Catalog model**: single and canonical. Durable rows live in the **plugin-owned** `usage_type_catalog` table alongside `usage_records`. No parallel gateway-side catalog.
-- **Semantic ownership**: structural request validation, `gts_id` derivation check against the reserved abstract base `gts.cf.core.uc.usage_record.v1~`, `metadata_fields` well-formedness check.
-- **Lifecycle**: registration, deletion, and existence-and-semantics enforcement (`cpt-cf-usage-collector-fr-usage-type-registration`, `cpt-cf-usage-collector-fr-usage-type-deletion`, `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`). On deletion the FK `usage_records.gts_id → usage_type_catalog(gts_id) ON DELETE RESTRICT` blocks unsafe deletes; this component surfaces the plugin-side rejection deterministically as `UsageTypeReferenced { gts_id, sample_ref_count }`.
-- **Plugin SPI dispatch**: `create_usage_type`, `get_usage_type`, `list_usage_types`, `delete_usage_type` — dispatched via `cpt-cf-usage-collector-component-plugin-host`. Read-only `get_usage_type` is the call the Ingestion Gateway and Query Gateway make per record/query.
-- **Entry-point uniformity**: both the REST handler and the SDK trait impl (`UsageCollectorClientImpl`) delegate into the same `UsageTypeCatalogService`. Counter vs gauge is read directly from the catalog row's closed `kind: UsageKind` field.
-
-##### Responsibility boundaries
-
-Does NOT persist any catalog row itself — durable persistence is delegated to the active storage plugin via the Plugin SPI. Does NOT enforce referential integrity on `usage_records → usage_type_catalog` itself — the FK lives in the plugin's backend transaction; this component only surfaces the `UsageTypeReferenced` error. Does NOT run a JSON-Schema validator or compile per-usage-type validators — per ADR-0012 (2026-06-02 amendment), `metadata_fields` is a closed list and admissibility is set-membership, not schema validation. Does NOT participate in any `types-registry` registration of UsageType definitions — UsageType types are NOT declared as GTS Instances of any platform base type; cross-gear discovery is served exclusively by `GET /usage-collector/v1/usage-types`. Does NOT enforce caller-gear-to-UsageType authorization — the PDP authorizes the supplied tenant/resource/subject against the caller's SecurityContext-derived gear identity (see [PDP Authorization Posture](#pdp-authorization-posture-cross-cutting-no-separate-component)). The in-plugin reference implementation of `usage_records.gts_id` (column type, index choice) is plugin-author choice and explicitly out of DESIGN scope.
-
-##### Related components (by ID)
-
-- `cpt-cf-usage-collector-contract-authz-resolver` — calls for PDP authorization of UsageType registration and deletion operator calls; covers `cpt-cf-usage-collector-fr-usage-type-registration`, `cpt-cf-usage-collector-fr-usage-type-deletion`.
-- `cpt-cf-usage-collector-component-ingestion-gateway` — provides read-only UsageType existence and counter/gauge semantics lookups; covers `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`.
-- `cpt-cf-usage-collector-component-query-gateway` — provides read-only UsageType existence checks for aggregation-query validation; covers `cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`.
-
-#### Deactivation Handler
-
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-component-deactivation-handler`
-
-##### Why this component exists
-
-Owns the monotonic active→inactive status transition for individual usage records and keeps deactivation a status-only operation that does not modify any other field. Without a dedicated handler, deactivation semantics would risk leaking into the ingestion or query paths and re-introducing mutable-record patterns into the metering substrate.
-
-##### Responsibility scope
-
-Realizes `cpt-cf-usage-collector-fr-event-deactivation`: authorizes the operator, validates that the targeted UsageRecord is currently `active`, rejects requests against already-inactive records with an actionable error, and dispatches a status-only update to the bound storage plugin. Surfaces the one-way UsageRecordStatus transition as a first-class lifecycle event for downstream consumers without altering any other property of the record.
+- Accepts a subscription declaring the GTS types a consumer reads, and excludes
+  everything else from the pages, the cursor, and the watermark.
+- Serves cursor-paginated pages ordered by `acceptance_sequence` within each
+  `(tenant, gts_type)` scope. Interleaving of scopes within a page is
+  implementation-defined but deterministic: the same cursor yields the same
+  continuation, extended only by entries accepted since. A replay that resends a
+  recorded watermark is identical, entry for entry.
+- Returns an opaque watermark token with every page, carrying the completed
+  position in every subscribed scope. A consumer resends it to bound a replay,
+  and the gateway applies the boundary per scope.
+- Refuses a cursor older than the retention floor with an actionable error,
+  rather than serving a silently truncated range.
+- Serves corrections as ordinary entries at their own acceptance position. No
+  feed entry represents a change to an already-delivered entry.
 
 ##### Responsibility boundaries
 
-Does NOT modify any property of the record other than UsageRecordStatus. Does NOT provide a reactivation operation. Does NOT delete records — inactive records remain queryable through the Query Gateway. Does NOT define authorization policy — see [PDP Authorization Posture](#pdp-authorization-posture-cross-cutting-no-separate-component). Does NOT manage UsageType lifecycle.
-
-##### Related components (by ID)
-
-- `cpt-cf-usage-collector-contract-authz-resolver` — calls per operator request for PDP authorization; covers `cpt-cf-usage-collector-fr-event-deactivation`.
-- `cpt-cf-usage-collector-component-plugin-host` — applies the status-only update against the bound storage plugin; covers `cpt-cf-usage-collector-fr-event-deactivation`.
+Does NOT apply a fold, filter withdrawn pairs, or remove either entry of a pair
+from the stream. Does NOT push — the feed is pull-only. Does NOT evaluate
+consumer progress or hold a stall threshold.
 
 #### Plugin Host (ClientHub-bound)
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-component-plugin-host`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-component-plugin-host`
 
 ##### Why this component exists
 
-Encapsulates the active storage backend behind the Plugin SPI so the Ingestion Gateway, Query Gateway, Deactivation Handler, and UsageType Catalog dispatch through one place — and so the active plugin can be swapped via operator configuration without touching any caller. Centralizing plugin dispatch is also where graceful-degradation and contract-stability guarantees are realized.
+Concentrates backend binding and dispatch so no domain component couples to a
+concrete plugin. Binding is a runtime concern resolved through `types-registry`
+and `ClientHub`. The host crate has no compile-time dependency on any plugin
+crate.
 
 ##### Responsibility scope
 
-Owns the PluginBinding lifecycle and the in-process dispatch surface:
-
-- **Binding**: resolves the configured GTS instance selector through the GTS Registry, materializes the binding lazily on first dispatch inside the host `Service` (no separate orchestrator), and registers the bound plugin in ClientHub with GTS instance scope.
-- **Dispatch surface**: covers `usage_records` persistence (single and batched), raw and aggregated query, individual event deactivation, and the catalog SPI methods `create_usage_type`, `get_usage_type`, `list_usage_types`, `delete_usage_type` — dispatched on behalf of `cpt-cf-usage-collector-component-usage-type-catalog`.
-- **Storage pluggability**: realizes `cpt-cf-usage-collector-fr-pluggable-storage` covering **both** `usage_records` and the `usage_type_catalog` table.
-- **Error classification**: surfaces deterministic backend-classified errors so callers can apply retry, circuit-break, or fail-closed semantics without re-parsing backend-specific shapes — including the structured `UsageTypeReferenced { gts_id, sample_ref_count }` variant lifted from the plugin's FK-RESTRICT rejection on unsafe `delete_usage_type`.
+Resolves the bound plugin instance lazily on first dispatch, through
+`GtsPluginSelector`. It caches the resolved `GtsInstanceId` for the
+`Service`'s lifetime, and performs a `ClientHub::try_get_scoped` lookup per
+call.
+Dispatches persistence, query, and feed operations, and classifies plugin errors
+into the gear's error taxonomy.
 
 ##### Responsibility boundaries
 
-Does NOT own any policy (semantics enforcement, attribution validation, authorization) — every call arrives already authorized and structurally validated. Does NOT serve a parallel cache or invent a binding when the GTS Registry is unreachable. Does NOT contain backend-specific SQL, schema, or client library code — the backend is reached only through the SPI. Does NOT split a logical operation across multiple backends — exactly one plugin instance is bound at a time.
+Does NOT authorize, validate, or interpret domain content. Does NOT invent a
+fallback binding or retain a prior one: `None` from `try_get_scoped` lifts to a
+per-call unavailability error. Does NOT keep a parallel local persistence path
+for use when no plugin is bound.
 
-##### Related components (by ID)
+##### Binding invariants
 
-- `cpt-cf-usage-collector-component-ingestion-gateway` — invoked by for every persistence call; covers `cpt-cf-usage-collector-fr-pluggable-storage`.
-- `cpt-cf-usage-collector-component-query-gateway` — invoked by for aggregated and raw query dispatch; covers `cpt-cf-usage-collector-fr-pluggable-storage`, `cpt-cf-usage-collector-fr-query-aggregation`, `cpt-cf-usage-collector-fr-query-raw`.
-- `cpt-cf-usage-collector-component-deactivation-handler` — invoked by for status-only deactivation dispatch; covers `cpt-cf-usage-collector-fr-event-deactivation`.
+- Exactly one active storage binding exists per configured GTS instance scope.
+- The binding is not modelled as a state machine. It is recomputed on each call
+  from two structural facts — the cached `GtsInstanceId` and the scoped
+  `ClientHub` lookup — so there is no bound/unbound state to keep consistent.
+- The SPI major version is encoded structurally in the `gts_schema_id` path
+  suffix rather than carried as a runtime field. There is no version
+  negotiation at dispatch.
 
 #### PDP Authorization Posture (cross-cutting, no separate component)
 
-PDP enforcement is realized per-domain-component, not by a centralized adapter. Each of `cpt-cf-usage-collector-component-ingestion-gateway`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-deactivation-handler`, and `cpt-cf-usage-collector-component-usage-type-catalog` calls `cpt-cf-usage-collector-contract-authz-resolver` directly through a shared, per-component PDP authorization helper (no centralized adapter) that wraps `authz-resolver-sdk`'s `PolicyEnforcer::access_scope_with(ctx, resource_type, action, resource_id, &request)`. Each per-operation call always pins `OWNER_TENANT_ID` (plus optional `RESOURCE_ID`) and selects whether PDP constraints are required by resource type: UsageType-catalog operations do not require constraints (an `allow_all` permit is a legitimate happy path), while usage-record ingestion / deactivation and raw-record list operations require the PDP to return scoping constraints and gate the returned scope against the operation's attribution (a returned constraint must pin the owning tenant, so an `allow_all` permit is denied fail-closed). Domain services pass their per-operation attribution tuple (tenant, resource, optional subject, UsageType `gts_id`) plus the inbound `&SecurityContext` (which carries the calling-gear identity for PDP evaluation) and receive `(PdpDecision, [PdpConstraint])` back. The collector NEVER consumes `authn-resolver` and NEVER synthesizes identity: the `SecurityContext` arrives already resolved either from the ToolKit gateway middleware (`OperationBuilder::authenticated()` → `Extension<SecurityContext>` on REST handlers) or directly from the in-process caller as the first argument to every `UsageCollectorClientV1` method. Fail-closed: PDP unavailability denies the operation deterministically with no cached decisions and no permissive fallback.
+PDP enforcement is not a component. Each domain component calls a shared
+`access_scope_with` helper — a thin wrapper over
+`PolicyEnforcer::access_scope_with` — inline, not as Tower or `OperationBuilder`
+middleware. `OperationBuilder::authenticated()` performs bearer-auth resolution
+and injects the `SecurityContext` extractor. Nothing beyond that runs at the
+framework layer. REST handlers are thin pass-throughs. This keeps in-process and
+REST callers on one authorization path.
 
-Actor cross-reference: `cpt-cf-usage-collector-actor-tenant-admin` actions reach the gear through the same REST + per-component PDP-helper path as every other caller — there is no tenant-admin-specific endpoint, sequence, or adapter; the role distinction is made entirely by the `cpt-cf-usage-collector-contract-authz-resolver` `PdpDecision` (permit / deny + tenant-scoped `PdpConstraint` filters) returned for the operation. The [§3.6](#36-interactions-sequences) query sequences (`cpt-cf-usage-collector-seq-query-aggregated`, `cpt-cf-usage-collector-seq-query-raw`) name `cpt-cf-usage-collector-actor-tenant-admin` in their Actors line for that reason.
+A PDP permit is not the whole decision. The PDP returns the scope the caller may
+act in. Each component then checks its operation's attribution against that
+scope and denies anything outside it. This post-permit check is part of the
+authorization, not an extra safeguard.
 
 ### 3.3 API Contracts
 
-The Usage Collector exposes three public surfaces: an in-process SDK trait consumed by platform gears, a Plugin SPI implemented by storage backends, and a REST API consumed by remote usage sources, operator tooling, and downstream consumers. Each surface versions independently. Detailed wire and trait specifications live in the sibling artifacts (`sdk-trait.md`, `plugin-spi.md`, `usage-collector-v1.yaml`) and are intentionally not duplicated here (per `INT-DESIGN-NO-001`, `DATA-DESIGN-NO-001`, `MAINT-DESIGN-NO-001`). `usage-collector-v1.yaml` is the authoritative machine-readable wire contract for REST; `sdk-trait.md` and `plugin-spi.md` are the reference specifications for the in-process surfaces.
+The Usage Collector exposes three public surfaces, each versioned
+independently. `usage-collector-v1.yaml` is the authoritative machine-readable
+REST contract. The two Rust surfaces are declared below and are canonical in
+`usage-collector-sdk/src/` once implemented.
+
+**No surface carries a GTS type operation, read or write.** Declaring,
+amending, withdrawing, and reading declarations are `types-registry` surfaces
+(`cpt-cf-usage-collector-fr-usage-type-declaration`).
+
+Rules that hold on both Rust surfaces:
+
+1. The trait implementation — not the REST handler, not middleware — is the
+   single site for authorization, validation, and dispatch. Each method runs, in
+   order: the PDP call, composition of the compiled scope against caller
+   filters, GTS type resolution where the method carries a type, plugin
+   dispatch, then the plugin-error lift. The point lookup carries neither a
+   type nor a caller filter, so its compiled scope is the whole filter.
+2. The fold is never a parameter. A caller cannot select one.
+3. Neither surface exposes a catalog operation or a mutation operation. Both
+   absences are load-bearing: see §2.2 `constraint-no-type-catalog` and the §3.1
+   append-only invariant.
+4. Cursors are opaque. The gateway mints, decodes, and validates
+   `toolkit_odata::CursorV1`. A caller threads back what it read.
+5. `AggregationQuery` and `RawQuery` are parameter tuples, not structs. The
+   time range is a typed parameter and never a `$filter` conjunct.
+6. `MetadataFilter` is the dynamic-key side channel, because the
+   `toolkit-odata` grammar does not express filters over JSON map keys. AND
+   across distinct keys, OR within one key's values, empty slice means no
+   metadata filter.
 
 #### SDK Trait — `cpt-cf-usage-collector-interface-sdk-client`
 
 - **Contracts**: `cpt-cf-usage-collector-contract-downstream-usage-reader`
-- **Technology**: In-process async Rust trait registered in ClientHub without scope
-- **Location**: `sdk-trait.md`
-- **Allocated To**: `cpt-cf-usage-collector-component-ingestion-gateway`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-deactivation-handler`, `cpt-cf-usage-collector-component-usage-type-catalog`
+- **Technology**: In-process async Rust trait, registered in ClientHub without scope
+- **Location**: `usage-collector-sdk/src/api.rs`
+- **Allocated To**: `cpt-cf-usage-collector-component-ingestion-gateway`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-feed-gateway`
 
-In-process surface covering ingestion (`cpt-cf-usage-collector-fr-ingestion`, `cpt-cf-usage-collector-fr-idempotency`, `cpt-cf-usage-collector-fr-usage-compensation`), raw query (`cpt-cf-usage-collector-fr-query-raw`), aggregated query (`cpt-cf-usage-collector-fr-query-aggregation`), individual event deactivation (`cpt-cf-usage-collector-fr-event-deactivation`), and UsageType catalog management. The operation set, method signatures, domain types, error taxonomy, and versioning policy are defined in `sdk-trait.md`.
+Covers ingestion of both entry types on the live and the backfill path
+(`fr-ingestion`, `fr-idempotency`, `fr-record-invalidation`, `fr-backfill`),
+raw query (`fr-query-raw`), aggregated query (`fr-query-aggregation`), point
+lookup (`fr-record-identity`), and the usage feed (`fr-billing-usage-feed`).
+Backfill is on the trait because it is the only route reaching past the live
+past tolerance. An in-process emitter needs that route to import history and to
+withdraw it. Operator operations — quota configuration and reconciliation
+metadata — are REST-only.
+
+```rust
+#[async_trait]
+pub trait UsageCollectorClientV1: Send + Sync + 'static {
+    /// Ingest one ledger entry — a measurement or an invalidation.
+    ///
+    /// `id` is derived from the dedup identity, never supplied. An
+    /// exact-equality retry returns the persisted entry. Any difference
+    /// under the same identity is `Conflict(IdempotencyConflict)`.
+    async fn create_usage_record(
+        &self,
+        ctx: &SecurityContext,
+        record: CreateUsageRecord,
+    ) -> Result<UsageRecord, UsageCollectorError>;
+
+    /// Ingest a batch. Per-entry outcomes align with input order.
+    async fn create_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError>;
+
+    /// Bulk historical import, isolated from live ingestion.
+    ///
+    /// Stamps `origin = backfill` and admits the periods the live past
+    /// tolerance rejects. Validation is otherwise identical.
+    async fn backfill_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        records: Vec<CreateUsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorError>>, UsageCollectorError>;
+
+    /// Point lookup, returning the exact persisted fact.
+    ///
+    /// The read runs under the compiled scope, so an entry outside it is
+    /// `NotFound`. This surface is not an existence oracle.
+    async fn get_usage_record(
+        &self,
+        ctx: &SecurityContext,
+        id: Uuid,
+    ) -> Result<UsageRecord, UsageCollectorError>;
+
+    /// Aggregated query over one meter and one range.
+    ///
+    /// Carries no aggregation parameter: the fold is resolved from the
+    /// queried type. A withdrawn record and its invalidation each
+    /// contribute nothing.
+    async fn query_aggregated_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+        group_by: &[AggregationDimension],
+    ) -> Result<AggregationResult, UsageCollectorError>;
+
+    /// Keyset-paginated ledger read over `(window_end, id)`.
+    ///
+    /// Returns withdrawn pairs as persisted: this is a ledger path, not a
+    /// derived view. Excluding them from a locally computed fold is the
+    /// reader's obligation.
+    async fn list_usage_records(
+        &self,
+        ctx: &SecurityContext,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+    ) -> Result<ODataPage<UsageRecord>, UsageCollectorError>;
+
+    /// Replay-safe feed page over `(acceptance_sequence, id)`.
+    ///
+    /// Snapshot-consistent, unlike the query paths (§3.10). A consumer that
+    /// must not miss entries reads this and not `list_usage_records`. A
+    /// cursor older than the retention floor is refused.
+    async fn read_usage_feed(
+        &self,
+        ctx: &SecurityContext,
+        subscription: &FeedSubscription,
+        cursor: Option<&CursorV1>,
+        watermark: Option<&FeedWatermarkBound>,
+        limit: Option<u64>,
+    ) -> Result<FeedPage, UsageCollectorError>;
+}
+```
 
 #### Plugin SPI — `cpt-cf-usage-collector-interface-plugin`
 
 - **Contracts**: `cpt-cf-usage-collector-contract-storage-plugin`
-- **Technology**: Async Rust SPI trait registered in ClientHub with GTS instance scope
-- **Location**: `plugin-spi.md`
+- **Technology**: Async Rust SPI trait, registered in ClientHub with GTS instance scope
+- **Location**: `usage-collector-sdk/src/plugin_api.rs`
 - **Allocated To**: `cpt-cf-usage-collector-component-plugin-host`
 
-Storage plugin SPI implemented by each backend (e.g., ClickHouse, TimescaleDB) for both `usage_records` and `usage_type_catalog` persistence (per ADR-0012). Co-locating both tables on the active plugin's backend lets the FK `usage_records.gts_id → usage_type_catalog(gts_id) ON DELETE RESTRICT` run inside a single backend transaction. The active plugin per GTS instance scope is selected by operator configuration and bound through `cpt-cf-usage-collector-contract-gts-registry`. The operation set, method contracts, domain types, error taxonomy, trace-context propagation, and versioning policy are defined in `plugin-spi.md`.
+One `usage-collector-plugin-<backend>` crate per backend implements this trait
+under `plugins/<backend>/`. Each depends on `usage-collector-sdk` only, never
+on the host crate. Registration, discovery, and vendor selection follow the
+platform pattern in [TOOLKIT_PLUGINS.md](../../../../docs/TOOLKIT_PLUGINS.md).
+The GTS spec is `usage-collector-sdk/src/gts.rs`. There is no readiness probe
+and no flush. Availability is the conjunction of a cached selector and a
+resolvable scoped client. A plugin that buffers writes drains them on its own
+`Gear::shutdown`.
+
+```rust
+#[async_trait]
+pub trait UsageCollectorPluginV1: Send + Sync + 'static {
+    /// Persist one ledger entry (record or invalidation).
+    async fn create_usage_record(
+        &self,
+        record: UsageRecord,
+    ) -> Result<UsageRecord, UsageCollectorPluginError>;
+
+    /// Persist a batch. Outcomes align with input order.
+    async fn create_usage_records(
+        &self,
+        records: Vec<UsageRecord>,
+    ) -> Result<Vec<Result<UsageRecord, UsageCollectorPluginError>>, UsageCollectorPluginError>;
+
+    /// Read one entry by identifier, with its correction linkage.
+    ///
+    /// `scope` is the compiled PDP scope, projected into a `toolkit_odata`
+    /// filter. A row outside it is not returned.
+    async fn get_usage_record(
+        &self,
+        id: Uuid,
+        scope: &ast::Expr,
+    ) -> Result<UsageRecord, UsageCollectorPluginError>;
+
+    /// Compute the given fold over the authorized scope.
+    ///
+    /// The fold arrives as a parameter: declarations never reach the SPI.
+    async fn query_aggregated_usage_records(
+        &self,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        fold: AggregationFold,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+        group_by: &[AggregationDimension],
+    ) -> Result<AggregationResult, UsageCollectorPluginError>;
+
+    /// Keyset-paginated ledger read over `(window_end, id)`.
+    async fn list_usage_records(
+        &self,
+        gts_type_id: MeterTypeId,
+        time_range: TimeRange,
+        query: &ODataQuery,
+        metadata_filter: &[MetadataFilter],
+    ) -> Result<ODataPage<UsageRecord>, UsageCollectorPluginError>;
+
+    /// Snapshot-consistent feed page over `(acceptance_sequence, id)`.
+    async fn read_feed_page(
+        &self,
+        subscription: &[MeterTypeId],
+        page_after: Option<FeedKeyset>,
+        limit: u64,
+    ) -> Result<FeedPage, UsageCollectorPluginError>;
+
+    /// Per-scope ingestion counters and watermarks.
+    ///
+    /// The counters cover the range; the watermarks do not.
+    async fn get_reconciliation_metadata(
+        &self,
+        scope: ReconciliationScope,
+        time_range: TimeRange,
+    ) -> Result<Vec<ReconciliationMetadata>, UsageCollectorPluginError>;
+}
+```
+
+**Plugin obligations.** These sit on top of the §3.1 invariants a plugin
+enforces (period-end selection, quantity fidelity, dedup identity, at most one
+invalidation, sequence monotonicity, `LATEST` tie-break, recomputation):
+
+- **Do not re-validate.** The gateway enforces PDP attribution, type
+  resolution, declaration validation, metadata shape, quantity range, period
+  ordering, quotas, and every invalidation rule before dispatch. A malformed
+  call that reaches the SPI is a host-contract breach and returns
+  `Internal(detail)`.
+- **Treat every filter as authoritative.** PDP constraints are already
+  intersected with user filters. A plugin MUST NOT widen a result set.
+- **Do not read a declaration.** Retention is the one permitted registry read,
+  because the plugin applies it. Metadata filters lower to the backend's
+  JSON-path facility and are ANDed onto the OData-derived `WHERE`.
+- **No business logic.** A plugin stores signed quantities and reports folds.
+  A negative `SUM` is an ordinary outcome.
+- **Offset/limit scans are forbidden** on both paginated paths.
+- **Trace context is ambient.** Continue the Plugin Host's span over the
+  backend dispatch.
+- **Latency sub-allocations** (§3.11.2): 75 ms p95 of the 200 ms ingestion
+  budget, 425 ms p95 of the 500 ms aggregated-query budget. For batched
+  ingestion, raw paging, feed reads, and reconciliation, reserve at least
+  25 ms of the end-to-end envelope for gateway, PDP, and core overhead.
+- **`AggregationBucket.key` encoding**: `tenant_id` as `Uuid::to_string()`
+  (lowercase, hyphenated), every other dimension verbatim.
+
+**Plugin contract tests.** Every conforming plugin MUST pass the suite in
+`usage-collector-sdk`. The tests are behavioural and MUST pass on any backend.
+
+| Test | Asserts |
+| --- | --- |
+| `window-end-selection` | A range selects by period end, exclusive at the upper bound. A point event needs no special case. An entry wider than the range is selected by neither side. |
+| `invalidation-excluded-from-fold` | A withdrawn pair folds to nothing while both entries stay readable. Excluding only the record double-counts the withdrawn measurement. |
+| `at-most-one-invalidation` | A second withdrawal of one record is rejected. Under two concurrent submissions exactly one succeeds. |
+| `dedup-identity-over-window` | Both period bounds are part of the identity, so a same-key submission over a different period is a distinct entry. |
+| `quantity-round-trip` | The full published range round-trips digit for digit, negative half included. |
+| `feed-snapshot-and-replay` | A paginated scan observes no entry appearing, disappearing, or changing, except append-only arrivals the watermark demarcates. Replay from one cursor yields the same entries in the same order, extended only by entries accepted since. Resending a recorded watermark, the replay is identical — including where the subscription's scopes sit at different positions and one has never been written. |
+| `latest-tie-break` | Greatest `window_end`, then greatest `acceptance_sequence`. |
 
 #### REST API — `cpt-cf-usage-collector-interface-rest-api`
 
 - **Contracts**: `cpt-cf-usage-collector-contract-downstream-usage-reader`
-- **Technology**: HTTP REST + OpenAPI 3 (major version reflected in the URL prefix)
-- **Location**: `usage-collector-v1.yaml`
-- **Allocated To**: `cpt-cf-usage-collector-component-ingestion-gateway`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-deactivation-handler`, `cpt-cf-usage-collector-component-usage-type-catalog`
+- **Technology**: HTTP REST + OpenAPI 3 (major version in the URL prefix)
+- **Location**: [`usage-collector-v1.yaml`](usage-collector-v1.yaml)
+- **Allocated To**: all four domain components
 
-Full HTTP REST operation surface, served behind the platform API gateway. Authentication is owned by the ToolKit gateway upstream of the collector; PDP authorization (`cpt-cf-usage-collector-contract-authz-resolver`) is on the critical path of every operation with no anonymous bypass and no cached decisions. The production OAS is emitted at runtime by `OpenApiRegistryImpl` and a CI drift-check diffs it against `usage-collector-v1.yaml` to fail the build on any divergence in paths, methods, operationIds, tags, parameters, or response schemas.
-
-#### Aggregate Asymmetry
-
-Per `cpt-cf-usage-collector-principle-aggregate-asymmetry` ([§2.1](#21-design-principles)), the collector exposes two read shapes that intentionally differ. `GET /usage-collector/v1/records` is an OData list endpoint (filter / order / cursor) that satisfies open-ended raw exploration with stable keyset pagination over `(created_at, id)`. `POST /usage-collector/v1/records/aggregate` is a body-shaped RPC that takes a typed aggregation request and returns a non-paginated result set. Toolkit's OData layer does not expose `$apply` (group-by / aggregate transforms), and the aggregate response is bounded by `group_by` cardinality rather than by row volume, so paginating it would add complexity without recovering safety.
+The full product operation surface, served behind the platform API gateway.
+Authentication is owned by the ToolKit gateway upstream. PDP authorization is
+on the critical path of every operation, with no anonymous bypass and no cached
+decisions. The production OAS is emitted at runtime by `OpenApiRegistryImpl`,
+and a CI drift-check diffs it against `usage-collector-v1.yaml`.
 
 #### Endpoints Overview
 
-| Path                                          | Method   | OperationId                                      | Tag             |
-| --------------------------------------------- | -------- | ------------------------------------------------ | --------------- |
-| `/usage-collector/v1/records`                 | `POST`   | `usage_collector.create_usage_records`           | `Usage Records` |
-| `/usage-collector/v1/records`                 | `GET`    | `usage_collector.list_usage_records`             | `Usage Records` |
-| `/usage-collector/v1/records/aggregate`       | `POST`   | `usage_collector.query_aggregated_usage_records` | `Usage Records` |
-| `/usage-collector/v1/records/{id}`            | `GET`    | `usage_collector.get_usage_record`               | `Usage Records` |
-| `/usage-collector/v1/records/{id}/deactivate` | `POST`   | `usage_collector.deactivate_usage_record`        | `Usage Records` |
-| `/usage-collector/v1/usage-types`             | `GET`    | `usage_collector.list_usage_types`               | `Usage Types`   |
-| `/usage-collector/v1/usage-types`             | `POST`   | `usage_collector.create_usage_type`              | `Usage Types`   |
-| `/usage-collector/v1/usage-types/{gts_id}`    | `GET`    | `usage_collector.get_usage_type`                 | `Usage Types`   |
-| `/usage-collector/v1/usage-types/{gts_id}`    | `DELETE` | `usage_collector.delete_usage_type`              | `Usage Types`   |
+| Path | Method | OperationId | Tag |
+| --- | --- | --- | --- |
+| `/usage-collector/v1/records` | `POST` | `usage_collector.create_usage_records` | `Usage Records` |
+| `/usage-collector/v1/records` | `GET` | `usage_collector.list_usage_records` | `Usage Records` |
+| `/usage-collector/v1/records/{id}` | `GET` | `usage_collector.get_usage_record` | `Usage Records` |
+| `/usage-collector/v1/records/aggregate` | `POST` | `usage_collector.query_aggregated_usage_records` | `Usage Records` |
+| `/usage-collector/v1/records/backfill` | `POST` | `usage_collector.backfill_usage_records` | `Backfill` |
+| `/usage-collector/v1/feed` | `GET` | `usage_collector.read_usage_feed` | `Usage Feed` |
+| `/usage-collector/v1/reconciliation` | `GET` | `usage_collector.get_reconciliation_metadata` | `Reconciliation` |
 
-All data paths are namespaced under `/usage-collector/v1/`. OperationIds follow `gear.snake_case` (`usage_collector.<verb_object>`); tags use Title Case drawn from `Usage Records` and `Usage Types`. Platform-level liveness and readiness probes are handled by the ToolKit host outside this gear; the collector does not expose gear-local health endpoints. Request/response schemas, parameters, and capacity caps are defined in `usage-collector-v1.yaml`.
+All data paths sit under `/usage-collector/v1/`. **OperationIds are
+`usage_collector.<operation name>`**, and where an operation also exists on the
+SDK trait the two names are identical — so a drift between the emitted OAS and
+the trait is a one-token diff. The reconciliation endpoint is operator-only: it
+has no trait counterpart and follows the same pattern. Single-entry ingestion
+has no endpoint of its own. REST ingests through the batch route. Tags are
+Title Case, drawn from `Usage Records`, `Backfill`, `Usage Feed`, and
+`Reconciliation`. Liveness and readiness probes are handled by the ToolKit host
+outside this gear. Request and response schemas, parameters, and capacity caps
+are defined in `usage-collector-v1.yaml`.
 
-**Single ingestion path for both ordinary measurements and counter compensations.** `POST /usage-collector/v1/records` is the only ingestion path. Each record carries a signed `value` plus an optional `corrects_id`; presence of `corrects_id` is the sole structural discriminator between an ordinary usage row and a counter compensation row (`cpt-cf-usage-collector-adr-usage-compensation`). No dedicated compensate endpoint, SDK method, or Plugin SPI call exists — compensation rides the existing ingestion path everywhere.
+**This gear exposes no usage-type endpoint at all.** Declarations are owned,
+served, and listed by `types-registry`. The Type Resolver reads them for the
+write and read paths and mirrors none of that onto this contract, per
+`cpt-cf-usage-collector-constraint-no-type-catalog`.
 
-**Deactivation cascade is depth-1 by construction.** `POST /usage-collector/v1/records/{id}/deactivate` returns `204 No Content`; the cascade — targeted row plus every currently-active counter compensation referencing it — is committed atomically inside a single backend transaction. Depth-1 is structural: a `corrects_id` may not target a row whose own `corrects_id IS NOT NULL`, so no second hop is possible (`cpt-cf-usage-collector-adr-monotonic-deactivation`).
+**One ingestion path for both entry types.** `POST /records` accepts ordinary
+records and invalidation entries alike, discriminated by the `invalidates`
+reference the entry carries. There is no dedicated correction endpoint, SDK
+method, or SPI call, and no endpoint modifies an accepted entry.
+`POST /records/backfill` is the same contract under workload isolation,
+stamping `origin = backfill`. Which of the two an entry belongs on follows from
+its covered period alone, and an invalidation copies the period it withdraws.
 
 #### Cursor & Pagination
 
-Per `cpt-cf-usage-collector-principle-cursor-gateway-ownership` ([§2.1](#21-design-principles)), the Query Gateway uses ToolKit's canonical cursor envelope, `toolkit_odata::CursorV1`, as the opaque continuation token for raw-record reads. The cursor is **owned, issued, decoded, and validated at the gateway**; the Plugin SPI never sees the wire-level token — it receives a structured `(filter_ast, order_keys, page_after, limit)` tuple and returns `(rows, last_keyset)`. Pagination is anchored on the canonical unique keyset `(created_at, id)`: the gateway appends that pair (direction-aware) as a tiebreaker suffix to whatever order the caller requests — defaulting to it outright when `$orderby` is omitted — so the effective order always ends in a globally-unique key. The monotonic-tiebreaker invariant then guarantees successive page boundaries do not skip or repeat rows within a stable filter scope, including under an explicit `$orderby` whose leading key is non-unique. Plugins MUST NOT mint, encode, or interpret a wire cursor — that keeps cursor versioning, signing posture, and validation rules at a single platform-owned location (`toolkit_odata`).
+Per `cpt-cf-usage-collector-principle-cursor-gateway-ownership`, the gateway
+owns `toolkit_odata::CursorV1` on both paginated paths. The SPI never sees the
+wire token. The two paths anchor on different keysets. Raw query uses
+`(window_end, id)`, and the feed uses `(acceptance_sequence, id)`. One orders
+the ledger by the column selection reads, the other by arrival. Each tuple is
+unique within its scope, so successive page boundaries neither skip nor repeat
+rows within a stable filter scope. The cursor binds the order and a hash of the
+filter it was minted under, so that stability is enforced and not trusted. A
+malformed token, a changed filter, or an order supplied alongside a cursor is
+rejected as `InvalidArgument` with a `cursor` field violation —
+`INVALID_CURSOR`, `FILTER_MISMATCH`, `ORDER_WITH_CURSOR`, and, in process only
+where a caller can set both at once, `ORDER_MISMATCH`.
 
-#### Canonical Page Envelope
+The feed's watermark token is owned the same way. It carries one acceptance
+position per subscribed scope, which no single sequence number can hold, so the
+gateway mints and decodes it and that set never becomes wire contract. The SPI
+receives a decoded `FeedWatermarkBound`, as it receives a decoded `Keyset`. A
+malformed or foreign token is rejected as `InvalidArgument` with a `watermark`
+field violation — `INVALID_WATERMARK`, `SUBSCRIPTION_MISMATCH`.
 
-Per `cpt-cf-usage-collector-principle-canonical-page` ([§2.1](#21-design-principles)), raw-read responses use `toolkit_odata::Page<UsageRecord>`; the gear does not define a bespoke paging schema. Aggregated reads return a non-paginated typed body.
+#### Error Contract
 
-#### Error Envelopes
+Both Rust surfaces return a flat `thiserror::Error` enum declared in
+`usage-collector-sdk/src/error.rs`. The SDK crate does **not** depend on
+`toolkit-canonical-errors`: consumers pattern-match variants directly, as they
+do with `account-management-sdk`, `credstore-sdk`, and `authz-resolver-sdk`.
+The host lifts `UsageCollectorError` onto
+`toolkit_canonical_errors::CanonicalError` in
+`usage-collector/src/infra/sdk_error_mapping.rs`, and `CanonicalError`'s
+`IntoResponse` produces the RFC-9457 `Problem` envelope. The gear defines no
+private HTTP-status table.
 
-Errors follow the canonical `toolkit_canonical_errors::Problem` envelope per `cpt-cf-usage-collector-principle-canonical-errors` ([§2.1](#21-design-principles)). UC does not define a private HTTP-status table — the status is a property of the AIP-193 category, owned by `toolkit_canonical_errors::CanonicalError::IntoResponse`. The variant → canonical-category lift is documented in `sdk-trait.md` "Error Taxonomy"; the `Problem.context.reason` vocabulary is additive within the major-version stability contract (`cpt-cf-usage-collector-adr-contract-stability`) and is not enumerated as a closed wire surface.
+`UsageCollectorError` — the public consumer taxonomy. Discrimination inside a
+category is a typed `reason` sub-enum, so a consumer matches the category, then
+the reason. The reason vocabularies are declared in
+`usage-collector-sdk/src/reason.rs` and carried on the wire in
+`usage-collector-v1.yaml`. They are additive within a major version.
+
+| Variant | AIP-193 category | HTTP | Raised for |
+| --- | --- | --- | --- |
+| `PermissionDenied` | `PermissionDenied` | 403 | PDP denial. The by-id surface reads under the scope, so it reports `NotFound`. |
+| `InvalidArgument` | `InvalidArgument` | 400 | Structural and semantic validation. `reason: ValidationReason` rides `field_violations[0].reason`. |
+| `NotFound` | `NotFound` | 404 | An unresolvable GTS type, a missing entry, an invalidation target that resolves to nothing, or an entry outside the caller's scope. |
+| `Conflict` | `Aborted` | 409 | `reason: ConflictReason` rides `context.reason`. |
+| `ResourceExhausted` | `ResourceExhausted` | 429 | Ingestion quota exceeded. Carries retry guidance. Entries are never silently dropped. |
+| `ServiceUnavailable` | `Unavailable` | 503 | Transient infrastructure failure. The only infrastructure-retryable class. |
+| `Internal` | `Internal` | 500 | Unclassified. `detail` MUST be DSN-free and redacted at the construction site. |
+
+`is_retryable()` is true for `ServiceUnavailable` alone. `ResourceExhausted` is
+retryable after the indicated delay and is reported separately, so a caller can
+tell backpressure from infrastructure failure.
+
+`UsageCollectorPluginError` — the SPI taxonomy, translated at the dispatch
+boundary in `usage-collector/src/domain/service.rs`:
+
+| `UsageCollectorPluginError` | Lifts to |
+| --- | --- |
+| `Transient(detail)` | `ServiceUnavailable` |
+| `Internal(detail)` | `Internal` |
+| `IdempotencyConflict { idempotency_key, existing_id }` | `Conflict(IdempotencyConflict)` |
+| `AlreadyInvalidated { id, invalidated_by }` | `Conflict(AlreadyInvalidated)` |
+| `UsageRecordNotFound { id }` | `NotFound` |
+| `CursorBeyondRetention { oldest_available }` | `InvalidArgument(CursorBeyondRetention)` |
+
+Six variants, deliberately. Type resolution, faithful-copy and reason-code
+checks, metadata shape and size, quantity range, cursor decoding, and
+authorization are all gateway-side. The SPI therefore carves no variant for any
+of them. A plugin that observes one has observed a host-contract breach and
+returns `Internal(detail)`. There is no `Unready` variant. A plugin can add
+per-variant context fields as long as the classification and the
+`error_category` metric mapping (§3.11.5) hold.
 
 #### Startup-time plugin binding
 
-Per `cpt-cf-usage-collector-principle-plugin-resolution-via-client-hub` ([§2.1](#21-design-principles)), the host's binding to a concrete plugin is settled once at startup via `types-registry` + ClientHub and cached for the `Service`'s lifetime; configuration changes take effect at gear restart. Resolution flow, GTS pattern, and per-request dispatch shape are defined in [plugin-spi.md §Host-side resolution flow](plugin-spi.md#host-side-resolution-flow).
+The host binds to a concrete plugin once at startup through `types-registry`
+and ClientHub, then caches the resolved instance for the `Service` lifetime.
+Selection is exact on the configured `[usage_collector].vendor`, and ties break
+on the lowest `PluginV1.priority`. Configuration changes take effect at gear
+restart. There is no parallel cache and no retain-prior fallback. The host does
+`try_get_scoped` per call. A miss lifts to a per-call plugin-unavailable error,
+never to a substituted prior binding. Plugins are workspace members
+linked at build time. The host crate has no compile-time dependency on any of
+them, and no dynamic loading is involved.
 
 ### 3.4 Internal Dependencies
 
-In-process platform gears consumed by the Usage Collector via SDK clients on ClientHub. Integration detail (driver, data, availability, compatibility) lives in [§3.5](#35-external-dependencies); call sites are visible in the [§3.6](#36-interactions-sequences) sequences.
+In-process platform gears consumed via SDK clients on ClientHub. Integration
+detail lives in [§3.5](#35-external-dependencies). Call sites are visible in the
+[§3.6](#36-interactions--sequences) sequences.
 
 | Dependency Gear | Interface Used | Purpose |
-|---|---|---|
-| `authz-resolver` | SDK client (`PolicyEnforcer`) via ClientHub, realising `cpt-cf-usage-collector-contract-authz-resolver` | PDP permit/deny + `PdpConstraint` filters for every ingestion, query, deactivation, and UsageType operation. |
-| `gts-registry` | SDK client (`TypesRegistryClient`) via ClientHub, realising `cpt-cf-usage-collector-contract-gts-registry` | Resolves the configured GTS selector to the bound storage-plugin instance. |
+| --- | --- | --- |
+| `authz-resolver` | SDK client (`PolicyEnforcer`) via ClientHub, realising `cpt-cf-usage-collector-contract-authz-resolver` | PDP permit/deny plus the constraint set it compiles into an `AccessScope`, for every ingestion, query, and feed operation. |
+| `types-registry` | SDK client (`TypesRegistryClient`) via ClientHub, realising `cpt-cf-usage-collector-contract-types-registry` | **Two distinct uses**: resolving GTS type *declarations* on the ingestion and query paths, and resolving the configured GTS selector to the bound storage-plugin *instance*. |
+
+The double role of `types-registry` is deliberate and worth naming. A
+declaration outage degrades the introduction of new meters. A plugin-instance
+outage degrades binding at startup. The two failure modes have
+different blast radii and different mitigations (declaration cache versus cached
+binding).
 
 ### 3.5 External Dependencies
-
-Integration contracts the Usage Collector consumes from the platform or provides outward. Direction, availability, and compatibility posture follow PRD §7.2. Plugin discovery and dispatch follow the standard `PluginV1<P>` + `types-registry` + `ClientHub` pattern — full code shape in [plugin-spi.md](plugin-spi.md#host-side-resolution-flow).
 
 #### Platform PDP
 
 - **Contract**: `cpt-cf-usage-collector-contract-authz-resolver`
-- **Consumed by**: ingestion-gateway, query-gateway, deactivation-handler, usage-type-catalog (each via a shared, per-component PDP authorization helper; no centralized adapter)
+- **Consumed by**: ingestion-gateway, query-gateway, feed-gateway (each via the shared per-component helper. No centralized adapter)
 
 | Aspect | Detail |
-|--------|--------|
+| --- | --- |
 | Direction | Consumed (Usage Collector → PDP) |
 | Driver | `PolicyEnforcer::access_scope_with(ctx, …)` from `authz-resolver-sdk` |
-| Data | `SecurityContext` (carries the calling-gear identity) + attribution tuple (tenant, resource, optional subject, UsageType `gts_id`); returns permit/deny + `PdpConstraint` filters |
-| Availability | Critical-path; fail-closed on unreachable. No cached decisions, no permissive fallback. |
-| Compatibility | Follows platform authorization protocol; breaking changes require coordinated release |
+| Data | `SecurityContext` plus attribution tuple (tenant, resource, optional subject, `gts_type_id`). Returns permit/deny plus the constraint set compiled into an `AccessScope` |
+| Availability | Critical-path. Fail-closed on unreachable. No cached decisions, no permissive fallback. |
+| Compatibility | Platform authorization protocol. Breaking changes require coordinated release |
 
-#### GTS Registry
+#### Types Registry
 
-- **Contract**: `cpt-cf-usage-collector-contract-gts-registry`
-- **Consumed by**: `cpt-cf-usage-collector-component-plugin-host`
+- **Contract**: `cpt-cf-usage-collector-contract-types-registry`
+- **Consumed by**: `cpt-cf-usage-collector-component-type-resolver` (declarations), `cpt-cf-usage-collector-component-plugin-host` (plugin instance)
 
 | Aspect | Detail |
-|--------|--------|
-| Direction | Consumed (plugin identity resolution) |
-| Driver | `TypesRegistryClient` lookup by `UsageCollectorPluginSpecV1::gts_schema_id()` + configured vendor (lowest `PluginV1.priority` wins) |
-| Data | GTS instance identifiers; resolved `GtsInstanceId` cached in `GtsPluginSelector` for the `Service`'s lifetime |
-| Availability | Lazy resolve on first dispatch. No matching instance ⇒ `PluginUnavailable`. Already-resolved binding tolerates transient registry unavailability. `[usage_collector].vendor` is read once at `Gear::init`; rebinding requires gear restart. |
-| Compatibility | Selector identifiers and binding shape follow platform GTS Registry protocol; breaking changes require coordinated release with registry and all plugin implementations |
+| --- | --- |
+| Direction | Consumed (declaration resolution and plugin identity resolution). One write: the restore registers a lost declaration back (`cpt-cf-usage-collector-adr-declaration-rehydration`) |
+| Driver | `TypesRegistryClient`. Declarations by `gts_type_id`, plugin instances by `UsageCollectorPluginSpecV1::gts_schema_id()` plus configured vendor (lowest `PluginV1.priority` wins) |
+| Data | GTS type declarations (fold, unit, metadata schema, retention, optional sampling interval). GTS instance identifiers |
+| Availability | **Declarations**: steady state served from the resolver cache. Cached declarations remain usable while the registry is unreachable, so an outage degrades the introduction of new types rather than ingestion of existing ones. An unresolvable reference is rejected fail-closed. **Plugin instance**: lazy resolve on first dispatch. No matching instance ⇒ `PluginUnavailable`. An already-resolved binding tolerates transient unavailability. |
+| Compatibility | Declaration shape and selector identifiers follow platform GTS protocol. Breaking changes require coordinated release |
 
 #### Storage Plugin SPI
 
 - **Contract**: `cpt-cf-usage-collector-contract-storage-plugin`
-- **Interface**: `cpt-cf-usage-collector-interface-plugin` (SPI offered to plugin authors; e.g. ClickHouse, TimescaleDB)
-- **Dispatched by**: `cpt-cf-usage-collector-component-plugin-host` on behalf of all four domain components
+- **Interface**: `cpt-cf-usage-collector-interface-plugin`
+- **Dispatched by**: `cpt-cf-usage-collector-component-plugin-host` on behalf of all domain components
 
 | Aspect | Detail |
-|--------|--------|
-| Direction | Provided (library SPI); plugins ship on independent release schedules |
-| Driver | Trait dispatch via `ClientHub::try_get_scoped::<dyn UsageCollectorPluginV1>` keyed by `ClientScope::gts_id(&instance_id)`, per `cpt-cf-usage-collector-fr-pluggable-storage` |
-| Data | Method contracts (persistence, raw/aggregated query, deactivation, UsageType catalog CRUD, error variants) live in [plugin-spi.md §Method Contracts](plugin-spi.md#method-contracts) |
-| Availability | Plugin owns its SLO; gateway dispatches per call — no parallel cache, no invented binding |
-| Compatibility | `cpt-cf-usage-collector-nfr-plugin-contract-stability`: stable across minor/patch within a major; breaking changes ship as a new major coexisting with the prior major during a migration window |
+| --- | --- |
+| Direction | Provided (library SPI). Plugins ship on independent release schedules |
+| Driver | Trait dispatch via `ClientHub::try_get_scoped::<dyn UsageCollectorPluginV1>` keyed by `ClientScope::gts_id(&instance_id)` |
+| Data | Seven method contracts — persistence, point lookup, aggregated and raw query, feed page reads, and per-scope reconciliation metadata — are declared in [§3.3](#33-api-contracts). Reconciliation is REST-only for consumers but needs an SPI method because the gear is stateless: the counters and watermarks live in the plugin. |
+| Availability | Plugin owns its SLO. Gateway dispatches per call — no parallel cache, no invented binding |
+| Compatibility | Stable across minor/patch within a major. Breaking changes ship as a new major coexisting with the prior during a migration window |
 
 #### Downstream Usage Reader
 
 - **Contract**: `cpt-cf-usage-collector-contract-downstream-usage-reader`
-- **Served by**: `cpt-cf-usage-collector-component-query-gateway` (record reads) and `cpt-cf-usage-collector-component-usage-type-catalog` (UsageType reads)
+- **Served by**: query-gateway (record reads) and feed-gateway (feed reads)
 
 | Aspect | Detail |
-|--------|--------|
-| Direction | Provided (read-only). Pull-only by design — no push/subscribe surface. |
-| Driver | REST `cpt-cf-usage-collector-interface-rest-api` (out-of-process) + SDK `cpt-cf-usage-collector-interface-sdk-client` (in-process). Wire contract: §3.3 + `usage-collector-v1.yaml`. |
-| Data | Raw reads (`GET /records`) and aggregated reads (`POST /records/aggregate`). Business logic (pricing, rating, quota decisions) MUST NOT run inside the Usage Collector. |
-| Availability | `cpt-cf-usage-collector-nfr-query-latency` + `cpt-cf-usage-collector-nfr-availability`. PDP fail-closed. Readers MUST NOT invent usage state when UC is unreachable. |
-| Compatibility | At most one prior major version of REST API + SDK trait supported concurrently. Additive changes within a major do not break readers. |
+| --- | --- |
+| Direction | Provided (read-only). **Pull-only by design** — no push/subscribe surface. |
+| Driver | REST plus in-process SDK. Wire contract: §3.3 plus `usage-collector-v1.yaml`. |
+| Data | Raw reads, aggregated reads, point lookups, and feed pages with cursor and watermark. Business logic must not run inside the Usage Collector. |
+| Availability | `nfr-query-latency` plus `nfr-availability`. Feed freshness and replay throughput are plugin-readiness gates. PDP fail-closed. Readers must not invent usage state when UC is unreachable. |
+| Compatibility | From 1.0 onward, at most one prior major of REST and SDK supported concurrently. |
 
 **Dependency Rules** (per project conventions):
 
@@ -633,594 +1346,613 @@ Integration contracts the Usage Collector consumes from the platform or provides
 
 ### 3.6 Interactions & Sequences
 
-The sequences below realize every PRD §8 use case. Each enters through the
-public surface (`cpt-cf-usage-collector-interface-rest-api` or
-`cpt-cf-usage-collector-interface-sdk-client`) carrying a resolved
-`SecurityContext` — populated upstream by the ToolKit gateway on REST, supplied
-directly by the in-process caller on SDK — runs PDP authorization inline
-through a per-component PDP authorization helper against `cpt-cf-usage-collector-contract-authz-resolver`,
-and dispatches through the Plugin Host
-(`cpt-cf-usage-collector-component-plugin-host`) to the active Storage Plugin
-via `cpt-cf-usage-collector-contract-storage-plugin`. Authentication is owned
-upstream and is not modeled here; authorization is fail-closed on every path.
-The `PH → Hub → SP` arrow shorthand denotes a `ClientHub::try_get_scoped`
-lookup against the resolved plugin instance — see
-[plugin-spi.md §Host-side resolution flow](plugin-spi.md#host-side-resolution-flow)
-for resolution, caching, and rebind semantics.
+Every sequence below is synchronous request/response. `SecurityContext` is
+resolved upstream by the ToolKit gateway and propagated on every in-process
+call.
 
 #### Emit Usage Record
 
-**ID**: `cpt-cf-usage-collector-seq-emit-usage`
-
-**Use cases**: `cpt-cf-usage-collector-usecase-emit`
-
-**Actors**: `cpt-cf-usage-collector-actor-usage-source`
-
-**References**: `cpt-cf-usage-collector-fr-ingestion`,
-`cpt-cf-usage-collector-fr-ingestion-authorization`,
-`cpt-cf-usage-collector-fr-idempotency`,
-`cpt-cf-usage-collector-fr-usage-compensation`,
-`cpt-cf-usage-collector-adr-usage-compensation`,
-[`features/usage-emission.md`](./features/usage-emission.md)
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-seq-emit-usage`
 
 ```mermaid
 sequenceDiagram
-    participant Caller as usage-source
-    participant Surface as rest-api / sdk-client
-    participant IG as ingestion-gateway
-    participant PDP as authz-resolver (via per-component helper)
-    participant MC as usage-type-catalog
-    participant PH as plugin-host
-    participant Hub as client-hub
-    participant SP as storage-plugin
-    Caller ->> Surface: Emit UsageRecord (+ idempotency key, &SecurityContext)
-    Surface ->> IG: emit_usage(&ctx, request)
-    IG ->> PDP: authorize "emit" (attribution tuple)
-    PDP -->> IG: PdpDecision (permit | deny) + PdpConstraints
-    IG ->> MC: Lookup UsageType (existence + counter/gauge)
-    MC -->> IG: UsageType (metadata_fields, counter/gauge derived from UsageTypeGtsId prefix) | not-found
-    IG ->> PH: Persist record (idempotency-keyed)
-    PH ->> Hub: try_get_scoped::<dyn UsageCollectorPluginV1>(ClientScope::gts_id(instance_id))
-    Hub -->> PH: bound plugin client (cached selector hit)
-    PH ->> SP: persist(record)
-    SP -->> PH: Acknowledged | Deduplicated (exact-equality retry) | Conflict (canonical-field mismatch) | classified error
-    PH -->> IG: Acknowledged | Deduplicated | Conflict (existing record id)
-    alt canonical-field mismatch
-        IG -->> Surface: per-record rejected outcome (idempotency_conflict, error Problem 409 / AlreadyExists)
-    else exact-equality retry
-        IG -->> Surface: Deduplicated acknowledgement (2xx)
-    else first write
-        IG -->> Surface: Per-record acknowledgement (2xx)
+    participant S as Usage Source
+    participant GW as ToolKit Gateway
+    participant IG as Ingestion Gateway
+    participant TR as Type Resolver
+    participant PDP as authz-resolver
+    participant PH as Plugin Host
+    participant P as Storage Plugin
+
+    S->>GW: POST /records (CreateUsageRecord[])
+    GW->>IG: authenticated SecurityContext + payload
+    IG->>IG: quota check (caller, tenant)
+    IG->>PDP: access_scope_with(ctx, tenant, resource, subject?, gts_type_id)
+    PDP-->>IG: permit | deny
+    alt deny
+        IG-->>GW: PermissionDenied (fail closed)
     end
-    Surface -->> Caller: 2xx acknowledgement | error envelope
+    IG->>TR: resolve(gts_type_id)
+    TR-->>IG: declaration (unit, metadata schema, retention) | unresolved
+    alt unresolved
+        IG-->>GW: NotFound naming the identifier (fail closed)
+    end
+    IG->>IG: validate period, quantity, metadata (closed shape), size cap
+    IG->>IG: derive id = UUIDv5(tenant, gts_type, key, window_start, window_end)
+    IG->>IG: stamp accepted_at, origin=live
+    IG->>PH: create_usage_record(s)
+    PH->>P: persist (assigns acceptance_sequence)
+    P-->>PH: persisted | absorbed retry | IdempotencyConflict
+    PH-->>IG: outcome
+    IG-->>GW: per-entry acknowledgement
 ```
 
-**Description**: The Ingestion Gateway authorizes the caller against the full
-attribution tuple (tenant, resource, optional subject,
-UsageType `gts_id`), then enforces UsageType existence and counter/gauge
-invariants through the UsageType Catalog before plugin dispatch. Compensation
-ingestion rides this same path: when a record carries `corrects_id`, the L1
-referential check runs pre-dispatch — the referenced row must exist, must
-itself carry `corrects_id IS NULL`, must share `(tenant_id, gts_id)`,
-and must be `active`. On a dedup-key collision the plugin decides by exact
-equality of the caller-supplied canonical fields: an exact-equality retry is
-absorbed as `Deduplicated`; a mismatch returns the conflicting record's id as
-a per-record `rejected` outcome (`idempotency_conflict`). Authorization
-denial, validation failure, and unknown UsageType reject before any record is
-persisted.
+The fold is **not** consulted anywhere on this path. Batch submissions apply the
+same steps per entry, with per-entry outcomes returned in input order.
+
+#### Invalidate Usage Record
+
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-seq-invalidate-record`
+
+```mermaid
+sequenceDiagram
+    participant S as Usage Source
+    participant IG as Ingestion Gateway
+    participant PDP as authz-resolver
+    participant PH as Plugin Host
+    participant P as Storage Plugin
+
+    S->>IG: POST /records or /records/backfill (invalidates, reason_code)
+    IG->>PDP: access_scope_with(ctx, attribution tuple)
+    PDP-->>IG: permit | deny
+    IG->>PH: get_usage_record(invalidates)
+    PH->>P: read target
+    P-->>PH: target | not found
+    alt target missing or entry_type=invalidation
+        IG-->>S: rejected (no invalidation of an invalidation)
+    end
+    IG->>IG: faithful-copy check on every caller-supplied field
+    IG->>IG: covered-period bounds of the path the entry arrived on
+    IG->>PH: create_usage_record (invalidation entry)
+    PH->>P: persist, rejecting an already-invalidated target
+    P-->>PH: persisted | AlreadyInvalidated | IdempotencyConflict
+    PH-->>IG: outcome
+    IG-->>S: acknowledgement
+```
+
+The entry travels the ordinary ingestion path: same PDP attribution, same
+mandatory idempotency key, same quota machinery, and the same covered-period
+bounds. It carries its own key, distinct from the target's. An entry submitted under
+the target's key collides on all five dedup attributes. That entry is rejected
+as a same-key content mismatch.
+
+The period is the target's, so a withdrawal reaching past the live past
+tolerance is rejected there and belongs on `/records/backfill`, which the
+rejection names.
 
 #### Query Aggregated Usage
 
-**ID**: `cpt-cf-usage-collector-seq-query-aggregated`
-
-**Use cases**: `cpt-cf-usage-collector-usecase-query-aggregated`
-
-**Actors**: `cpt-cf-usage-collector-actor-usage-consumer`, `cpt-cf-usage-collector-actor-tenant-admin`
-
-**References**: `cpt-cf-usage-collector-fr-query-aggregation`,
-`cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`,
-`cpt-cf-usage-collector-principle-aggregate-asymmetry`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-seq-query-aggregated`
 
 ```mermaid
 sequenceDiagram
-    participant Caller as usage-consumer / tenant-admin
-    participant Surface as rest-api / sdk-client
-    participant QG as query-gateway
-    participant PDP as authz-resolver (via per-component helper)
-    participant MC as usage-type-catalog
-    participant PH as plugin-host
-    participant Hub as client-hub
-    participant SP as storage-plugin
-    Caller ->> Surface: POST /usage-collector/v1/records/aggregate (AggregationQuery: time range, single UsageType, group-by, &SecurityContext)
-    Surface ->> QG: query_aggregated(&ctx, request)
-    QG ->> PDP: authorize "query_aggregated_records" (attribution tuple)
-    PDP -->> QG: PdpDecision + PdpConstraints
-    QG ->> MC: Validate single-UsageType filter
-    MC -->> QG: UsageType exists | not-found
-    alt UsageType not-found
-        QG -->> Surface: Reject (unregistered UsageType)
-        Surface -->> Caller: Actionable error envelope
-    end
-    QG ->> QG: Compose user filters ∩ PdpConstraints
-    QG ->> PH: Execute aggregation (composed filters, grouping)
-    PH ->> Hub: try_get_scoped::<dyn UsageCollectorPluginV1>(ClientScope::gts_id(instance_id))
-    Hub -->> PH: bound plugin client (cached selector hit)
-    PH ->> SP: aggregate(query)
-    SP -->> PH: AggregationResult buckets
-    PH -->> QG: AggregationResult
-    QG -->> Surface: Aggregated buckets
-    Surface -->> Caller: Result set | error envelope
+    participant C as Consumer
+    participant QG as Query Gateway
+    participant TR as Type Resolver
+    participant PDP as authz-resolver
+    participant PH as Plugin Host
+    participant P as Storage Plugin
+
+    C->>QG: POST /records/aggregate (gts_type_id, time_range, group_by?)
+    QG->>PDP: access_scope_with(ctx, read scope)
+    PDP-->>QG: permit + constraints | deny
+    QG->>TR: resolve(gts_type_id)
+    TR-->>QG: declaration (fold, metadata schema) | unresolved
+    QG->>QG: validate grouping/filter fields against the declared schema
+    QG->>QG: intersect authorized scope with user filters
+    QG->>PH: query_aggregated_usage_records(gts_type_id, range, filters, group_by)
+    PH->>P: push down declared fold + grouping, excluding withdrawn pairs
+    P-->>PH: AggregationResult
+    PH-->>QG: buckets
+    QG-->>C: AggregationResult
 ```
 
-**Description**: The Query Gateway intersects user-supplied filters with
-PDP-returned constraints — the authorized scope can only narrow, never widen.
-PDP denial or empty constraints fail closed. An unregistered UsageType filter
-is rejected before plugin dispatch; a registered UsageType with no matching
-records returns an empty result set, not an error.
-
-#### Register UsageType
-
-**ID**: `cpt-cf-usage-collector-seq-register-usage-type`
-
-**Use cases**: `cpt-cf-usage-collector-usecase-register-usage-type`
-
-**Actors**: `cpt-cf-usage-collector-actor-platform-operator`
-
-**References**: `cpt-cf-usage-collector-fr-usage-type-registration`,
-`cpt-cf-usage-collector-fr-usage-type-existence-and-semantics`,
-`cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-
-```mermaid
-sequenceDiagram
-    participant Operator as platform-operator
-    participant Surface as rest-api / sdk-client
-    participant MC as usage-type-catalog
-    participant PDP as authz-resolver (via per-component helper)
-    participant PH as plugin-host
-    participant Hub as client-hub
-    participant SP as storage-plugin
-    Operator ->> Surface: RegisterUsageType (gts_id, kind, metadata_fields, &SecurityContext)
-    Surface ->> MC: create_usage_type(&ctx, request)
-    MC ->> PDP: authorize "create_usage_type" (attribution tuple)
-    PDP -->> MC: PdpDecision (permit | deny)
-    MC ->> MC: Validate gts_id (UsageTypeGtsId derivation from gts.cf.core.uc.usage_record.v1~) and metadata_fields (unique non-empty strings); kind already validated as closed UsageKind enum at the UsageKind::from_str handler-boundary parse
-    MC ->> PH: create_usage_type(row { gts_id, kind, metadata_fields })
-    PH ->> Hub: try_get_scoped::<dyn UsageCollectorPluginV1>(ClientScope::gts_id(instance_id))
-    Hub -->> PH: bound plugin client
-    PH ->> SP: create_usage_type(row)
-    SP -->> PH: Ok | UsageTypeAlreadyExists { gts_id }
-    PH -->> MC: Ok | UsageTypeAlreadyExists { gts_id }
-    MC -->> Surface: Registered UsageType | error
-    Surface -->> Operator: 2xx confirmation | error envelope
-```
-
-**Description**: The UsageType Catalog authorizes the operator, validates
-that `metadata_fields` is a list of unique non-empty strings, and dispatches
-`create_usage_type` to the active plugin. `gts_id` well-formedness — including
-derivation from the reserved abstract base `gts.cf.core.uc.usage_record.v1~`
-with at least one further `~`-separated segment — is enforced upstream at the
-`UsageTypeGtsId::new` boundary, not inside this service. The plugin enforces
-the `gts_id` UNIQUE constraint in its backend transaction and returns
-`UsageTypeAlreadyExists { gts_id }` on collision. Once acknowledged the
-UsageType is immediately available for ingestion across all tenants; counter
-vs gauge is derived per lookup from the `UsageTypeGtsId` prefix.
-
-#### Delete UsageType
-
-**ID**: `cpt-cf-usage-collector-seq-delete-usage-type`
-
-**Use cases**: `cpt-cf-usage-collector-usecase-delete-usage-type`
-
-**Actors**: `cpt-cf-usage-collector-actor-platform-operator`
-
-**References**: `cpt-cf-usage-collector-fr-usage-type-deletion`,
-`cpt-cf-usage-collector-adr-0012-unified-plugin-catalog-and-gts-id-reference`
-
-```mermaid
-sequenceDiagram
-    participant Operator as platform-operator
-    participant Surface as rest-api / sdk-client
-    participant MC as usage-type-catalog
-    participant PDP as authz-resolver (via per-component helper)
-    participant PH as plugin-host
-    participant Hub as client-hub
-    participant SP as storage-plugin
-    Operator ->> Surface: DeleteUsageType (gts_id, &SecurityContext)
-    Surface ->> MC: delete_usage_type(&ctx, gts_id)
-    MC ->> PDP: authorize "delete_usage_type" (attribution tuple)
-    PDP -->> MC: PdpDecision (permit | deny)
-    MC ->> PH: delete_usage_type(gts_id)
-    PH ->> Hub: try_get_scoped::<dyn UsageCollectorPluginV1>(ClientScope::gts_id(instance_id))
-    Hub -->> PH: bound plugin client
-    PH ->> SP: delete_usage_type(gts_id)
-    Note over SP: Backend transaction: FK usage_records.gts_id → usage_type_catalog(gts_id) ON DELETE RESTRICT
-    SP -->> PH: Ok | UsageTypeNotFound { gts_id } | UsageTypeReferenced { gts_id, sample_ref_count }
-    PH -->> MC: Ok | UsageTypeNotFound | UsageTypeReferenced
-    MC -->> Surface: 204 No Content | 404 UsageTypeNotFound | 409 UsageTypeReferenced | error
-    Surface -->> Operator: 2xx confirmation | error envelope
-```
-
-**Description**: Two steps: PDP authorize, then dispatch `delete_usage_type`
-to the active plugin. The plugin's backend transaction enforces the FK
-`usage_records.gts_id → usage_type_catalog(gts_id) ON DELETE RESTRICT`
-atomically — missing rows surface as `UsageTypeNotFound { gts_id }` and
-referencing records as the structured
-`UsageTypeReferenced { gts_id, sample_ref_count }`; a successful delete drops
-the row inside the same transaction. A deleted `gts_id` becomes available
-for re-registration.
+The request carries **no aggregation parameter** — the fold comes from the
+declaration. Time selection reads the period end.
 
 #### Query Raw Usage Records
 
-**ID**: `cpt-cf-usage-collector-seq-query-raw`
-
-**Use cases**: `cpt-cf-usage-collector-usecase-query-raw`
-
-**Actors**: `cpt-cf-usage-collector-actor-usage-consumer`, `cpt-cf-usage-collector-actor-tenant-admin`
-
-**References**: `cpt-cf-usage-collector-fr-query-raw`,
-`cpt-cf-usage-collector-principle-cursor-gateway-ownership`,
-`cpt-cf-usage-collector-principle-canonical-errors`,
-`cpt-cf-usage-collector-principle-canonical-page`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-seq-query-raw`
 
 ```mermaid
 sequenceDiagram
-    participant Caller as usage-consumer / tenant-admin
-    participant Surface as rest-api / sdk-client
-    participant QG as query-gateway
-    participant PDP as authz-resolver (via per-component helper)
-    participant PH as plugin-host
-    participant Hub as client-hub
-    participant SP as storage-plugin
-    Caller ->> Surface: GET /usage-collector/v1/records?$filter=…&$orderby=created_at asc, id asc&$top=N&cursor=<opaque CursorV1> (with &SecurityContext)
-    Surface ->> QG: query_raw(&ctx, request) (OData parse: $filter → FilterNode<UsageRecordFilterField>, $orderby → ODataOrderBy, $top / limit → ODataQuery.limit, cursor → opaque CursorV1 blob)
-    QG ->> PDP: authorize "query_raw_records" (attribution tuple)
-    PDP -->> QG: PdpDecision + PdpConstraints
-    QG ->> QG: CursorV1::decode(cursor) → Result<CursorV1, CursorDecodeError>
-    alt cursor decode fails
-        QG -->> Surface: InvalidArgument (field_violations[0].field="cursor", reason="INVALID_CURSOR")
-        Surface -->> Caller: Canonical Problem envelope
-    end
-    QG ->> QG: toolkit_odata::validate_cursor_against(decoded, $filter_ast, $orderby)
-    alt OrderMismatch
-        QG -->> Surface: InvalidArgument (field_violations[0].field="cursor", reason="ORDER_MISMATCH")
-        Surface -->> Caller: Canonical Problem envelope
-    else FilterMismatch
-        QG -->> Surface: InvalidArgument (field_violations[0].field="cursor", reason="FILTER_MISMATCH")
-        Surface -->> Caller: Canonical Problem envelope
-    else OK
-        QG ->> QG: Extract page_after: Option<Keyset>
-    end
-    QG ->> QG: Enforce time-range mandatoriness (created_at ge X and created_at lt Y) post-parse, pre-dispatch
-    QG ->> QG: Compose user filters ∩ PdpConstraints (into filter_ast)
-    QG ->> PH: list_usage_records(filter_ast: FilterNode<UsageRecordFilterField>, order: ODataOrderBy, page_after: Option<Keyset>, limit: u64)
-    PH ->> Hub: try_get_scoped::<dyn UsageCollectorPluginV1>(ClientScope::gts_id(instance_id))
-    Hub -->> PH: bound plugin client (cached selector hit)
-    PH ->> SP: list_usage_records(filter_ast, order, page_after, limit)
-    SP -->> PH: (rows: Vec<UsageRecord>, last_keyset: Option<Keyset>)
-    PH -->> QG: (rows, last_keyset)
-    QG ->> QG: If last_keyset.is_some() → encode next CursorV1::from(last_keyset, $filter, $orderby)
-    QG -->> Surface: toolkit_odata::Page<UsageRecord> { value: rows, next_cursor: Option<CursorV1> }
-    Surface -->> Caller: 200 OK { value: rows, "@odata.nextLink" | nextCursor: <encoded CursorV1> } | empty | canonical Problem envelope
+    participant C as Consumer
+    participant QG as Query Gateway
+    participant TR as Type Resolver
+    participant PDP as authz-resolver
+    participant PH as Plugin Host
+    participant P as Storage Plugin
+
+    C->>QG: GET /records (gts_type_id, time_range, $filter?, cursor?)
+    QG->>PDP: access_scope_with(ctx, read scope)
+    PDP-->>QG: permit + constraints | deny
+    QG->>TR: resolve(gts_type_id)
+    TR-->>QG: declaration (metadata schema)
+    QG->>QG: validate filter fields, decode and validate cursor
+    QG->>PH: list_usage_records(gts_type_id, range, filters, page_after, limit)
+    PH->>P: keyset scan over (window_end, id)
+    P-->>PH: rows + last keyset
+    PH-->>QG: rows
+    QG->>QG: mint next_cursor
+    QG-->>C: Page<UsageRecord>
 ```
 
-**Description**: The Query Gateway owns the cursor lifecycle end-to-end: it
-decodes the opaque `CursorV1`, validates it against the current `$filter` /
-`$orderby` (mismatches return canonical Problem envelopes), enforces the
-mandatory `(created_at ge X) and (created_at lt Y)` window after OData parsing,
-and re-encodes the plugin-returned `last_keyset` (over the canonical
-`(created_at, id)` `Keyset`) into the next `CursorV1`. The plugin sees only
-the structured tuple `(filter_ast, order, page_after, limit)` and returns
-`(rows, last_keyset)` — never an encoded cursor. An empty match within the
-authorized scope returns an empty `value`, not an error.
+Withdrawn pairs are returned as persisted. The path applies no fold, so it has
+none to correct.
 
-#### Deactivate Usage Event
+#### Read Usage Feed
 
-**ID**: `cpt-cf-usage-collector-seq-deactivate-event`
-
-**Use cases**: `cpt-cf-usage-collector-usecase-deactivate-event`
-
-**Actors**: `cpt-cf-usage-collector-actor-platform-operator`
-
-**References**: `cpt-cf-usage-collector-fr-event-deactivation`,
-`cpt-cf-usage-collector-adr-monotonic-deactivation`,
-`cpt-cf-usage-collector-adr-usage-compensation`,
-`cpt-cf-usage-collector-principle-monotonic-deactivation`
+- [ ] `p1` - **ID**: `cpt-cf-usage-collector-seq-read-feed`
 
 ```mermaid
 sequenceDiagram
-    participant Operator as platform-operator
-    participant Surface as rest-api
-    participant DH as deactivation-handler
-    participant PDP as authz-resolver (via per-component helper)
-    participant PH as plugin-host
-    participant Hub as client-hub
-    participant SP as storage-plugin
-    Operator ->> Surface: Deactivate (event id, &SecurityContext)
-    Surface ->> DH: deactivate_event(&ctx, event_id)
-    DH ->> PDP: authorize "deactivate_record" (attribution tuple)
-    PDP -->> DH: PdpDecision (permit | deny)
-    DH ->> PH: Transition active → inactive (event id)
-    PH ->> Hub: try_get_scoped::<dyn UsageCollectorPluginV1>(ClientScope::gts_id(instance_id))
-    Hub -->> PH: bound plugin client (cached selector hit)
-    PH ->> SP: deactivate_usage_record(event id)
-    SP -->> PH: Transitioned | already-inactive | not-found
-    PH -->> DH: Outcome
-    DH -->> Surface: Deactivation confirmation | error
-    Surface -->> Operator: 2xx confirmation | error envelope
+    participant C as Charging Consumer
+    participant FG as Feed Gateway
+    participant PDP as authz-resolver
+    participant PH as Plugin Host
+    participant P as Storage Plugin
+
+    C->>FG: GET /feed (subscription: gts_type_ids[], cursor?)
+    FG->>PDP: access_scope_with(ctx, read scope per subscribed type)
+    PDP-->>FG: permit + constraints | deny
+    FG->>FG: decode cursor, reject if older than the retention floor
+    FG->>PH: read_feed_page(subscription, page_after, limit)
+    PH->>P: snapshot scan over (acceptance_sequence, id) per scope
+    P-->>PH: entries + last keyset + watermark
+    PH-->>FG: page
+    FG->>FG: mint next_cursor
+    FG-->>C: FeedPage { entries, next_cursor, watermark }
 ```
 
-**Description**: The Deactivation Handler authorizes the operator and issues
-a single atomic status-only transition through the Plugin SPI's
-`deactivate_usage_record`. The plugin enforces `active → inactive`
-monotonicity at the storage layer: concurrent races resolve as
-first-commit-wins, with the second surfacing `UsageRecordAlreadyInactive`.
-**Depth-1 cascade**: when the deactivated row is an ordinary usage row
-(`corrects_id IS NULL`), the same plugin step atomically flips every
-currently-active counter compensation row whose `corrects_id` references it
-to `inactive` inside the same backend transaction. The cascade is strictly
-depth-1 by construction — L1 rejects any `corrects_id` that targets a row
-with `corrects_id IS NOT NULL`, so no second hop is possible. Only the
-`status` column is modified; inactive records remain queryable through the
-Query Gateway.
+Corrections arrive as ordinary entries at their own acceptance position. An accepted invalidation removes no entry from the feed. A replay from a
+cursor within the retention floor therefore observes the same entries the
+original scan observed.
+
+#### Backfill Import
+
+- [ ] `p2` - **ID**: `cpt-cf-usage-collector-seq-backfill-import`
+
+```mermaid
+sequenceDiagram
+    participant O as Operator / Importer
+    participant IG as Ingestion Gateway (backfill path)
+    participant PDP as authz-resolver
+    participant PH as Plugin Host
+
+    O->>IG: POST /records/backfill (CreateUsageRecord[])
+    IG->>PDP: access_scope_with(ctx, attribution tuple)
+    PDP-->>IG: permit | deny
+    IG->>IG: backfill window check, hard bound, no override
+    IG->>IG: identical validation to the live path
+    IG->>IG: stamp origin=backfill
+    IG->>PH: create_usage_records (isolated workload)
+    PH-->>IG: per-entry outcomes
+    IG-->>O: per-entry acknowledgements
+```
+
+Validation is identical to the live path. Only the window rule, the origin
+marker, and the workload isolation differ. The route takes invalidation entries
+alongside **Usage Records**, under the same per-entry rules.
 
 ### 3.7 Database schemas & tables
 
-The Usage Collector gateway is **stateless**: it owns no durable tables
-and opens no database connections. The two logical persistence anchors
-the gateway dispatches against — the usage-type catalog and the usage
-records store — are wholly plugin-owned per
-[ADR-0012](./ADR/0012-unified-plugin-catalog-and-gts-id-reference.md)
+The Usage Collector gateway owns one durable table, and it is temporary. The
+single logical persistence anchor — the entry ledger — is wholly plugin-owned
 and reached exclusively through `cpt-cf-usage-collector-interface-plugin`.
 
-Concrete table shapes — column types, primary keys, indexes,
-partitioning, retention, materialized views, acceleration structures —
-are plugin-internal per `DATA-DESIGN-NO-001` and are owned by each
-plugin's own DESIGN document.
+**There is no usage-type catalog table.** Declarations live in
+`types-registry`, and the gear serves resolution from an in-memory cache that
+is derived state with no durability obligation.
+
+**There is a declaration mirror table**, holding one row per resolved GTS type:
+the type identifier, the declaration document as registered, and first-seen and
+last-seen timestamps. Declarations are platform-global, so it is not
+tenant-scoped, and it holds one row per meter rather than per entry. Only the
+Type Resolver reads it, only on the restore path. No entry references it and it
+enforces no referential integrity. It exists because `types-registry` stores
+declarations in memory, and it is dropped when that changes
+(`cpt-cf-usage-collector-adr-declaration-rehydration`).
+
+Concrete table shapes are plugin-internal per `DATA-DESIGN-NO-001`, and each
+plugin's own DESIGN document owns them. These shapes cover column types,
+primary keys, indexes, partitioning, retention, materialised views, and
+acceleration structures. Two obligations bind them from here. The dedup identity must be enforced as a
+uniqueness constraint over the 5-tuple, and preserved for the retention
+horizon. The plugin assigns `acceptance_sequence` and must keep it strictly
+monotonic per `(tenant_id, gts_type_id)`.
 
 ### 3.8 Deployment Topology
 
 - [ ] `p3` - **ID**: `cpt-cf-usage-collector-topology-gear-runtime`
 
-Usage Collector is a stateless ToolKit gear deployed as a horizontally scalable instance set behind the ToolKit API gateway; durable state is reached exclusively through the ClientHub-bound storage plugin (`cpt-cf-usage-collector-component-plugin-host`). There is no leader election, no sharding, and no gear-owned background coordination, so any instance can serve any request — this is how the topology realizes `cpt-cf-usage-collector-nfr-availability` (99.95%), `cpt-cf-usage-collector-nfr-throughput` (≥10K records/sec), and `cpt-cf-usage-collector-nfr-workload-isolation` (ingestion/query separation is deferred to the storage tier).
-
-**Out of scope**: concrete instance counts, autoscaling thresholds, network zoning, secret distribution, observability pipelines, and storage backend HA configuration are platform-operations-owned (per `OPS-DESIGN-NO-001`) and live in platform ops docs and the active plugin's deployment guide.
+The gear runs behind the platform API gateway, horizontally scalable by replica
+count. Entry state lives in the active storage plugin's backend, and
+declaration state lives in `types-registry`. A replica holds its
+resolved-declaration cache and its cached plugin binding, both reconstructible
+on restart. The one durable table the gear owns is the declaration mirror of
+[§3.7](#37-database-schemas--tables), shared across replicas, so a restore by
+one replica serves all of them. Multi-region deployment is not a v1 capability.
 
 ### 3.9 Security Architecture
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-design-security-architecture`
-
-The Usage Collector is a platform-internal metering substrate. Authentication, session lifecycle, MFA / SSO, credential storage, authentication timeout, TLS termination, CORS, network zoning, at-rest encryption, key management, identifier masking, record disposal, audit retention, tamper-proofing, IR runbooks, and rate limiting are owned by the surrounding platform layers (ToolKit gateway, `authn-resolver`, platform identity layer, platform API gateway, platform audit infrastructure, active storage plugin) and are NOT reproduced in this gear. The subsections below address each SEC-DESIGN check and call out only the gear-specific content underneath that ownership map.
-
 #### 3.9.1 Authentication Architecture (SEC-DESIGN-001)
 
-Authentication is owned by the ToolKit gateway: REST routes register with `OperationBuilder::authenticated()`, the gateway middleware resolves the caller, and the handler receives `Extension<SecurityContext>`. The SDK trait (`UsageCollectorClientV1`) takes `&SecurityContext` as the first parameter on every method; in-process callers supply it directly. The collector NEVER consumes `authn-resolver`, NEVER parses or mints tokens, NEVER synthesizes identity, and `cpt-cf-usage-collector-principle-fail-closed` rejects any operation that arrives without a resolved `SecurityContext`. Token format, session management, MFA / SSO, credential storage, and authentication timeout are platform-identity-layer concerns per the lead paragraph.
+Authentication is owned by the ToolKit gateway upstream of the gear, which
+resolves and injects `SecurityContext`. The collector never resolves
+credentials, never synthesizes an identity, and exposes no anonymous path.
 
 #### 3.9.2 Data Protection (SEC-DESIGN-003)
 
-Persisted identifiers (`tenant_id`, `resource_id`, `subject_id`) are opaque platform-internal handles the gear neither interprets nor redacts. The `metadata` field is opaque caller-supplied content with a size cap (`cpt-cf-usage-collector-fr-record-metadata`, default 8 KiB). TLS-in-transit is gateway-owned (REST) and plugin-deployment-owned (Plugin SPI when out-of-process); at-rest encryption, key management, masking, and disposal are plugin-owned through `cpt-cf-usage-collector-contract-storage-plugin` and `cpt-cf-usage-collector-adr-pluggable-storage`, and each active plugin's deployment guide MUST document its at-rest encryption posture. Monotonic deactivation (`cpt-cf-usage-collector-adr-monotonic-deactivation`) does not delete records, by design.
+The gear persists opaque platform identifiers, operational telemetry, and
+caller-supplied metadata only. At-rest encryption, key management, masking, and
+disposal are plugin-owned. Callers are contractually forbidden from placing PII,
+payment data, regulated health data, or credentials into metadata.
 
 #### 3.9.3 Security Boundaries (SEC-DESIGN-004)
 
-REST responses are produced by the platform API gateway with the encoding declared by `usage-collector-v1.yaml`; the gear does not produce HTML or untrusted client-facing content, so XSS-shape escaping does not arise. CORS, TLS termination, and network zoning are gateway-deployment-owned per the lead paragraph and [§3.8](#38-deployment-topology) "Out of scope".
+Three boundaries: the platform gateway (authentication), the per-component PDP
+call (authorization), and the Plugin SPI (persistence). No domain component
+reaches a backend directly, and no surface admits an unauthorized entry.
 
 #### 3.9.4 Threat Modeling (SEC-DESIGN-005)
 
 | Threat | Mitigation |
 | --- | --- |
-| **Forged attribution** — caller submits records claiming a tenant / resource / subject it does not own | Resolved `SecurityContext` plus PDP authorization on the full attribution tuple before persistence — `cpt-cf-usage-collector-adr-pdp-centric-authorization`, `cpt-cf-usage-collector-fr-tenant-attribution` |
-| **PDP bypass** — request reaches plugin persistence without a permit decision | Inline gate on every read / write; no cached PDP decisions; absence ⇒ fail-closed rejection |
-| **Plugin supply-chain compromise** — a malicious or compromised storage plugin is loaded into the process and matches the configured `[usage_collector].vendor` | Operator-configured `[usage_collector].vendor` read once at `Gear::init`, resolved lazily on the first dispatch after the `types-registry` is consistent. Plugin provenance, signature verification, and supply-chain attestation are platform-plugin-trust-owned |
-| **Idempotency-key replay across tenants** — a caller reuses a key under a tenant it is not authorized for, or two tenants choose the same key | Dedup composite `(tenant_id, gts_id, idempotency_key, created_at)` (Plugin SPI cross-entity invariant — see [`plugin-spi.md`](./plugin-spi.md) §"Cross-entity invariants honored by the Plugin SPI") makes the boundary per-tenant; PDP attribution rejects unauthorized cross-tenant submissions before dedup; within a tenant, same-key-differing-fields surfaces as `idempotency_conflict` ([§3.3](#33-api-contracts)), not silent absorption — `cpt-cf-usage-collector-adr-mandatory-idempotency` |
-| **Idempotency-key collision across caller gears under one `(tenant, UsageType)`** — two caller gears authorized to emit for the same `(tenant, UsageType)` pick the same key | Dedup boundary is intentionally per-(tenant, UsageType) — this collision is a coordination requirement, not a security boundary. Same canonical fields = exact-equality duplicate; differing fields = `idempotency_conflict`. Operators MUST coordinate key allocation across emitting gears (typically a caller-scoped key prefix — see [`features/usage-emission.md`](./features/usage-emission.md) §5 "FR: Idempotency" and `cpt-cf-usage-collector-adr-caller-supplied-attribution`) |
-
-Security assumptions: the ToolKit gateway and `authz-resolver` are trusted platform components (gateway owns authentication; `authz-resolver` owns PDP decisions); the platform API gateway terminates TLS; the active storage plugin is operator-trusted at bootstrap. Input fuzz-resistance and DoS mitigation are gateway-owned.
+| Cross-tenant attribution by an authorized caller | The PDP returns the caller's scope. The post-permit gate denies any entry whose attribution falls outside that scope. |
+| Forged correction — withdrawing another caller's measurement | The invalidation carries the target's full attribution, and the same PDP check applies. A faithful-copy mismatch is rejected naming the field. |
+| Quantity poisoning via non-finite or out-of-range values | Ingestion rejects absent, non-numeric, non-finite, or out-of-range quantities before persistence. |
+| Existence oracle via point lookup | The by-id read carries the compiled scope, so an entry outside it is indistinguishable from a missing one. |
+| Ingestion flood from a misbehaving emitter | Per-caller and per-(caller, tenant) quotas reject over-quota submissions with an actionable throttle error rather than dropping silently. |
+| Duplicate charges from an overlapping feed replay | The feed refuses a cursor older than the retention floor, and delivery inside it is at-least-once, so consumers deduplicate by entry identifier. Ingestion adds no such case: the backfill window bound keeps every admissible submission inside its idempotency horizon. |
+| Supply-chain risk in a storage plugin | Plugins are workspace members reviewed under the gear's provenance checks. Binding is operator-configured, not caller-influenced. |
 
 #### 3.9.5 Audit Architecture (SEC-DESIGN-006)
 
-The authoritative access trail is composed at the ToolKit API gateway (authentication boundary) and at the `authz-resolver` PDP decision point (invoked per domain component through the shared PDP authorization helper). The Usage Collector itself emits structured operational events on ingestion, query, deactivation, and UsageType-lifecycle paths, each carrying the inbound `SecurityContext.correlation_id`; a dedicated gear-local audit-emission capability is deferred per the [§4](#4-additional-context) forward-looking note. Operational metrics, thresholds, and alerting live in [§3.11.5](#3115-operational-metric-inventory-ops-design-002) and [§3.11.6](#3116-alerting-and-error-budget-architecture-ops-design-005). Retention, tamper-proofing, and IR hooks are platform-audit-infrastructure-owned per the lead paragraph.
+The v1 access trail is composed at the platform gateway and at the per-component
+PDP decision points, correlated by the `correlation_id` the gear propagates
+unchanged. The gear hosts no audit log of its own. Gear-side audit emission for
+operator-write paths is deferred ([§3.12.2](#3122-known-technical-debt-and-runbook-maint-design-002-maint-design-003)).
 
 #### 3.9.6 Authorization Architecture (SEC-DESIGN-002)
 
-The Usage Collector's authorization model is **attribute-based access control (ABAC) anchored at the platform PDP**, with no gear-local role / permission table. Every read and write — ingestion, raw query, aggregated query, deactivation, UsageType registration, UsageType deletion, UsageType list / get — is enforced inline by the handling domain component (`cpt-cf-usage-collector-component-ingestion-gateway`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-deactivation-handler`, `cpt-cf-usage-collector-component-usage-type-catalog`) per [§3.6](#36-interactions-sequences) sequences via a shared, per-component PDP authorization helper; the helper returns a `PdpDecision` plus any `PdpConstraint` filters from `cpt-cf-usage-collector-contract-authz-resolver` before any plugin dispatch. Attributes evaluated are the caller's `SecurityContext` (which carries the calling-gear identity) plus the operation's attribution tuple (tenant, resource, optional subject, UsageType `gts_id`). Anchored by `cpt-cf-usage-collector-principle-pdp-centric-authorization` ([§2.1](#21-design-principles)) and the resolver contract `cpt-cf-usage-collector-contract-authz-resolver` ([§3.4](#34-internal-dependencies), [§3.5](#35-external-dependencies)). All REST endpoints in [§3.3](#33-api-contracts) and every SDK method enter the gate through the [§3.6](#36-interactions-sequences) sequences — no anonymous bypass, no PDP-skipping path.
+Every operation is authorized at the platform PDP against the caller's
+`SecurityContext` and the operation's attribution tuple. Read decisions return
+constraint filters that define the authorization boundary and are intersected
+with user filters before dispatch, so a user filter can only narrow. No decision
+is cached, and there is no gear-local access table.
 
-- **Constraint composition (privilege-escalation prevention)**: `PdpConstraint` filters intersect with user filters in `cpt-cf-usage-collector-component-query-gateway` — user filters can only **narrow** within the PDP-authorized scope, never widen. Caller-supplied attribution is never derived from `SecurityContext`, eliminating "elevate via implicit attribution" as a class.
-- **Plugin SPI scope**: plugins receive only the already-authorized and constraint-narrowed query; they cannot expand scope. Per `cpt-cf-usage-collector-principle-pdp-centric-authorization` the gear holds no implicit trust — no per-tenant cached permits, no constraint-default-allow path.
-- **Roles, license gate, rate limiting**: roles (`cpt-cf-usage-collector-actor-usage-source`, `…-usage-consumer`, `…-tenant-admin`, `…-platform-operator`, `…-platform-developer`) are operator-configured in the platform PDP policy store, not in this gear. All REST routes register with `.no_license_required()` (D5) — usage collection runs across every licensed surface, so license gating lives in the calling product surfaces. Per-route rate limits are gateway-owned (D4); the gear declares no per-route quotas.
+The decision and constraint types are platform-owned: `authz-resolver` returns
+`EvaluationResponse`, which the gear compiles into a
+`toolkit_security::AccessScope` through `PolicyEnforcer::access_scope_with`.
+What is domain-local is **which dimensions of an entry can be scoped at all**.
+A PDP predicate addresses a column by property name, and the gear advertises
+the names it can compile in the `supported_properties` of its `ResourceType`.
+A constraint naming an unadvertised property fails to compile, and a read whose
+constraints all fail to compile fails closed. Every advertised property maps to
+a fixed field of `UsageRecordFilterField` (§3.1):
 
-This subsection is the canonical gear-side answer to SEC-DESIGN-002; downstream review MUST treat the PDP and `authz-resolver` policy store as the authoritative location for any role / permission matrix change.
+| PDP property | Filter field | Scope it authorizes |
+| --- | --- | --- |
+| `owner_tenant_id` | `tenant_id` | The tenant an entry is attributed to. Carries `InTenantSubtree`, so nested tenants authorize a subtree rather than an enumerated set. |
+| `resource_id`, `resource_type` | same | The attributed resource. |
+| `subject_id`, `subject_type` | same | The attributed subject, where one is present. |
+| `gts_type_id` | *(reserved)* | The meter. Scopable even though it is not user-filterable: the typed parameter stays the caller's only way to name a type, and PDP narrows independently of it. |
+
+Deny decisions reject the operation before any state change or plugin read. A
+read requires a permit **and** a non-empty compiled scope: an empty constraint
+set is a fail-closed condition, not an unrestricted grant. A write requires a
+permit **and** a returned scope that admits the full attribution tuple —
+tenant, resource, referenced GTS type, and subject where supplied. An empty
+constraint set fails closed on the write path too.
 
 ### 3.10 Consistency Contract
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-design-consistency-contract`
 
-This section publishes the single plugin-agnostic consistency contract SDK, REST, and feature consumers code against. It exists because `cpt-cf-usage-collector-nfr-workload-isolation` ([§1.2](#12-architecture-drivers)) routes ingestion and query to isolated backend pools (read replicas, separate executor pools), and that isolation creates queryability lag between the synchronous ingestion ack path and the subsequent Query SPI path that nothing else in DESIGN names. The architectural decision is recorded in `cpt-cf-usage-collector-adr-consistency-contract` (ADR-0011, "Consistency contract for usage-collector read/write paths" — Status: Accepted) and follows a **floor-and-ceiling split**: the floor below lives at the gear surface so consumers get one plugin-agnostic contract; per-plugin deployment guides MAY publish a stronger **ceiling** that consumers MAY opt into by coupling to that plugin (`plugin-spi.md` §"Consistency profile" carries the SPI-side floor and the plugin-author obligation).
+This section publishes the single plugin-agnostic consistency contract SDK,
+REST, and feature consumers code against. It exists because `cpt-cf-usage-collector-nfr-workload-isolation` routes
+ingestion and query to isolated backend pools. That isolation creates
+queryability lag between the synchronous ack path and the subsequent read
+paths. The decision is recorded in
+`cpt-cf-usage-collector-adr-consistency-contract` and follows a
+**floor-and-ceiling split**.
 
-**Floor (gear-level, normative).** The floor is the strongest guarantee every plugin on the v1 roadmap honours under default deployment posture; it is not the strongest guarantee plugins can offer.
+**Floor (gear-level, normative).**
 
-- **Ingestion ack (`Acknowledged`)** — once `cpt-cf-usage-collector-interface-rest-api` or `cpt-cf-usage-collector-interface-sdk-client` returns `Acknowledged` for a usage record, the record is durable; the `(tenant_id, gts_id, idempotency_key, created_at)` dedup tuple is permanently visible to every subsequent ingestion attempt on the ingestion path; and a subsequent `deactivate` of that record commits atomically with its depth-1 compensation cascade in a single plugin backend transaction. These are intra-plugin invariants — see `cpt-cf-usage-collector-adr-mandatory-idempotency`, `cpt-cf-usage-collector-adr-monotonic-deactivation`, and `cpt-cf-usage-collector-adr-usage-compensation`; the floor restates them so the ingestion-side guarantee is named in one place alongside the read-side guarantee below.
-- **Query SPI (raw + aggregated + catalog)** — every read through the Plugin SPI (`cpt-cf-usage-collector-interface-plugin` — `query_aggregated`, `query_raw_keyset`, `get_usage_type`, `list_usage_types`) is **eventually consistent with no upper bound** relative to a same-tenant ingestion `Acknowledged`. The same record MAY be invisible to raw, aggregated, and catalog reads for an indeterminate window after acknowledgement; the window is driven by the active plugin's replication topology and the workload-isolation routing the plugin chose, not by Usage Collector. **No monotonic-reads guarantee at the floor:** a consumer that has observed record R on one read MAY legitimately fail to observe R on a subsequent read against the same `(tenant_id, gts_id)` if the second read lands on a less-converged replica; flows that cannot tolerate observed-then-disappeared records MUST consume a plugin whose deployment guide advertises a stronger ceiling. The floor is scoped to **`usage_records` and the plugin-owned `usage_type_catalog`** reached through the Plugin SPI. **The floor is per-`(tenant_id, gts_id)`**; UC publishes no cross-tenant or cross-usage-type ordering claim.
+- **Ingestion ack** — after an ingestion call returns the persisted entry, that
+entry is durable. Its dedup identity stays visible to subsequent ingestion
+attempts for as long as the referenced type's retention policy keeps it. The dedup
+  window is therefore **per-meter and bounded**, not unbounded.
+- **Read paths (raw, aggregate, point lookup, feed)** — **eventually consistent
+  with no upper bound** relative to a same-tenant ingestion ack. The window is
+  driven by the active plugin's replication topology, not by Usage Collector.
+  **No monotonic-reads guarantee at the floor.** The floor is per
+  `(tenant_id, gts_type_id)`. No cross-tenant or cross-type ordering is claimed.
+- **Type declarations are outside this floor.** They are resolved from `types-registry` through the Type Resolver cache. Their
+propagation delay is therefore a property of that resolution path rather than
+of the storage plugin.
 
 **Consumer rules (normative consequence).**
 
-- **Read-after-write flows MUST NOT be designed on the Query SPI.** Admission control, post-emit summary, immediate-readback dashboards, and any caller-gear flow that needs same-request outcome MUST consume the ingestion ack: the synchronous `Acknowledged` outcome carries the durable result and is the only surface the floor binds for write-derived state.
-- **Near-real-time observers poll within the query-latency NFR and tolerate lag.** Consumers that watch usage in near-real-time poll the Query SPI within `cpt-cf-usage-collector-nfr-query-latency` and accept that the visible state lags the ingestion-acked state by the active plugin's profile (`plugin-spi.md` §"Consistency profile"). This is the content of the [§3.12.3](#3123-event-architecture-and-user-experience-int-design-003-ux-design-001) polling redirect.
-- **Defend against observed-then-disappeared.** Consumers that iterate over Query-SPI results (e.g., cursor pagination, repeated aggregations during reporting) MUST tolerate that a record observed in one page or one window MAY be missing from a subsequent page or window read against a different replica; flows that cannot tolerate this MUST consume a plugin whose deployment guide advertises a monotonic-reads or stronger ceiling.
-- **Deactivate cascade atomicity is a plugin-transaction invariant, not a cross-path guarantee.** When `deactivate` returns success, the primary row and every active referencing compensation row have been flipped together in a single backend transaction per `cpt-cf-usage-collector-adr-monotonic-deactivation` and `plugin-spi.md` §"Cross-entity invariants"; this is what the plugin commits, NOT a promise that a subsequent Query-SPI read against any replica observes the post-cascade state. Consumers that need the post-cascade state for an immediate decision MUST use the deactivate ack, not a follow-up query.
+- **Read-after-write flows must not be designed on the query paths.** Admission
+  control, post-emit summary, and immediate-readback dashboards must consume the
+  ingestion ack, which is the only surface the floor binds for write-derived
+  state.
+- **Near-real-time observers poll within the query-latency NFR and tolerate
+  lag.**
+- **Defend against observed-then-disappeared** on the query paths: an entry seen
+  in one page may be missing from a later page read against a different replica.
+- **Raw tailing is best-effort, not a change feed.** `window_end` is
+  emitter-supplied event time, and the live path accepts it back to the
+  configured past tolerance while backfill accepts its whole window. An entry may
+  therefore be inserted at a position a forward `(window_end, id)` cursor has
+  already passed. This is orthogonal to replica lag — it occurs even on a
+  fully-converged single node. **A consumer that must not miss entries reads the feed.** The feed orders by
+  `acceptance_sequence` and therefore has no such hole. Such a consumer can
+  also re-aggregate over a closed window.
 
-**Plugin SPI floor parity.** The Plugin SPI's floor is the same floor stated above; `plugin-spi.md` §"Consistency profile" carries it on the SPI side and obliges every active plugin's deployment guide to publish its actual profile (e.g., "sync, single-node", "bounded staleness ≤ N ms", "eventual, no bound"). A typed `consistency_profile()` SPI method is **deferred for v1**: the Plugin SPI surface does not change in this ADR, and the method MAY be added additively under `cpt-cf-usage-collector-adr-contract-stability` (ADR-0006) once a real consumer demand surfaces.
+**The feed is the exception, and deliberately so.** Unlike the query paths, the feed guarantees a **consistent snapshot**. A
+paginated scan does not observe entries appearing, disappearing, or changing
+mid-scan. The one exception is append-only arrivals, which the watermark
+returned with each page demarcates. The append-only ledger purchases that guarantee. No entry is ever mutated, and
+a correction arrives as a later entry rather than a change to a delivered one.
+A scan therefore has nothing to observe changing. Feed *freshness* remains a
+plugin-readiness gate (`nfr-billing-feed-freshness`). Feed *consistency* is a
+gear-level guarantee.
 
-**Tie-back to the NFR.** This contract is the read-side consequence of `cpt-cf-usage-collector-nfr-workload-isolation`: the isolated-pool routing the NFR allocates is the structural source of the queryability lag the floor names. The NFR's load-test verification (ingestion p95 ≤ 200ms under concurrent query) verifies the workload-isolation posture; the floor here covers what the workload-isolation posture COSTS on the read side, and that cost is paid by consumers in the form of the rules above rather than by the gear in the form of cross-path synchronization.
+**Plugin SPI floor parity.** The same floor binds the SPI. Nothing a plugin
+does relaxes or strengthens it. Each plugin crate's deployment guide MUST
+publish that plugin's actual consistency profile. A consumer needing a tighter
+bound can then opt in by coupling to it. Every guide MUST state:
 
-**`gts_id` and `kind` are independent.** Per the ADR-0012 2026-06-08 amendment, the `gts_id` does not encode kind; `gts_id` derives structurally from the reserved abstract base `gts.cf.core.uc.usage_record.v1~`, and the closed `kind: UsageKind` enum on the catalog row carries the counter / gauge classification. The two fields are independently validated (`UsageTypeGtsId::new` boundary for `gts_id`; `UsageKind::from_str` handler-boundary parse for `kind`); there is no "wrong kind for this gts_id" failure mode because the two are orthogonal.
+1. whether ingestion and query land on the same backend pool or on isolated
+   pools, and the expected upper bound on query-path lag
+2. **acceptance → feed visibility, p95.** A deployment whose plugin publishes
+   no qualifying ceiling here MUST NOT feed a charging consumer
+   (`nfr-billing-feed-freshness`, ≤ 5 minutes p95)
+3. **acceptance → aggregate visibility**, where the aggregate is materialised,
+   **and separately how an accepted invalidation reaches it**. Withdrawal
+   obliges recomputation, so a single number for both overstates one of them
+   (`nfr-aggregate-freshness`)
+4. whether monotonic reads per `(tenant_id, gts_type_id)` hold by default, and
+   which knobs preserve them
+5. the retention it enforces per GTS type. The floor is the backfill window
+   plus one replay horizon, and the retention must meet it for every type a
+   charging consumer reads
+6. the sustained bulk read rate it can serve the feed at, against
+   `nfr-replay-throughput`, and the procedure for deploying outside the
+   documented posture.
+
+A consumer depending on a tighter bound than the gear floor couples itself to
+one plugin's ceiling. That coupling MUST be recorded in the consumer's own
+design document, so a plugin substitution surfaces as a known impact rather
+than a latent regression. Weakening a published bound is a breaking change for
+every coupled consumer. Profile discovery is documentation-only in v1: there is
+no typed `consistency_profile()` method.
 
 ### 3.11 Performance and Operations Architecture
 
-- [ ] `p2` - **ID**: `cpt-cf-usage-collector-design-performance-operations-architecture`
-
 #### 3.11.1 Performance Patterns (PERF-DESIGN-001)
 
-The collector holds no gear-owned cache, no merge core, and no in-process result caching: the usage-type catalog SoR is the plugin-owned `usage_type_catalog` reached per call through the Plugin SPI, and query semantics are server-side aggregation pushdown — the core never fans out per-row reads. Gear instances are async (Rust); pooling against the active plugin is plugin-host-owned. Per-request memory is bounded by the metadata size limit (`cpt-cf-usage-collector-fr-record-metadata`, default 8 KiB) and by the batch and query caps in `usage-collector-v1.yaml`, enforced at the wire boundary.
-
-The aggregation path resolves the queried usage type (existence **and** `kind`) through a single `get_usage_type` catalog SPI read before dispatch. The per-kind aggregation-op guard (`require_op_allowed_for_kind`) reads `kind` from that same lookup, so it adds no round-trip beyond the catalog existence check already required on every aggregation query — consistent with the no-cache posture above, that read is deliberately not memoized (a `gts_id`→`kind` cache is avoided so the plugin remains the single catalog SoR). This is an accepted per-request cost within the aggregated-query p95 budget ([§3.11.2](#3112-latency-budgets-perf-design-003)); if aggregation QPS later dominates plugin load, folding `kind` into the aggregate SPI response (rather than a gateway cache) is the preferred lever.
+Three patterns carry the budgets. **Aggregation pushdown**: the fold and every
+grouping dimension execute in the plugin's native acceleration structures. The
+gear never iterates rows. **Declaration caching**: steady-state type resolution
+is an in-memory lookup, so ingestion does not pay a registry round-trip.
+**Batch ingestion**: a first-class SPI method so each plugin drives its native
+bulk-write path.
 
 #### 3.11.2 Latency Budgets (PERF-DESIGN-003)
 
 Canonical NFR p95 budgets:
 
-| Operation                               | NFR ID                                         | Total p95 |
-| --------------------------------------- | ---------------------------------------------- | --------- |
-| Ingestion                               | `cpt-cf-usage-collector-nfr-ingestion-latency` | 200 ms    |
-| Aggregated query (30-day single-tenant) | `cpt-cf-usage-collector-nfr-query-latency`     | 500 ms    |
+| Operation | NFR ID | Total p95 |
+| --- | --- | --- |
+| Ingestion | `cpt-cf-usage-collector-nfr-ingestion-latency` | 200 ms |
+| Aggregated query (30-day single-tenant) | `cpt-cf-usage-collector-nfr-query-latency` | 500 ms |
 
-Aggregation pushdown is plugin-owned and dominates query latency; per-component PDP enforcement (one PDP authorization call per operation) dominates ingestion latency. Plugins MUST publish their own SPI-internal budgets in their deployment guide.
+SPI sub-allocations: **75 ms** of the ingestion budget and **425 ms** of the
+aggregated-query budget. Per-component PDP enforcement dominates ingestion
+latency. Aggregation pushdown dominates query latency. Type resolution adds no
+round-trip in the steady state — a cache miss is a cold-path cost, not a budget
+line. DESIGN carves no sub-allocation for batched ingestion, raw paging, or feed
+reads. For those, plugins **SHOULD** reserve ≥ 25 ms of the end-to-end envelope for
+gateway, PDP, and core overhead. Plugins must publish their own SPI-internal
+budgets in their deployment guide.
 
 #### 3.11.3 Resource Efficiency (PERF-DESIGN-004)
 
-- **CPU**: Gear instances are stateless and CPU-bound by per-component PDP enforcement (one PDP authorization call per operation) plus JSON encoding; authentication CPU cost is owned upstream by the ToolKit gateway. Horizontal scale-out is the canonical lever.
-- **Memory**: Bounded by per-request metadata caps ([§3.11.1](#3111-performance-patterns-perf-design-001)); the gateway holds no long-lived catalog state.
-- **Storage**: Not applicable as a gear-owned concern — durable storage is plugin-owned. Plugin storage sizing is operator-tuned.
-- **Network**: Inbound bandwidth is gateway-shaped; egress to the active plugin is plugin-host-shaped. The gear does not introduce additional fanout.
+The gear holds no entry state and two bounded caches: resolved declarations
+(bounded by the number of registered types) and the plugin binding (a single
+identifier). Memory growth is therefore driven by in-flight request
+concurrency, not by data volume. Storage growth is plugin-owned. The dominant
+driver is per-entry metadata, bounded by the configurable size cap.
 
 #### 3.11.4 Observability Architecture Applicability (OPS-DESIGN-002)
 
-Per `cpt-cf-usage-collector-principle-otlp-push-emission` ([§2.1](#21-design-principles)), operational telemetry is pushed via OTLP from ToolKit's global `SdkMeterProvider`; the gear declares instruments on a scoped `Meter` at bootstrap and does not expose a `/metrics` scrape endpoint. Downstream pipeline concerns (log shippers, trace exporters, OTLP collector and backend selection, dashboards, retention) are platform-config-owned through the `[opentelemetry]` block.
-
-Trace context is propagated by ToolKit middleware on all three surfaces (REST, SDK, Plugin SPI); the resulting `trace_id` is recorded on every structured operational event and is the correlation key tying logs, metrics, and traces — satisfying the correlation requirement in `cpt-cf-usage-collector-nfr-operational-visibility`.
-
-**Platform health probes** (host-provided): The Usage Collector does **not** expose gear-local liveness or readiness HTTP endpoints. Platform liveness and readiness probes are handled by the ToolKit host above the gear boundary; the collector contributes only the internal structural-readiness facts that surface as the gauges `uc_plugin_ready` and `uc_pdp_ready` in [§3.11.5](#3115-operational-metric-inventory-ops-design-002), pushed via OTLP. Operators consume those gauges (and the alert sources in [§3.11.6](#3116-alerting-and-error-budget-architecture-ops-design-005)) rather than a per-gear health URL.
+Instruments are constructed via `opentelemetry::global::meter_with_scope` at
+bootstrap and exported through ToolKit's `SdkMeterProvider` over OTLP. W3C trace context (`traceparent` required, `tracestate` optional) propagates
+on the ambient span. The Plugin Host opens that span around each dispatch, so
+end-to-end traces span gateway → core → plugin → backend. Every accepted and rejected operation
+emits a structured log entry carrying the propagated `correlation_id`.
 
 #### 3.11.5 Operational Metric Inventory (OPS-DESIGN-002)
 
-The gear emits the operational metrics inventoried below to realize the seven observable signals mandated by `cpt-cf-usage-collector-nfr-operational-visibility` plus the four architecture-derived alert sources named in [§3.11.6](#3116-alerting-and-error-budget-architecture-ops-design-005) (workload-isolation, PDP unavailability, deactivation-path health, authorization-denial anomaly). Instrument names are the **full, literal Prometheus names** under a substitutable `uc_` prefix (the leading namespace segment is fixed at adapter construction), following the account-management gear's metric-adapter naming convention. Histogram bucket layouts bracket the NFR p95 budgets in [§3.11.2](#3112-latency-budgets-perf-design-003); the instrument names, bucket layouts, and label vocabularies are part of the architectural contract.
+Instrument names are the full literal Prometheus names under a substitutable
+`uc_` prefix. Histogram bucket layouts bracket the
+[§3.11.2](#3112-latency-budgets-perf-design-003) budgets. Names, buckets, and
+label vocabularies are part of the architectural contract.
 
 ##### Counters
 
-| Instrument (Prometheus name)               | Kind    | Unit | Labels                                                                                                                                                                                                                                                   | Emitting component                                                                                                                                                                                                                                                       | Emitted when                                                                                                                                                                                                                                                                                                        |
-| -------------------------------------- | ------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uc_ingestion_requests_total`   | counter | —    | `outcome` (`accepted`, `partial`, `rejected`), `error_category` (`none`, `missing_security_context`, `authz`, `unknown_usage_type`, `semantics_violation`, `metadata_size`, `plugin_error`)                                                                              | `cpt-cf-usage-collector-component-ingestion-gateway`                                                                                                                                                                                                                     | Every batch-submission request completes: `accepted` maps to HTTP 200 (all records accepted or deduplicated), `partial` to HTTP 207 (at least one per-record rejection), `rejected` to a request-wide Problem; `error_category` carries the request-wide rejection reason and is `"none"` for `accepted` / `partial` — per-record reasons live on `uc_ingestion_records_total`                                                                                                                                                                                                        |
-| `uc_query_requests_total`       | counter | —    | `query_kind` (`aggregated`, `raw`), `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `missing_security_context`, `authz`, `unknown_usage_type`, `cursor_decode`, `order_mismatch`, `filter_mismatch`, `query_budget`, `plugin_error`) | `cpt-cf-usage-collector-component-query-gateway`                                                                                                                                                                                                                         | Every query attempt completes; `error_category="none"` is emitted only when `outcome="success"`, aligning the query path with the canonical Problem discriminators from `cpt-cf-usage-collector-principle-canonical-errors` |
-| `uc_pdp_failures_total`         | counter | —    | `operation` (`ingest`, `query_raw`, `query_aggregated`, `get_record`, `deactivate`, `usage_type_create`, `usage_type_get`, `usage_type_list`, `usage_type_delete`), `cause` (`unreachable`, `timeout`)                                                                                                                                                                                                                       | any domain component performing PDP enforcement (`cpt-cf-usage-collector-component-ingestion-gateway`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-deactivation-handler`, `cpt-cf-usage-collector-component-usage-type-catalog`) | PDP authorization call against `authz-resolver` (via the per-component PDP helper) fails or times out; PDP denials are not failures and are surfaced via `outcome="denied"` on the ingestion / query counters. **v1 `cause` mapping:** the bootstrap-bound `PolicyEnforcer` surfaces `AuthZResolverError` (`NoPluginAvailable` / `ServiceUnavailable` / `Internal`), which carries no timeout discriminator, so every such failure maps to `cause="unreachable"`; `cause="timeout"` is **reserved** for a future host-side PDP-dispatch deadline (none exists in v1) and is not emitted until that deadline is added                                                                                                          |
-| `uc_plugin_accept_errors_total` | counter | —    | `operation` (Plugin SPI method name: `create_usage_record`, `create_usage_records`, `query_aggregated_usage_records`, `list_usage_records`, `get_usage_record`, `deactivate_usage_record`, `create_usage_type`, `get_usage_type`, `list_usage_types`, `delete_usage_type`), `error_category` (`unready`, `backend_error`, `timeout`)                                                                                                                                                                           | `cpt-cf-usage-collector-component-plugin-host`                                                                                                                                                                                                                           | Active plugin returns a deterministic backend-classified error on persistence, query, deactivation, or UsageType-lifecycle dispatch                                                                                                                                                                                 |
-| `uc_ingestion_records_total` | counter | — | `outcome` (`accepted`, `duplicate`, `rejected`), `record_kind` (`usage`, `compensation`), `error_category` (`none`, `authz`, `unknown_usage_type`, `semantics_violation`, `metadata_size`, `idempotency_conflict`, `plugin_error`) | `cpt-cf-usage-collector-component-ingestion-gateway` | One increment per record in every batch acknowledgement. This is the instrument that carries the records/sec throughput NFR — `cpt-cf-usage-collector-nfr-throughput-profile` is stated in records, not requests — plus the compensation share (`record_kind="compensation"`, per `cpt-cf-usage-collector-adr-usage-compensation`); `error_category="none"` is emitted unless `outcome="rejected"`. **`outcome="duplicate"` is reserved:** the Method 1/2 SPI returns `Ok(UsageRecord)` indistinguishably for a fresh persist and an exact-equality idempotent replay (`cpt-cf-usage-collector-adr-mandatory-idempotency`), so the gateway cannot label the replay `duplicate` — the value stays in this counter's label vocabulary but is not emitted until the SPI exposes a dedup signal. It is a metric label only: the wire `CreateUsageRecordResult` union has exactly two branches, `accepted` and `rejected`, and a replay is acknowledged as `accepted` |
-| `uc_deactivation_requests_total` | counter | — | `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `missing_security_context`, `authz`, `not_found`, `already_inactive`, `plugin_error`) | `cpt-cf-usage-collector-component-deactivation-handler` | Every deactivation attempt completes; `error_category="none"` is emitted only when `outcome="success"`; the vocabulary mirrors the deactivate path's canonical Problem discriminators (`ALREADY_INACTIVE`, `NotFound`; `ServiceUnavailable` / `Internal` plugin faults collapse to `plugin_error`) |
-| `uc_usage_type_requests_total` | counter | — | `operation` (`create`, `get`, `list`, `delete`), `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `missing_security_context`, `authz`, `validation`, `conflict`, `not_found`, `referenced`, `plugin_error`) | `cpt-cf-usage-collector-component-usage-type-catalog` | Every UsageType-lifecycle attempt completes; `error_category="none"` is emitted only when `outcome="success"`; `conflict` covers duplicate registration on create (HTTP 409), `referenced` covers the referentially-unsafe delete rejection (HTTP 409) |
-| `uc_authz_decisions_total` | counter | — | `operation` (same nine-value gateway set as on `uc_pdp_failures_total`), `decision` (`permit`, `deny`) | any domain component performing PDP enforcement (same four components as `uc_pdp_failures_total`) | Every completed PDP authorization records its **effective gear decision** (not merely the raw scope returned by the PDP). `permit` is recorded only when the PDP permits **and** the gear's post-permit gate admits the request — the per-record attribution gate on ingestion / deactivation and the scope→OData projection on query / list. When PDP constraints are required, the PDP returns a *permit-with-constraints* that the SDK does not auto-match, so a record attributed to a tenant outside the granted scope (or an un-projectable row scope) comes back as a permit-with-scope yet is fail-closed **denied** by the gate and recorded as `deny` — otherwise the reconnaissance signal below would be mislabeled `permit`. A hard PDP deny / uncompilable constraint records `deny` at the boundary; PDP failures and timeouts are NOT decisions and land on `uc_pdp_failures_total`. Exactly one decision (or one failure) is recorded per authorization, so the ratio can never double-count. The per-operation deny share is consumed by the deny-anomaly alert in [§3.11.6](#3116-alerting-and-error-budget-architecture-ops-design-005), which therefore observes cross-tenant attribution attempts, not only outright PDP denials |
+| Instrument | Labels | Emitting component | Emitted when |
+| --- | --- | --- | --- |
+| `uc_ingestion_requests_total` | `outcome` (`accepted`, `partial`, `rejected`), `error_category` (`none`, `missing_security_context`, `authz`, `unresolved_type`, `validation`, `metadata_size`, `quota`, `plugin_error`) | ingestion-gateway | Every submission request completes. `error_category` carries the request-wide reason and is `none` for `accepted`/`partial`. |
+| `uc_ingestion_records_total` | `outcome` (`accepted`, `duplicate`, `rejected`), `entry_type` (`record`, `invalidation`), `origin` (`live`, `backfill`), `error_category` (`none`, `authz`, `unresolved_type`, `validation`, `idempotency_conflict`, `invalidation_rule`, `plugin_error`) | ingestion-gateway | One increment per entry. **This carries the throughput NFR** — the profile is stated in entries, not requests — plus the correction and backfill shares. A period-bound rejection is `validation` for either `entry_type`, since the bound belongs to the path; `invalidation_rule` covers the copy, reference and at-most-one rules alone. |
+| `uc_query_requests_total` | `query_kind` (`aggregated`, `raw`, `point`), `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `missing_security_context`, `authz`, `unresolved_type`, `cursor_decode`, `undeclared_field`, `missing_time_range`, `query_budget`, `plugin_error`) | query-gateway | Every query attempt completes. |
+| `uc_feed_requests_total` | `outcome` (`success`, `denied`, `error`), `error_category` (`none`, `authz`, `cursor_decode`, `cursor_beyond_retention`, `watermark_decode`, `plugin_error`) | feed-gateway | Every feed page request completes. `cursor_beyond_retention` is the replay-refusal signal. |
+| `uc_type_resolution_total` | `result` (`cache_hit`, `cache_miss`, `restored`, `unresolved`, `registry_error`) | type-resolver | Every declaration resolution. The `cache_hit` share is the signal that the ingestion budget assumption holds. A sustained `restored` rate means `types-registry` is losing declarations. |
+| `uc_declaration_mirror_write_failures_total` | — | type-resolver | A declaration resolved but not mirrored. Each one is a type that a later registry restart will not restore. Ingestion is unaffected. |
+| `uc_pdp_failures_total` | `operation` (`ingest`, `backfill`, `query_raw`, `query_aggregated`, `get_record`, `read_feed`, `reconciliation`), `cause` (`unreachable`, `timeout`) | any component performing PDP enforcement | PDP call fails or times out. Denials are not failures. `cause="timeout"` is reserved until a host-side PDP deadline exists. |
+| `uc_authz_decisions_total` | `operation` (same set), `decision` (`permit`, `deny`) | any component performing PDP enforcement | Every completed authorization records the **effective gear decision**: `permit` only when the PDP permits *and* the post-permit gate admits. Exactly one decision or one failure per authorization. |
+| `uc_plugin_accept_errors_total` | `operation` (SPI method name), `error_category` (`unready`, `backend_error`, `timeout`) | plugin-host | Active plugin returns a classified error. |
 
 ##### Histograms
 
-| Instrument (Prometheus name)            | Kind      | Unit             | Labels                             | Buckets                                          | Emitting component                                   | Emitted when                                                                                                                                                     |
-| ----------------------------------- | --------- | ---------------- | ---------------------------------- | ------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uc_ingestion_duration_seconds` | histogram | seconds | —                                  | 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0 | `cpt-cf-usage-collector-component-ingestion-gateway` | Ingestion request completes; bucket layout brackets the `cpt-cf-usage-collector-nfr-ingestion-latency` 200 ms p95 budget                                         |
-| `uc_query_duration_seconds`     | histogram | seconds | `query_kind` (`aggregated`, `raw`) | 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0        | `cpt-cf-usage-collector-component-query-gateway`     | Query completes; bucket layout brackets the `cpt-cf-usage-collector-nfr-query-latency` 500 ms p95 budget for the canonical 30-day single-tenant aggregated query |
-| `uc_deactivation_duration_seconds` | histogram | seconds | — | 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0 | `cpt-cf-usage-collector-component-deactivation-handler` | Deactivation request completes; single-record write with an atomic depth-1 cascade — the bucket layout mirrors the ingestion write path (no dedicated NFR budget exists for deactivation) |
-| `uc_plugin_call_duration_seconds` | histogram | seconds | `operation` (Plugin SPI method name, same ten-value set as on `uc_plugin_accept_errors_total`) | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0 | `cpt-cf-usage-collector-component-plugin-host` | Every Plugin SPI dispatch completes (success or error); separates plugin-owned time from gear overhead so the [§3.11.2](#3112-latency-budgets-perf-design-003) budget breaches are attributable — aggregation pushdown dominates query latency, and the persist dispatch is the SPI share of the ingestion budget |
-| `uc_pdp_duration_seconds` | histogram | seconds | `operation` (same nine-value gateway set as on `uc_pdp_failures_total`) | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 | any domain component performing PDP enforcement (same four components as `uc_pdp_failures_total`) | Every per-component PDP authorization call completes; per-component PDP enforcement dominates ingestion latency per [§3.11.2](#3112-latency-budgets-perf-design-003), so this histogram attributes the PDP share of the 200 ms budget |
-| `uc_ingestion_batch_size` | histogram | — (records per request) | — | 1, 2, 5, 10, 20, 50, 100 | `cpt-cf-usage-collector-component-ingestion-gateway` | Every batch submission is received; the upper bucket equals the wire batch cap (100 records per request in `usage-collector-v1.yaml`) — input for capacity and cost analysis |
-| `uc_record_metadata_bytes` | histogram | bytes | — | 256, 512, 1024, 2048, 4096, 8192 | `cpt-cf-usage-collector-component-ingestion-gateway` | Recorded for every submitted record that carries metadata; the upper bucket equals the 8 KiB metadata cap (`cpt-cf-usage-collector-fr-record-metadata`) — observes the dominant plugin-storage growth driver |
-| `uc_query_result_rows` | histogram | — (rows per response) | `query_kind` (`aggregated`, `raw`) | 1, 10, 50, 100, 500, 1000, 10000, 100000 | `cpt-cf-usage-collector-component-query-gateway` | Query completes successfully; records the raw page size (capped at 1000 by `$top`) or the aggregated group count (capped at 100000 per `usage-collector-v1.yaml`) — read together with `uc_query_duration_seconds`, this separates "slow because large" from "slow because degraded" |
+| Instrument | Unit | Labels | Buckets | Emitting component |
+| --- | --- | --- | --- | --- |
+| `uc_ingestion_duration_seconds` | seconds | `origin` (`live`, `backfill`) | 0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0 | ingestion-gateway |
+| `uc_query_duration_seconds` | seconds | `query_kind` (`aggregated`, `raw`, `point`) | 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0, 5.0 | query-gateway |
+| `uc_feed_page_duration_seconds` | seconds | — | 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0 | feed-gateway |
+| `uc_plugin_call_duration_seconds` | seconds | `operation` (SPI method name) | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0 | plugin-host |
+| `uc_pdp_duration_seconds` | seconds | `operation` (same nine-value set) | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5 | any PDP-enforcing component |
+| `uc_type_resolution_duration_seconds` | seconds | `result` (`cache_hit`, `cache_miss`) | 0.0001, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5 | type-resolver |
+| `uc_ingestion_batch_size` | entries/request | — | 1, 2, 5, 10, 20, 50, 100 | ingestion-gateway |
+| `uc_record_metadata_bytes` | bytes | — | 256, 512, 1024, 2048, 4096, 8192 | ingestion-gateway |
+| `uc_query_result_rows` | rows/response | `query_kind` (`aggregated`, `raw`) | 1, 10, 50, 100, 500, 1000, 10000, 100000 | query-gateway |
+| `uc_feed_page_entries` | entries/page | — | 1, 10, 50, 100, 500, 1000, 5000 | feed-gateway |
 
 ##### Gauges
 
-| Instrument (Prometheus name)                  | Kind  | Unit | Labels                             | Emitting component                                                                                                                                                                                                                                                       | Update trigger                                                                                                                                                                                                                                                                                                                                                                                                             |
-| ----------------------------------------- | ----- | ---- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uc_plugin_ready`            | gauge | —    | —                                  | `cpt-cf-usage-collector-component-plugin-host`                                                                                                                                                                                                                           | Set to `1` iff the active plugin binding is resolved structurally — the host's `GtsPluginSelector` has cached an instance id AND `ClientHub::try_get_scoped::<dyn UsageCollectorPluginV1>` returns `Some` under `ClientScope::gts_id(&instance_id)`; set to `0` otherwise. This is a structural check, not a plugin-side probe (the SPI exposes no `ready()` method). |
-| `uc_pdp_ready`               | gauge | —    | —                                  | any domain component performing PDP enforcement (`cpt-cf-usage-collector-component-ingestion-gateway`, `cpt-cf-usage-collector-component-query-gateway`, `cpt-cf-usage-collector-component-deactivation-handler`, `cpt-cf-usage-collector-component-usage-type-catalog`) | Set to `1` while the `authz-resolver` client is bound in the bootstrap-constructed `PolicyEnforcer`; set to `0` otherwise. A structural bootstrap-binding fact (unlike `uc_plugin_ready`, the AuthZ client is resolved once at gear bootstrap, not lazily per call), not a resolver-side probe. Because the binding is established at construction, this gauge is effectively a constant post-bootstrap readiness signal.                                                                                                                                                                                 |
-| `uc_query_inflight`          | gauge | —    | `query_kind` (`aggregated`, `raw`) | `cpt-cf-usage-collector-component-query-gateway`                                                                                                                                                                                                                         | Incremented on query-gateway entry once authorization composes, decremented on query completion or failure; gives a current-state in-flight count for the workload-isolation alert in [§3.11.6](#3116-alerting-and-error-budget-architecture-ops-design-005)                                                                                                                                                               |
-| `uc_usage_types` | gauge | —    | —                                  | `cpt-cf-usage-collector-component-usage-type-catalog`                                                                                                                                                                                                                    | Set to the current entry count of the plugin-owned `usage_type_catalog` table, read by a periodic gear-lifecycle task (`serve`, 60 s) that fully paginates `list_usage_types` over the Plugin SPI. Best-effort — a failed, timed-out, or partial read leaves the prior value. Populated within one interval of plugin readiness (no dependence on a create/delete). **Per-instance**: each gear replica reports the whole-catalog count independently — see the aggregation note below                                                              |
-
-> **`uc_usage_types` aggregation.** The gauge is a whole-catalog count re-read independently by every gear replica, so all replicas converge to the same value each interval. A multi-replica dashboard or alert MUST aggregate this series with `max` or `last`, **never `sum`** — summing would multiply the catalog count by the replica count. A per-instance delta counter is deliberately not used: independent per-instance deltas cannot reconcile against the shared plugin-owned backend.
-
-Process CPU / RAM consumption is observed through platform infrastructure metrics (Kubernetes scrape path via the OTel Collector), not through gear-emitted instruments.
+| Instrument | Labels | Emitting component | Update trigger |
+| --- | --- | --- | --- |
+| `uc_plugin_ready` | — | plugin-host | `1` iff the selector has cached an instance id AND `try_get_scoped` returns `Some`. A structural check, not a plugin probe — the SPI exposes no `ready()`. |
+| `uc_pdp_ready` | — | any PDP-enforcing component | `1` while the `authz-resolver` client is bound in the bootstrap-constructed `PolicyEnforcer`. A structural bootstrap fact. |
+| `uc_query_inflight` | `query_kind` (`aggregated`, `raw`) | query-gateway | Incremented on entry once authorization composes. Feeds the workload-isolation alert. |
+| `uc_resolved_types` | — | type-resolver | Current entry count of the resolved-declaration cache. **Per-instance** — aggregate with `max` or `last`, never `sum`. |
+| `uc_declaration_cache_age_seconds` | — | type-resolver | Age of the oldest cached declaration since its last successful refresh. Backs the cache-staleness signal mandated by `nfr-operational-visibility`. |
 
 ##### Label cardinality
 
-All labels are bounded to the enumerated value sets above. Unbounded identifiers — `tenant_id`, `resource_id`, `subject_id`, UsageType `gts_id`, `request_id`, `trace_id`, idempotency keys — **MUST NOT** be used as metric labels: they belong in structured logs and distributed traces, not in metric dimensions. `MetricsConfig.cardinality_limit` in the `[opentelemetry]` configuration block acts as the SDK-level safety net: the `SdkMeterProvider` caps unique attribute combinations per instrument and drops further series rather than letting an unexpected attribute explode the time-series space.
+All labels are bounded to the enumerated sets above. Unbounded identifiers —
+`tenant_id`, `resource_id`, `subject_id`, `gts_type_id`, `request_id`,
+`trace_id`, idempotency keys — **must not** be used as metric labels. They
+belong in structured logs and traces. `MetricsConfig.cardinality_limit` in the
+`[opentelemetry]` block is the SDK-level safety net.
 
-Plugins MAY expose additional backend-internal metrics under their own prefix (for example `uc_clickhouse_*` for an active ClickHouse plugin); those series are owned by the active plugin's deployment guide and are not part of this gear's contract.
+Plugins may expose backend-internal metrics under their own prefix. Those series
+are owned by the plugin's deployment guide.
 
-#### 3.11.6 Alerting and Error-Budget Architecture (OPS-DESIGN-005)
+#### 3.11.6 Alerting and Error-Budget Architecture (OPS-DESIGN-004)
 
-Alerting thresholds are aligned to the NFR SLOs already in [§1.2](#12-architecture-drivers) and consume the metrics inventoried in [§3.11.5](#3115-operational-metric-inventory-ops-design-002). The first five rows are the PRD-mandated alert categories from `cpt-cf-usage-collector-nfr-operational-visibility`; the remaining four are architecture-derived alerts added to cover workload-isolation, fail-closed posture, deactivation-path health, and authorization-denial anomalies:
+| Signal | NFR / Principle | Threshold | Backing metric(s) |
+| --- | --- | --- | --- |
+| Ingestion-latency breach | `nfr-ingestion-latency` | p95 > 200 ms over 5 min | `uc_ingestion_duration_seconds{origin="live"}` |
+| Throughput cliff | `nfr-throughput-profile` | sustained drop ≥ 50% from trailing 1-hour baseline | rate(`uc_ingestion_records_total{outcome="accepted"}`) |
+| Availability-budget burn | `nfr-availability` | ≥ 25% of monthly budget in any 24-hour window | `uc_plugin_ready` AND rate(`uc_plugin_accept_errors_total`) |
+| Query-latency breach | `nfr-query-latency` | p95 > 500 ms over 15 min | `uc_query_duration_seconds{query_kind="aggregated"}` |
+| Plugin-unready | `nfr-availability` | structural readiness fails ≥ 1 min | `uc_plugin_ready` |
+| Workload-isolation breach | `nfr-workload-isolation` | ingestion p95 > 200 ms over ≥ 5 min while ≥ 100 aggregation queries are in flight | `uc_ingestion_duration_seconds` AND `uc_query_inflight{query_kind="aggregated"}` |
+| PDP unavailability | `principle-fail-closed` | > 1% PDP failures over 5 min | rate(`uc_pdp_failures_total`) over total requests. Corroborated by `uc_pdp_ready` |
+| **Type-resolution failure** | `fr-usage-type-resolution`, `nfr-operational-visibility` | `unresolved` + `registry_error` share > 1% over 5 min | rate(`uc_type_resolution_total{result=~"unresolved\|registry_error"}`) |
+| **Declaration-cache staleness** | `nfr-operational-visibility` | oldest cached declaration exceeds the configured refresh interval by ≥ 2× | `uc_declaration_cache_age_seconds` |
+| **Feed replay refusal** | `fr-billing-usage-feed` | any sustained occurrence over 15 min | rate(`uc_feed_requests_total{error_category="cursor_beyond_retention"}`) — a consumer is falling behind the retention floor |
+| AuthZ deny-rate anomaly | `principle-fail-closed` | per-operation deny share ≥ 3× trailing 24-hour baseline over 15 min | `uc_authz_decisions_total{decision="deny"}` over total, per `operation` |
 
-| Signal                                           | NFR / Principle ID                                                                               | Alert threshold                                                                                                                                                                      | Backing metric(s) from [§3.11.5](#3115-operational-metric-inventory-ops-design-002)                                                                                                   | Burn-rate window                                                     |
-| ------------------------------------------------ | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| Ingestion-latency breach                         | `cpt-cf-usage-collector-nfr-ingestion-latency`                                                   | p95 > 200 ms over 5 min                                                                                                                                                              | `uc_ingestion_duration_seconds`                                                                                                                                                   | n/a — latency SLO has no error budget; alert on SLO breach           |
-| Throughput cliff                                 | `cpt-cf-usage-collector-nfr-throughput-profile`                                                  | sustained drop ≥ 50% from trailing 1-hour baseline                                                                                                                                   | rate(`uc_ingestion_records_total{outcome="accepted"}`) — the NFR threshold is stated in records/sec, so the per-record counter (not the batch-request counter) is the backing series                                                                                                                        | n/a — capacity-drop signal, paged when sustained                     |
-| Availability-budget burn                         | `cpt-cf-usage-collector-nfr-availability`                                                        | ≥ 25% of monthly budget consumed in any 24-hour window                                                                                                                               | `uc_plugin_ready` AND rate(`uc_plugin_accept_errors_total`)                                                                                                       | 99.95% monthly availability budget — fast-burn 14.4×, slow-burn 1.0× |
-| Query-latency breach                             | `cpt-cf-usage-collector-nfr-query-latency`                                                       | p95 > 500 ms over 15 min, 30-day single-tenant range                                                                                                                                 | `uc_query_duration_seconds{query_kind="aggregated"}`                                                                                                                              | n/a — latency SLO has no error budget                                |
-| Plugin-unready                                   | `cpt-cf-usage-collector-nfr-availability`                                                        | host's structural readiness fact (`GtsPluginSelector` cached AND `ClientHub::try_get_scoped` returns `Some`) fails to hold for ≥ 1 minute (structural condition, not a plugin probe) | `uc_plugin_ready`                                                                                                                                                        | n/a — readiness signal                                               |
-| Workload-isolation breach (architecture-derived) | `cpt-cf-usage-collector-nfr-workload-isolation`, `cpt-cf-usage-collector-nfr-throughput-profile` | ingestion p95 > 200 ms over a ≥ 5-minute window while ≥ 100 concurrent aggregation queries are active (±10% tolerance per PRD §9)                                                    | `uc_ingestion_duration_seconds` AND `uc_query_inflight{query_kind="aggregated"}`                                                                                     | n/a — isolation signal                                               |
-| PDP unavailability (architecture-derived)        | `cpt-cf-usage-collector-principle-fail-closed`                                                   | > 1% PDP timeouts over 5 min                                                                                                                                                         | rate(`uc_pdp_failures_total`) over rate(`uc_ingestion_requests_total` + `uc_query_requests_total`); current-state corroboration from `uc_pdp_ready` | n/a — fail-closed signal                                             |
-| Deactivation error rate (architecture-derived)   | `cpt-cf-usage-collector-adr-monotonic-deactivation`, `cpt-cf-usage-collector-nfr-availability`   | > 5% over 15 min (PDP denials carry `outcome="denied"` and are already outside the numerator; `already_inactive` completions carry `outcome="error"` and are excluded by the `error_category` predicate — both are caller-side conditions, not path faults)                                        | rate(`uc_deactivation_requests_total{outcome="error", error_category!="already_inactive"}`) over rate(`uc_deactivation_requests_total`) — numerator-only exclusion; denominator is all outcomes                                                                                   | n/a — write-path health signal                                       |
-| AuthZ deny-rate anomaly (architecture-derived)    | `cpt-cf-usage-collector-principle-fail-closed`                                                   | per-operation deny share ≥ 3× its trailing 24-hour baseline, sustained over 15 min                                                                                                   | `uc_authz_decisions_total{decision="deny"}` over `uc_authz_decisions_total`, per `operation`                                                                                          | n/a — security anomaly signal (reconnaissance or misconfigured caller) |
-
-Error-budget governance: the 99.95% monthly availability budget yields ~21.6 minutes of unavailability per month; burn-rate alerting is realized over the OTLP-exported metrics from [§3.11.5](#3115-operational-metric-inventory-ops-design-002). Threshold tuning is owned by the platform observability + on-call rotation, not by the gear itself.
+Error-budget governance: the 99.95% monthly availability budget yields ~21.6
+minutes per month. Burn-rate alerting is realized over the OTLP-exported
+metrics. Threshold tuning is owned by the platform observability and on-call
+rotation.
 
 ### 3.12 Maintainability, Testing, UX, and Integration Architecture
 
 - [ ] `p2` - **ID**: `cpt-cf-usage-collector-design-maintainability-testing-ux-integration`
 
-This subsection captures the gear's testing posture, technical-debt register, and integration-versioning policy. The [§1.3](#13-architecture-layers) tech-stack table above carries a per-layer Maintainability column.
-
 #### 3.12.1 Testing (TEST-DESIGN-001, TEST-DESIGN-002)
 
-The Plugin SPI (`cpt-cf-usage-collector-interface-plugin`) is the canonical testability seam: the core ingestion / query / deactivation / UsageType-lifecycle paths run unchanged against an in-memory test plugin, isolating gear logic from any real storage backend. The per-component PDP-helper call (against `cpt-cf-usage-collector-contract-authz-resolver`) is a secondary seam: test doubles are injected via ClientHub, and tests construct fixture `SecurityContext` values directly (no AuthN double is required — authentication is owned upstream by the ToolKit gateway).
+The Plugin SPI is the canonical testability seam: the core ingestion, query, and
+feed paths run unchanged against an in-memory test plugin. The Type Resolver is the second seam. A fixture declaration set replaces
+`types-registry`. That fixture makes fold, unit, and metadata-surface
+behaviour testable without a live registry. The per-component PDP helper is the third. Test doubles are injected
+via ClientHub and tests construct fixture `SecurityContext` values directly.
 
-| Category    | Scope                                                                                                                                         | Environment / Tooling                                                                                                     |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| Unit        | Core orchestration: semantics enforcement, idempotency check, attribution validation, query-constraint application.                           | `cargo test`; mock PDP + in-memory plugin.                                                                                |
-| Integration | End-to-end through REST + SDK against an in-memory plugin.                                                                                    | Integration target in the gear crate; `docs/toolkit_unified_system/12_unit_testing.md` and `13_e2e_testing.md` patterns. |
-| E2E         | Cross-gear: caller-gear → ToolKit gateway → usage-collector → downstream-consumer.                                                         | `testing/e2e/`; live ToolKit gateway (supplying `SecurityContext`) + live `authz-resolver` double.                         |
-| Performance | Sustained-throughput + p95-latency conformance against `cpt-cf-usage-collector-nfr-throughput`, `nfr-ingestion-latency`, `nfr-query-latency`. | Load-generator targeting the gateway; representative active plugin.                                                       |
-| Security    | Negative tests for unauthenticated calls, cross-tenant attribution, forged usage-type ownership; supply-chain checks on plugin provenance.    | CI security gate + manual review against [§3.9](#39-security-architecture) Threat Modeling.                               |
-| Contract    | OpenAPI diff (REST), Rust trait diff (SDK), Plugin SPI compatibility (compile-time).                                                          | Diff-on-PR gate.                                                                                                          |
-
-Unit / Integration / Contract are owned by the gear team; E2E by platform-integration; Performance by platform-perf; Security by platform-security.
+| Category | Scope | Environment / Tooling |
+| --- | --- | --- |
+| Unit | Identity derivation, idempotency, invalidation rules, period validation, constraint application, fold selection. | `cargo test`. Mock PDP, fixture declarations, in-memory plugin. |
+| Integration | End-to-end through REST and SDK against an in-memory plugin, including feed pagination and replay. | Integration target in the gear crate. |
+| E2E | Cross-gear: caller-gear → gateway → usage-collector → consumer, with a live `types-registry`. | `testing/e2e/`. |
+| Performance | Sustained throughput, p95 latency, and the feed recovery objective. | Load generator. Representative active plugin. |
+| Security | Unauthenticated calls, cross-tenant attribution, forged corrections, existence-oracle probes. | CI security gate plus review against [§3.9.4](#394-threat-modeling-sec-design-005). |
+| Contract | OpenAPI diff (REST), Rust trait diff (SDK), SPI compatibility, and the SPI contract-test suite in [§3.3](#33-api-contracts). | Diff-on-PR gate. |
 
 #### 3.12.2 Known Technical Debt and Runbook (MAINT-DESIGN-002, MAINT-DESIGN-003)
 
-| Debt entry                                                                                       | Why deferred                                                                                                                                                                                                                       | Owner                       | Remediation target                                                                                                               |
-| ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| Gear-emitted audit events for operator-write paths (UsageType register / delete / deactivate). | v1 access trail is composed at the ToolKit gateway (authentication boundary) and at the per-component PDP call. Dedicated audit-emission inside the gear is a forward-looking item per [§4](#4-additional-context).               | usage-collector gear team | Track for a follow-up release once platform audit infrastructure stabilizes contract for gear-side emission.                   |
-| Multi-region deployment story.                                                                   | Not a v1 capability per [§4](#4-additional-context); depends on platform topology.                                                                                                                                                 | platform-topology team      | After platform multi-region milestone lands.                                                                                     |
-| Rate limiting and watermarks.                                                                    | Caller- and operator-tuned at gateway + caller-gear layers per [§4](#4-additional-context).                                                                                                                                      | platform-edge team          | After traffic-shaping product decision.                                                                                          |
-| Dedicated backfill capability (watermarks, late-data coordination, bulk-import method).          | Explicit non-goal in v1 per [§4](#4-additional-context); old event timestamps are still accepted without wall-clock validation and bulk historical import rides the normal batched ingestion path per `domain-model.md` §2.1.      | usage-collector gear team | Re-evaluate when downstream consumers require coordinated historical re-emission beyond what batched ingestion already supports. |
-| Individual record amendment beyond deactivation.                                                 | Intentionally omitted.                                                                                                                                                                                                             | usage-collector gear team | Not planned — deactivation + re-emission is the canonical pattern. (Listed for traceability, not for remediation.)               |
-| Gear-specific runbook at `gears/system/usage-collector/docs/RUNBOOK.md`.                     | v1 on-call procedures follow the active plugin's deployment guide; a gear-specific runbook is authored once operational signals stabilize and the active plugin's deployment guide is finalized. | usage-collector gear team | Before v1 GA.                                                                                                                    |
+| Debt entry | Why deferred | Owner | Remediation target |
+| --- | --- | --- | --- |
+| **The implementation predates this design.** The gear, the SDK crate and the TimescaleDB plugin still implement the superseded model throughout — its entry shape, its correction mechanism, its dedup identity and its type catalog. No list of the differences is kept here: the whole surface is superseded, and a partial list would read as if the rest agreed. This document is normative, and the code is not a second source for any of it. Part of the divergence reaches public SDK API, so an emitter coding against this document does not match the shipped crate until the change lands. | This revision is docs-first by decision. The specs drive the code change rather than describing it. | usage-collector gear team | Next implementation cycle, as one model change rather than a sequence of reconciliations. |
+| **The REST contract is published ahead of its routes.** `usage-collector-v1.yaml` describes the Phase 2 surface, carries `x-contract-status: unreleased`, and the six `openapi_contract_tests` checks that diff it against the registered routes are `#[ignore]`d, so nothing verifies document against runtime for this cycle. | Same docs-first decision. Diffing a Phase 2 document against Phase 1 routes reports the intended change as a defect, and the two surfaces differ in operation set and in the shape of the operations they share, so no subset of the comparison can stay live. The YAML-internal checks, the registry-internal checks, and both operation counts remain enforced. | usage-collector gear team | Next implementation cycle. The marker and the six checks are retired in one change. |
+| DECOMPOSITION and the feature specifications still describe the superseded model. | Quarantined in `artifacts.toml` pending this rewrite. | usage-collector gear team | After this design settles. |
+| Gear-emitted audit events for operator-write paths. | v1 access trail is composed at the gateway and the PDP call. | usage-collector gear team | Once platform audit infrastructure stabilizes a gear-side contract. |
+| Multi-region deployment story. | Not a v1 capability. Depends on platform topology. | platform-topology team | After the platform multi-region milestone. |
+| Bulk and range invalidation. | v1 withdraws one entry per invalidation entry. A predicate-shaped bulk operation interacts with quotas, recomputation scope, and the feed contract (PRD §13). | usage-collector gear team | When an emitter-defect scenario forces it. |
+| Gear-specific runbook. | v1 on-call procedures follow the active plugin's deployment guide. | usage-collector gear team | Before v1 GA. |
 
-Owners are roles, not individuals; remediation targets are release-bound, not date-bound (avoiding stale dates per `STALE-DOC-001`). Until the gear-specific runbook lands (last row above), on-call procedures follow the active plugin's deployment guide (`<active-plugin>/deployment.md`).
+Owners are roles, not individuals. Remediation targets are release-bound.
 
 #### 3.12.3 Event Architecture and User Experience (INT-DESIGN-003, UX-DESIGN-001)
 
-Event architecture is Not applicable in v1: the gear is intentionally synchronous request/response on every public surface ([§3.6](#36-interactions-sequences) sequences confirm this end-to-end). Near-real-time consumers (admission control, live dashboards, rate-of-change alerting) poll the Query SPI within `cpt-cf-usage-collector-nfr-query-latency` — subject to the freshness floor and consumer rules carried by [§3.10](#310-consistency-contract) and `cpt-cf-usage-collector-adr-consistency-contract` (the polled Query SPI surface is eventually consistent with no upper bound at the gear floor, so read-after-write flows MUST use the ingestion ack rather than the Query SPI) — or subscribe at the caller-gear layer where the underlying event originates. The forward-looking shape if push is ever added is documented in [§4](#4-additional-context) and is additive within REST v1 / SDK v1 under `cpt-cf-usage-collector-adr-contract-stability` (ADR-0006). The gear emits operational telemetry events for observability ([§3.11.4](#3114-observability-architecture-applicability-ops-design-002)) but does not publish or subscribe to a business event bus. User experience is Not applicable: the gear is a backend service exposing REST + SDK + Plugin SPI surfaces only and has no end-user UI; UX for the platform consoles that read from this gear belongs to those consoles' own DESIGN documents.
+Event architecture is **not applicable in v1**: every public surface is
+synchronous request/response, and the usage feed is deliberately **pull-based**
+rather than a push channel. Pull over the existing reader contract reuses a
+surface that is already built, and with consumer-side deduplication by entry
+identifier an overlapping replay is harmless. A push surface would also couple
+downstream outages into ingestion. Near-real-time observers poll within
+`nfr-query-latency`, subject to the floor and consumer rules in
+[§3.10](#310-consistency-contract). The gear emits operational telemetry but
+publishes to no business event bus. User experience is not applicable: the gear
+exposes REST, SDK, and SPI surfaces only and has no end-user UI.
 
 #### 3.12.4 Versioning and Deprecation Policy (INT-DESIGN-004)
 
-Versioning and deprecation are governed by `cpt-cf-usage-collector-adr-contract-stability` (ADR-0006): each public surface — REST API, SDK trait, Plugin SPI — versions independently under a major-version stability contract; within a major only additive changes are permitted, breaking changes require a new major, and at most one prior major is supported concurrently per surface. Deprecation flow: mark the affected element `deprecated` in OpenAPI / Rust trait docs at least one minor release before the next major bump, then remove in the next major. Compatibility tests gate every PR against the prior major per surface.
+Each public surface versions independently under
+`cpt-cf-usage-collector-adr-contract-stability`. The contract starts at the 1.0
+release of each surface. From then on, only additive changes ship within a
+major, a breaking change needs a new major, and at most one prior major stays
+supported. Deprecation flow: mark the element `deprecated` in OpenAPI or Rust
+trait docs at least one minor release before the next major, then remove.
+Compatibility tests gate every PR per surface.
+
+No surface has reached 1.0 yet. Until each one does, a breaking change ships in
+place and that surface's compatibility gate stays off.
 
 ## 4. Additional context
 
-The Usage Collector is scoped as a metering substrate. The table below names
-v1 deferrals — each is anchored to a PRD-acknowledged out-of-scope item and
-carries a future-additive hook so later work fits inside
-`cpt-cf-usage-collector-adr-contract-stability` (ADR-0006) without a
-major-version bump on REST v1 or SDK v1.
+The Usage Collector is scoped as a metering substrate. The table below names v1 deferrals. Each one is anchored to a PRD-acknowledged
+out-of-scope item and carries a future-additive hook. Later work therefore
+fits inside `cpt-cf-usage-collector-adr-contract-stability` without a major-
+version bump.
 
 | Topic | v1 stance | Additive hook |
-|---|---|---|
-| **Retention policy** (lifecycle, tiering, archival) | Plugin-owned; gear persists indefinitely from its own perspective and defers physical retention to the active plugin's deployment profile (PRD §4.2, §11). | Plugin-internal — no gear-surface change. |
-| **Multi-region deployment** | Not a v1 capability; cross-region durability, read locality, and conflict resolution remain a platform-topology concern. | Stateless, plugin-backed shape (`cpt-cf-usage-collector-topology-gear-runtime`) layers a future multi-region story without contract breaks. |
-| **Audit events for operator-write paths** (UsageType registration / deletion, event deactivation) | Not emitted; gateway-level access logging covers the access trail. | Dedicated audit-emission capability added later, additive on the SDK and REST surfaces. |
-| **Rate limiting & watermarks** (high-cardinality bursts, late-arrival coordination) | Explicit non-goal; caller- and operator-tuned at gateway / caller-gear layers. | None inside this gear. |
-| **Push / subscribe surface for downstream readers** | Pull-only by design ([§3.5](#35-external-dependencies)); near-real-time consumers poll within `cpt-cf-usage-collector-nfr-query-latency` or subscribe at the caller gear. Reserved-not-built — a push surface must not couple downstream outages into ingestion, and `cpt-cf-usage-collector-adr-pluggable-storage` admits backends with no native change-feed (e.g. ClickHouse). | SSE on REST (`GET /usage-collector/v1/records/stream`) plus a `Stream`-returning SDK method, added once a concrete consumer requirement and fan-out design land together. |
-| **Dedicated backfill capability** (watermarks, late-data coordination, bulk-import beyond batched ingestion) | Explicit non-goal; old event timestamps are accepted without wall-clock validation (`domain-model.md` §2.1), so historical import rides the normal batched ingestion path. | None required — existing batched ingestion is the path. |
-| **Individual record amendment** of `value` / attribution / `metadata` | Intentionally omitted; within-record value mutation is out of scope. The only post-acceptance mutation is the one-way `active → inactive` UsageRecordStatus transition (`cpt-cf-usage-collector-principle-monotonic-deactivation`). Corrections use two primitives: **counter value-reversal** via compensation (`cpt-cf-usage-collector-adr-usage-compensation` / `cpt-cf-usage-collector-fr-usage-compensation`) — an append-only, strictly-negative-`value` UsageRecord with `corrects_id` set — and **cross-kind error retraction** via deactivation (`cpt-cf-usage-collector-adr-monotonic-deactivation` / `cpt-cf-usage-collector-fr-event-deactivation`) with its depth-1 cascade to active referencing compensation rows. | Future work refines compensation and downstream consumers, not stored-row mutation. |
+| --- | --- | --- |
+| **Caller-scoped reconciliation** | Not served. Reconciliation reports the `(tenant, gts_type)` scope only, because the tenant plane carries no calling-gear identity. | Widening the `scope` enum is additive for a request parameter. A caller field on the SPI record is additive too. |
+| **Retention mechanics** | Declared per GTS type, enforced by the plugin. The gear holds the floor as a plugin-readiness condition, not a gear-side sweep. | Plugin-internal — no gear-surface change. |
+| **Multi-region deployment** | Not a v1 capability. Cross-region durability, read locality, and conflict resolution are platform-topology concerns. | The stateless, plugin-backed shape layers a multi-region story without contract breaks. |
+| **Audit events for operator-write paths** | Not emitted. Gateway-level access logging covers the trail. | Dedicated audit emission added later, additive on SDK and REST. |
+| **Push / subscribe surface** | Pull-only by design. Reserved-not-built: a push surface must not couple downstream outages into ingestion, and the pluggable-storage ADR admits backends with no native change feed. | SSE on REST plus a `Stream`-returning SDK method, once a concrete consumer requirement and fan-out design land together. |
+| **Bulk and range invalidation** | One entry per invalidation entry. The under-served case — an emitter defect producing many wrong entries — interacts with quotas, recomputation scope, and the feed contract, since a consumer cannot deduplicate a predicate by entry identifier. | A predicate-shaped operation, additive on REST and SDK. |
+| **Import beyond the backfill window** | Not served. The configured window is a hard bound on REST and on the SDK trait, so usage older than it can be neither imported nor withdrawn. An override reaching past it was reserved in earlier revisions and is withdrawn: it carried no permission, no error and no bound of its own, and it was the only construct able to place a submission outside its own idempotency horizon. | A distinct elevated operation, additive on REST and SDK, once its permission, its own bound, and the treatment of already-charged history are settled together. |
+| **A cumulative fold** | The fold set admits accrued amounts and single observations only. An emitter able to report only a running total must difference its own readings before submission. | Adding a fold is additive. It would require relaxing the prohibition on differentiating and taking on reset detection. |
+| **Typed metadata values** | All values are strings on the wire and at rest, irrespective of richer typing the schema can express. | Widening is additive once a consumer needs typed grouping or filtering. |
+| **Entry amendment** | Intentionally omitted. The ledger is append-only: the only correction is an appended invalidation, and correcting a quantity is an invalidation followed by a fresh emission under a new key. | Future work refines corrections and consumers, never stored-entry mutation. |
+
+**Open item.** Whether `pep_properties::RESOURCE_ID` binds to a ledger entry's
+own `id` or to `resource_ref.resource_id` is not settled (§3.9.6). The two
+differ: the first authorizes individual entries, the second authorizes
+everything measured about a resource. Settle it before the PEP is written,
+because `supported_properties` is a wire-visible contract with the PDP.
 
 ## 5. Traceability
 
 - **PRD**: [PRD.md](./PRD.md)
 - **Authoritative REST contract**: [usage-collector-v1.yaml](./usage-collector-v1.yaml)
-- **Domain model**: [domain-model.md](./domain-model.md)
-- **SDK trait reference**: [sdk-trait.md](./sdk-trait.md)
-- **Plugin SPI reference**: [plugin-spi.md](./plugin-spi.md)
-- **ADRs**: [ADR/](./ADR/)
+- **GTS base type**: [schemas/usage_record.v1.schema.json](./schemas/usage_record.v1.schema.json)
+- **ADRs**: [ADR/](./ADR/) — the ADR inventory in [§1.2](#12-architecture-drivers) indexes all fifteen. Every one is current against this design.

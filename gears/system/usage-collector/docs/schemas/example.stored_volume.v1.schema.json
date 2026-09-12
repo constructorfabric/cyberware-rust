@@ -1,0 +1,39 @@
+{
+  "$id": "gts://gts.cf.core.uc.usage_record.v1~example.metering._.stored_volume.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Example meter - stored volume",
+  "description": "Illustrative derived meter, published under the reserved `example` vendor so that no deployment can mistake it for a real declaration. It exists to pin the derivation pattern every meter follows: reference the base, resolve its traits, and close the metadata surface. Nothing structural is restated - the entry shape is inherited from the base. Stored volume is the worked case deliberately: consumption of a stored volume is naturally a level, and no fold this gear offers integrates a level series, so the emitter pre-integrates into accrued `byte-hours` and the meter declares `SUM`. A meter declaring the same series in `bytes` would be a different, and wrong, declaration. Meters are leaves - `x-gts-final` forbids a sub-type, matching the base's rule of exactly one derivation segment.",
+  "x-gts-final": true,
+  "allOf": [
+    { "$ref": "gts://gts.cf.core.uc.usage_record.v1~" },
+    {
+      "x-gts-traits": {
+        "aggregation_fold": "SUM",
+        "canonical_unit": "byte-hours",
+        "retention": "P125D",
+        "nominal_sampling_interval": "PT1H"
+      },
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Closed metadata surface for this meter. Declared equals queryable: both properties are groupable and equality-filterable on the raw and aggregate read paths, and an entry carrying any other key is rejected before persistence. The base admits any key with a string value; this subschema forbids undeclared keys, and the two intersect to exactly the properties below.",
+          "properties": {
+            "region": {
+              "description": "Placement region of the stored volume.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "storage_class": {
+              "description": "Durability or performance tier the volume was billed at.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          }
+        }
+      }
+    }
+  ]
+}

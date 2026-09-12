@@ -1,25 +1,51 @@
 # Reference contract for the Usage Collector REST surface. The runtime
 # OpenAPI document is emitted from `OperationBuilder` calls under
-# `gears/system/usage-collector/usage-collector/src/api/rest/routes/`.
+# `gears/system/usage-collector/usage-collector/src/api/rest/routes/`; a CI
+# drift-check diffs paths, methods, operationIds, tags, parameters, and
+# response schemas against this file.
 #
-# This file is enforced. The `openapi_contract_tests` module beside those
-# registrars builds the route registry and fails if the two disagree on
-# the set of operations, their methods, operation ids, tags, parameters
-# (name / location / required), request bodies (media type, `required`,
-# schema), 2xx responses (status, media type, schema), standard-error
-# coverage, or per-operation authentication posture.
+# STATUS: unreleased. This file describes the Phase 2 metering model
+# (registry-owned GTS type declarations, declared aggregation folds,
+# invalidation-only corrections, interval usage windows, usage feed,
+# isolated backfill, reconciliation). It is the *target* contract, not the
+# served one: the routes registered today, `usage-collector-sdk`, and the
+# TimescaleDB plugin all still implement the superseded Phase 1 surface.
 #
-# NOT enforced, and therefore maintained by hand: descriptions, examples,
-# field-level schema contents, and response headers. Keep them honest.
+# The divergence is deliberate and expected. This gear moves its
+# specification first and lets the implementation follow, so the document
+# leads the code for one cycle by decision rather than by neglect; the debt
+# is carried in DESIGN.md 3.12.2 and PRD section 13.
+#
+# What that costs, stated plainly: for as long as the marker below reads
+# `unreleased`, the six checks in `openapi_contract_tests.rs` that compare
+# this document against the registered routes are `#[ignore]`d, so no CI
+# job diffs the two. Do not generate a client from this file and expect it
+# to work against a running gear. The YAML-internal checks (every `$ref`
+# resolves) and the registry-internal checks stay live, so neither side is
+# free to rot on its own, and both operation counts are pinned, so the gap
+# can neither widen nor close unnoticed.
 
 openapi: 3.1.0
+
+# Machine-readable form of the STATUS note above, so a reader of the
+# document alone — a client generator, a downstream gear — sees the same
+# thing a reader of the test module does. Flipping this to `released` is
+# the same edit as removing those six `#[ignore]`s: a live test holds the
+# two together.
+x-contract-status: unreleased
 info:
   title: Usage Collector API
-  version: 1.1.0
+  version: 1.0.0-alpha
   description: |
-    Attributed usage-record ingestion, raw (OData) and aggregated read
-    surfaces, individual record deactivation, and usage-type catalog
-    lifecycle.
+    Append-only metering ledger. Attributed usage-record ingestion
+    (including invalidation entries), raw and aggregated read surfaces, a
+    replay-safe usage feed, bulk backfill import, and reconciliation
+    metadata.
+
+    All operations require a resolved `SecurityContext` supplied upstream by
+    the platform gateway. **No operation modifies an accepted entry** and
+    **no operation writes a GTS type declaration** — declaring, amending, and
+    withdrawing declarations are `types-registry` surfaces.
 
 servers:
   - url: https://api.example.com
@@ -28,11 +54,19 @@ servers:
 tags:
   - name: Usage Records
     description: |
-      Usage-record ingestion, raw (OData) and aggregated read surfaces,
-      individual-record reads, and one-way `active → inactive` deactivation.
-  - name: Usage Types
-    description: Platform-global usage-type catalog lifecycle and read surfaces.
-
+      Ingestion of usage records and invalidation entries, raw and
+      aggregated reads, and point lookup by record identifier.
+  - name: Backfill
+    description: |
+      Bulk historical import, workload-isolated from live ingestion. Takes
+      measurements and invalidation entries alike — the route for any covered
+      period the live past tolerance rejects.
+  - name: Usage Feed
+    description: |
+      Replay-safe, snapshot-consistent, cursor-paginated feed for charging
+      consumers, scoped by GTS type subscription.
+  - name: Reconciliation
+    description: Per-scope ingestion counters and watermarks.
 security:
   - bearerAuth: []
 
@@ -41,15 +75,43 @@ paths:
     post:
       operationId: usage_collector.create_usage_records
       tags: [Usage Records]
-      summary: Ingest a batch of usage records
+      summary: Ingest a batch of usage records or invalidation entries
       description: |
-        Submit up to 100 usage records for persistence. Every record
-        carries an `idempotency_key` and is deduplicated per
-        `(tenant_id, gts_id, idempotency_key, created_at)`. A record with
-        `corrects_id` set is a counter compensation row; otherwise it is
-        an ordinary usage row. Returns `200` if every record was accepted
-        or deduplicated, `207 Multi-Status` if at least one record was
-        rejected.
+        Submit up to 100 ledger entries. Every entry carries an
+        `idempotency_key` and is deduplicated on
+        `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
+
+        The presence of `invalidates` is the sole discriminator between an
+        ordinary measurement and an invalidation; an entry is never
+        identified as a correction by the value or sign of its quantity. An
+        invalidation entry is a faithful copy of the record it withdraws,
+        carrying additionally its own idempotency key, the target reference,
+        and a reason code.
+
+        **The live path bounds the covered period on both sides, for every
+        entry it admits.** An entry whose period ends further into the
+        future than the configured future tolerance (default 5 minutes) is
+        rejected with
+        `context.field_violations[N].reason = FUTURE_WINDOW`, and one whose
+        period ends further into the past than the configured past
+        tolerance (default 48 hours) is rejected with
+        `context.field_violations[N].reason = PAST_WINDOW`.
+        Each violation names the offending instant and the bound it
+        breached. A period older than the past bound is never admitted
+        here: the error names
+        `POST /usage-collector/v1/records/backfill` as the route that
+        accepts it.
+
+        Both bounds govern an invalidation entry too, over the period it
+        copies from its target. Withdrawing a record older than the past
+        tolerance goes to the backfill route, not to this one.
+
+        An `idempotency_key` or `gts_type_id` carrying a control character
+        is rejected before the entry identifier is derived, because that
+        derivation concatenates both values under a `0x1F` separator.
+
+        Returns `200` if every entry was accepted or deduplicated, `207
+        Multi-Status` if at least one was rejected.
       requestBody:
         required: true
         content:
@@ -58,42 +120,57 @@ paths:
               $ref: "#/components/schemas/CreateUsageRecordsRequest"
             examples:
               example_usage:
-                summary: Ordinary usage emission
+                summary: Ordinary measurement over a covered period
                 value:
                   records:
                     - tenant_id: "11111111-1111-1111-1111-111111111111"
-                      gts_id: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1
-                      value: "42"
-                      created_at: "2026-05-29T12:00:00Z"
+                      gts_type_id: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~
+                      quantity: "42"
+                      window_start: "2026-05-29T12:00:00Z"
+                      window_end: "2026-05-29T13:00:00Z"
                       idempotency_key: ik-emit-usage-0001
                       resource_ref:
                         resource_id: rsc_compute_vm_001
                         resource_type: compute.vm
-              example_compensation:
-                summary: Counter compensation (signed-negative, with corrects_id)
+              example_point_event:
+                summary: Point event (zero-length period)
                 value:
                   records:
                     - tenant_id: "11111111-1111-1111-1111-111111111111"
-                      gts_id: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1
-                      value: "-10"
-                      created_at: "2026-05-29T12:05:00Z"
-                      idempotency_key: ik-emit-compensation-0001
-                      corrects_id: "01234567-89ab-cdef-0123-456789abcdef"
+                      gts_type_id: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.requests.v1~
+                      quantity: "1"
+                      window_start: "2026-05-29T12:00:00Z"
+                      window_end: "2026-05-29T12:00:00Z"
+                      idempotency_key: ik-emit-point-0001
+                      resource_ref:
+                        resource_id: rsc_compute_vm_001
+                        resource_type: compute.vm
+              example_invalidation:
+                summary: Invalidation — a faithful copy, quantity echoed not negated
+                value:
+                  records:
+                    - tenant_id: "11111111-1111-1111-1111-111111111111"
+                      gts_type_id: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~
+                      invalidates: "01234567-89ab-cdef-0123-456789abcdef"
+                      reason_code: emitter_duplicate
+                      quantity: "42"
+                      window_start: "2026-05-29T12:00:00Z"
+                      window_end: "2026-05-29T13:00:00Z"
+                      idempotency_key: ik-invalidate-0001
                       resource_ref:
                         resource_id: rsc_compute_vm_001
                         resource_type: compute.vm
       responses:
         "200":
-          description: Every record accepted or deduplicated.
+          description: Every entry accepted or deduplicated.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/CreateUsageRecordsResponse"
         "207":
           description: |
-            At least one record rejected. Inspect each per-record
-            `outcome`; entries with `outcome: rejected` carry an
-            `error` envelope, `outcome: accepted` entries a `record`.
+            At least one entry rejected. Inspect each per-entry `outcome`
+            and `error` field.
           content:
             application/json:
               schema:
@@ -104,177 +181,41 @@ paths:
     get:
       operationId: usage_collector.list_usage_records
       tags: [Usage Records]
-      summary: Query raw usage records (OData, cursor-paginated)
+      summary: Query raw usage records (cursor-paginated)
       description: |
-        Read a cursor-paginated page of raw `UsageRecord`s for a single
-        usage type. `$filter` admits the fixed read-filter set plus the
-        queried usage type's declared metadata keys. PDP-authorized scope
-        is intersected with the user-supplied filter.
-      parameters:
-        - name: gts_id
-          in: query
-          required: true
-          description: Single UsageType GTS id being queried.
-          schema:
-            $ref: "#/components/schemas/UsageTypeGtsId"
-        - name: $filter
-          in: query
-          required: false
-          description: |
-            OData `$filter` over the closed `UsageRecordFilterField`
-            operand set: `id`, `created_at`, `tenant_id`, `resource_id`,
-            `resource_type`, `subject_id`, `subject_type`, `corrects_id`,
-            `status`. A bounded `created_at` window (at least one lower
-            and one upper bound, e.g. `created_at ge … and created_at lt
-            …`) is mandatory; its absence is `MISSING_TIME_WINDOW`
-            (`400`).
+        Ledger read path over exactly one GTS type within a mandatory time
+        range. Returns entries **as persisted**: a withdrawn record and its
+        invalidation are both returned, and the invalidation names its target.
+        The path applies no fold.
 
-            The set is closed. Any other operand is rejected `400`
-            (`INVALID_FILTER`) when the expression is parsed, before any
-            authorization or storage work. In particular, a usage type's
-            declared `metadata_fields` are **not** `$filter` operands —
-            filter on them with the `metadata.<key>` parameter below —
-            and neither is `gts_id`, which is the required typed query
-            parameter above.
-          schema:
-            type: string
-        - name: $orderby
-          in: query
-          required: false
-          description: |
-            OData $orderby. All keys MUST share one sort direction, and
-            each key MUST name a mandatory (never-null) record field
-            (`id`, `created_at`, `tenant_id`, `resource_id`,
-            `resource_type`, `status`). The server appends the canonical
-            unique `(created_at, id)` tiebreaker in the caller's
-            direction. Ordering by an optional field (`subject_id`,
-            `subject_type`, `corrects_id`) or mixing `asc`/`desc` across
-            keys is rejected `400` (`VALIDATION`), because keyset
-            pagination requires a uniform-direction, never-null keyset.
-          schema:
-            type: string
-        - name: $top
-          in: query
-          required: false
-          description: |
-            Page size in the canonical OData spelling (OASIS OData 4.01
-            Part 2, §5.1.6); rejected with `400` above 1000, never
-            silently clamped. Folds onto the same slot as `limit`;
-            sending both in one request is ambiguous and is rejected
-            `400`.
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-        - name: limit
-          in: query
-          required: false
-          description: |
-            Page size hint; alias of `$top`, rejected with `400` above
-            1000.
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-        - name: metadata.<key>
-          in: query
-          required: false
-          description: |
-            Repeated metadata-filter entries. Values for the same key are
-            OR-ed; distinct keys are AND-ed. Each `<key>` MUST be a member
-            of the queried usage type's declared `metadata_fields`.
-          schema:
-            type: string
-        - name: cursor
-          in: query
-          required: false
-          description: Opaque continuation marker. Callers MUST NOT parse or modify.
-          schema:
-            type: string
+        An entry is selected when the end of its covered period falls in
+        the requested range (`from <= window_end < to`), whatever the length
+        of that period. Pagination is keyset-stable over `(window_end, id)`,
+        which a caller `$orderby` prefixes rather than replaces.
+
+        Declared metadata properties are filtered by repeated
+        `metadata.<key>=<value>` query parameters, for example
+        `?metadata.region=eu&metadata.region=us&metadata.tier=gold`. Each
+        distinct `<key>` forms one filter and its repetitions form that
+        filter's value set. `MetadataFilter` is the normative definition of
+        the predicate they build, and it bounds them. These parameters are
+        specified here rather than under `parameters` below because OpenAPI
+        cannot declare a parameter whose name carries a placeholder.
+      parameters:
+        - $ref: "#/components/parameters/GtsTypeIdQuery"
+        - $ref: "#/components/parameters/RangeFrom"
+        - $ref: "#/components/parameters/RangeTo"
+        - $ref: "#/components/parameters/Filter"
+        - $ref: "#/components/parameters/OrderBy"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
       responses:
         "200":
-          description: One page of raw usage records.
+          description: A page of usage records.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Page_UsageRecord"
-        default:
-          $ref: "#/components/responses/Problem"
-
-  /usage-collector/v1/records/aggregate:
-    post:
-      operationId: usage_collector.query_aggregated_usage_records
-      tags: [Usage Records]
-      summary: Query server-side aggregated usage
-      description: |
-        Compute a server-side aggregation (`sum`, `count`, `min`, `max`,
-        `avg`) for a single usage type. Group-by is capped at 2
-        dimensions; result rows bounded to 100,000 (a result exceeding
-        that is a `400`, `AGGREGATION_RESULT_TOO_LARGE`). Mirrors the SDK's
-        `UsageCollectorClientV1::query_aggregated_usage_records`
-        signature.
-
-        `sum` requires a counter usage type; `min`/`max`/`avg` require a gauge;
-        `count` is valid for both. A mismatched op/kind pair is a `400`.
-      parameters:
-        - name: gts_id
-          in: query
-          required: true
-          description: Single UsageType GTS id being aggregated.
-          schema:
-            $ref: "#/components/schemas/UsageTypeGtsId"
-        - name: metadata.<key>
-          in: query
-          required: false
-          description: |
-            Repeated metadata-filter entries. Values for the same key are
-            OR-ed; distinct keys are AND-ed. Each `<key>` MUST be a member
-            of the queried usage type's declared `metadata_fields`.
-          schema:
-            type: string
-        - name: $filter
-          in: query
-          required: false
-          description: |
-            OData `$filter` over the record read-filter set. A bounded
-            `created_at` window (at least one lower and one upper bound)
-            is mandatory; its absence is `MISSING_TIME_WINDOW` (`400`).
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/QueryAggregatedUsageRecordsRequest"
-      responses:
-        "200":
-          description: Aggregation result for the requested usage type.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AggregationResult"
-        "400":
-          description: |
-            Canonical `InvalidArgument` envelope. Discrimination via
-            `field_violations[0].reason`: `MISSING_TIME_WINDOW` (no bounded
-            `created_at` window), `OP_NOT_ALLOWED_FOR_KIND` (the `op` is not
-            valid for the usage type's `kind` — `sum` on a gauge, or
-            `min`/`max`/`avg` on a counter), or `AGGREGATION_RESULT_TOO_LARGE`
-            (the grouping produced more than 100,000 buckets — narrow the
-            window or drop a high-cardinality `group_by` dimension).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "404":
-          description: |
-            The requested `gts_id` is not registered in the usage-type
-            catalog (resolved via a pre-dispatch `get_usage_type`).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -284,170 +225,213 @@ paths:
     get:
       operationId: usage_collector.get_usage_record
       tags: [Usage Records]
-      summary: Read a single usage record by id
-      description: Read a single persisted usage record by its `id`.
+      summary: Point lookup of a single entry by identifier
+      description: |
+        Returns the exact persisted fact. The read runs under the caller's
+        authorized scope, so an entry outside it returns `404` and this
+        surface never acts as an existence oracle.
       responses:
         "200":
-          description: The persisted usage record.
+          description: The persisted entry.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/UsageRecord"
-        "404":
-          description: Usage record not found.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
         default:
           $ref: "#/components/responses/Problem"
 
-  /usage-collector/v1/records/{id}/deactivate:
-    parameters:
-      - $ref: "#/components/parameters/RecordId"
+  /usage-collector/v1/records/aggregate:
     post:
-      operationId: usage_collector.deactivate_usage_record
+      operationId: usage_collector.query_aggregated_usage_records
       tags: [Usage Records]
-      summary: Deactivate an individual usage record
+      summary: Aggregated usage query over one GTS type
       description: |
-        Flip the targeted record's `status` from `active` to `inactive`
-        atomically. When the target is a usage row, every active
-        compensation row referencing it is flipped in the same plugin
-        transaction (depth-1 cascade). Monotonic — there is no
-        reactivation.
-      responses:
-        "204":
-          description: Record transitioned from `active` to `inactive`.
-        default:
-          $ref: "#/components/responses/Problem"
+        Derived view over the ledger. **The request carries no aggregation
+        parameter**: the fold is the one declared by the queried GTS type,
+        resolved from its declaration.
 
-  /usage-collector/v1/usage-types:
-    get:
-      operationId: usage_collector.list_usage_types
-      tags: [Usage Types]
-      summary: List usage types
-      description: Cursor-paginated list of usage-type catalog rows in the caller's authorized scope.
-      parameters:
-        - $ref: "#/components/parameters/Limit"
-        - $ref: "#/components/parameters/Cursor"
-        - name: $filter
-          in: query
-          required: false
-          description: OData `$filter` over the usage-type catalog field set.
-          schema:
-            type: string
-        - name: $orderby
-          in: query
-          required: false
-          description: OData `$orderby` over the usage-type catalog field set.
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Page of usage-type catalog entries.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Page_UsageType"
-        default:
-          $ref: "#/components/responses/Problem"
-    post:
-      operationId: usage_collector.create_usage_type
-      tags: [Usage Types]
-      summary: Register a new UsageType
-      description: |
-        Create a usage type in the catalog. `gts_id` MUST be a GTS
-        *instance* id deriving directly from the reserved abstract base
-        `gts.cf.core.uc.usage_record.v1~`. Duplicate registration
-        returns `409`.
+        A record withdrawn by an accepted invalidation, and the invalidation
+        entry itself, each contribute nothing to the selected set. Because
+        the invalidation carries the target's covered period, no requested
+        range selects one of the pair without the other.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CreateUsageTypeRequest"
+              $ref: "#/components/schemas/AggregationRequest"
       responses:
-        "201":
-          description: UsageType registered.
+        "200":
+          description: Aggregated result buckets.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UsageType"
-          headers:
-            Location:
-              schema:
-                type: string
-                format: uri-reference
-              description: URI of the newly registered usage type.
-        "400":
-          description: |
-            Canonical `InvalidArgument` envelope. Discrimination via
-            `context.field_violations[].field` and `.reason` (e.g.
-            `INVALID_BASE_GTS_ID`,
-            `INVALID_METADATA_FIELDS_EMPTY_STRING`,
-            `INVALID_METADATA_FIELDS_DUPLICATE`).
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
-        "409":
-          description: |
-            Canonical `AlreadyExists` envelope — `gts_id` already
-            registered. Discrimination via `context.resource_type` +
-            `context.resource.name`.
-          content:
-            application/problem+json:
-              schema:
-                $ref: "#/components/schemas/Problem"
+                $ref: "#/components/schemas/AggregationResult"
         default:
           $ref: "#/components/responses/Problem"
 
-  /usage-collector/v1/usage-types/{gts_id}:
-    parameters:
-      - $ref: "#/components/parameters/UsageTypeGtsIdPath"
-    get:
-      operationId: usage_collector.get_usage_type
-      tags: [Usage Types]
-      summary: Look up a UsageType by gts_id
-      description: Read a single catalog entry.
+  /usage-collector/v1/records/backfill:
+    post:
+      operationId: usage_collector.backfill_usage_records
+      tags: [Backfill]
+      summary: Bulk historical import, isolated from live ingestion
+      description: |
+        Identical validation and request shape to `POST /records`, differing
+        only in four respects: the workload is isolated from live ingestion
+        so it cannot breach live-path SLOs, every accepted entry is stamped
+        `origin: backfill`, the live path's past bound on the covered period
+        (default 48 hours) does not apply because this route exists for
+        exactly the periods that bound rejects, and the configured
+        backfill window (default 90 days) is a hard bound: a submission
+        whose covered period ends further back is rejected with
+        `context.field_violations[N].reason = PAST_WINDOW` naming the
+        window, and no override is accepted on this or any other surface.
+        The bound refuses only what lies past it, so a covered period
+        ending exactly at the window is admitted.
+
+        The route takes measurements and invalidation entries alike, mixed
+        in one batch, under the same per-entry rules `POST /records`
+        applies. Every accepted entry carries `origin: backfill`, the
+        invalidation included, so a correction of closed history reads as
+        history. The in-process SDK trait carries the same operation as
+        `backfill_usage_records`.
+
+        A deployment must not admit a backfill window that leaves any GTS
+        type's retention below the window plus one operational replay
+        horizon.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUsageRecordsRequest"
       responses:
         "200":
-          description: UsageType catalog entry.
+          description: Every entry accepted or deduplicated.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/UsageType"
-        "404":
-          description: UsageType not found.
+                $ref: "#/components/schemas/CreateUsageRecordsResponse"
+        "207":
+          description: At least one entry rejected.
           content:
-            application/problem+json:
+            application/json:
               schema:
-                $ref: "#/components/schemas/Problem"
+                $ref: "#/components/schemas/CreateUsageRecordsResponse"
         default:
           $ref: "#/components/responses/Problem"
-    delete:
-      operationId: usage_collector.delete_usage_type
-      tags: [Usage Types]
-      summary: Delete a UsageType (referentially safe)
+
+  /usage-collector/v1/feed:
+    get:
+      operationId: usage_collector.read_usage_feed
+      tags: [Usage Feed]
+      summary: Read a page of the usage feed
       description: |
-        Delete a catalog row. The storage plugin rejects deletion if any
-        usage row still references the targeted `gts_id`
-        (`ON DELETE RESTRICT`).
+        Deterministic, replay-safe, pull-based read path for charging
+        consumers.
+
+        Ordering is monotonic `acceptance_sequence`, scoped per
+        `(tenant_id, gts_type_id)`; no cross-tenant or cross-type total
+        order is claimed. Interleaving of scopes within a page is
+        implementation-defined but deterministic — the same cursor yields
+        the same continuation, extended only by entries accepted since. A
+        replay that resends a previously recorded `watermark` is identical,
+        entry for entry.
+
+        A paginated scan does not observe entries appearing, disappearing,
+        or changing mid-scan, except append-only arrivals demarcated by the
+        `watermark` returned with each page. Corrections arrive as ordinary
+        entries at their own acceptance position; an accepted invalidation
+        removes neither entry from the feed.
+
+        A cursor older than the retention floor is refused with `400`
+        (`context.reason = CURSOR_BEYOND_RETENTION`) rather than served as a
+        silently truncated range.
+      parameters:
+        - name: gts_type_id
+          in: query
+          required: true
+          description: |
+            Subscription: the GTS types this consumer reads. Repeat the
+            parameter for each type. The feed excludes everything else —
+            from the entries, the cursor, and the watermark.
+
+            The list is bounded because the subscription is: it spans every
+            tenant of each named type, and the watermark carries one
+            position per `(tenant_id, gts_type_id)` scope. A consumer of
+            more than 100 types reads them over several subscriptions.
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items:
+              $ref: "#/components/schemas/GtsTypeId"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Watermark"
       responses:
-        "204":
-          description: UsageType deleted.
-        "404":
-          description: UsageType not found.
+        "200":
+          description: A page of feed entries with cursor and watermark.
           content:
-            application/problem+json:
+            application/json:
               schema:
-                $ref: "#/components/schemas/Problem"
-        "409":
-          description: UsageType still referenced by usage rows.
+                $ref: "#/components/schemas/FeedPage"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /usage-collector/v1/reconciliation:
+    get:
+      operationId: usage_collector.get_reconciliation_metadata
+      tags: [Reconciliation]
+      summary: Per-scope ingestion counters and watermarks
+      description: |
+        Sufficient for an external reconciliation job to compare gear-side
+        accepted totals against a consumer's processed totals for a range
+        without a full raw scan, and to detect an emitter that has silently
+        stopped.
+
+        **Stall detection is consumer-side.** The gear exposes the
+        watermarks; the declared nominal sampling interval is served by
+        `types-registry`. The gear evaluates neither, raises no
+        stalled-emitter signal, and holds no threshold of its own.
+      parameters:
+        - name: scope
+          in: query
+          required: true
+          description: |
+            Granularity at which to report. The `caller` and
+            `caller_tenant` scopes are reserved and not served in v1,
+            because the tenant plane carries no calling-gear identity.
+            Adding them later widens this enum, which is additive.
+          schema:
+            type: string
+            enum: [tenant_gts_type]
+        - name: gts_type_id
+          in: query
+          required: true
+          description: The GTS type to report on.
+          schema:
+            $ref: "#/components/schemas/GtsTypeId"
+        - $ref: "#/components/parameters/RangeFrom"
+        - $ref: "#/components/parameters/RangeTo"
+        - name: tenant_id
+          in: query
+          required: false
+          description: |
+            Narrow to one tenant. Omitted, the read reports every tenant of
+            the requested type that has data in the range, so it paginates.
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: A page of reconciliation metadata for the requested scopes.
           content:
-            application/problem+json:
+            application/json:
               schema:
-                $ref: "#/components/schemas/Problem"
+                $ref: "#/components/schemas/ReconciliationMetadataList"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -467,17 +451,77 @@ components:
       name: id
       in: path
       required: true
-      description: Gateway-derived `UsageRecord.id` (RFC 4122 UUID).
+      description: Server-derived entry identifier (RFC 4122 UUID).
       schema:
         type: string
         format: uuid
-    UsageTypeGtsIdPath:
-      name: gts_id
-      in: path
+    GtsTypeIdQuery:
+      name: gts_type_id
+      in: query
       required: true
-      description: URL-encoded GTS instance id of the usage type.
+      description: |
+        The single GTS type to query. Both read paths target exactly one
+        type, so returned rows share one unit, one fold, and one declared
+        metadata surface.
       schema:
-        $ref: "#/components/schemas/UsageTypeGtsId"
+        $ref: "#/components/schemas/GtsTypeId"
+    RangeFrom:
+      name: from
+      in: query
+      required: true
+      description: |
+        Inclusive lower bound of the requested range (UTC, RFC 3339). The
+        range is mandatory on every read path.
+      schema:
+        type: string
+        format: date-time
+    RangeTo:
+      name: to
+      in: query
+      required: true
+      description: Exclusive upper bound of the requested range (UTC, RFC 3339).
+      schema:
+        type: string
+        format: date-time
+    Filter:
+      name: $filter
+      in: query
+      required: false
+      description: |
+        OData `$filter` over the fixed field set (`tenant_id`,
+        `resource_id`, `resource_type`, `subject_id`, `subject_type`,
+        `entry_type`, `origin`, `invalidates`). Opaque-identifier fields
+        accept `eq` and `in` only.
+
+        Declared metadata properties are **not** operands here — the
+        `toolkit-odata` grammar does not express filters over JSON map
+        keys. Filter on them with the repeated `metadata.<key>` parameters
+        described on the operation and defined by `MetadataFilter`.
+
+        The covered period is **not** filtered here — it is carried by the
+        mandatory `from` / `to` parameters, which select on the period end.
+      schema:
+        type: string
+    OrderBy:
+      name: $orderby
+      in: query
+      required: false
+      # A `$ref` rather than a copy: `every_ref_resolves` walks every node,
+      # so renaming the component fails a live test instead of orphaning
+      # the prose below.
+      x-order-keys:
+        $ref: "#/components/schemas/RecordOrderKey"
+      description: |
+        OData `$orderby`. Every key MUST be a value `RecordOrderKey` names,
+        and all keys MUST share one sort direction. Anything else is
+        rejected `400` (`VALIDATION`), because keyset pagination requires a
+        uniform-direction, never-null keyset.
+
+        Absent `$orderby` the order is `(window_end, id)`. Supplied, the
+        effective order is the caller's keys followed by that pair, which
+        the server appends in the caller's direction.
+      schema:
+        type: string
     Limit:
       name: limit
       in: query
@@ -492,7 +536,31 @@ components:
       name: cursor
       in: query
       required: false
-      description: Opaque cursor token. Forward-only; callers MUST NOT parse or modify.
+      description: |
+        Opaque cursor token. Forward-only; callers MUST NOT parse or
+        modify. It binds the order and the full query scope it was
+        minted under — every filtering and scoping parameter, `$filter`
+        and `metadata.<key>` included: a malformed token, any change to
+        that scope, or an accompanying `$orderby` is rejected `400` with
+        a `cursor` field violation (`INVALID_CURSOR`, `FILTER_MISMATCH`,
+        `ORDER_WITH_CURSOR`).
+        Continue a page by resending the same query, cursor apart.
+      schema:
+        type: string
+    Watermark:
+      name: watermark
+      in: query
+      required: false
+      description: |
+        A `watermark.token` this operation returned earlier. It bounds the
+        page at that position in each subscribed scope, so a replay from the
+        same cursor is identical entry for entry. Omit it to read the live
+        feed.
+
+        It binds the subscription it was minted under. A malformed or
+        foreign token is rejected `400` with a `watermark` field violation
+        (`INVALID_WATERMARK`, `SUBSCRIPTION_MISMATCH`). One older than the
+        retention floor is refused as a cursor is.
       schema:
         type: string
 
@@ -505,107 +573,217 @@ components:
             $ref: "#/components/schemas/Problem"
 
   schemas:
-    UsageRecordStatus:
+    EntryType:
       type: string
-      enum: [active, inactive]
-      description: Monotonic record lifecycle marker. Only `active → inactive` is permitted.
-
-    AggregationOp:
-      type: string
-      enum: [sum, count, min, max, avg]
+      enum: [record, invalidation]
+      readOnly: true
       description: |
-        Aggregation function applied to the filtered `UsageRecord.value`
-        stream. Matches the SDK's `AggregationOp` wire shape (serde
-        `rename_all = "lowercase"`). `count` counts matched rows and is
-        well-defined for any value shape; the others require a numeric
-        `value`.
+        The closed discriminator between a measurement and a withdrawal,
+        **derived** from whether the entry carries `invalidates`. It appears
+        on read shapes only; the ingestion shape accepts no discriminator
+        field, so a marker can never disagree with the payload it marks.
 
-        Ops are restricted per usage kind: a counter usage type admits
-        `{sum, count}`; a gauge admits `{min, max, avg, count}`. A mismatched
-        `(op, kind)` pair is rejected with a `400`
-        (`field_violations[0].reason="OP_NOT_ALLOWED_FOR_KIND"`) before the
-        server-side aggregation runs.
+        An entry is never identified as a correction by the value or sign of
+        its quantity: zero and negative quantities are ordinary
+        measurements, and an invalidation echoes the quantity it withdraws
+        rather than negating it.
+
+    RecordOrigin:
+      type: string
+      enum: [live, backfill]
+      description: |
+        Which ingestion path admitted the entry. Server-assigned from the
+        path itself, never caller-supplied, and returned on every read path.
 
     AggregationDimension:
       oneOf:
         - type: string
           enum: [tenant_id, resource_id, resource_type, subject_id, subject_type]
           description: |
-            Group by a static `UsageRecord` column. `resource_id` /
-            `resource_type` flatten `resource_ref`; `subject_id` /
-            `subject_type` flatten `subject_ref` (records without a
-            subject are excluded from the grouping).
+            Group by a fixed field. `resource_id` / `resource_type` flatten
+            `resource_ref`; `subject_id` / `subject_type` flatten
+            `subject_ref` (entries without a subject are excluded from the
+            grouping).
         - type: object
           additionalProperties: false
           required: [metadata]
           description: |
-            Group by the value of a single declared metadata key. The
-            key MUST be a non-empty string that is a member of the
-            queried usage type's `metadata_fields`.
+            Group by the value of a single declared metadata property. The
+            key MUST be a property the queried type's metadata schema
+            declares.
           properties:
             metadata:
               type: string
               minLength: 1
-              description: Metadata key declared on the usage type.
       description: |
-        Aggregation grouping dimension. Either one of the fixed static
-        columns (`tenant_id`, `resource_id`, `resource_type`,
-        `subject_id`, `subject_type`) — emitted as a JSON string — or a
-        single-field tagged object `{"metadata": "<key>"}` selecting a
-        declared metadata key. Matches the SDK's `AggregationDimension`
-        wire shape (serde `rename_all = "snake_case"` over unit and
-        single-field variants).
+        Aggregation grouping dimension: either a fixed field emitted as a
+        JSON string, or a single-field tagged object `{"metadata": "<key>"}`
+        selecting a declared metadata property.
+
+    RecordOrderKey:
+      type: string
+      enum:
+        - id
+        - tenant_id
+        - resource_id
+        - resource_type
+        - entry_type
+        - origin
+        - window_start
+        - window_end
+        - accepted_at
+      description: |
+        The admissible `$orderby` keys, defined here once. A key qualifies
+        when it is scalar, mandatory on every entry, and ordered the way its
+        wire form reads. `resource_id` and `resource_type` flatten
+        `resource_ref`, as on `$filter` and `AggregationDimension`.
+
+        Fail-closed: a field added to `UsageRecord` is not an order key
+        until this enum names it. The five required fields it excludes each
+        fail one of those three tests — `resource_ref` is an object,
+        `quantity` is a decimal carried as a string (so `"9"` sorts after
+        `"42.5"`), `idempotency_key` is opaque, `gts_type_id` is reserved
+        and holds one value per request, and `acceptance_sequence` is
+        monotonic only per `(tenant_id, gts_type_id)`. Optional fields are
+        excluded by the nullable-keyset rule.
 
     Timestamp:
       type: string
       format: date-time
-      description: UTC instant (RFC 3339).
+      description: |
+        UTC instant (RFC 3339). Timestamps carrying no offset are rejected;
+        non-UTC offsets are normalized to UTC. A covered-period bound carries
+        at most microsecond precision — the record-identity derivation reads a
+        fixed-width microsecond form, so a finer value is rejected rather than
+        truncated.
 
-    UsageValue:
+    UsageQuantity:
       type: string
-      pattern: '^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$'
+      pattern: '^-?(?:0|[1-9][0-9]{0,27})(?:\.[0-9]{1,28})?$'
       example: "42.5"
       description: |
-        Signed fixed-precision numeric measurement, wire-encoded as a JSON
-        **string** (never a JSON number) so client/server number
-        representations cannot round-trip through float and silently lose
-        precision. The carrier type on every server surface is
-        `rust_decimal::Decimal` (Postgres `NUMERIC` at rest). Sign rules
-        are enforced server-side from the usage type's `kind` and the
-        presence of `corrects_id` (see `UsageRecord.corrects_id`).
+        Finite, signed decimal measurement in the canonical unit bound to
+        the entry's GTS type. Wire-encoded as a JSON **string**, never a
+        JSON number, so client and server representations cannot round-trip
+        through float and silently lose precision. The carrier on every
+        server surface is `rust_decimal::Decimal`, persisted in an exact
+        decimal type.
 
-    AggregatedValue:
+        **The sign is never constrained.** A negative quantity records a
+        real decrease in consumption and is an ordinary measurement, not a
+        correction. Absent, non-numeric, non-finite, or out-of-range values
+        are rejected at ingestion.
+
+        Published range: at most 28 significant decimal digits (leading
+        zeros excluded) and at most 28 digits after the decimal point.
+        The magnitude is therefore below 10²⁸, and the smallest non-zero
+        value is 1×10⁻²⁸.
+
+        The pattern bounds the integer and fraction parts separately and
+        cannot express the significant-digit bound, so it is a necessary
+        but not sufficient check — the gear enforces the full bound at
+        ingestion. The published bound is deliberately narrower than the
+        `rust_decimal::Decimal` carrier, which reaches 29 significant
+        digits; where the two disagree, the published bound is normative.
+
+        Every storage plugin MUST round-trip that full range —
+        **including its negative half** — and the full precision without
+        loss, and no path may convert, scale, round, or truncate a
+        quantity between acceptance and read.
+
+    AggregatedQuantity:
       type: string
       pattern: '^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$'
       example: "79228162514264337593543950400"
       description: |
-        Signed **arbitrary-precision** numeric aggregation result, wire-encoded
-        as a JSON **string** (never a JSON number) for the same float-round-trip
-        safety as `UsageValue`. Unlike `UsageValue` (a single record's
-        fixed-precision `rust_decimal::Decimal`), a `sum`/`avg` aggregate over a
-        wide window can exceed `Decimal`'s ~7.9×10²⁸ ceiling, so the carrier on
-        every server surface is `bigdecimal::BigDecimal` (Postgres `NUMERIC`,
-        unbounded, at rest). `avg` may carry a plugin-chosen rounding scale on
-        non-terminating quotients.
+        Signed **arbitrary-precision** fold result, wire-encoded as a JSON
+        string for the same float-safety reason as `UsageQuantity`. A `SUM`
+        over a wide window can exceed `Decimal`'s ceiling, so the carrier is
+        `bigdecimal::BigDecimal`, unbounded rather than capped at
+        `UsageQuantity`'s ceiling.
 
     IdempotencyKey:
       type: string
       minLength: 1
       maxLength: 256
+      pattern: '^[^\x00-\x1F\x7F]+$'
       description: |
-        Caller-supplied dedup key. Dedup unique is
-        `(tenant_id, gts_id, idempotency_key, created_at)`.
+        Caller-supplied dedup key. The dedup identity is the 5-tuple
+        `(tenant_id, gts_type_id, idempotency_key, window_start,
+        window_end)`, so submissions differing in period are distinct
+        entries rather than duplicates and an emitter does not encode the
+        period into the key.
+
+        **The key carries what the identity does not.** `resource_ref` and
+        `subject_ref` are compared on a collision but are not part of the
+        identity, so one key shared across two resources in one period is a
+        conflict, not a duplicate. Two entries covering one period need two
+        keys, an invalidation needs a key distinct from its target's, and a
+        retry must repeat its key exactly.
+
+        An exact-equality retry on that identity is absorbed and the stored
+        entry is returned. Any differing caller-supplied field — including a
+        metadata-only difference — is rejected as a conflict.
+
+        **Control characters are excluded.** The entry identifier
+        derivation concatenates this value with the other dedup-identity
+        inputs under a `0x1F` separator, so a key carrying a control
+        character would break the derivation's injectivity. The charset is
+        otherwise unconstrained, and the length is bounded at 1 to 256
+        characters. No token shape is enforced.
+
+    GtsTypeId:
+      type: string
+      minLength: 1
+      maxLength: 512
+      pattern: '^gts\.cf\.core\.uc\.usage_record\.v1~[^\x00-\x1F\x7F~]+~$'
+      example: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1~
+      description: |
+        Reference to the GTS type declaration held by `types-registry`. The
+        value identifies exactly one declared meter across the deployment;
+        the gear resolves the declaration by it and infers no metering
+        meaning — fold, canonical unit, or metadata surface — from its
+        shape. Those come from the declaration alone.
+
+        **The value ends with `~`.** That terminal marker is the platform
+        GTS convention distinguishing a *type* identifier from an *instance*
+        identifier (`guidelines/GTS.md`), and this field holds a type
+        identifier.
+
+        **The base prefix is mandatory.** Every meter is a derived type of
+        `gts.cf.core.uc.usage_record.v1~`, carrying exactly one further
+        segment. That base is published at
+        `docs/schemas/usage_record.v1.schema.json`, and deriving from it is
+        what subjects a declaration to the `x-gts-traits-schema` that makes
+        the aggregation fold, the canonical unit, and the retention policy
+        mandatory and checkable when the declaration is registered rather
+        than when the first entry is rejected. A deeper chain is refused: a
+        meter is a leaf, not a base for further meters.
+
+        **Control characters are excluded**, for the same reason as
+        `IdempotencyKey`: the entry identifier derivation concatenates this
+        value with the other dedup-identity inputs under a `0x1F` separator.
+
+    ReasonCode:
+      type: string
+      minLength: 1
+      maxLength: 128
+      description: |
+        Why an invalidation was issued. Mandatory on an invalidation entry
+        and forbidden on an ordinary record — including one whose quantity
+        is negative, since that records real consumption rather than a
+        correction. Returned on every read path exposing the correction.
 
     RecordMetadata:
       type: object
       additionalProperties:
         type: string
       description: |
-        Closed key/value map. Every key MUST be a member of the
-        referenced usage type's `metadata_fields`; values are strings.
-        Default cap 8 KiB per record (operator-configurable). MUST NOT
-        contain PII, payment data, regulated health data, or
-        credentials.
+        Closed key/value map. Every key MUST be a property the referenced
+        type's metadata schema declares; values are strings in v1
+        irrespective of richer typing the schema can express. Default cap
+        8 KiB per entry (operator-configurable). MUST NOT contain PII,
+        payment data, regulated health data, or credentials.
 
     ResourceRef:
       type: object
@@ -647,48 +825,108 @@ components:
         - id
         - tenant_id
         - resource_ref
-        - gts_id
-        - value
-        - created_at
+        - gts_type_id
+        - entry_type
+        - quantity
+        - window_start
+        - window_end
         - idempotency_key
-        - status
+        - accepted_at
+        - acceptance_sequence
+        - origin
+      oneOf:
+        - title: record
+          description: A measurement. Carries neither `invalidates` nor `reason_code`.
+          properties:
+            entry_type:
+              const: record
+            invalidates: false
+            reason_code: false
+        - title: invalidation
+          description: A withdrawal. Carries both `invalidates` and `reason_code`.
+          properties:
+            entry_type:
+              const: invalidation
+          required:
+            - invalidates
+            - reason_code
       description: |
-        One accepted measurement. Immutable after acceptance except for
-        the one-way `status` transition. `corrects_id` distinguishes a
-        usage row (absent) from a counter compensation row (set).
+        One accepted ledger entry — a measurement or an invalidation,
+        discriminated by `entry_type`, which the server derives from
+        `invalidates`. **Never rewritten, retired, or
+        altered after acceptance**; there is no status field and no
+        lifecycle flag.
+
+        The two entry types are exclusive schema branches, so a shape that
+        contradicts its own discriminator is unrepresentable: an
+        `invalidation` carries both `invalidates` and `reason_code`, a
+        `record` carries neither.
+
+        The metering unit and the aggregation fold are resolved from the GTS
+        type declaration and are deliberately **not** carried per entry:
+        denormalizing them onto a high-rate stream would create a second
+        place the same fact can be read and disagree.
       properties:
         id:
           type: string
           format: uuid
-          description: Deterministic gateway-derived UUIDv5 of (tenant_id, gts_id, idempotency_key, created_at).
+          description: |
+            Server-derived UUIDv5 over
+            `(tenant_id, gts_type_id, idempotency_key, window_start, window_end)`.
+            Stable across exact-equality retries and reproducible offline by
+            the emitter, so a correction reference can be computed before
+            submission. `invalidates` is deliberately excluded from the
+            derivation — and so is the `entry_type` derived from it — so one
+            key cannot stand for both a measurement and its withdrawal. The
+            namespace constant is recorded in the identity ADR.
         tenant_id:
           type: string
           format: uuid
-          description: Owning tenant for this record.
         resource_ref:
           $ref: "#/components/schemas/ResourceRef"
         subject_ref:
           $ref: "#/components/schemas/SubjectRef"
-        gts_id:
-          $ref: "#/components/schemas/UsageTypeGtsId"
-        value:
-          $ref: "#/components/schemas/UsageValue"
-        created_at:
+        gts_type_id:
+          $ref: "#/components/schemas/GtsTypeId"
+        entry_type:
+          $ref: "#/components/schemas/EntryType"
+        quantity:
+          $ref: "#/components/schemas/UsageQuantity"
+        window_start:
+          $ref: "#/components/schemas/Timestamp"
+        window_end:
           $ref: "#/components/schemas/Timestamp"
         idempotency_key:
           $ref: "#/components/schemas/IdempotencyKey"
-        status:
-          $ref: "#/components/schemas/UsageRecordStatus"
-        corrects_id:
+        accepted_at:
+          allOf:
+            - $ref: "#/components/schemas/Timestamp"
+          description: |
+            Gear-assigned instant of acceptance. **Not settable or
+            overridable by the emitter** — an emitter-supplied one would let
+            a skewed emitter hide its own lateness. Late arrival is
+            evaluated as `accepted_at` against `window_end`.
+        acceptance_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Gear-assigned position, monotonic per
+            `(tenant_id, gts_type_id)`. Orders the usage feed and breaks
+            `LATEST` ties. No cross-tenant or cross-type total order is
+            claimed.
+        origin:
+          $ref: "#/components/schemas/RecordOrigin"
+        invalidates:
           type: string
           format: uuid
           description: |
-            Optional reference to a prior usage row's `id`. Presence
-            marks this record as a counter compensation row. The
-            referenced row MUST itself have `corrects_id` absent, share
-            the full identity tuple
-            `(tenant_id, gts_id, resource_ref, subject_ref)`,
-            and be `active`.
+            The entry this one withdraws. Present exactly when
+            `reason_code` is; its presence is what makes this entry an
+            invalidation. The target MUST exist, MUST itself be a `record`,
+            and MUST NOT already be invalidated.
+        reason_code:
+          $ref: "#/components/schemas/ReasonCode"
         metadata:
           $ref: "#/components/schemas/RecordMetadata"
 
@@ -698,25 +936,32 @@ components:
       required:
         - tenant_id
         - resource_ref
-        - gts_id
-        - value
-        - created_at
+        - gts_type_id
+        - quantity
+        - window_start
+        - window_end
         - idempotency_key
+      dependentRequired:
+        invalidates: [reason_code]
+        reason_code: [invalidates]
       description: |
-        Ingestion projection of `UsageRecord` — same shape minus
-        `status` (server-defaulted to `active`) and minus the record
-        identity: `id` is gateway-derived, never caller-supplied, and
-        is rejected as an unknown field if present. The gateway
-        computes it as a deterministic UUIDv5 of the dedup key:
-        `id = UUIDv5(NS, tenant_id ⟨0x1F⟩ gts_id ⟨0x1F⟩ created_at_micros ⟨0x1F⟩ idempotency_key)`,
-        where `NS` is the fixed namespace
-        `56313026-863b-4de8-b32b-1f96b67306ed` and `created_at_micros` is
-        the event timestamp as integer microseconds-since-epoch
-        (ADR-0014). The caller supplies `created_at` on every
-        submission. The same schema carries both
-        ordinary usage and counter compensations; the server enforces
-        the `(kind × corrects_id presence)` value matrix and
-        `corrects_id` referential integrity at ingestion.
+        Ingestion projection of `UsageRecord`: the same shape minus the four
+        server-owned fields — `id`, `accepted_at`, `acceptance_sequence`,
+        and `origin` — and minus the derived `entry_type`. A stray value for
+        any of them is rejected as an unknown field.
+
+        The same schema carries both entry types, distinguished by
+        `invalidates` alone: supplying it makes the submission an
+        invalidation, omitting it makes it an ordinary record. There is no
+        caller-supplied discriminator, so a marker cannot disagree with the
+        payload it marks. `invalidates` and `reason_code` are
+        both-or-neither, enforced by `dependentRequired`.
+
+        For an invalidation the server additionally enforces that every
+        caller-supplied field equals the target's — tenant, type, resource,
+        subject (presence against absence is itself a mismatch), covered
+        period, quantity, and metadata — rejecting any difference by naming
+        the field that differs.
       properties:
         tenant_id:
           type: string
@@ -725,20 +970,30 @@ components:
           $ref: "#/components/schemas/ResourceRef"
         subject_ref:
           $ref: "#/components/schemas/SubjectRef"
-        gts_id:
-          $ref: "#/components/schemas/UsageTypeGtsId"
-        value:
-          $ref: "#/components/schemas/UsageValue"
-        created_at:
+        gts_type_id:
+          $ref: "#/components/schemas/GtsTypeId"
+        quantity:
+          $ref: "#/components/schemas/UsageQuantity"
+        window_start:
           $ref: "#/components/schemas/Timestamp"
+        window_end:
+          allOf:
+            - $ref: "#/components/schemas/Timestamp"
+          description: |
+            Exclusive end of the covered period; MUST be greater than or
+            equal to `window_start`. Equal bounds mark a **point event** —
+            a zero-length period, not an error.
         idempotency_key:
           $ref: "#/components/schemas/IdempotencyKey"
-        corrects_id:
+        invalidates:
           type: string
           format: uuid
           description: |
-            Optional reference to a prior usage row's `id`. See
-            `UsageRecord.corrects_id`.
+            The entry this submission withdraws. Supplying it makes the
+            submission an invalidation and requires `reason_code`; omitting
+            it makes the submission an ordinary record.
+        reason_code:
+          $ref: "#/components/schemas/ReasonCode"
         metadata:
           $ref: "#/components/schemas/RecordMetadata"
 
@@ -771,9 +1026,9 @@ components:
         lifted out of the array.
 
         There is no `duplicate` outcome on the wire. An exact-equality
-        retry is absorbed by the dedup unique
-        `(tenant_id, gts_id, idempotency_key, created_at)` and reported as
-        `accepted` carrying the already-persisted record; a same-key
+        retry is absorbed by the dedup unique `(tenant_id, gts_type_id,
+        idempotency_key, window_start, window_end)` and reported as
+        `accepted` carrying the already-persisted record. A same-key
         submission whose canonical fields differ is `rejected` with
         `IDEMPOTENCY_CONFLICT`.
 
@@ -829,7 +1084,7 @@ components:
       type: object
       additionalProperties: false
       required: [items, page_info]
-      description: Cursor-paginated page of usage records.
+      description: Cursor-paginated page of ledger entries, keyset-stable over `(window_end, id)`, which a caller `$orderby` prefixes rather than replaces.
       properties:
         items:
           type: array
@@ -839,153 +1094,284 @@ components:
         page_info:
           $ref: "#/components/schemas/PageInfo"
 
-    QueryAggregatedUsageRecordsRequest:
+    FeedPage:
       type: object
       additionalProperties: false
-      required: [op]
+      required: [entries, watermark, page_info]
       description: |
-        Aggregation request body. Carries only the aggregation spec: the
-        function to compute (`op`) and the optional grouping
-        (`group_by`).
-
-        The target usage type (`gts_id`), the OData `filter`, and the
-        metadata filters are query parameters on this operation,
-        mirroring `GET /usage-collector/v1/records` — they are not part
-        of this body. PDP-authorized scope is intersected with the
-        supplied filter.
+        A page of the usage feed, keyset-stable over
+        `(acceptance_sequence, id)` within each subscribed
+        `(tenant_id, gts_type_id)` scope.
       properties:
-        op:
-          $ref: "#/components/schemas/AggregationOp"
+        entries:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/UsageRecord"
+        watermark:
+          $ref: "#/components/schemas/FeedWatermark"
+        page_info:
+          $ref: "#/components/schemas/PageInfo"
+
+    FeedWatermark:
+      type: object
+      additionalProperties: false
+      required: [token, accepted_at]
+      description: |
+        The acceptance position through which this page is complete, in
+        **every** subscribed `(tenant_id, gts_type_id)` scope.
+
+        There is one position per scope, and a subscription names GTS types
+        but not tenants, so it spans every tenant. A single
+        `acceptance_sequence` cannot carry that set — it is monotonic only
+        within a scope. The token carries it.
+      properties:
+        token:
+          type: string
+          description: |
+            Opaque replay boundary. Callers MUST NOT parse or modify it —
+            record it and resend it as the `watermark` parameter. The
+            gateway owns the encoding as it owns the cursor's
+            (`cpt-cf-usage-collector-principle-cursor-gateway-ownership`).
+        accepted_at:
+          allOf:
+            - $ref: "#/components/schemas/Timestamp"
+          description: |
+            How fresh the boundary is, for lag observation only. It carries
+            no replay semantics — the boundary is `token`. Per-scope figures
+            are served by `get_reconciliation_metadata`.
+
+    MetadataFilter:
+      type: object
+      additionalProperties: false
+      required: [key, values]
+      description: |
+        Equality-set filter over one declared metadata property, and the
+        normative definition of metadata filtering for **both** read paths.
+
+        - `key` MUST be a property the queried type's metadata schema
+          declares; an undeclared key is rejected `400` (`VALIDATION`).
+        - Within one filter, `values` are OR-ed.
+        - Across filters, distinct keys are AND-ed.
+        - The resulting predicate is AND-ed with `$filter` / `filter`, which
+          cannot carry these operands itself. No filter at all — an absent
+          or empty set — imposes no metadata restriction.
+        - A query carries at most 16 filters, each with at most 32 values.
+        - The predicate is part of the query scope a `cursor` is bound to.
+
+        The aggregation path carries these objects in its request body. The
+        raw read path carries the same predicate as repeated
+        `metadata.<key>=<value>` query parameters, because OpenAPI cannot
+        declare a parameter whose name carries a placeholder. The two
+        spellings denote one predicate with one meaning.
+      properties:
+        key:
+          type: string
+          minLength: 1
+          description: A property the queried type's metadata schema declares.
+        values:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: string
+
+    TimeRange:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      description: |
+        Mandatory bounded range. An entry is selected when the end of its
+        covered period falls in the range — `from <= window_end < to`.
+      properties:
+        from:
+          allOf:
+            - $ref: "#/components/schemas/Timestamp"
+          description: Inclusive lower bound.
+        to:
+          allOf:
+            - $ref: "#/components/schemas/Timestamp"
+          description: Exclusive upper bound.
+
+    AggregationRequest:
+      type: object
+      additionalProperties: false
+      required: [gts_type_id, time_range]
+      description: |
+        Aggregation request. **There is no aggregation parameter** — the
+        fold is resolved from the queried type's declaration, which is what
+        makes "usage for this period" a single number per meter. A caller
+        free to pick a different fold over the same entries could obtain a
+        second defensible answer with nothing recording which one a charge
+        derived from.
+      properties:
+        gts_type_id:
+          allOf:
+            - $ref: "#/components/schemas/GtsTypeId"
+          description: The single GTS type to aggregate.
+        time_range:
+          $ref: "#/components/schemas/TimeRange"
+        filter:
+          type: string
+          description: |
+            OData `$filter` over the fixed field set. Declared metadata
+            properties are filtered by `metadata_filter`, not here; the two
+            are AND-ed. The covered period is carried by `time_range`.
+        metadata_filter:
+          type: array
+          maxItems: 16
+          description: |
+            Metadata predicate, AND-ed with `filter`. Semantics and bounds
+            are defined by `MetadataFilter`.
+          items:
+            $ref: "#/components/schemas/MetadataFilter"
         group_by:
           type: array
           maxItems: 2
           uniqueItems: true
           description: |
             Ordered grouping dimensions. Omitted or empty for the
-            no-grouping case, which yields a single bucket with no
-            `key`. Capped at 2 dimensions.
+            no-grouping case, which yields a single bucket with an empty
+            `key`. Capped at 2 dimensions, so a bucket `key` never carries
+            more than 2 entries.
           items:
             $ref: "#/components/schemas/AggregationDimension"
 
     AggregationBucket:
       type: object
       additionalProperties: false
-      required: [value]
+      required: [key, value]
       description: |
-        Single aggregated bucket. `key` carries the dimension values in
-        the request's `group_by` order; omitted when `group_by` was
-        empty (the no-grouping case yields one bucket with no `key`).
-        Matches the SDK's `AggregationBucket` wire shape.
+        Single folded bucket. `key` carries the dimension values in
+        `group_by` order, one entry per dimension; an empty array when
+        `group_by` was empty.
       properties:
         key:
           type: array
+          maxItems: 2
           description: |
-            Dimension key values in `group_by` order. Each entry is the
-            string form of the corresponding dimension's value
-            (`Uuid::to_string()` for `tenant_id`; the record's
-            identifier/type string verbatim for `resource_id`,
-            `resource_type`, `subject_id`, `subject_type`; the
-            metadata value at the declared key for
-            `{"metadata":"<key>"}`).
+            Dimension values in `group_by` order. Each entry is the string
+            form of its dimension: `Uuid::to_string()` (lowercase,
+            hyphenated) for `tenant_id`; the record's value verbatim for
+            the other fixed fields; the metadata value at the declared key
+            for `{"metadata":"<key>"}`.
           items:
             type: string
         value:
           oneOf:
-            - $ref: "#/components/schemas/AggregatedValue"
+            - $ref: "#/components/schemas/AggregatedQuantity"
             - type: "null"
           description: |
-            Aggregated value for the bucket. `null` when no rows
-            matched (e.g. `min` over an empty set). Wire-encoded as a
-            JSON string (see `AggregatedValue`); `avg` may carry a
-            plugin-chosen rounding scale on non-terminating quotients.
+            The folded quantity. `null` when no entries matched — for
+            example `MAX` over an empty set.
 
     AggregationResult:
       type: object
       additionalProperties: false
       required: [buckets]
       description: |
-        Aggregated-query result. A single bucket with no `key` (or an
-        empty `key`) represents the no-grouping case. Matches the SDK's
-        `AggregationResult` wire shape (`gts_id` and
-        `aggregation` are caller-supplied request inputs and not
-        echoed in the result).
+        Aggregated-query result. A single bucket with an empty `key`
+        represents the no-grouping case. Neither the fold nor
+        `gts_type_id` is echoed: the fold is a property of the declaration
+        the caller already resolves, and the type was a request input.
       properties:
         buckets:
           type: array
           maxItems: 100000
-          description: Result buckets in plugin-emitted order.
+          description: |
+            Result buckets. A request producing more than
+            `MAX_AGGREGATION_BUCKETS` (100,000) is rejected with `400`
+            (`context.reason = AGGREGATION_RESULT_TOO_LARGE`); narrow the
+            range or drop the high-cardinality dimension.
           items:
             $ref: "#/components/schemas/AggregationBucket"
 
-    UsageTypeGtsId:
-      type: string
-      minLength: 1
-      maxLength: 512
-      pattern: '^gts\.cf\.core\.uc\.usage_record\.v1~[^~]+$'
-      example: gts.cf.core.uc.usage_record.v1~cf.mini_chat._.tokens_consumed.v1
-      description: |
-        GTS **instance** id of a usage type, deriving directly from the
-        reserved abstract base `gts.cf.core.uc.usage_record.v1~`.
-
-    UsageType:
+    ReconciliationMetadata:
       type: object
       additionalProperties: false
       required:
-        - gts_id
-        - kind
-        - metadata_fields
-      description: Canonical UsageType catalog row.
-      properties:
-        gts_id:
-          $ref: "#/components/schemas/UsageTypeGtsId"
-        kind:
-          type: string
-          enum: [counter, gauge]
-          description: |
-            Classification axis. `counter` accepts compensations;
-            `gauge` rejects them.
-        metadata_fields:
-          type: array
-          items:
-            type: string
-          uniqueItems: true
-          description: |
-            Closed list of metadata key names accepted for this usage
-            type. Values are stringly-typed end-to-end. Every name here
-            is admissible as a `$filter` operand on raw query and as a
-            `group_by` operand on aggregation.
-
-    CreateUsageTypeRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - gts_id
-        - kind
-        - metadata_fields
+        - scope
+        - accepted_count
+        - quantity_summary
+        - accepted_at_watermark
+        - window_end_watermark
+        - sequence_watermark
       description: |
-        Registration body for `POST /usage-collector/v1/usage-types`.
-      properties:
-        gts_id:
-          $ref: "#/components/schemas/UsageTypeGtsId"
-        kind:
-          type: string
-          enum: [counter, gauge]
-        metadata_fields:
-          type: array
-          items:
-            type: string
-          uniqueItems: true
+        Per-scope ingestion metadata. Counts report ingestion activity
+        rather than aggregating the meter, so they are reported for every
+        GTS type irrespective of its declared fold.
 
-    Page_UsageType:
+        `accepted_count` and `quantity_summary` cover exactly the entries
+        the requested range selects (`from <= window_end < to`), the same
+        rule every read path applies. The three watermarks are current as
+        of the response and are not bounded by the range.
+      properties:
+        scope:
+          type: object
+          additionalProperties: false
+          required: [tenant_id, gts_type_id]
+          description: |
+            The scope these figures cover: tenant and GTS type in v1.
+            Serving a reserved `caller` or `caller_tenant` scope later
+            widens this object, which is additive.
+          properties:
+            tenant_id:
+              type: string
+              format: uuid
+            gts_type_id:
+              $ref: "#/components/schemas/GtsTypeId"
+        accepted_count:
+          type: integer
+          format: int64
+          minimum: 0
+        quantity_summary:
+          description: |
+            Fold-appropriate summary: the accrued sum for a `SUM` type, or
+            the observation count together with the latest observation
+            otherwise, since quantities under any other fold are not
+            summable. The type's declared fold selects the branch, so
+            exactly one of the two is present.
+          oneOf:
+            - type: object
+              additionalProperties: false
+              required: [accrued_sum]
+              description: Summary for a `SUM` type.
+              properties:
+                accrued_sum:
+                  $ref: "#/components/schemas/AggregatedQuantity"
+            - type: object
+              additionalProperties: false
+              required: [observation_count, latest_observation]
+              description: Summary for any other fold.
+              properties:
+                observation_count:
+                  type: integer
+                  format: int64
+                  minimum: 0
+                latest_observation:
+                  $ref: "#/components/schemas/UsageQuantity"
+        accepted_at_watermark:
+          $ref: "#/components/schemas/Timestamp"
+        window_end_watermark:
+          $ref: "#/components/schemas/Timestamp"
+        sequence_watermark:
+          type: integer
+          format: int64
+          minimum: 0
+
+    ReconciliationMetadataList:
       type: object
       additionalProperties: false
       required: [items, page_info]
-      description: Cursor-paginated page of usage-type catalog rows.
+      description: |
+        Cursor-paginated page of per-scope counters, keyset-stable over
+        `tenant_id` within the requested GTS type.
       properties:
         items:
           type: array
+          maxItems: 1000
           items:
-            $ref: "#/components/schemas/UsageType"
+            $ref: "#/components/schemas/ReconciliationMetadata"
         page_info:
           $ref: "#/components/schemas/PageInfo"
 
@@ -1013,19 +1399,18 @@ components:
       additionalProperties: true
       required: [type, title, status, detail, context]
       description: |
-        RFC 9457 problem+json envelope. `type` is a canonical-error
-        category URI; `status` is the HTTP status; `context` is a
-        per-category structured object. Discrimination layers (in order
-        of granularity): `type` (broad category), `context.resource_type`
-        (which entity), `context.field_violations[N].field`/`.reason`
-        (per-field for `InvalidArgument`), or `context.reason` (carried
-        natively only on `Aborted`, `PermissionDenied`,
-        `Unauthenticated`). `context.retryable` is a retry-safety hint.
+        RFC 9457 problem+json envelope. `type` is a canonical-error category
+        URI; `status` is the HTTP status; `context` is a per-category
+        structured object. Discrimination layers, in order of granularity:
+        `type` (broad category), `context.resource_type` (which entity),
+        `context.field_violations[N].field`/`.reason` (per-field for
+        `InvalidArgument`), or `context.reason` (carried natively on
+        `Aborted`, `PermissionDenied`, `Unauthenticated`).
+        `context.retryable` is a retry-safety hint.
       properties:
         type:
           type: string
           format: uri-reference
-          description: Canonical-error category URI.
         title:
           type: string
         status:
@@ -1044,6 +1429,6 @@ components:
           type: object
           additionalProperties: true
           description: |
-            Per-category structured context. Common fields include
-            `reason`, `retryable`, `retry_after_seconds`,
-            `field_violations`, `resource_type`, and `resource_name`.
+            Per-category structured context. Common fields include `reason`,
+            `retryable`, `retry_after_seconds`, `field_violations`,
+            `resource_type`, and `resource_name`.
