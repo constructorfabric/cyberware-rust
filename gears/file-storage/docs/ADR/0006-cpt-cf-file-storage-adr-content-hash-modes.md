@@ -146,6 +146,29 @@ over both the prior 3-mode BLAKE3 draft and ADR-0002's original P2 vision:
   per-session choice between BLAKE3-tree and composite-SHA-256 before any bytes arrived), the multipart mode here is
   a constant, not a decision.
 
+#### Amendment (2026-07): the one-part plan degenerates to `whole-sha256`
+
+The original decision made "uploaded via multipart" imply the composite mode unconditionally. This amendment narrows
+that: **a multipart plan consisting of exactly one part finalizes as `whole-sha256`**, not
+`multipart-composite-sha256`. Rationale: for a one-part plan the single part spans the entire object, so the part's
+streaming SHA-256 digest **is** `sha256(whole object bytes)` — already computed on the fly, no re-read needed — and
+wrapping it in a one-entry manifest (`root = sha256("v1,0:<h>")`) would only make the same bytes hash differently
+depending on whether they arrived as a single-shot PUT or a one-part multipart session. Consequences:
+
+* `complete_multipart_upload` stores `hash_mode = 'whole-sha256'`, `hash_value = sha256(bytes)` (the part digest),
+  `part_count = NULL`, and persists **no** `version_hash_manifest` row; the `complete` response's `manifest` field is
+  omitted (it became `Option` on the wire).
+* The mode-selection invariant above is unchanged: `hash_mode` still records which mode actually produced the stored
+  hash, set at finalize from the executed path — the "path" now includes the plan's part count.
+* §3's "minimum-degenerate" single-entry manifest (`v1,0:<digest>`) remains a **valid encoding at the type level**
+  (the grammar has no special case); it is simply never persisted or returned by `complete` anymore.
+* **Compatibility**: versions finalized as one-part composites before this amendment keep their stored
+  `multipart-composite-sha256` mode and manifest row, and verify by that mode — verification always follows the
+  version row's own `hash_mode`, never re-derives it.
+* The split-dependent-identity trade-off (risk 2 below) is thereby removed for the one-part case only: a one-part
+  multipart upload of some content now hashes identically to a single-shot upload of the same content. Plans of two
+  or more parts keep the composite semantics unchanged.
+
 ### The on-the-fly / no-re-read principle and its trust model
 
 Every mode is computed **as bytes flow to the backend during upload**, never by reading the object back afterward.
@@ -274,7 +297,11 @@ left untouched** — it is never widened, since both modes use SHA-256 as their 
 move from being unset at pending-insert time to being set at finalize time (the existing `VersionRepo::finalize` never
 touches `hash_algorithm`, a gap independent of this decision); `StorageBackend::upload_part` gains a `part_offset`
 parameter and `complete_multipart`'s contract flips from "re-read and hash the assembled object" to "build the
-manifest and root from the hashes and offsets you were given."
+manifest and root from the hashes and offsets you were given." **Gap, not enforced anywhere:** `part_count` and the
+`version_hash_manifest` row's own entry count are both derived from the same `parts` collection at finalize time, so
+they agree in practice, but nothing — no DB constraint, no runtime assertion — cross-checks that `part_count` actually
+equals the manifest's entry count after the fact; a future bug in a code path that sets one without the other would
+not be caught automatically.
 
 ### Consequences
 
@@ -412,7 +439,7 @@ read-back-and-rehash at finalize/complete indefinitely.
 
 ### Open decisions and risks
 
-Carried forward from `content-hash-modes.md` §12, not resolved by this ADR — flagged honestly rather than glossed over:
+Carried forward from `content-hash-modes.md` §11, not resolved by this ADR — flagged honestly rather than glossed over:
 
 1. **Manifest storage size is bounded but not tiny.** Worst case ~10,000 parts × ~80 bytes/entry ≈ ~800 KB per
    manifest. This is why the manifest lives in its own table (not inline on `file_versions`), and why the multipart
@@ -448,5 +475,7 @@ This decision directly addresses the following requirements or design elements:
   `part_offset` parameter and manifest-building contract this decision requires
 * `cpt-cf-file-storage-fr-metadata-storage` — the version row's `(hash_mode, hash_value)` plus the
   `version_hash_manifest` table remains the system-managed metadata this decision's verification model depends on
-* `cpt-cf-file-storage-fr-get-metadata` — metadata responses continue to surface the resolved hash fields, now
-  including `hash_mode`, `part_count`, and (for multipart versions) the `manifest` text, so consumers can re-verify
+* `cpt-cf-file-storage-fr-get-metadata` — metadata responses (`VersionDto`, `GET /files/{id}/versions`) continue to
+  surface the resolved hash fields, now including `hash_mode` and `part_count`. The `manifest` text itself is
+  **not** part of this surface — it is returned only by the one-shot multipart `complete` response; see the tracked
+  API-exposure gap under [Client and migrate_backend re-verification](#client-and-migrate_backend-re-verification)

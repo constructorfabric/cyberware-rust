@@ -124,10 +124,20 @@ patterns = [
 ]
 
 [[ignore]]
-reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, and operations.md is an operator-facing config/runbook reference (P2 remediation item 3.8), not standalone SDLC artifacts."
+reason = "Ignore file-storage companion docs — api.md is a reference summary supplementary to DESIGN.md, operations.md is an operator-facing config/runbook reference, and concurrency-and-failure-model.md is a reference catalogue of the gear's races and failure modes (cited from its tests). All three are supplementary to DESIGN.md, not standalone SDLC artifacts."
 patterns = [
   "gears/file-storage/docs/api.md",
   "gears/file-storage/docs/operations.md",
+  "gears/file-storage/docs/concurrency-and-failure-model.md",
+]
+
+[[ignore]]
+reason = "Ignore file-storage codebase and features — the feature docs declare CDSL flows (multipart collide/reclaim, policy-set, retention-create) that were reworked in the file-storage feature branch and cannot be validated against the current main code until the code MR (2/3) lands; the matching code/tests/sdk markers stay in sync with them there. Same shape as the oagw entry below. PRD/DESIGN/ADR/DECOMPOSITION and non-flow feature docs stay validated via autodetect."
+patterns = [
+  "gears/file-storage/file-storage/src/*",
+  "gears/file-storage/file-storage/tests/*",
+  "gears/file-storage/file-storage-sdk/src/*",
+  "gears/file-storage/docs/features/*",
 ]
 
 [[ignore]]

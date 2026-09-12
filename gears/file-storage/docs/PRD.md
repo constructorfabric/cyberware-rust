@@ -121,7 +121,7 @@ Gears security and governance model.
 | File                | Binary content stored in FileStorage with associated metadata                                                                                                                                                                                                                           |
 | Control Plane       | The FileStorage API/SDK. Owns metadata, authorization, versioning, and conditional-request semantics; issues signed URLs. Its REST surface never carries file content                                                                                                                    |
 | Sidecar (Data Plane)| The only component that moves user bytes. Has its own domain/URL, is connected to the storage backends, validates platform auth tokens and signed-URL signatures, and reaches the control plane via the FS SDK. Serves content only through signed URLs                                  |
-| Signed URL          | A short-lived, control-minted **PASETO `v4.public`** token (Ed25519) pointing at the sidecar that authorizes one content operation (`GET`/`PUT`/part) on a specific object, subject to AND-combined claims (`exp`, optional `ip`, optional token-claim predicates, upload size/hash). Carried in the query (`?fs-token=`) or a header; **opaque** to all but control+sidecar (`cpt-cf-file-storage-fr-signed-urls`) |
+| Signed URL          | A short-lived, control-minted **codec-equivalent Ed25519-signed token** (bespoke `base64url(json).base64url(ed25519_signature)` in P1 -- opaque and codec-evolvable per ADR-0004's Implementation note, not a literal PASETO library) pointing at the sidecar that authorizes one content operation (`GET`/`PUT`/part) on a specific object, subject to AND-combined claims (`exp`, optional `ip`, optional token-claim predicates, upload size/hash). Carried in the query (`?fs-token=`) or a header; **opaque** to all but control+sidecar (`cpt-cf-file-storage-fr-signed-urls`) |
 | File ID             | The immutable uuid identity of a logical file. The current content is reached by resolving the file's content pointer (`content_id`)                                                                                                                                                     |
 | Version ID          | A uuid assigned by FileStorage (control plane) identifying one immutable content blob; the backend object lives at `/{file_id}/{version_id}` and is never mutated in place                                                                                                                |
 | Content Pointer (`content_id`) | The `version_id` currently bound as a file's live content; changing content is a pointer swap, not an in-place mutation. The content-only ETag derives from `(file_id, content_id)`                                                                                            |
@@ -458,10 +458,8 @@ namespace, and has no JWT-bypass paths — its surface is identical for every co
 platform authentication and the Authorization Service.
 
 **Rationale**: Public/anonymous access is a sharing concern, not a storage concern. Keeping FileStorage purely
-internal in P1 (a) lets sharing semantics evolve independently inside a single gear with the appropriate
-data model, (b) eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage, and
-(c) matches the main-branch design where external sharing was already a separate (P2) FR rather than a P1
-storage concern.
+internal in P1 lets sharing semantics evolve independently inside a single gear with the appropriate data model, and
+eliminates JWT-bypass surfaces and owner-private-header redaction logic from FileStorage.
 
 ### 5.4 Policies (Phase 2)
 
@@ -535,9 +533,9 @@ exhaustion for the platform. Quota checks must cover all storage-consuming opera
 prevent quota bypass through versioned overwrites.
 **Actors**: `cpt-cf-file-storage-actor-platform-user`, `cpt-cf-file-storage-actor-cf-gears`
 
-**Implementation status (P2)**: not met yet; the requirement remains open. Storage quota is
-**not enforced in any deployment** — the Quota Enforcement service this depends on does not exist yet.
-`file-storage` has built its side and is ready to consume the check once that service ships. Technical detail in
+**Current status**: Storage quota is **not enforced in any deployment** — the Quota Enforcement service this
+requirement depends on does not exist yet. `file-storage`'s consumer side (the `QuotaClient` port and its
+fail-closed call sites) is implemented and ready to enforce the check once that service exists. Technical detail in
 [DESIGN.md](./DESIGN.md) (`quota-adapter`) and [operations.md](./operations.md).
 
 ### 5.5 Metadata
@@ -894,8 +892,10 @@ what allows the data plane (sidecar) to scale independently (ADR-0003).
 The control plane **MUST** issue short-lived **signed URLs** that authorize a single content operation
 (`GET`/`PUT`/part) against the **sidecar** for a specific object. Signed URLs **MUST**:
 
-- be a **stateless, opaque PASETO `v4.public` token** (Ed25519), verifiable by the sidecar without a database lookup,
-  for which the control plane holds the private key (**sole minter**) and the sidecar holds only the public key;
+- be a **stateless, opaque, asymmetric Ed25519-signed token** (the bespoke codec-equivalent format per ADR-0004's
+  Implementation note — `base64url(json).base64url(ed25519_signature)`, not a literal PASETO library), verifiable by the
+  sidecar without a database lookup, for which the control plane holds the private key (**sole minter**) and the sidecar
+  holds only the public key;
 - be carried either in the `fs-token` URL query parameter (`?fs-token=<token>`, for bare embeddable URLs) or in the
   `X-FS-Token` request header (for programmatic/batch) — the **same token**, chosen by access intent; it is **never**
   carried in `Authorization`, which always carries the standard platform JWT;
@@ -919,7 +919,7 @@ The control plane **MUST** issue short-lived **signed URLs** that authorize a si
 - optionally carry a set of response headers the sidecar **MUST** echo verbatim on the served response (e.g.
   `Content-Disposition`, `Content-Type` override, `Cache-Control`), so the sidecar needs no control-plane round-trip.
 
-In P1 a single static signing keypair is used (a `kid` in the PASETO footer is reserved for P2 rotation; no per-token
+In P1 a single static signing keypair is used (a `kid` in a future PASETO footer is reserved for P2 rotation; the bespoke format carries no `kid` in P1; no per-token
 revocation and no key rotation in P1; emergency access revocation is the platform auth module's token revocation). Key
 rotation and a multi-key set are deferred to P2, as is enforcement
 of the `max_rate` / `max_conns` constraints (which additionally require coordinating the multi-instance sidecar fleet
@@ -961,7 +961,13 @@ system **MUST**:
 - Support `If-None-Match` on download/metadata reads — return `304 Not Modified` when the ETag matches
 - Support `If-Match` on reads — return `400 failed_precondition` when the ETag does not match
 - Require `If-Match` on every content **bind** (the optimistic CAS that swaps `content_id`) and on `DELETE` —
-  `400 failed_precondition` on mismatch. The retry re-binds the already-uploaded `version_id` without re-upload
+  `400 failed_precondition` on mismatch. The retry re-binds the already-uploaded `version_id` without re-upload.
+  The bind may also execute **inside** the upload itself (`bind: "auto"`, the
+  default on `POST /files`) — the CAS requirement is unchanged, only the transport differs: multipart `complete`
+  reuses its own `If-Match` (absent → the first-content `content_id IS NULL` case) as the embedded bind's
+  precondition, and the single-part finalize binds strictly under `content_id IS NULL` (first content of a new file
+  only). A lost CAS never fails the upload: it is reported (`bind_state: "conflict"` / `X-FS-Bound: conflict` with
+  the current ETag) and resolved by the same manual re-bind, still with no re-upload
 
 **ETag is content-only.** Metadata-only updates bump `meta_version` and `last_modified_at` but **MUST NOT** change the
 ETag or content hash — both remain tied to the content. Consequently `If-Match` on a metadata-only update protects
@@ -1153,7 +1159,9 @@ signed-URL issuance. It does **not** carry file content — content moves over s
 **Type**: HTTP (signed-URL authorized)
 **Stability**: unstable
 **Description**: The sidecar's content surface (`GET`/`PUT`/part), addressed only via control-plane-issued signed
-URLs and served from its own domain. Verifies the PASETO `v4.public` token and its claims, validates the platform token
+URLs and served from its own domain. Verifies the bespoke codec-equivalent Ed25519 token and its claims per ADR-0004's
+Implementation note (base64url-encoded JSON plus a base64url-encoded signature; not a literal PASETO library), validates
+the platform token
 when a token-claim predicate is present, serves `Range` and conditional requests, and echoes the response headers
 baked into the URL. It holds **no** backend/tenant/user policy or quota state — all such limits (storage quota,
 allowed types, size policy, retention) live in the control plane and are applied at presign; the sidecar enforces only
@@ -1196,8 +1204,8 @@ debits/credits per `cpt-cf-file-storage-fr-usage-reporting`)
 (per `cpt-cf-file-storage-fr-storage-quota`)
 **Compatibility**: Contract follows platform quota enforcement protocol; changes require coordinated release.
 
-**Implementation status (P2)**: not satisfied yet — the Quota Enforcement counterparty does not
-exist, so this contract is not exercised in any deployment. `file-storage`'s side is ready. See [DESIGN.md](./DESIGN.md).
+**Current status**: The Quota Enforcement counterparty does not exist, so this contract is not exercised in any
+deployment. `file-storage`'s side is implemented and ready. See [DESIGN.md](./DESIGN.md).
 
 #### EventBroker Contract
 
@@ -1422,7 +1430,7 @@ exist, so this contract is not exercised in any deployment. `file-storage`'s sid
 - [ ] Policies enforce file type and size restrictions on upload (most restrictive wins across tenant and user levels)
 - [ ] All content traffic flows through the **sidecar** via signed URLs; no backend-addressable URL is returned to any client
 - [ ] Content upload and download are each a two-step exchange (control request → signed URL → byte transfer to/from the sidecar); the control REST surface never carries content
-- [ ] The credential is an opaque PASETO `v4.public` token (Ed25519), carried in the query (`?fs-token=`) or a header, stateless, enforcing AND-combined claims (expiry, optional ip, optional token-claim predicates, upload size/hash); altering any claim invalidates the signature; only control+sidecar parse it
+- [ ] The credential is an opaque, asymmetric Ed25519-signed token (the bespoke codec-equivalent format per ADR-0004's Implementation note — not a literal PASETO library), carried in the query (`?fs-token=`) or a header, stateless, enforcing AND-combined claims (expiry, optional ip, optional token-claim predicates, upload size/hash); altering any claim invalidates the signature; only control+sidecar parse it
 - [ ] file_not_found error returned for non-existent files
 - [ ] access_denied error returned for unauthorized operations
 - [ ] Metadata-only queries complete without transferring file content
