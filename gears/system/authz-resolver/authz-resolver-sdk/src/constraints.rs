@@ -92,10 +92,17 @@ impl InPredicate {
 
 /// Group membership predicate: resource is visible if it belongs to any of the listed groups.
 ///
-/// Compiles to: `property IN (SELECT resource_id FROM resource_group_membership WHERE group_id IN (group_ids))`
+/// The PEP compiler combines this wire-level predicate with the current
+/// [`crate::pep::ResourceType`]'s RG member-handle type. `SecureORM` compiles the
+/// result to a type-qualified membership subquery and casts the entity property
+/// to text to match RG's opaque `resource_id` storage. Compilation fails closed
+/// when the resource descriptor has no membership mapping; a degraded PDP
+/// response must use an explicit [`InPredicate`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupPredicate {
-    /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).
+    /// Resource property to filter. Native compilation currently requires
+    /// `pep_properties::RESOURCE_ID`; other properties need a future
+    /// per-property RG member-type mapping.
     pub property: String,
     /// Group UUIDs - the resource must be a member of at least one.
     pub group_ids: Vec<Value>,
@@ -121,11 +128,17 @@ impl InGroupPredicate {
 /// Group subtree predicate: resource is visible if it belongs to any group
 /// that is a descendant of the listed ancestor groups.
 ///
-/// Compiles to: `property IN (SELECT resource_id FROM resource_group_membership
-///   WHERE group_id IN (SELECT descendant_id FROM resource_group_closure WHERE ancestor_id IN (ancestor_ids)))`
+/// The PEP compiler combines this wire-level predicate with the current
+/// [`crate::pep::ResourceType`]'s RG member-handle type. `SecureORM` compiles the
+/// result to a type-qualified membership subquery whose group set comes from
+/// `resource_group_closure`. Compilation fails closed when the resource
+/// descriptor has no membership mapping; a degraded PDP response must use an
+/// explicit [`InPredicate`] instead.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, utoipa::ToSchema)]
 pub struct InGroupSubtreePredicate {
-    /// Resource property to filter (e.g., `pep_properties::RESOURCE_ID`).
+    /// Resource property to filter. Native compilation currently requires
+    /// `pep_properties::RESOURCE_ID`; other properties need a future
+    /// per-property RG member-type mapping.
     pub property: String,
     /// Ancestor group UUIDs - the resource must be a member of any descendant.
     pub ancestor_ids: Vec<Value>,

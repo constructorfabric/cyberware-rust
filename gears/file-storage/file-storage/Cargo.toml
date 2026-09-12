@@ -34,7 +34,7 @@ default = []
 cf-gears-file-storage-sdk = { version = "0.1.1", path = "../file-storage-sdk" }
 
 # Authorization Service (PEP) — per-type access decisions
-cf-gears-authz-resolver-sdk = { version = "0.4.0", path = "../../system/authz-resolver/authz-resolver-sdk" }
+cf-gears-authz-resolver-sdk = { version = "0.5.0", path = "../../system/authz-resolver/authz-resolver-sdk" }
 authz-resolver = { workspace = true }
 
 # Core dependencies

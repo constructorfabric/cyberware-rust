@@ -2,7 +2,7 @@
 use async_trait::async_trait;
 
 use super::*;
-use crate::constraints::{Constraint, InPredicate, Predicate};
+use crate::constraints::{Constraint, InGroupPredicate, InPredicate, Predicate};
 use crate::models::{EvaluationResponse, EvaluationResponseContext};
 use toolkit_gts::gts_id;
 use toolkit_security::{PlatformIdentity, PlatformSecurityContext, pep_properties};
@@ -187,6 +187,38 @@ impl AuthZResolverApi for CapturingMock {
     }
 }
 
+/// Mock PDP response used to verify that the resource descriptor's trusted RG
+/// member-handle type reaches the compiled `AccessScope`.
+struct GroupScopeMock;
+
+#[async_trait]
+impl AuthZResolverApi for GroupScopeMock {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _req: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![
+                        Predicate::In(InPredicate::new(
+                            pep_properties::OWNER_TENANT_ID,
+                            [uuid(TENANT)],
+                        )),
+                        Predicate::InGroup(InGroupPredicate::new(
+                            pep_properties::RESOURCE_ID,
+                            [uuid(RESOURCE)],
+                        )),
+                    ],
+                }],
+                ..Default::default()
+            },
+        })
+    }
+}
+
 fn test_ctx() -> SecurityContext {
     SecurityContext::builder()
         .subject_id(uuid(SUBJECT))
@@ -199,6 +231,9 @@ const TEST_RESOURCE: ResourceType = ResourceType::from_static(
     gts_id!("cf.core.users.user.v1~"),
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
+const GROUP_MEMBERSHIP_TYPE: &str = gts_id!("cf.core.rg.type.v1~cf.core.users.user.v1~");
+const GROUP_TYPED_TEST_RESOURCE: ResourceType =
+    TEST_RESOURCE.with_group_membership_type(GROUP_MEMBERSHIP_TYPE);
 
 fn enforcer(mock: impl AuthZResolverApi + 'static) -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(mock))
@@ -278,6 +313,77 @@ fn build_request_populates_fields() {
 }
 
 #[test]
+fn build_request_suppresses_group_capabilities_for_untyped_resource() {
+    assert_eq!(
+        TEST_RESOURCE
+            .with_group_membership_type("")
+            .group_membership_type(),
+        None,
+        "an empty mapping must normalize to an untyped resource"
+    );
+    let e = enforcer(AllowAllMock).with_capabilities(vec![
+        Capability::TenantHierarchy,
+        Capability::GroupMembership,
+        Capability::GroupHierarchy,
+    ]);
+
+    let req = e.build_request(&test_ctx(), &TEST_RESOURCE, "list", None, true);
+
+    assert_eq!(req.context.capabilities, vec![Capability::TenantHierarchy]);
+}
+
+#[test]
+fn build_request_preserves_group_capabilities_for_typed_resource() {
+    let capabilities = vec![Capability::GroupMembership, Capability::GroupHierarchy];
+    let e = enforcer(AllowAllMock).with_capabilities(capabilities.clone());
+
+    let req = e.build_request(&test_ctx(), &GROUP_TYPED_TEST_RESOURCE, "list", None, true);
+
+    assert_eq!(req.context.capabilities, capabilities);
+    assert_eq!(
+        GROUP_TYPED_TEST_RESOURCE.group_membership_type(),
+        Some(GROUP_MEMBERSHIP_TYPE)
+    );
+}
+
+#[test]
+fn build_request_suppresses_group_hierarchy_without_group_membership() {
+    // `InGroupSubtree` compilation requires BOTH group capabilities, so a
+    // lone `GroupHierarchy` advertisement is a dead capability the PDP could
+    // only act on with predicates destined to fail — it must be suppressed.
+    let e = enforcer(AllowAllMock).with_capabilities(vec![
+        Capability::TenantHierarchy,
+        Capability::GroupHierarchy,
+    ]);
+
+    let req = e.build_request(&test_ctx(), &GROUP_TYPED_TEST_RESOURCE, "list", None, true);
+
+    assert_eq!(req.context.capabilities, vec![Capability::TenantHierarchy]);
+}
+
+#[test]
+fn build_request_suppresses_group_capabilities_without_resource_id_property() {
+    // Native group predicates are hard-restricted to the `id` property; a
+    // typed resource that does not support `id` can never execute one, so
+    // its group capabilities must be suppressed despite the mapping.
+    const NO_ID_GROUP_TYPED_RESOURCE: ResourceType = ResourceType::from_static(
+        gts_id!("cf.core.users.user.v1~"),
+        &[pep_properties::OWNER_TENANT_ID],
+    )
+    .with_group_membership_type(GROUP_MEMBERSHIP_TYPE);
+
+    let e = enforcer(AllowAllMock).with_capabilities(vec![
+        Capability::TenantHierarchy,
+        Capability::GroupMembership,
+        Capability::GroupHierarchy,
+    ]);
+
+    let req = e.build_request(&test_ctx(), &NO_ID_GROUP_TYPED_RESOURCE, "list", None, true);
+
+    assert_eq!(req.context.capabilities, vec![Capability::TenantHierarchy]);
+}
+
+#[test]
 fn build_request_with_overrides_tenant() {
     let custom_tenant = uuid("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
     let e = enforcer(AllowAllMock);
@@ -346,6 +452,61 @@ async fn access_scope_threads_caller_identity_into_subject() {
 
     // The ctx argument is a credential-free plane marker carrying no identity.
     assert!(matches!(plane_ctx.identity(), PlatformIdentity::Unknown));
+}
+
+#[tokio::test]
+async fn access_scope_carries_resource_group_membership_type_into_filter() {
+    let scope = enforcer(GroupScopeMock)
+        .with_capabilities(vec![Capability::GroupMembership])
+        .access_scope(&test_ctx(), &GROUP_TYPED_TEST_RESOURCE, "list", None)
+        .await
+        .expect("typed resource must compile the negotiated native group predicate");
+
+    let filter = &scope.constraints()[0].filters()[1];
+    let toolkit_security::ScopeFilter::InGroup(filter) = filter else {
+        panic!("expected InGroup filter, got {filter:?}");
+    };
+    assert_eq!(filter.membership_resource_type(), GROUP_MEMBERSHIP_TYPE);
+}
+
+#[tokio::test]
+async fn access_scope_rejects_unadvertised_native_group_predicate() {
+    let error = enforcer(GroupScopeMock)
+        .access_scope(&test_ctx(), &GROUP_TYPED_TEST_RESOURCE, "list", None)
+        .await
+        .expect_err("a native group predicate must have been advertised");
+
+    let EnforcerError::CompileFailed(ConstraintCompileError::UnadvertisedCapabilities {
+        predicate,
+        missing,
+    }) = error
+    else {
+        panic!("expected typed unadvertised-capability error, got: {error:?}");
+    };
+    assert_eq!(predicate, "InGroup");
+    assert_eq!(missing, vec!["group_membership"]);
+}
+
+#[tokio::test]
+async fn access_scope_rejects_group_predicate_after_suppressing_untyped_capability() {
+    let error = enforcer(GroupScopeMock)
+        .with_capabilities(vec![Capability::GroupMembership])
+        .access_scope(&test_ctx(), &TEST_RESOURCE, "list", None)
+        .await
+        .expect_err("an untyped resource must not accept an unsolicited group predicate");
+
+    let EnforcerError::CompileFailed(ConstraintCompileError::UnadvertisedCapabilities {
+        predicate,
+        missing,
+    }) = error
+    else {
+        panic!(
+            "the resource mapping must suppress the configured capability before evaluation, \
+             got: {error:?}"
+        );
+    };
+    assert_eq!(predicate, "InGroup");
+    assert_eq!(missing, vec!["group_membership"]);
 }
 
 #[tokio::test]

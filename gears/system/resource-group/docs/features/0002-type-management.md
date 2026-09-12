@@ -435,12 +435,15 @@ Existing tests cover `DomainError -> ResourceGroupError` and `DomainError -> Pro
 - **Covers**: G49
 - **Assert**: Mapping produces AccessDenied variant
 
-#### TC-ERR-02: EnforcerError::EvaluationFailed -> DomainError::AccessDenied [P2]
+#### TC-ERR-02: EnforcerError::EvaluationFailed -> DomainError::InternalError [P2]
 - **Covers**: G49
-- **Assert**: Non-deny enforcer errors also map to AccessDenied
+- **Assert**: PDP RPC failures are infrastructure faults, not denials
 
-#### TC-ERR-03: EnforcerError::CompileFailed -> DomainError::AccessDenied [P2]
+#### TC-ERR-03: EnforcerError::CompileFailed -> DomainError::InternalError [P2]
 - **Covers**: G49
+- **Assert**: Constraint compile failures map to InternalError, except the
+  `UnadvertisedCapabilities` sub-case (a PDP capability-negotiation
+  violation), which maps to AccessDenied (TC-ERR-03b)
 
 #### TC-ERR-04: sea_orm::DbErr -> DomainError::Database [P2]
 - **Covers**: G50

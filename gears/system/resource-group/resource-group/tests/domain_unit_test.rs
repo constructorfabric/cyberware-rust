@@ -1015,9 +1015,9 @@ fn enforcer_denied_maps_to_access_denied() {
     );
 }
 
-// TC-ERR-02: EnforcerError::EvaluationFailed -> DomainError::AccessDenied
+// TC-ERR-02: EnforcerError::EvaluationFailed -> DomainError::InternalError
 #[test]
-fn enforcer_evaluation_failed_maps_to_access_denied() {
+fn enforcer_evaluation_failed_maps_to_internal_error() {
     use authz_resolver_sdk::pep::EnforcerError;
 
     let err: DomainError = EnforcerError::EvaluationFailed(
@@ -1030,9 +1030,9 @@ fn enforcer_evaluation_failed_maps_to_access_denied() {
     );
 }
 
-// TC-ERR-03: EnforcerError::CompileFailed -> DomainError::AccessDenied
+// TC-ERR-03: EnforcerError::CompileFailed -> DomainError::InternalError
 #[test]
-fn enforcer_compile_failed_maps_to_access_denied() {
+fn enforcer_compile_failed_maps_to_internal_error() {
     use authz_resolver_sdk::pep::ConstraintCompileError;
     use authz_resolver_sdk::pep::EnforcerError;
 
@@ -1041,6 +1041,25 @@ fn enforcer_compile_failed_maps_to_access_denied() {
     assert!(
         matches!(err, DomainError::InternalError),
         "Expected InternalError, got: {err:?}"
+    );
+}
+
+// TC-ERR-03b: a capability-negotiation violation (the PDP emitted a native
+// predicate this gear never advertised) maps to a clean denial, not a 500.
+#[test]
+fn enforcer_unadvertised_capability_maps_to_access_denied() {
+    use authz_resolver_sdk::pep::ConstraintCompileError;
+    use authz_resolver_sdk::pep::EnforcerError;
+
+    let err: DomainError =
+        EnforcerError::CompileFailed(ConstraintCompileError::UnadvertisedCapabilities {
+            predicate: "InTenantSubtree",
+            missing: vec!["tenant_hierarchy"],
+        })
+        .into();
+    assert!(
+        matches!(err, DomainError::AccessDenied { .. }),
+        "Expected AccessDenied, got: {err:?}"
     );
 }
 

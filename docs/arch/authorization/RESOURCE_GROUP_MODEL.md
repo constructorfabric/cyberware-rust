@@ -55,14 +55,80 @@ Whether and which tables to project depends on the deployment topology and acces
 | Deployment | Recommended projections | Rationale |
 |------------|------------------------|-----------|
 | **Monolith** (single shared DB) | **None** — all tables are already co-located | PEP JOINs against canonical tables directly; no extra databases or sync needed |
-| **Microservices** (separate DBs, typical case) | **`resource_group` + `resource_group_closure`** | Enables `in_group_subtree` predicates locally; hierarchy tables are small (~100 K rows). Membership resolved by PDP via capability degradation → `in` predicates |
-| **Microservices** with membership filtering/pagination | **`resource_group` + `resource_group_closure` + `resource_group_membership`** | Only when profiling confirms the two-request pattern (RG API → domain service) is unacceptable for latency budget. Membership table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables — see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates) for concrete numbers |
+| **Microservices** (separate DBs, typical case) | **`resource_group` + `resource_group_closure`** | Supports local hierarchy operations. Authorization must use explicit `in` predicates expanded by a capable PDP because the membership table is absent. Hierarchy tables are small (~100 K rows). |
+| **Microservices** with membership filtering/pagination | **`resource_group` + `resource_group_closure` + `resource_group_membership` + `gts_type`** | Only when profiling confirms the two-request pattern (RG API → domain service) is unacceptable for latency budget. `gts_type` is required to resolve external member-handle types to RG-local membership discriminators. The membership table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables — see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates) for concrete numbers |
 
 > **Important:** When a domain service query includes filters by resource group attributes (e.g., `GET /tasks?status=pending&project={projectX}&after=…&limit=50`), the two-request pattern means N additional round-trips to the RG Membership API (one per filter page or group), not just +1. If this N-request fan-out violates the latency budget, that is the signal to project the membership table locally.
 >
-> **Architecture guidance:** default to consuming degraded `in` predicates from PDP. The `in_group` and `in_group_subtree` predicates are natively executable within the RG gear; domain services that choose not to project the membership table rely on PDP capability degradation.
+> **Architecture guidance:** default to consuming explicit `in` predicates expanded by the PDP. Advertise a native group capability only when every table required to execute its SQL is co-located or projected into the querying service's database.
 
-PEP within the RG gear compiles `in_group`/`in_group_subtree` predicates into SQL subqueries using the membership table. Domain services without the membership projection receive degraded `in` predicates and do not need group-related projection tables for authorization filtering.
+| Native predicate | Capabilities advertised together | Required local tables |
+|------------------|----------------------------------|-----------------------|
+| `in_group` | `GroupMembership` | `resource_group_membership`, `gts_type` |
+| `in_group_subtree` | `GroupMembership`, `GroupHierarchy` | `resource_group_membership`, `gts_type`, `resource_group_closure` |
+
+`GroupHierarchy` is not independently executable: subtree membership also needs
+`GroupMembership` and all of its tables. A service MUST omit either capability
+when its required tables are unavailable. Capability omission asks the PDP to
+expand the group scope to explicit resource-ID `in` predicates; the PEP does not
+perform this expansion automatically. A PDP that cannot expand the scope MUST
+deny rather than emit an unadvertised native predicate or remove group filtering.
+
+For native group predicates, the PEP resource descriptor MUST also configure its
+RG member-handle GTS path with
+`ResourceType::with_group_membership_type(...)`. The mapping is necessary but
+not evidence that projection tables exist: the service owner remains responsible
+for configuring `PolicyEnforcer::with_capabilities(...)` to match the local
+schema. SecureORM resolves the external path through RG's local `gts_type` table
+and adds the resulting `gts_type_id` condition to the membership subquery. This
+is required because `resource_group_membership` is shared by all member types
+and external resource IDs are only unique within a type. The AuthZ resource name
+must not be used as an implicit replacement: a gear may deliberately use a
+different GTS path for policy matching. The configured value MUST be a member
+type actually registered in RG's type registry (a `gts.cf.core.rg.type.v1~`-prefixed
+code accepted by `validate_type_code`, whose resolved `gts_type_id` is stored
+on membership rows) — a value that never resolves through `gts_type` makes
+every native group predicate silently match zero rows. Resource groups themselves have no member-handle type:
+group nesting is hierarchy (`parent_id`/`resource_group_closure`), not
+membership, so RG's own group resource descriptor deliberately carries no
+mapping.
+
+A resource descriptor without the mapping suppresses configured group
+capabilities for that request. The PEP also rejects a native group predicate
+that was not among the capabilities actually advertised or that lacks the
+trusted mapping.
+
+Native group predicates currently target only `id`: one resource descriptor
+carries one RG member-handle type, so applying that mapping to another property
+could compare identifiers from unrelated resource types. Every group predicate
+must also have an `owner_tenant_id` predicate in the same AND constraint. Keeping
+the tenant predicate in a separate OR branch would let the group branch escape
+the platform's mandatory tenant boundary and is rejected fail-closed.
+
+The native SQL casts the querying entity's ID to text, rather than casting RG's
+opaque `resource_id` to UUID, because non-UUID member identifiers are valid.
+The comparison is intentionally an exact textual comparison: consuming gears
+must write membership IDs in the same canonical representation produced by the
+entity column's text cast. UUID-backed resources should use lowercase hyphenated
+UUID strings (for example, `Uuid::to_string()`); RG treats IDs as opaque and does
+not normalize uppercase, brace, URN, or unhyphenated variants. Text-backed ID
+columns and projections must use deterministic, case-sensitive equality so
+identifiers that differ by case are not conflated.
+
+Casting the entity key can prevent PostgreSQL from using its ordinary native-type
+index for the group condition alone. Deployments that enable native predicates
+for large tables should confirm plans with `EXPLAIN`. When group filtering is
+selective within a large tenant, a composite expression index matching the
+physical tenant and resource columns lets PostgreSQL drive the entity lookup
+from the membership result instead of scanning all tenant rows:
+
+```sql
+CREATE INDEX resource_tenant_id_text_idx
+    ON resource_table (tenant_id, (CAST(id AS text)));
+```
+
+The exact table and column names belong in the consuming gear's migration; the
+generic toolkit cannot create this index on behalf of arbitrary entities.
 
 - RG canonical table schemas: [RG DESIGN §Database Schemas](../../../gears/system/resource-group/docs/DESIGN.md#37-database-schemas--tables)
 - When to use which table: [AUTHZ_USAGE_SCENARIOS §Choosing Projection Tables](./AUTHZ_USAGE_SCENARIOS.md#choosing-projection-tables)

@@ -79,6 +79,21 @@ impl Service {
             };
         }
 
+        // This static PDP has no RG client and therefore cannot resolve group
+        // selectors to explicit resource IDs. Ignoring a selector would widen
+        // it to tenant-wide access, so deny whenever group scoping is requested.
+        if request.resource.properties.contains_key("group_ids")
+            || request
+                .resource
+                .properties
+                .contains_key("ancestor_group_ids")
+        {
+            return EvaluationResponse {
+                decision: false,
+                context: EvaluationResponseContext::default(),
+            };
+        }
+
         // Baseline OWNER_TENANT_ID clamp -- the universal shape a PEP binds when its
         // entity declares `tenant_col`. Emitted only when the PEP declares that property:
         // the compiler fails any constraint naming something outside
