@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-file-parser"
-version = "0.1.41"
+version = "0.1.42"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
