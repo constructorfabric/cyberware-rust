@@ -856,7 +856,7 @@ async fn wrapping_preserves_multiple_www_authenticate_challenges() {
 
 #[tokio::test]
 async fn wrapping_preserves_rate_limit_headers_on_a_recovered_canonical_error() {
-    // `gears/system/api-gateway/src/middleware/rate_limit.rs` and
+    // `gears/system/api-gateway/src/middleware/throttling.rs` and
     // `oagw`'s `error_response` both attach rate-limit/quota headers
     // (RateLimit-Policy, RateLimit-Limit, X-RateLimit-Limit/-Remaining/
     // -Reset) directly onto a `CanonicalError`/`Problem` response - the

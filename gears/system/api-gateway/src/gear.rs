@@ -91,6 +91,9 @@ pub struct ApiGateway {
     // `separate`/`both` mode and merged onto the main router in `main`/`both` mode. Cached
     // so repeat `health_router()`/`build_health_router()` calls are cheap.
     pub(crate) health_router: OnceLock<axum::Router>,
+    // Pending throttling keyed-store pruner from the last middleware build;
+    // consumed by `serve` to spawn a prune task bound to the lifecycle token.
+    pub(crate) throttle_key_pruner: Mutex<Option<middleware::throttling::ThrottleKeyPruner>>,
 
     // Duplicate detection (per (method, path) and per handler id)
     pub(crate) registered_routes: DashMap<(Method, String), ()>,
@@ -121,6 +124,7 @@ impl Default for ApiGateway {
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             health_router: OnceLock::new(),
+            throttle_key_pruner: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
@@ -214,6 +218,7 @@ impl ApiGateway {
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             health_router: OnceLock::new(),
+            throttle_key_pruner: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
@@ -237,6 +242,11 @@ impl ApiGateway {
     }
 
     /// Force rebuild and cache of the router.
+    ///
+    /// Replaces only the cached router; the serving router (and the throttling
+    /// key pruner paired with it, handed to `serve`) is unaffected, so the
+    /// rebuild's own pruner is deliberately discarded rather than allowed to
+    /// desynchronize `throttle_key_pruner` from the router actually served.
     ///
     /// # Errors
     /// Returns an error if router building fails.
@@ -358,11 +368,16 @@ impl ApiGateway {
     }
 
     /// Apply all middleware layers to a router (request ID, tracing, timeout, body limit, CORS, rate limiting, error mapping, auth)
+    ///
+    /// Returns the router together with the throttling key pruner built from
+    /// the same zone instances, so the caller can keep the pair consistent:
+    /// the pruner handed to `serve` must be the one paired with the router
+    /// actually being served.
     pub(crate) fn apply_middleware_stack(
         &self,
         mut router: Router,
         authn_client: Option<Arc<dyn AuthNResolverClient>>,
-    ) -> Result<Router> {
+    ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
         // Build route policy once
         let route_policy = self.build_route_policy_from_specs()?;
 
@@ -371,7 +386,8 @@ impl ApiGateway {
         //
         // Desired request execution order (outermost -> innermost):
         // SetRequestId -> PropagateRequestId -> Trace -> push_req_id_to_extensions
-        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> RateLimit -> ErrorMapping -> Auth -> ScopeEnforcement -> License -> Router
+        // -> Timeout -> BodyLimit -> CORS -> MIME validation -> PreAuthThrottling -> ErrorMapping
+        // -> Auth -> ScopeEnforcement -> PostAuthThrottling -> License -> Router
         //
         // Therefore we must add layers in the reverse order (innermost -> outermost) below.
         // Due future refactoring, this order must be maintained.
@@ -387,7 +403,10 @@ impl ApiGateway {
 
         let config = self.get_cached_config();
 
-        // Collect specs once; used by MIME validation + rate limiting maps.
+        // Fail fast on invalid throttling configuration (undefined zone refs, zero limits, etc.).
+        config.validate_throttling()?;
+
+        // Collect specs once; used by MIME validation + throttling maps.
         let specs: Vec<_> = self
             .openapi_registry
             .operation_specs
@@ -402,6 +421,21 @@ impl ApiGateway {
             move |req: axum::extract::Request, next: axum::middleware::Next| {
                 let map = license_map.clone();
                 middleware::license_validation::license_validation_middleware(map, req, next)
+            },
+        ));
+
+        // Build both throttling partitions together so a zone referenced from
+        // both pre-auth and post-auth operations shares a single limiter/gate
+        // instance. The pre-auth map is layered later (step 9b).
+        let (throttling_map, throttling_map_noauth, throttle_key_pruner) =
+            middleware::throttling::build_maps(&specs, &config)?;
+
+        // 11b) Post-auth throttling (identity-keyed zones). Added before the auth
+        // layer so it runs AFTER auth and can read SecurityContext for identity keys.
+        router = router.layer(from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let map = throttling_map.clone();
+                middleware::throttling::throttling_middleware(map, req, next)
             },
         ));
 
@@ -471,13 +505,13 @@ impl ApiGateway {
         // 11) Error mapping (outer to auth so it can translate auth/handler errors)
         router = router.layer(from_fn(toolkit::api::error_layer::error_mapping_middleware));
 
-        // 10) Per-route rate limiting & in-flight limits
-        let rate_map = middleware::rate_limit::RateLimiterMap::from_specs(&specs, &config)?;
-
+        // 9b) Pre-auth throttling (IP-keyed zones). Added after the auth layer so
+        // it runs BEFORE auth; identity keying is not available here. The map was
+        // built together with the post-auth map (above) to share zone runtimes.
         router = router.layer(from_fn(
             move |req: axum::extract::Request, next: axum::middleware::Next| {
-                let map = rate_map.clone();
-                middleware::rate_limit::rate_limit_middleware(map, req, next)
+                let map = throttling_map_noauth.clone();
+                middleware::throttling::throttling_no_auth_middleware(map, req, next)
             },
         ));
 
@@ -601,22 +635,39 @@ impl ApiGateway {
             crate::middleware::request_id::MakeReqId,
         ));
 
-        Ok(router)
+        Ok((router, throttle_key_pruner))
     }
 
     /// Build the HTTP router from registered routes and operations.
     ///
+    /// The pruner paired with the freshly built router is dropped: this entry
+    /// point serves inspection/caching callers, and the serving pairing kept
+    /// in `throttle_key_pruner` must not be overwritten by a router that is
+    /// not the one `serve` runs (see `get_or_build_router` for the serving
+    /// path, which keeps the pair together).
+    ///
+    /// Side effect: every call rebuilds and re-stores into `router_cache`, so
+    /// `get_cached_router` reflects the latest build rather than staying
+    /// frozen after first use.
+    ///
     /// # Errors
     /// Returns an error if router building or middleware setup fails.
     pub fn build_router(&self) -> Result<Router> {
-        // If the cached router is currently held elsewhere (e.g., by the running server),
-        // return it without rebuilding to avoid unnecessary allocations.
-        let cached_router = self.router_cache.load();
-        if Arc::strong_count(&cached_router) > 1 {
-            tracing::debug!("Using cached router");
-            return Ok((*cached_router).clone());
-        }
+        let (router, _pruner) = self.build_router_with_pruner()?;
+        Ok(router)
+    }
 
+    /// Build the router together with the throttling key pruner created from
+    /// the same zone instances.
+    ///
+    /// Always builds fresh. A previous revision short-circuited to the cached
+    /// router when `Arc::strong_count(...) > 1`, but `RouterCache::load()` is
+    /// `ArcSwap::load_full()` — the swap always retains its own reference, so
+    /// the count was at least 2 and the "reuse" branch was taken
+    /// unconditionally, returning the stale cached router with no pruner.
+    fn build_router_with_pruner(
+        &self,
+    ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
         tracing::debug!("Building new router (standalone/fallback mode)");
         // No "main" routes here — the empty router is tolerated (`has_routes` guard).
         // Health probes are not part of this router; see `health_router`.
@@ -632,7 +683,7 @@ impl ApiGateway {
             router = self.mount_proxy_fallback(router)?;
         }
 
-        let router = self.apply_middleware_stack(router, authn_client)?;
+        let (router, pruner) = self.apply_middleware_stack(router, authn_client)?;
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         let router = Self::apply_prefix(router, &prefix);
@@ -640,7 +691,7 @@ impl ApiGateway {
         // Cache the built router for future use
         self.router_cache.store(router.clone());
 
-        Ok(router)
+        Ok((router, pruner))
     }
 
     /// Build `OpenAPI` specification from registered routes and components.
@@ -653,10 +704,12 @@ impl ApiGateway {
         let info = toolkit::api::OpenApiInfo {
             title: config.openapi.title.clone(),
             version: config.openapi.version.clone(),
-            description: config.openapi.description,
+            description: config.openapi.description.clone(),
             servers: (!prefix.is_empty()).then_some(prefix).into_iter().collect(),
         };
-        self.openapi_registry.build_openapi(&info)
+        let mut openapi = self.openapi_registry.build_openapi(&info)?;
+        enrich_openapi_with_zone_limits(&mut openapi, &config);
+        Ok(openapi)
     }
 
     /// Parse bind address from configuration string.
@@ -690,6 +743,10 @@ impl ApiGateway {
     }
 
     /// Get the finalized router or build a default one.
+    ///
+    /// On the fallback path the freshly built pruner is stored so `serve`
+    /// picks up the one paired with the router it is about to run; the
+    /// REST-phase path relies on `rest_finalize` having stored that pair.
     fn get_or_build_router(self: &Arc<Self>) -> anyhow::Result<Router> {
         let stored = { self.final_router.lock().take() };
 
@@ -698,7 +755,9 @@ impl ApiGateway {
             Ok(router)
         } else {
             tracing::debug!("No router from REST phase, building default router");
-            self.build_router()
+            let (router, pruner) = self.build_router_with_pruner()?;
+            *self.throttle_key_pruner.lock() = Some(pruner);
+            Ok(router)
         }
     }
 
@@ -714,6 +773,17 @@ impl ApiGateway {
         let cfg = self.get_cached_config();
         let addr = Self::parse_bind_address(&cfg.bind_addr)?;
         let router = self.get_or_build_router()?;
+
+        // Bound the throttling keyed stores: spawn the periodic pruner produced
+        // during middleware build, tied to the lifecycle token so it stops on
+        // shutdown. Without this the keyed stores grow one entry per distinct
+        // (attacker-influenced) key with no eviction, and pruning off the hot
+        // path avoids per-request all-shard write-locking scans under a flood.
+        if let Some(pruner) = self.throttle_key_pruner.lock().take() {
+            // The task self-terminates when `cancel` fires, so the handle is
+            // intentionally discarded rather than joined.
+            drop(pruner.spawn(cancel.clone()));
+        }
 
         // Bind the main socket.
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1218,7 +1288,12 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         // unprefixed OperationBuilder paths; layers run before nest() strips the prefix).
         tracing::debug!("Applying middleware stack to finalized router");
         let authn_client = self.authn_client.lock().clone();
-        router = self.apply_middleware_stack(router, authn_client)?;
+        let (stacked, pruner) = self.apply_middleware_stack(router, authn_client)?;
+        router = stacked;
+        // Hand the keyed-store pruner paired with this router to `serve`,
+        // which owns the lifecycle CancellationToken needed to bound the
+        // background prune task.
+        *self.throttle_key_pruner.lock() = Some(pruner);
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         router = Self::apply_prefix(router, &prefix);
@@ -1334,10 +1409,168 @@ async fn build_internal_authenticator(
     )
 }
 
+/// Enrich throttled operations with their zones' numeric limits.
+///
+/// The toolkit registry emits only zone *names* (`x-throttling-*-zone`)
+/// because the contract layer does not know the gateway configuration. Here,
+/// where the zone definitions are in scope, every operation carrying such an
+/// extension additionally gains `x-rate-limit-rps` / `x-rate-limit-burst` /
+/// `x-in-flight-limit`, so spec consumers keep seeing the numeric limits (as
+/// they did before the zone model, when the limits lived inline on the
+/// operation).
+fn enrich_openapi_with_zone_limits(
+    openapi: &mut utoipa::openapi::OpenApi,
+    config: &ApiGatewayConfig,
+) {
+    for item in openapi.paths.paths.values_mut() {
+        let operations = [
+            item.get.as_mut(),
+            item.put.as_mut(),
+            item.post.as_mut(),
+            item.delete.as_mut(),
+            item.options.as_mut(),
+            item.head.as_mut(),
+            item.patch.as_mut(),
+            item.trace.as_mut(),
+        ];
+        for op in operations.into_iter().flatten() {
+            let zone_name = |op: &utoipa::openapi::path::Operation, key: &str| {
+                op.extensions
+                    .as_ref()
+                    .and_then(|ext| ext.get(key))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+
+            if let Some(name) = zone_name(op, "x-throttling-rate-limit-zone")
+                && let Some(zone) = config.rate_limit_zones.get(name.as_str())
+            {
+                let ext = op.extensions.get_or_insert_with(Default::default);
+                ext.insert(
+                    "x-rate-limit-rps".to_owned(),
+                    serde_json::json!(zone.rate_limit.rps),
+                );
+                ext.insert(
+                    "x-rate-limit-burst".to_owned(),
+                    serde_json::json!(zone.burst_limit),
+                );
+            }
+
+            if let Some(name) = zone_name(op, "x-throttling-in-flight-limit-zone")
+                && let Some(zone) = config.in_flight_limit_zones.get(name.as_str())
+            {
+                let ext = op.extensions.get_or_insert_with(Default::default);
+                ext.insert(
+                    "x-in-flight-limit".to_owned(),
+                    serde_json::json!(zone.in_flight_limit),
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrich_openapi_adds_zone_limits_by_zone_name() {
+        use crate::config::{KeyConfig, KeyType, RateLimitZone, RateSpec, RetryAfter};
+        use utoipa::openapi::extensions::Extensions;
+        use utoipa::openapi::path::OperationBuilder;
+        use utoipa::openapi::{HttpMethod, OpenApiBuilder, PathItem, PathsBuilder};
+
+        let throttled = OperationBuilder::new()
+            .extensions(Some(Extensions::from_iter([(
+                "x-throttling-rate-limit-zone",
+                serde_json::json!("z1"),
+            )])))
+            .build();
+        let unknown_zone = OperationBuilder::new()
+            .extensions(Some(Extensions::from_iter([(
+                "x-throttling-rate-limit-zone",
+                serde_json::json!("missing"),
+            )])))
+            .build();
+        let plain = OperationBuilder::new().build();
+        let inflight_only = OperationBuilder::new()
+            .extensions(Some(Extensions::from_iter([(
+                "x-throttling-in-flight-limit-zone",
+                serde_json::json!("ifl1"),
+            )])))
+            .build();
+        let mut openapi = OpenApiBuilder::new()
+            .paths(
+                PathsBuilder::new()
+                    .path("/throttled", PathItem::new(HttpMethod::Get, throttled))
+                    .path("/unknown", PathItem::new(HttpMethod::Get, unknown_zone))
+                    .path("/plain", PathItem::new(HttpMethod::Get, plain))
+                    .path("/inflight", PathItem::new(HttpMethod::Get, inflight_only))
+                    .build(),
+            )
+            .build();
+
+        let mut config = ApiGatewayConfig::default();
+        config.rate_limit_zones.insert(
+            "z1".to_owned(),
+            RateLimitZone {
+                rate_limit: RateSpec { rps: 50 },
+                burst_limit: 100,
+                response_status_code: 429,
+                response_retry_after: RetryAfter::Auto,
+                key: KeyConfig {
+                    key_type: KeyType::Ip,
+                },
+                max_keys: 1000,
+            },
+        );
+        config.in_flight_limit_zones.insert(
+            "ifl1".to_owned(),
+            crate::config::InFlightLimitZone {
+                in_flight_limit: 25,
+                backlog_limit: 0,
+                backlog_timeout: std::time::Duration::ZERO,
+                response_status_code: 429,
+                key: KeyConfig {
+                    key_type: KeyType::Ip,
+                },
+                max_keys: 1000,
+                excluded_keys: vec![],
+            },
+        );
+
+        enrich_openapi_with_zone_limits(&mut openapi, &config);
+        let json = serde_json::to_value(&openapi).unwrap();
+
+        let throttled = &json["paths"]["/throttled"]["get"];
+        assert_eq!(throttled["x-rate-limit-rps"], serde_json::json!(50));
+        assert_eq!(throttled["x-rate-limit-burst"], serde_json::json!(100));
+        // The zone-name binding emitted by the toolkit stays in place.
+        assert_eq!(
+            throttled["x-throttling-rate-limit-zone"],
+            serde_json::json!("z1")
+        );
+
+        // An in-flight-only operation gains the numeric in-flight limit and
+        // nothing rate-limit related; a rate-only operation the reverse.
+        let inflight = &json["paths"]["/inflight"]["get"];
+        assert_eq!(inflight["x-in-flight-limit"], serde_json::json!(25));
+        assert!(inflight.get("x-rate-limit-rps").is_none());
+        assert!(throttled.get("x-in-flight-limit").is_none());
+
+        // A binding to an unknown zone and an unthrottled operation gain nothing.
+        assert!(
+            json["paths"]["/unknown"]["get"]
+                .get("x-rate-limit-rps")
+                .is_none()
+        );
+        assert!(
+            json["paths"]["/plain"]["get"]
+                .get("x-rate-limit-rps")
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_openapi_generation() {
@@ -1664,9 +1897,12 @@ mod tests {
 
         // Binding to `:0` lets the OS pick a free port; `serve` must publish the
         // actual bound address (via `listener.local_addr()`), not the configured
-        // `:0`.
+        // `:0`. Auth is disabled because this test exercises the fallback
+        // router build (no `rest_finalize`), which fails fast when auth is
+        // enabled but no AuthN Resolver client is available.
         let cfg = ApiGatewayConfig {
             bind_addr: "127.0.0.1:0".to_owned(),
+            auth_disabled: true,
             ..Default::default()
         };
         let api = Arc::new(ApiGateway::new(cfg));

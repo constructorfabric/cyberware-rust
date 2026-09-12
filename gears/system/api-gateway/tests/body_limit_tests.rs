@@ -40,12 +40,7 @@ fn create_test_gear_ctx_with_body_limit(limit_bytes: usize) -> GearCtx {
         "cors_enabled": true,
         "auth_disabled": true,
         "defaults": {
-            "body_limit_bytes": limit_bytes,
-            "rate_limit": {
-                "rps": 100,
-                "burst": 200,
-                "in_flight": 64
-            }
+            "body_limit_bytes": limit_bytes
         }
     }));
 

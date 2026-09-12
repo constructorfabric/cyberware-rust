@@ -322,9 +322,6 @@ async fn e2e_full_middleware_stack_logs_remote_addr() -> anyhow::Result<()> {
                 "bind_addr": "127.0.0.1:0",
                 "cors_enabled": false,
                 "auth_disabled": true,
-                "defaults": {
-                    "rate_limit": { "rps": 1000, "burst": 1000, "in_flight": 64 }
-                },
             }
         }
     });

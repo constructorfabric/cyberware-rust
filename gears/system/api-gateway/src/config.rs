@@ -1,7 +1,15 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::time::Duration;
 
 fn default_require_auth_by_default() -> bool {
     true
+}
+
+fn default_throttle_status() -> u16 {
+    429
 }
 
 fn default_body_limit_bytes() -> usize {
@@ -105,6 +113,27 @@ pub struct ApiGatewayConfig {
     /// (`cpt-cf-adr-two-plane-auth`). Default: `None` (Profile 1 monolith).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_auth: Option<toolkit_security::InternalAuthConfig>,
+
+    /// Named rate-limit zones (token-bucket limits keyed per zone strategy).
+    #[serde(default)]
+    pub rate_limit_zones: BTreeMap<String, RateLimitZone>,
+
+    /// Named in-flight (concurrency) limit zones.
+    #[serde(default)]
+    pub in_flight_limit_zones: BTreeMap<String, InFlightLimitZone>,
+
+    /// Number of trusted reverse-proxy hops in front of the gateway.
+    ///
+    /// Controls how the client IP is derived for IP-keyed throttling. When `0`
+    /// (the default) the immediate peer address from `ConnectInfo` is used and
+    /// the client-supplied `X-Forwarded-For` / `X-Real-IP` headers are ignored,
+    /// preventing a caller from spoofing or rotating the throttling bucket key
+    /// to bypass pre-auth IP limits. When set to `n >= 1`, the client IP is
+    /// taken from the `X-Forwarded-For` entry `n` positions from the right (the
+    /// value written by the outermost trusted proxy), which an untrusted client
+    /// cannot forge.
+    #[serde(default)]
+    pub trusted_proxy_hops: usize,
 }
 
 /// Reverse-proxy (embedded edge) configuration.
@@ -222,6 +251,9 @@ impl Default for ApiGatewayConfig {
             health: HealthConfig::default(),
             gateway_proxy: GatewayProxyConfig::default(),
             internal_auth: None,
+            rate_limit_zones: BTreeMap::new(),
+            in_flight_limit_zones: BTreeMap::new(),
+            trusted_proxy_hops: 0,
         }
     }
 }
@@ -229,8 +261,6 @@ impl Default for ApiGatewayConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Defaults {
-    /// Fallback rate limit when operation does not specify one
-    pub rate_limit: RateLimitDefaults,
     /// Global request body size limit in bytes
     pub body_limit_bytes: usize,
 }
@@ -238,26 +268,7 @@ pub struct Defaults {
 impl Default for Defaults {
     fn default() -> Self {
         Self {
-            rate_limit: RateLimitDefaults::default(),
             body_limit_bytes: default_body_limit_bytes(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct RateLimitDefaults {
-    pub rps: u32,
-    pub burst: u32,
-    pub in_flight: u32,
-}
-
-impl Default for RateLimitDefaults {
-    fn default() -> Self {
-        Self {
-            rps: 50,
-            burst: 100,
-            in_flight: 64,
         }
     }
 }
@@ -392,6 +403,231 @@ pub struct RoutePolicyRule {
     // Future fields: rate_limit, timeout, operation_id, etc.
 }
 
+// =================================================================================================
+// Throttling configuration (zone-based, NGINX-style)
+// =================================================================================================
+
+/// A steady-state rate expressed as requests-per-second.
+///
+/// Parsed from the string form `"<n>/s"` (e.g. `"50/s"`). Only the `/s` unit is
+/// supported; any other unit is rejected with an explanatory error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateSpec {
+    /// Requests per second.
+    pub rps: u32,
+}
+
+impl<'de> Deserialize<'de> for RateSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        let s = raw.trim();
+        let value = s.strip_suffix("/s").ok_or_else(|| {
+            de::Error::custom(format!(
+                "invalid rate '{s}': only the '/s' (per-second) unit is supported, e.g. '50/s'"
+            ))
+        })?;
+        let rps: u32 = value.trim().parse().map_err(|_| {
+            de::Error::custom(format!(
+                "invalid rate '{s}': '{value}' is not a valid integer"
+            ))
+        })?;
+        Ok(Self { rps })
+    }
+}
+
+impl Serialize for RateSpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("{}/s", self.rps))
+    }
+}
+
+/// `Retry-After` response policy for a rate-limit zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetryAfter {
+    /// Compute the retry delay automatically from the limiter state.
+    #[default]
+    Auto,
+    /// Always advertise a fixed number of seconds.
+    Seconds(u64),
+}
+
+impl<'de> Deserialize<'de> for RetryAfter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RetryAfterVisitor;
+
+        impl Visitor<'_> for RetryAfterVisitor {
+            type Value = RetryAfter;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("the string \"auto\" or a non-negative integer number of seconds")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(RetryAfter::Seconds(v))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                u64::try_from(v)
+                    .map(RetryAfter::Seconds)
+                    .map_err(|_| E::custom("response_retry_after must be non-negative"))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.eq_ignore_ascii_case("auto") {
+                    Ok(RetryAfter::Auto)
+                } else {
+                    Err(E::custom(format!(
+                        "invalid response_retry_after '{v}': expected \"auto\" or a number of seconds"
+                    )))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(RetryAfterVisitor)
+    }
+}
+
+impl Serialize for RetryAfter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Seconds(n) => serializer.serialize_u64(*n),
+        }
+    }
+}
+
+/// The keying strategy used by a throttling zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyType {
+    /// Key by a per-operation identity (supplied in code via `ThrottlingSpec`).
+    /// Identity keying requires authentication, so identity-keyed zones may only
+    /// be referenced by operations marked `require_security_context = true`.
+    Identity,
+    /// Key by client IP address. Usable before authentication.
+    Ip,
+}
+
+/// Key configuration block for a zone (`key: { type: identity }`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyConfig {
+    /// Keying strategy.
+    #[serde(rename = "type")]
+    pub key_type: KeyType,
+}
+
+/// A rate-limit zone definition.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitZone {
+    /// Steady-state rate (e.g. `50/s`).
+    pub rate_limit: RateSpec,
+    /// Maximum burst size (token-bucket capacity).
+    pub burst_limit: u32,
+    /// HTTP status returned when the limit is exceeded.
+    #[serde(default = "default_throttle_status")]
+    pub response_status_code: u16,
+    /// `Retry-After` policy.
+    #[serde(default)]
+    pub response_retry_after: RetryAfter,
+    /// Keying strategy.
+    pub key: KeyConfig,
+    /// Cap on distinct keys tracked at once (approximate). Requests with a new
+    /// key beyond the cap are rejected with `response_status_code` until the
+    /// periodic prune drops stale keys and reopens admission.
+    pub max_keys: u64,
+}
+
+/// An in-flight (concurrency) limit zone definition.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InFlightLimitZone {
+    /// Maximum number of concurrently in-flight requests per key.
+    pub in_flight_limit: u32,
+    /// Maximum number of queued (waiting) requests per key.
+    pub backlog_limit: u32,
+    /// Maximum time a request may wait in the backlog before rejection.
+    #[serde(with = "humantime_serde")]
+    pub backlog_timeout: Duration,
+    /// HTTP status returned when the limit is exceeded.
+    #[serde(default = "default_throttle_status")]
+    pub response_status_code: u16,
+    /// Keying strategy.
+    pub key: KeyConfig,
+    /// Cap on distinct keys tracked at once (approximate). Requests with a new
+    /// key beyond the cap are rejected with `response_status_code` until the
+    /// periodic prune drops gates not held by an in-flight request and reopens
+    /// admission (a held gate is never evicted, so a cap filled by live
+    /// requests stays closed until they finish).
+    pub max_keys: u64,
+    /// Keys that bypass this zone entirely (e.g. privileged identities).
+    #[serde(default)]
+    pub excluded_keys: Vec<String>,
+}
+
+impl ApiGatewayConfig {
+    /// Validate the throttling configuration at load time.
+    ///
+    /// Checks that:
+    /// - zone numeric fields are non-zero where required,
+    /// - response status codes are valid HTTP statuses.
+    ///
+    /// # Errors
+    /// Returns an error describing the first invalid entry encountered.
+    pub fn validate_throttling(&self) -> anyhow::Result<()> {
+        for (name, zone) in &self.rate_limit_zones {
+            if zone.rate_limit.rps == 0 {
+                anyhow::bail!("rate_limit_zone '{name}': rate_limit must be greater than 0");
+            }
+            if zone.burst_limit == 0 {
+                anyhow::bail!("rate_limit_zone '{name}': burst_limit must be greater than 0");
+            }
+            if zone.max_keys == 0 {
+                anyhow::bail!("rate_limit_zone '{name}': max_keys must be greater than 0");
+            }
+            validate_status(name, zone.response_status_code)?;
+        }
+
+        for (name, zone) in &self.in_flight_limit_zones {
+            if zone.in_flight_limit == 0 {
+                anyhow::bail!(
+                    "in_flight_limit_zone '{name}': in_flight_limit must be greater than 0"
+                );
+            }
+            if zone.max_keys == 0 {
+                anyhow::bail!("in_flight_limit_zone '{name}': max_keys must be greater than 0");
+            }
+            validate_status(name, zone.response_status_code)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn validate_status(zone: &str, status: u16) -> anyhow::Result<()> {
+    let code = http::StatusCode::from_u16(status)
+        .map_err(|_| anyhow::anyhow!("zone '{zone}': invalid response_status_code {status}"))?;
+    if !(code.is_client_error() || code.is_server_error()) {
+        anyhow::bail!(
+            "zone '{zone}': response_status_code {status} must be a 4xx or 5xx error status"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::GatewayProxyConfig;
@@ -431,5 +667,146 @@ mod tests {
             ..GatewayProxyConfig::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod throttling_tests {
+    use super::*;
+
+    const FULL_CONFIG: &str = r#"
+bind_addr: "0.0.0.0:8086"
+rate_limit_zones:
+  rl_identity:
+    rate_limit: 50/s
+    burst_limit: 100
+    response_status_code: 429
+    response_retry_after: auto
+    key:
+      type: identity
+    max_keys: 50000
+in_flight_limit_zones:
+  ifl_identity:
+    in_flight_limit: 64
+    backlog_limit: 128
+    backlog_timeout: 30s
+    response_status_code: 429
+    key:
+      type: identity
+    max_keys: 50000
+  ifl_identity_expensive_op:
+    in_flight_limit: 4
+    backlog_limit: 8
+    backlog_timeout: 30s
+    response_status_code: 429
+    key:
+      type: identity
+    max_keys: 50000
+    excluded_keys:
+      - "150853ab-322c-455d-9793-8d71bf6973d9"
+"#;
+
+    fn parse(yaml: &str) -> ApiGatewayConfig {
+        serde_saphyr::from_str(yaml).expect("config should deserialize")
+    }
+
+    #[test]
+    fn parses_rate_limit_zones() {
+        let cfg = parse(FULL_CONFIG);
+        assert_eq!(cfg.rate_limit_zones.len(), 1);
+        let rl = &cfg.rate_limit_zones["rl_identity"];
+        assert_eq!(rl.rate_limit, RateSpec { rps: 50 });
+        assert_eq!(rl.burst_limit, 100);
+        assert_eq!(rl.response_status_code, 429);
+        assert_eq!(rl.response_retry_after, RetryAfter::Auto);
+        assert_eq!(rl.key.key_type, KeyType::Identity);
+        assert_eq!(rl.max_keys, 50000);
+    }
+
+    #[test]
+    fn parses_in_flight_zones() {
+        let cfg = parse(FULL_CONFIG);
+        assert_eq!(cfg.in_flight_limit_zones.len(), 2);
+
+        let ifl = &cfg.in_flight_limit_zones["ifl_identity"];
+        assert_eq!(ifl.in_flight_limit, 64);
+        assert_eq!(ifl.backlog_limit, 128);
+        assert_eq!(ifl.backlog_timeout, Duration::from_secs(30));
+        assert!(ifl.excluded_keys.is_empty());
+
+        let expensive = &cfg.in_flight_limit_zones["ifl_identity_expensive_op"];
+        assert_eq!(expensive.in_flight_limit, 4);
+        assert_eq!(
+            expensive.excluded_keys,
+            vec!["150853ab-322c-455d-9793-8d71bf6973d9".to_owned()]
+        );
+    }
+
+    #[test]
+    fn full_config_validates() {
+        parse(FULL_CONFIG)
+            .validate_throttling()
+            .expect("config is valid");
+    }
+
+    #[test]
+    fn rate_spec_rejects_non_per_second_unit() {
+        let err = serde_saphyr::from_str::<RateSpec>("50/m")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/s"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rate_spec_rejects_non_integer() {
+        assert!(serde_saphyr::from_str::<RateSpec>("abc/s").is_err());
+    }
+
+    #[test]
+    fn retry_after_parses_auto_and_seconds() {
+        assert_eq!(
+            serde_saphyr::from_str::<RetryAfter>("auto").unwrap(),
+            RetryAfter::Auto
+        );
+        assert_eq!(
+            serde_saphyr::from_str::<RetryAfter>("15").unwrap(),
+            RetryAfter::Seconds(15)
+        );
+    }
+
+    #[test]
+    fn validate_status_accepts_4xx_5xx_rejects_others() {
+        // 4xx / 5xx are valid throttle statuses.
+        assert!(validate_status("z", 429).is_ok());
+        assert!(validate_status("z", 503).is_ok());
+        // 2xx / 3xx are parseable but not error statuses.
+        let err = validate_status("zone_a", 200).unwrap_err().to_string();
+        assert!(err.contains("zone_a") && err.contains("200"), "got: {err}");
+        assert!(validate_status("z", 302).is_err());
+        // Out-of-range codes remain rejected as invalid.
+        assert!(validate_status("z", 999).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_zero_limit() {
+        let yaml = r#"
+bind_addr: "0.0.0.0:8086"
+rate_limit_zones:
+  bad:
+    rate_limit: 0/s
+    burst_limit: 100
+    key:
+      type: identity
+    max_keys: 100
+"#;
+        let cfg = parse(yaml);
+        assert!(cfg.validate_throttling().is_err());
+    }
+
+    #[test]
+    fn empty_config_validates() {
+        let cfg = ApiGatewayConfig::default();
+        cfg.validate_throttling().expect("empty config is valid");
     }
 }

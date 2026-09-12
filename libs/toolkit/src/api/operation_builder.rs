@@ -376,8 +376,10 @@ pub struct OperationSpec {
     /// Independent of [`authenticated`](Self::authenticated) — an exposed route
     /// may still require a JWT.
     pub exposed: bool,
-    /// Optional rate & concurrency limits for this operation
-    pub rate_limit: Option<RateLimitSpec>,
+    /// Optional zone-based throttling configuration for this operation.
+    /// Binds the operation to gateway throttling zones and supplies the
+    /// identity extractor for identity-keyed zones.
+    pub throttling: Option<ThrottlingSpec>,
     /// Optional whitelist of allowed request Content-Type values (without parameters).
     /// Example: Some(vec!["application/json", "multipart/form-data", "application/pdf"])
     /// When set, gateway middleware will enforce these types and return HTTP 415 for
@@ -425,15 +427,37 @@ pub struct ODataPagination<T> {
     pub allowed_fields: T,
 }
 
-/// Per-operation rate & concurrency limit specification
+/// Per-operation throttling specification.
+///
+/// References throttling zones (defined in the API gateway configuration) by
+/// name. Limits themselves live in config (zones are the primary source of
+/// truth); this struct only binds an operation to zones and provides the
+/// code-side behavior that config cannot express.
 #[derive(Clone, Debug, Default)]
-pub struct RateLimitSpec {
-    /// Target steady-state requests per second
-    pub rps: u32,
-    /// Maximum burst size (token bucket capacity)
-    pub burst: u32,
-    /// Maximum number of in-flight requests for this route
-    pub in_flight: u32,
+pub struct ThrottlingSpec {
+    /// Name of the rate-limit zone this operation participates in, or `None`
+    /// when the operation is not rate-limited.
+    pub rate_limit_zone: Option<String>,
+    /// Name of the in-flight-limit zone this operation participates in, or
+    /// `None` when the operation has no in-flight limit.
+    pub in_flight_limit_zone: Option<String>,
+    /// Whether this operation's throttling must run after authentication
+    /// (so a `SecurityContext` / subject identity is available).
+    ///
+    /// - `false` (default): the operation is throttled *before* auth, using
+    ///   IP-keyed zones only.
+    /// - `true`: the operation is throttled *after* auth, allowing
+    ///   identity-keyed zones (keyed by the subject id or a custom extractor).
+    pub require_security_context: bool,
+    /// Observe-but-don't-enforce mode.
+    ///
+    /// - `false` (default): limits are enforced normally (over-limit requests
+    ///   are rejected).
+    /// - `true`: requests are never rejected by this operation's rate-limit or
+    ///   in-flight limits. Instead, whenever a limit *would* have triggered, the
+    ///   gateway emits a `warn` log (with the offending key) and serves the
+    ///   request. Useful for tuning zones before enabling enforcement.
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default)]
@@ -624,7 +648,7 @@ impl<S> OperationBuilder<Missing, Missing, S, AuthNotSet> {
                 handler_id,
                 authenticated: false,
                 exposed: false,
-                rate_limit: None,
+                throttling: None,
                 allowed_request_content_types: None,
                 vendor_extensions: VendorExtensions::default(),
                 license_requirement: None,
@@ -689,14 +713,12 @@ where
         self
     }
 
-    /// Require per-route rate and concurrency limits.
-    /// Stores metadata for the gateway to enforce.
-    pub fn require_rate_limit(&mut self, rps: u32, burst: u32, in_flight: u32) -> &mut Self {
-        self.spec.rate_limit = Some(RateLimitSpec {
-            rps,
-            burst,
-            in_flight,
-        });
+    /// Attach zone-based throttling configuration to this operation.
+    ///
+    /// Binds the operation to gateway throttling zones (by name). The limits
+    /// themselves are defined in the gateway configuration.
+    pub fn with_throttling(mut self, spec: ThrottlingSpec) -> Self {
+        self.spec.throttling = Some(spec);
         self
     }
 

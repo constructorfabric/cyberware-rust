@@ -388,7 +388,7 @@ const PRESERVED_FOREIGN_HEADERS: &[axum::http::HeaderName] = &[
 
 /// Rate-limit/quota headers set alongside a `resource_exhausted`/
 /// `service_unavailable` `CanonicalError` response by
-/// `gears/system/api-gateway/src/middleware/rate_limit.rs` (`RateLimit-Policy`,
+/// `gears/system/api-gateway/src/middleware/throttling.rs` (`RateLimit-Policy`,
 /// `RateLimit-Limit`, `X-RateLimit-Limit`) and `gears/system/oagw`'s
 /// `error_response` (`x-ratelimit-limit`, `x-ratelimit-remaining`,
 /// `x-ratelimit-reset`) - both attach these to the same kind of response

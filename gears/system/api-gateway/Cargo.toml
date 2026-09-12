@@ -41,6 +41,7 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+humantime-serde = { workspace = true }
 parking_lot = { workspace = true }
 
 dashmap = { workspace = true }
@@ -68,6 +69,7 @@ futures-core = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+serde-saphyr = { workspace = true }
 
 [features]
 grpc = []

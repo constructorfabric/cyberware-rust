@@ -22,10 +22,6 @@ api_gateway:
   require_auth_by_default: false
 
   defaults:
-    rate_limit:
-      rps: 100
-      burst: 200
-      in_flight: 128
     body_limit_bytes: 16777216  # 16 MB
 
   cors:

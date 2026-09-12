@@ -18,7 +18,10 @@ use axum::{
 use serde_json::json;
 use std::sync::Arc;
 use toolkit::{
-    Gear, api::OperationBuilder, config::ConfigProvider, context::GearCtx,
+    Gear,
+    api::{OperationBuilder, ThrottlingSpec},
+    config::ConfigProvider,
+    context::GearCtx,
     contracts::ApiGatewayCapability,
 };
 use tower::ServiceExt;
@@ -59,8 +62,13 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
                 "bind_addr": "127.0.0.1:0",
                 "cors_enabled": true,
                 "auth_disabled": true,
-                "defaults": {
-                    "rate_limit": { "rps": 1, "burst": 1, "in_flight": 64 }
+                "rate_limit_zones": {
+                    "rl_order": {
+                        "rate_limit": "1/s",
+                        "burst_limit": 1,
+                        "key": { "type": "ip" },
+                        "max_keys": 1000
+                    }
                 },
             }
         }
@@ -70,14 +78,19 @@ async fn real_middlewares_observe_documented_order() -> Result<()> {
     let api = api_gateway::ApiGateway::default();
     api.init(&ctx).await?;
 
-    // Register an endpoint that enables both MIME validation and rate limiting.
+    // Register an endpoint that enables both MIME validation and throttling.
     let mut router = Router::new();
-    let mut builder = OperationBuilder::post("/tests/v1/middleware-order");
-    builder.require_rate_limit(1, 1, 64);
-    router = builder
+    router = OperationBuilder::post("/tests/v1/middleware-order")
         .operation_id("test:middleware-order")
         .summary("Middleware order test endpoint")
         .anonymous()
+        // Zone-based throttling: 1 rps / burst 1, IP-keyed (pre-auth).
+        .with_throttling(ThrottlingSpec {
+            rate_limit_zone: Some("rl_order".to_owned()),
+            in_flight_limit_zone: None,
+            require_security_context: false,
+            dry_run: false,
+        })
         .allow_content_types(&["application/json"]) // turns on MIME validation
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::post(handler))
@@ -182,8 +195,13 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
                 "cors_enabled": true,
                 "auth_disabled": true,
                 "prefix_path": "/cf",
-                "defaults": {
-                    "rate_limit": { "rps": 1, "burst": 1, "in_flight": 64 }
+                "rate_limit_zones": {
+                    "rl_order": {
+                        "rate_limit": "1/s",
+                        "burst_limit": 1,
+                        "key": { "type": "ip" },
+                        "max_keys": 1000
+                    }
                 },
             }
         }
@@ -193,14 +211,19 @@ async fn real_middlewares_observe_documented_order_with_prefix() -> Result<()> {
     let api = api_gateway::ApiGateway::default();
     api.init(&ctx).await?;
 
-    // Register an endpoint that enables both MIME validation and rate limiting.
+    // Register an endpoint that enables both MIME validation and throttling.
     let mut router = Router::new();
-    let mut builder = OperationBuilder::post("/tests/v1/middleware-order");
-    builder.require_rate_limit(1, 1, 64);
-    router = builder
+    router = OperationBuilder::post("/tests/v1/middleware-order")
         .operation_id("test:middleware-order")
         .summary("Middleware order test endpoint")
         .anonymous()
+        // Zone-based throttling: 1 rps / burst 1, IP-keyed (pre-auth).
+        .with_throttling(ThrottlingSpec {
+            rate_limit_zone: Some("rl_order".to_owned()),
+            in_flight_limit_zone: None,
+            require_security_context: false,
+            dry_run: false,
+        })
         .allow_content_types(&["application/json"]) // turns on MIME validation
         .json_response(StatusCode::OK, "OK")
         .handler(axum::routing::post(handler))
