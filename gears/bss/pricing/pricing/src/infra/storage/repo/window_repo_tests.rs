@@ -38,7 +38,6 @@
 //! the pair the race depends on — that the trigger refuses, and that its wording
 //! is one the recognizer knows.
 
-use chrono::{DateTime, TimeZone, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
@@ -49,17 +48,19 @@ use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
 use super::{OCCUPYING_STATES, intersects, overlap_or, pick, render_interval};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::scope_key::ScopeKey;
 use crate::domain::window::WindowState;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::{price, price_window};
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo::price_repo;
+use time::OffsetDateTime;
 
 /// `2026-08-05T<hour>:00:00Z`. Every instant below is a whole hour of one day, so
 /// a reader can see the shape of an interval pair at a glance.
-fn t(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 5, hour, 0, 0).unwrap()
+fn t(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 5, hour, 0, 0)
 }
 
 /// **The rule §9 names by name.** `effectiveTo = next.effectiveFrom` is adjacency
@@ -219,10 +220,8 @@ const MIRROR_ABORT: &str = "interval overlaps an occupying window on this price 
 /// rather than by the overlap trigger it is written for, on any instant that has
 /// passed. [`t`] above is 2026 and deliberately stays there: it feeds arithmetic,
 /// which has no clock.
-fn future(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, day, 0, 0, 0)
-        .single()
-        .expect("a fixed instant")
+fn future(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, day, 0, 0, 0)
 }
 
 /// A migrated in-memory mirror holding one price row, with that row's canonical
@@ -281,8 +280,8 @@ async fn mirror() -> (DBProvider<DbError>, ScopeKey) {
 async fn insert_window(
     provider: &DBProvider<DbError>,
     id: u128,
-    from: DateTime<Utc>,
-    to: DateTime<Utc>,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
 ) -> Result<(), ScopeError> {
     let am = price_window::ActiveModel {
         window_id: Set(Uuid::from_u128(id)),

@@ -189,6 +189,18 @@
 //! the key's arity is not a signature anything spells out.
 //!
 //! Dependency level 1.
+//!
+//! # `display_name`, and the kind roster (D-357, D-358)
+//!
+//! `display_name text` is the operator's optional label for the phase (D-357):
+//! free-form, no uniqueness, no behaviour, versioned with the revision like every
+//! other column. The `kind` roster is `trial | interim | evergreen` — the middle
+//! token was `intro` until D-358, renamed because it named a business meaning
+//! nothing behaved on; the label above is where that meaning now lives. **Edited
+//! in place** (this chain's convention), which means a stand that already applied
+//! this migration keeps the old DDL until the equivalent `ALTER` is run — D-358
+//! carries the runbook. Frozen `CatalogVersion` snapshots taken before the rename
+//! keep `"kind": "intro"`; nothing in this gear parses `kind` back out of one.
 
 use sea_orm_migration::prelude::*;
 
@@ -204,12 +216,13 @@ const PG_UP_STATEMENTS: &[&str] = &[
             converts_to_phase_id uuid,
             display_trial_days   integer,
             kind                 text    NOT NULL,
+            display_name         text,
             ordinal              integer NOT NULL,
             phase_duration_days  integer,
             CONSTRAINT chk_pricing_plan_phase_display_trial_days CHECK (display_trial_days IS NULL OR display_trial_days = phase_duration_days),
             CONSTRAINT chk_pricing_plan_phase_duration_non_negative CHECK (phase_duration_days IS NULL OR phase_duration_days >= 0),
             CONSTRAINT chk_pricing_plan_phase_trial_projection_non_negative CHECK (display_trial_days IS NULL OR display_trial_days >= 0),
-            CONSTRAINT chk_pricing_plan_phase_kind CHECK (kind IN ('trial','intro','evergreen')),
+            CONSTRAINT chk_pricing_plan_phase_kind CHECK (kind IN ('trial','interim','evergreen')),
             CONSTRAINT fk_pricing_plan_phase_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES bss.pricing_plan(plan_id, revision),
             CONSTRAINT pricing_plan_phase_pkey PRIMARY KEY (tenant_id, plan_id, plan_revision, phase_id)
         )",
@@ -276,13 +289,14 @@ const SQLITE_UP_STATEMENTS: &[&str] = &[
             converts_to_phase_id text,
             display_trial_days   int,
             kind                 text   NOT NULL,
+            display_name         text,
             ordinal              int    NOT NULL,
             phase_duration_days  int,
             PRIMARY KEY (tenant_id, plan_id, plan_revision, phase_id),
             CONSTRAINT chk_pricing_plan_phase_display_trial_days CHECK (display_trial_days IS NULL OR display_trial_days = phase_duration_days),
             CONSTRAINT chk_pricing_plan_phase_duration_non_negative CHECK (phase_duration_days IS NULL OR phase_duration_days >= 0),
             CONSTRAINT chk_pricing_plan_phase_trial_projection_non_negative CHECK (display_trial_days IS NULL OR display_trial_days >= 0),
-            CONSTRAINT chk_pricing_plan_phase_kind CHECK (kind IN ('trial','intro','evergreen')),
+            CONSTRAINT chk_pricing_plan_phase_kind CHECK (kind IN ('trial','interim','evergreen')),
             CONSTRAINT fk_pricing_plan_phase_revision FOREIGN KEY (plan_id, plan_revision) REFERENCES pricing_plan(plan_id, revision)
         )",
     "CREATE INDEX idx_pricing_plan_phase_revision ON pricing_plan_phase (tenant_id, plan_id, plan_revision)",

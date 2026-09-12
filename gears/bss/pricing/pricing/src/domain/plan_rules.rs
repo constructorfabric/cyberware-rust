@@ -253,8 +253,8 @@ pub const PHASE_CHAIN_NONLINEAR: &str = "PHASE_CHAIN_NONLINEAR";
 /// structural and the column admits all three kinds, so nothing rejected a
 /// `trial`-terminal chain — which leaves "the first non-trial phase" undefined
 /// for setup timing and D-39 and collides with the
-/// `display_trial_days = phase_duration_days` CHECK. "Intro pricing forever" is
-/// an `evergreen` terminal phase at the intro price, not an `intro` terminal.
+/// `display_trial_days = phase_duration_days` CHECK. "Interim pricing forever" is
+/// an `evergreen` terminal phase at the interim price, not an `interim` terminal.
 pub const TERMINAL_PHASE_KIND_INVALID: &str = "TERMINAL_PHASE_KIND_INVALID";
 
 /// A non-terminal phase without `phaseDurationDays`, or a terminal phase with

@@ -1,6 +1,5 @@
 //! Tests for the canonical scope key and its axes.
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::{
@@ -9,7 +8,10 @@ use super::{
     USAGE_LINE_AXIS_MISMATCH, check_cohort_eligibility, check_usage_line_axes,
 };
 use crate::domain::error::DomainError;
+use crate::domain::instant::from_unix;
+use crate::domain::instant::timestamp_millis;
 use crate::domain::money::CurrencyCode;
+use time::OffsetDateTime;
 
 fn plan() -> PlanId {
     PlanId::new(Uuid::from_u128(1))
@@ -27,8 +29,8 @@ fn eu() -> Region {
     Region::new("EU").expect("EU is a non-blank region")
 }
 
-fn cutover() -> DateTime<Utc> {
-    DateTime::from_timestamp(1_770_000_000, 0).expect("fixed instant is in range")
+fn cutover() -> OffsetDateTime {
+    from_unix(1_770_000_000, 0).expect("fixed instant is in range")
 }
 
 fn key(
@@ -215,7 +217,7 @@ fn two_cutovers_on_one_key_produce_two_keys() {
         Cohort::Generation(cutover()),
     )
     .expect("first generation");
-    let later = DateTime::from_timestamp(1_780_000_000, 0).expect("fixed instant is in range");
+    let later = from_unix(1_780_000_000, 0).expect("fixed instant is in range");
     let second = key(
         PriceEligibility::ExistingGrandfathered,
         ChargeKind::Recurring,
@@ -272,7 +274,7 @@ fn the_canonical_rendering_carries_the_first_eight_axes_in_order() {
     assert_eq!(axes[4], phase().to_string());
     assert_eq!(axes[5], "existing_grandfathered");
     assert_eq!(axes[6], "one_time");
-    assert_eq!(axes[7], cutover().timestamp_millis().to_string());
+    assert_eq!(axes[7], timestamp_millis(cutover()).to_string());
 }
 
 #[test]

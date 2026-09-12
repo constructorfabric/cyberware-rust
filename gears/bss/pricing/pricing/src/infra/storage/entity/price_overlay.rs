@@ -27,10 +27,11 @@
 //! [`Json`](sea_orm::entity::prelude::Json) here — the same treatment
 //! [`super::approval`]'s pinned payload takes.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_price_overlay")]
@@ -64,9 +65,9 @@ pub struct Model {
     pub precedence: i32,
     /// The overlay's **own** interval, not a price-row key axis: an overlay is
     /// not a price row.
-    pub effective_from: Option<DateTime<Utc>>,
+    pub effective_from: Option<OffsetDateTime>,
     /// Exclusive end of the overlay's own interval.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// `inclusive` | `exclusive` | `delegated_tariffs`. `NOT NULL` is what L5's
     /// *"silence fails"* means physically.
     pub tax_basis: String,

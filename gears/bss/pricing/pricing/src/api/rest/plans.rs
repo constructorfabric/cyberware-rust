@@ -28,8 +28,8 @@
 //! 422 response.
 
 use std::collections::BTreeMap;
-
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -37,9 +37,11 @@ use axum::extract::{Extension, Path, Query};
 use axum::http::header::{ETAG, LOCATION};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
-use chrono::{DateTime, Utc};
+use bss_pricing_sdk::odata::{PlanFilterField, PlanOrderField};
+
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamLocation, ParamSpec};
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::{AccessScope, DbTx};
 use toolkit_odata::Page;
@@ -48,8 +50,8 @@ use uuid::Uuid;
 
 use crate::api::rest::auth_context::{audit_stamp, require_authenticated};
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
-use crate::api::rest::cursor::{self, PageRequest};
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::preconditions::{self, RevisionTag};
 use crate::api::rest::state::AuthoringState;
 use crate::domain::audit::AuditStamp;
@@ -58,6 +60,8 @@ use crate::domain::contracts::{
     EntitlementGrants, GrantSet, PlanChangeContract, UsageCounterOnPlanChange,
 };
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
+use crate::domain::instant::rfc3339;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount};
 use crate::domain::plan::{PlanRevision, PlanShapePatch};
@@ -74,6 +78,7 @@ use crate::infra::clone::{CloneNotice, CloneReceipt, SeededPhaseOrigin, clone_pl
 use crate::infra::idempotent::{self, Guarded, GuardedRequest, TxFuture};
 use crate::infra::storage::repo::{NewPlanDraft, PlanRepo, plan_repo, plan_shape_repo};
 use crate::infra::storage::{RepoError, repo_failure};
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to every plan operation (DE0205).
 const TAG: &str = "BSS Pricing Plans";
@@ -89,6 +94,9 @@ const TAG: &str = "BSS Pricing Plans";
 pub const PLANS: &str = "/bss-pricing/v1/plans";
 /// One plan, by id.
 pub const PLAN: &str = "/bss-pricing/v1/plans/{planId}";
+/// The plan counts by authoring state (D-360). A static segment beside `{planId}`:
+/// Axum matches it first, and a plan id is a UUID, so the two cannot collide.
+pub const PLANS_COUNTS: &str = "/bss-pricing/v1/plans/counts";
 /// The abandon action, as a sub-resource segment (D-140: never a colon method).
 pub const PLAN_ABANDON: &str = "/bss-pricing/v1/plans/{planId}/abandon";
 
@@ -237,8 +245,13 @@ pub struct PlanPhaseView {
     /// Stable across revisions (D-83): the `phase` scope-key axis is filed under
     /// it, so a copy-forward keeps the id rather than minting a new one.
     pub phase_id: Uuid,
-    /// `trial` | `intro` | `evergreen`.
+    /// `trial` | `interim` | `evergreen`. `intro` is not accepted as a legacy
+    /// spelling (D-358).
     pub kind: String,
+    /// The operator's label for the phase (D-357): optional and free-form. Absent
+    /// in a body means "no label"; a blank string is read as absent.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Position in the chain.
     pub ordinal: i32,
     /// The phase this one converts into; `null` on the terminal phase.
@@ -254,6 +267,7 @@ impl From<PlanPhase> for PlanPhaseView {
         Self {
             phase_id: phase.phase_id.get(),
             kind: phase.kind.as_str().to_owned(),
+            display_name: phase.display_name,
             ordinal: phase.ordinal,
             converts_to_phase_id: phase
                 .converts_to_phase_id
@@ -498,13 +512,19 @@ pub struct PlanView {
     /// The Billing invoice-layout hint (D-96).
     pub invoice_grouping_key: Option<String>,
     /// Start of the availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_from: Option<OffsetDateTime>,
     /// End of the availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_to: Option<OffsetDateTime>,
     /// Pseudonymous principal id of the authoring actor.
     pub created_by: Uuid,
-    /// When the revision was created, UTC.
-    pub created_at_utc: DateTime<Utc>,
+    /// When the plan's first revision was created, UTC; stable across revisions.
+    #[serde(with = "rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// When this shown revision was created, UTC.
+    #[serde(with = "rfc3339")]
+    pub revision_created_at: OffsetDateTime,
     /// The revision's optimistic-concurrency version - the same number the
     /// `ETag` header quotes, carried in the body too so a client that cannot see
     /// response headers can still submit a precondition.
@@ -564,12 +584,55 @@ pub struct PlanView {
     /// for the fail-safe and `[]` for an author who cleared their edges, and the
     /// two are different states of the same plan.
     pub change_contract: PlanChangeContractRequest,
+    /// Submitted approvals belonging directly to this plan: revision, window
+    /// and price units. Empty when none are pending; sorted by submission time
+    /// and approval id. Matches the list contract.
+    ///
+    /// **Derived, not stored.** No plan state says "in review": the revision's
+    /// lifecycle does not change just because a unit opens. This field is read
+    /// from the approval store on every GET, following `voided`,
+    /// `rejected`, `withdrawn` and `approved` without a second writer of one
+    /// fact. It is **not part of the `ETag`**, which digests the revision and its
+    /// `row_version`: a unit opening or closing is not a change to plan content,
+    /// and a tag that moved with it would stale every author's `If-Match` for
+    /// something they did not edit.
+    ///
+    /// GET always returns a fresh body with `Cache-Control: private, no-store`;
+    /// it does not evaluate `If-None-Match`. The tag is a write precondition,
+    /// not a validator for these derived fields. Advisory, like every snapshot:
+    /// the unit can be decided between this read
+    /// and the caller's next act, and the write path stays the authority
+    /// (`PENDING_CHANGE_UNIT_EXISTS` on a second submit,
+    /// `APPROVAL_NOT_PENDING` on a stale decision).
+    pub pending_approvals: Vec<PendingApprovalView>,
+}
+
+/// One submitted approval belonging directly to a plan's aggregate.
+///
+/// Only what a `plan × read` caller may learn: **that** a unit is pending,
+/// **which** one, and since when. The submitter, the verdict, the reason and the
+/// pinned content sit behind `approval × read` on
+/// `GET /bss-pricing/v1/approvals/{approvalId}`, and this view exists so a
+/// client can open that resource under its own gate rather than page the
+/// approvals list and join on `subject_ref` — which it cannot narrow
+/// server-side today.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct PendingApprovalView {
+    /// The unit to open under `approval × read`.
+    pub approval_id: Uuid,
+    /// `plan_revision`, `window` or `price_unit`.
+    pub subject_kind: String,
+    /// When the unit was opened, UTC.
+    #[serde(with = "rfc3339")]
+    pub submitted_at: OffsetDateTime,
 }
 
 impl PlanView {
     /// Compose a revision with its five child sets.
     fn new(
         revision: PlanRevision,
+        created_at: OffsetDateTime,
         phases: Vec<PlanPhase>,
         addon_rules: Vec<AddonRule>,
         descriptor_set: Option<DescriptorSet>,
@@ -594,7 +657,8 @@ impl PlanView {
             available_from: revision.available_from,
             available_to: revision.available_to,
             created_by: revision.created_by,
-            created_at_utc: revision.created_at_utc,
+            created_at,
+            revision_created_at: revision.created_at_utc,
             row_version: revision.row_version.get(),
             phases: phases.into_iter().map(PlanPhaseView::from).collect(),
             addon_rules: addon_rules.into_iter().map(AddonRuleView::from).collect(),
@@ -612,6 +676,9 @@ impl PlanView {
             // pair already decoded them on the read that produced `revision`.
             entitlement_grants: EntitlementGrantsRequest::from(revision.entitlement_grants),
             change_contract: PlanChangeContractRequest::from(revision.change_contract),
+            // Filled by the read handler, which is the only caller that has a
+            // connection to ask the approval store with (D-359).
+            pending_approvals: Vec::new(),
         }
     }
 }
@@ -643,19 +710,57 @@ pub struct PlanSummaryView {
     /// `one_time` | `recurring` | `usage` | `hybrid`.
     pub billing_cycle: Option<String>,
     /// Start of the availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_from: Option<OffsetDateTime>,
     /// End of the availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
-    /// When the revision was created, UTC.
-    pub created_at_utc: DateTime<Utc>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_to: Option<OffsetDateTime>,
+    /// When the plan's first revision was created, UTC; stable across revisions.
+    #[serde(with = "rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// When this shown revision was created, UTC.
+    #[serde(with = "rfc3339")]
+    pub revision_created_at: OffsetDateTime,
     /// The precondition a caller needs to `PATCH` this row without reading it
     /// again. Carried on the page for the same reason [`PlanView`] carries it: a
     /// client that cannot see response headers can still submit an `If-Match`.
     pub row_version: u64,
+    /// Same pending metadata as [`PlanView::pending_approvals`]. Empty when no
+    /// directly owned unit is submitted; oldest first, then approval id.
+    /// Computed and advisory; filter its non-emptiness with `has_pending_approvals`.
+    pub pending_approvals: Vec<PendingApprovalView>,
+    /// The plan's `draft` + `published` rows — the count `GET …/prices` returns
+    /// with no `$filter` (**D-360**). Filled by `list_plans` from one grouped
+    /// read over the page's plans, so a catalogue screen no longer reads every
+    /// plan's rows to show it.
+    pub price_row_count: u64,
+    /// Distinct `model_kind`s of those rows, sorted; a row with none contributes
+    /// no kind (D-360).
+    pub model_kinds: Vec<String>,
+    /// Distinct currencies of those rows, sorted (D-360).
+    pub currencies: Vec<String>,
 }
 
-impl From<&PlanRevision> for PlanSummaryView {
-    fn from(revision: &PlanRevision) -> Self {
+/// The tenant's plans counted by **authoring** state — what the list's rows
+/// show, over the whole catalogue rather than one page (D-360). `total` is the
+/// number of plans; the three states sum to it.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct PlanCountsView {
+    /// The number of plans in the authoring set.
+    pub total: u64,
+    /// Plans holding an open draft, whatever their current revision's state — the
+    /// list's own collapse.
+    pub draft: u64,
+    /// Plans whose current revision is `published` and that hold no draft.
+    pub published: u64,
+    /// Plans whose current revision is `retired` and that hold no draft.
+    pub retired: u64,
+}
+
+impl From<&plan_repo::PlanListEntry> for PlanSummaryView {
+    fn from(entry: &plan_repo::PlanListEntry) -> Self {
+        let revision = &entry.revision;
         Self {
             plan_id: revision.plan_id.get(),
             revision: revision.revision,
@@ -668,22 +773,19 @@ impl From<&PlanRevision> for PlanSummaryView {
                 .map(|cycle| cycle.as_str().to_owned()),
             available_from: revision.available_from,
             available_to: revision.available_to,
-            created_at_utc: revision.created_at_utc,
+            created_at: entry.created_at,
+            revision_created_at: revision.created_at_utc,
             row_version: revision.row_version.get(),
+            // The revision alone cannot answer this; `list_plans` fills it from
+            // one read of the tenant's pending units (D-359).
+            pending_approvals: Vec::new(),
+            // Nor these: `list_plans` fills them from one grouped read over the
+            // page's plans (D-360). A plan with no authoring row keeps them.
+            price_row_count: 0,
+            model_kinds: Vec::new(),
+            currencies: Vec::new(),
         }
     }
-}
-
-/// The two pagination query parameters plus the lifecycle filter (D-125).
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct PlanPageQuery {
-    /// Plans per page; server default 100, hard cap 1,000.
-    pub limit: Option<String>,
-    /// The opaque token a previous page returned.
-    pub cursor: Option<String>,
-    /// Comma-separated lifecycle states. Absent is the authoring set: each
-    /// plan's open draft when it has one, else its current revision.
-    pub lifecycle_state: Option<String>,
 }
 
 /// The plan shape a create authors, and the one facet a `PATCH` may move.
@@ -717,9 +819,11 @@ pub struct PlanShapeRequest {
     /// The Billing invoice-layout hint (D-96).
     pub invoice_grouping_key: Option<String>,
     /// Start of the availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_from: Option<OffsetDateTime>,
     /// End of the availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_to: Option<OffsetDateTime>,
     /// The entitlement grant set (Slice 6, §6, D-41): the plan-level feature
     /// flags and quotas, the `PlanTier` they resolved from when they did, and
     /// any per-phase sets keyed by `phaseId`.
@@ -918,7 +1022,8 @@ pub struct PatchPlanRequest {
 fn without_placeholder_plan(
     mut report: crate::domain::validation::ValidationReport,
 ) -> crate::domain::validation::ValidationReport {
-    let placeholder = PlanShape::new(PlanId::new(Uuid::nil()), 0, Utc::now()).subject();
+    let placeholder =
+        PlanShape::new(PlanId::new(Uuid::nil()), 0, OffsetDateTime::now_utc()).subject();
     for violation in &mut report.violations {
         violation.subject = match violation.subject.strip_prefix(&placeholder) {
             Some(rest) => {
@@ -958,7 +1063,7 @@ fn without_placeholder_plan(
 /// [`require_authorable_period_bounds`] and
 /// [`require_authorable_purchase_window`] — have no suffix at all.
 fn require_authorable_addon_bounds(rules: &[AddonRule]) -> Result<(), DomainError> {
-    let mut subject = PlanShape::new(PlanId::new(Uuid::nil()), 0, Utc::now());
+    let mut subject = PlanShape::new(PlanId::new(Uuid::nil()), 0, OffsetDateTime::now_utc());
     subject.addon_rules = rules.to_vec();
     let report = ValidationPipeline::new()
         .with_rule(Box::new(AddonQtyRange))
@@ -1092,7 +1197,7 @@ fn require_distinct_period_markets(
 /// the create does not, or the market in the violation's subject the way
 /// `AddonQtyRange` names its SKU.
 fn require_authorable_period_bounds(bounds: &[PeriodFloorCap]) -> Result<(), DomainError> {
-    let mut subject = PlanShape::new(PlanId::new(Uuid::nil()), 0, Utc::now());
+    let mut subject = PlanShape::new(PlanId::new(Uuid::nil()), 0, OffsetDateTime::now_utc());
     subject.period_floor_caps = bounds.to_vec();
     let report = ValidationPipeline::new()
         .with_rule(Box::new(PeriodFloorCapAmounts))
@@ -1139,7 +1244,7 @@ fn require_authorable_purchase_window(
     min: Option<u64>,
     max: Option<u64>,
 ) -> Result<(), DomainError> {
-    let mut subject = PlanShape::new(PlanId::new(Uuid::nil()), 0, Utc::now());
+    let mut subject = PlanShape::new(PlanId::new(Uuid::nil()), 0, OffsetDateTime::now_utc());
     subject.purchase_min_qty = min;
     subject.purchase_max_qty = max;
     let report = ValidationPipeline::new()
@@ -1176,8 +1281,8 @@ fn require_authorable_purchase_window(
 /// [`require_authorable_windows_against_the_stored_row`], which merges before it
 /// calls this.
 fn require_ordered_availability_window(
-    available_from: Option<DateTime<Utc>>,
-    available_to: Option<DateTime<Utc>>,
+    available_from: Option<OffsetDateTime>,
+    available_to: Option<OffsetDateTime>,
 ) -> Result<(), DomainError> {
     let (Some(from), Some(to)) = (available_from, available_to) else {
         return Ok(());
@@ -1188,8 +1293,8 @@ fn require_ordered_availability_window(
     Err(DomainError::InvalidRequest(format!(
         "availableTo {} is not after availableFrom {}: the window is open for no instant at \
          all, so the plan is authorable and unsellable",
-        to.to_rfc3339(),
-        from.to_rfc3339()
+        format_rfc3339(to),
+        format_rfc3339(from)
     )))
 }
 
@@ -1301,16 +1406,21 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .operation_id("bss_pricing.list_plans")
         .summary("List the tenant's plans (cursor-paginated)")
         .description(
-            "One page of the tenant's plans in `planId` order, with an opaque `cursor` and a \
-             `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Each plan \
-             is rendered as the revision an **author** is holding: its open draft when it has \
-             one, else its current revision - `draft` is not a current revision \
-             (`is_current_revision()` is `published | retired`), so a listing that asked for \
-             current revisions would hide every plan being authored right now. \
-             `lifecycle_state` narrows the page to a comma-separated set of states. The five \
-             child sets are **not** on this page - a hundred plans would be six hundred \
-             queries - so a caller opens `GET /bss-pricing/v1/plans/{planId}` for a plan's \
-             shape.",
+            "One row per plan: choose its open draft, else current published/retired revision, \
+             then apply filters, ordering and keyset pagination. Historical revisions cannot \
+             match filters on the displayed name/state. Default order is plan_id asc; supported \
+             sort fields are plan_id, plan_name, lifecycle_state, billing_cycle, created_at and \
+             price_row_count. plan_id asc is appended as a unique tie-breaker when absent; \
+             nullable names/cycles sort last in both directions. limit defaults to 100, max 1,000. \
+             Repeat the same $filter with cursor; omit $orderby on subsequent pages. \
+             plan_name supports exact equality and case-insensitive contains/startswith/endswith. \
+             Query-only model_kind and currency predicates independently match draft/published \
+             price rows (possibly different rows); response arrays stay model_kinds/currencies. \
+             Example: $filter=model_kind eq 'flat' and currency in ('EUR','USD'). \
+             has_pending_approvals eq true tests the same direct submitted units as pending_approvals. \
+             created_at is the original plan creation time; revision_created_at is the shown \
+             revision's creation time. No created_at_utc alias. Full shape remains on GET /plans/{planId}. \
+             Cache-Control: private, no-store.",
         )
         .tag(TAG)
         .authenticated()
@@ -1322,18 +1432,38 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
             "integer",
         )
         .query_param("cursor", false, "Opaque base64url pagination cursor")
-        .query_param(
-            "lifecycle_state",
-            false,
-            "Comma-separated lifecycle states; absent is each plan's authoring revision",
-        )
         .handler(list_plans)
+        .with_odata_filter::<PlanFilterField>()
+        .with_odata_orderby::<PlanOrderField>()
         .json_response_with_schema::<Page<PlanSummaryView>>(
             openapi,
             StatusCode::OK,
             "One page of the tenant's plans.",
         )
         .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    // D-360. Registered ahead of the `{planId}` routes so the static segment is
+    // unambiguous; the route census pins the pair.
+    router = OperationBuilder::get("/bss-pricing/v1/plans/counts")
+        .operation_id("bss_pricing.count_plans")
+        .summary("Count the tenant's plans by authoring state")
+        .description(
+            "How many plans the tenant holds as `draft`, `published` and `retired`, counted the \
+             way the list renders them: a plan with an open draft counts as `draft`, else as its \
+             current revision's state (D-360). Over the whole catalogue - a tab strip built from \
+             one page of `GET /plans` is wrong past that page. `total` is the number of plans and \
+             the three counts sum to it. Gates on `plan` x `read`, like the list.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .handler(count_plans)
+        .json_response_with_schema::<PlanCountsView>(openapi, StatusCode::OK, "The counts.")
         .error_401(openapi)
         .error_403(openapi)
         .error_500(openapi)
@@ -1528,28 +1658,21 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
              published content a consumer resolves comes from the read model, which is a \
              different contract. `lifecycle_state` and `revision` name which revision was \
              answered, so a caller never infers it. The `ETag` header carries the revision's row \
-             version and is what the mutating verbs take as `If-Match`. A plan outside the \
+             version and is what the mutating verbs take as `If-Match`. It is not a cache \
+             validator for derived pending metadata: this GET returns a fresh body with \
+             `Cache-Control: private, no-store` and does not evaluate `If-None-Match`. \
+             A plan outside the \
              caller's scope reads exactly like an absent one (404, no existence leak).",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
         .path_param("planId", "The plan to read.")
-        .param(crate::api::rest::plans::if_none_match_param())
         .handler(get_plan)
         .json_response_with_schema::<PlanView>(
             openapi,
             StatusCode::OK,
             "The plan's open draft revision, or its current revision.",
-        )
-        // The conditional read's answer (RFC 9110 section 15.4.5). Declared
-        // because it is reachable: this route emits an `ETag` and honours the
-        // `If-None-Match` a caller sends it back in. A read that emits a validator
-        // and ignores the conditional is the half-implementation to avoid.
-        .no_content_response(
-            StatusCode::NOT_MODIFIED,
-            "The caller's `If-None-Match` matches the current representation, so the body is \
-             not re-sent.",
         )
         .error_400(openapi)
         .error_401(openapi)
@@ -1591,7 +1714,6 @@ async fn get_plan(
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
     Path(plan_id): Path<Uuid>,
-    headers: HeaderMap,
 ) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
     let plan_id = PlanId::new(plan_id);
@@ -1617,13 +1739,33 @@ async fn get_plan(
         .await
         .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
     let tag = plan_tag(&view);
-    // The conditional read (RFC 9110 §13.1.2). Compared against the tag this
-    // response is about to carry rather than against a second reading of the plan,
-    // which is what `preconditions::if_none_match`'s doc asks of every caller.
-    if preconditions::if_none_match(&headers, &tag) {
-        return Ok(preconditions::not_modified(&tag));
-    }
-    Ok(([(ETAG, tag)], Json(view)).into_response())
+    // Always enrich: the authored-content tag cannot validate pending metadata.
+    //
+    // Asked of the service rather than of the repository, because the scope this
+    // read needs is **not** the door's: the door pins `resource_id = plan_id` and
+    // `pricing_approval` is keyed on `approval_id`.
+    // `ApprovalService::pending_for_plans` carries that whole argument and does
+    // the narrowing where a narrowed scope is sanctioned — a handler that minted
+    // one would bypass the PEP structurally, which `rest_authz` bans outright. No
+    // second PDP question is asked here: `plan × read` on this plan is the whole
+    // gate, and the field says only that a unit exists and which one.
+    let mut view = view;
+    view.pending_approvals = state
+        .approvals
+        .pending_for_plans(tenant, &[plan_id])
+        .await
+        .map_err(|e| CanonicalError::from(repo_failure(&e)))?
+        .remove(&plan_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|unit| PendingApprovalView {
+            approval_id: unit.approval_id,
+            subject_kind: unit.subject_kind.as_str().to_owned(),
+            submitted_at: unit.submitted_at,
+        })
+        .collect();
+
+    Ok(preconditions::fresh_read(([(ETAG, tag)], Json(view))))
 }
 
 /// `GET /plans`.
@@ -1639,13 +1781,16 @@ async fn get_plan(
 /// [`authoring_revision`]'s rule applied to a page rather than to one id;
 /// `plan_repo::list_authoring_page` holds the argument for why a listing over
 /// current revisions would be the wrong one.
+#[allow(clippy::implicit_hasher)]
 async fn list_plans(
     Extension(state): Extension<Arc<AuthoringState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<PlanPageQuery>,
-) -> Result<Json<Page<PlanSummaryView>>, CanonicalError> {
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
+) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let scope = crate::authz::access_scope(
         &enforcer,
         &ctx,
@@ -1657,65 +1802,102 @@ async fn list_plans(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    let page = PageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )?;
-    let states = lifecycle_filter(query.lifecycle_state.as_deref())?;
-    // One row more than the page, so "is there another page" needs no second
-    // query and no page whose `next_cursor` points at nothing.
-    let probe = page.limit.saturating_add(1);
-    let mut rows = state
+    let tenant = ctx.subject_tenant_id();
+    let page = state
         .plans
-        .list_authoring(&scope, ctx.subject_tenant_id(), &states, page.after, probe)
+        .list_authoring_odata(&scope, tenant, &odata)
+        .await
+        .map_err(map_odata_page_err)?;
+
+    // D-359: one read of the tenant's pending units for the whole page, marked
+    // onto the rows here. Not a lookup per row, and not a column: the set is
+    // bounded by how many units are open. `get_plan`'s comment carries the reason
+    // this goes through the service.
+    let ids: Vec<PlanId> = page
+        .items
+        .iter()
+        .map(|entry| entry.revision.plan_id)
+        .collect();
+    let mut pending = state
+        .approvals
+        .pending_for_plans(tenant, &ids)
         .await
         .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
 
-    let has_more = u64::try_from(rows.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        rows.pop();
-    }
-    let next = has_more
-        .then(|| rows.last().map(|row| row.plan_id.get()))
-        .flatten();
-    Ok(Json(Page {
-        items: rows.iter().map(PlanSummaryView::from).collect(),
-        page_info: cursor::page_info(next, page.limit),
-    }))
+    // The page IDs were authorized under the original plan scope. Project that
+    // exact set to child metadata; a plan ID must never be used as a price ID.
+    let conn = state.db.conn().map_err(|e| {
+        CanonicalError::from(repo_failure(&RepoError::Db(format!(
+            "plan aggregates conn: {e}"
+        ))))
+    })?;
+    let aggregates = crate::infra::storage::repo::price_repo::aggregate_rows_for_authorized_plans(
+        &conn, tenant, &ids,
+    )
+    .await
+    .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
+
+    Ok(preconditions::fresh_read(Json(Page {
+        items: page
+            .items
+            .iter()
+            .map(|entry| {
+                let revision = &entry.revision;
+                let mut item = PlanSummaryView::from(entry);
+                item.pending_approvals = pending
+                    .remove(&revision.plan_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|unit| PendingApprovalView {
+                        approval_id: unit.approval_id,
+                        subject_kind: unit.subject_kind.as_str().to_owned(),
+                        submitted_at: unit.submitted_at,
+                    })
+                    .collect();
+                if let Some(aggregate) = aggregates.get(&revision.plan_id) {
+                    item.price_row_count = aggregate.price_row_count;
+                    item.model_kinds.clone_from(&aggregate.model_kinds);
+                    item.currencies.clone_from(&aggregate.currencies);
+                }
+                item
+            })
+            .collect(),
+        page_info: page.page_info,
+    })))
 }
 
-/// Read the `lifecycle_state` filter, refusing a token the machine has no state
-/// for rather than silently returning everything.
-///
-/// The tokens are matched against [`LifecycleState::ALL`] rather than written
-/// out here, `approvals::state_filter`'s discipline exactly: a state added to
-/// the machine becomes filterable the day it is added, and one removed stops
-/// being accepted the day it is removed.
-fn lifecycle_filter(raw: Option<&str>) -> Result<Vec<LifecycleState>, CanonicalError> {
-    let Some(raw) = raw else {
-        return Ok(Vec::new());
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(|token| {
-            LifecycleState::ALL
-                .iter()
-                .copied()
-                .find(|state| state.as_str() == token)
-                .ok_or_else(|| {
-                    let known: Vec<&str> = LifecycleState::ALL
-                        .iter()
-                        .copied()
-                        .map(LifecycleState::as_str)
-                        .collect();
-                    CanonicalError::from(DomainError::InvalidRequest(format!(
-                        "lifecycle_state `{token}` is not one of {}",
-                        known.join(", ")
-                    )))
-                })
-        })
-        .collect()
+/// `GET /plans/counts` (D-360): the list's gate - `plan` x `read`, no resource -
+/// asked of the PDP once, then one read over the authoring set.
+async fn count_plans(
+    Extension(state): Extension<Arc<AuthoringState>>,
+    Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
+    extension_ctx: Option<Extension<SecurityContext>>,
+) -> Result<Json<PlanCountsView>, CanonicalError> {
+    let ctx = require_authenticated(extension_ctx)?;
+    let scope = crate::authz::access_scope(
+        &enforcer,
+        &ctx,
+        &crate::authz::resource_types::PLAN,
+        crate::authz::actions::READ,
+        /* owner_tenant_id */ None,
+        /* resource_id */ None,
+    )
+    .await
+    .map_err(authz_error_to_canonical)?;
+    let conn = state.db.conn().map_err(|e| {
+        CanonicalError::from(repo_failure(&RepoError::Db(format!(
+            "plan counts conn: {e}"
+        ))))
+    })?;
+    let counts = plan_repo::count_plans_by_authoring_state(&conn, &scope, ctx.subject_tenant_id())
+        .await
+        .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
+    Ok(Json(PlanCountsView {
+        total: counts.total,
+        draft: counts.draft,
+        published: counts.published,
+        retired: counts.retired,
+    }))
 }
 
 /// The revision an authoring caller is working with: the open draft, else the
@@ -1770,6 +1952,7 @@ async fn read_shape(
         .await?;
     Ok(PlanView::new(
         row,
+        state.plans.created_at(scope, tenant, plan_id).await?,
         phases,
         addon_rules,
         descriptor_set,
@@ -1841,7 +2024,7 @@ async fn create_plan(
     let client_key = preconditions::idempotency_key(&headers)?;
     let request_hash = preconditions::request_digest(&body)?;
     let draft_shape = shape_of(&body)?;
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
 
     let guard = GuardedRequest {
         operation: CREATE_PLAN_OPERATION,
@@ -1892,6 +2075,7 @@ async fn create_plan(
                 let phase = PlanPhase {
                     phase_id: PhaseId::new(Uuid::now_v7()),
                     kind: PhaseKind::Evergreen,
+                    display_name: None,
                     ordinal: 0,
                     converts_to_phase_id: None,
                     phase_duration_days: None,
@@ -1914,7 +2098,8 @@ async fn create_plan(
             let (revision, phase) = created;
             let view = PlanView::new(
                 revision.clone(),
-                vec![*phase],
+                revision.created_at_utc,
+                vec![phase.clone()],
                 Vec::new(),
                 None,
                 Vec::new(),
@@ -1954,7 +2139,7 @@ async fn patch_plan(
     let body: PatchPlanRequest = preconditions::parse_body(&body)?;
     let asserted = preconditions::if_match_revision(&headers)?;
     let facet = Facet::of(body)?;
-    let stamp = audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp = audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
 
     // D-342's write-stage door, on **this facet and no other**. Before the match
     // rather than inside its arm because every arm answers `RepoError` and this
@@ -2148,7 +2333,7 @@ async fn abandon_plan_draft(
             plan_id,
             revision,
             expected,
-            audit_stamp(&ctx, Utc::now(), correlation),
+            audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation),
         )
         .await
         .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
@@ -2193,6 +2378,10 @@ async fn write_scope(
 }
 
 /// Which of the six facets a `PATCH` carries.
+// Built once per request and destructured on the next line, so the 304-byte
+// variant is one stack value that never outlives the handler. Boxing it would
+// buy an allocation and a deref at every read for no measurable gain.
+#[allow(clippy::large_enum_variant)]
 enum Facet {
     /// The plan's own columns.
     Shape(PlanShapePatch),
@@ -2519,7 +2708,8 @@ async fn answer_revision(
 fn created(revision: &PlanRevision, phase: &PlanPhase) -> Response {
     let view = PlanView::new(
         revision.clone(),
-        vec![*phase],
+        revision.created_at_utc,
+        vec![phase.clone()],
         Vec::new(),
         None,
         Vec::new(),
@@ -2693,7 +2883,7 @@ async fn clone_plan(
     let client_key = preconditions::idempotency_key(&headers)?;
     let request_hash =
         preconditions::request_digest(&serde_json::json!({ "source_plan_id": source.get() }))?;
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = audit_stamp(&ctx, now, correlation);
 
     let guard = GuardedRequest {
@@ -2815,9 +3005,9 @@ struct DraftShape {
     /// The Billing invoice-layout hint.
     invoice_grouping_key: Option<String>,
     /// Start of the availability window.
-    available_from: Option<DateTime<Utc>>,
+    available_from: Option<OffsetDateTime>,
     /// End of the availability window.
-    available_to: Option<DateTime<Utc>>,
+    available_to: Option<OffsetDateTime>,
     /// The two governed facets the create accepts and now stores: the entitlement
     /// grant set and the plan-change contract.
     ///
@@ -2846,7 +3036,7 @@ impl DraftShape {
         plan_id: PlanId,
         tenant_id: Uuid,
         created_by: Uuid,
-        created_at_utc: DateTime<Utc>,
+        created_at_utc: OffsetDateTime,
         correlation_id: Uuid,
     ) -> (NewPlanDraft, plan_repo::AuthoredGrants) {
         let granted = self.granted;
@@ -2997,7 +3187,8 @@ async fn require_no_stranded_rows(
     .await
     .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
 
-    let mut subject = crate::domain::plan_shape::PlanShape::new(plan_id, revision, Utc::now());
+    let mut subject =
+        crate::domain::plan_shape::PlanShape::new(plan_id, revision, OffsetDateTime::now_utc());
     subject.phases = crate::domain::plan_shape::PhaseGraph::new(phases.to_vec());
     subject.rows = rows;
 
@@ -3254,6 +3445,14 @@ fn phase_of(view: &PlanPhaseView) -> Result<PlanPhase, DomainError> {
     Ok(PlanPhase {
         phase_id: PhaseId::new(view.phase_id),
         kind: wire_token("phases.kind", &view.kind, PhaseKind::ALL, PhaseKind::as_str)?,
+        // A blank label is an absence wearing a value's shape (D-318's reading of
+        // `planName`): `""` and `"   "` read as no label, never as a label.
+        display_name: view
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(ToOwned::to_owned),
         ordinal: view.ordinal,
         converts_to_phase_id: view.converts_to_phase_id.map(PhaseId::new),
         phase_duration_days: view.phase_duration_days,

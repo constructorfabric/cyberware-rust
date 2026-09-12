@@ -28,6 +28,7 @@ use bss_ledger_sdk::{
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -105,7 +106,7 @@ async fn provision_is_idempotent_and_additive() {
     let service = ProvisioningService::new(provider.clone());
 
     let tenant_id = Uuid::new_v4();
-    let expected_period = chrono::Utc::now().format("%Y%m").to_string();
+    let expected_period = bss_ledger::domain::instant::yyyymm(OffsetDateTime::now_utc());
 
     // --- Call #1: seed everything fresh. ---
     let req1 = ProvisionRequest {

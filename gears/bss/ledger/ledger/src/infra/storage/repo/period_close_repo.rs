@@ -3,7 +3,6 @@
 //! the two-phase close drives (Slice 7, design §4.5). The Foundation
 //! `fiscal_period.status` stays the posting gate; this row tracks the process.
 
-use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use serde_json::Value as JsonValue;
@@ -14,6 +13,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::period_close;
+use time::OffsetDateTime;
 
 /// SeaORM-backed period-close-process repository.
 #[derive(Clone)]
@@ -49,7 +49,7 @@ impl PeriodCloseRepo {
         initiated_by: &str,
         blocked_reasons: Option<JsonValue>,
         recon_watermark: Option<i64>,
-        closed_at: Option<DateTime<Utc>>,
+        closed_at: Option<OffsetDateTime>,
     ) -> Result<(), RepoError> {
         let am = period_close::ActiveModel {
             tenant_id: Set(tenant),

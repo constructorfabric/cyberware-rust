@@ -47,6 +47,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use bss_ledger::api::rest::payments::{ApiState, router};
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::precedence::DEFAULT_PRECEDENCE_POLICY;
@@ -68,11 +69,12 @@ use bss_ledger_sdk::posting::{
 use bss_ledger_sdk::{
     AccountClass, MappingStatus, ProvisionOutcome, ProvisionRequest, Side, SourceDocType,
 };
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -230,7 +232,7 @@ impl LedgerClientV1 for RealPaymentClient {
                         invoice_id: s.invoice_id,
                         amount_minor: s.amount_minor,
                         currency: currency.clone(),
-                        allocated_at_utc: Utc::now(),
+                        allocated_at_utc: OffsetDateTime::now_utc(),
                         precedence_policy_ref: policy_ref.clone(),
                     })
                     .collect();
@@ -521,7 +523,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// for the current month, and the four payment-flow chart accounts. Mirrors
 /// `postgres_payments.rs::setup_seller`.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: SUBJECT_TENANT,
         payer: Uuid::now_v7(),
@@ -529,7 +531,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         unallocated: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -645,7 +647,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -661,7 +663,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -760,6 +762,34 @@ async fn send(
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+/// `time::serde::rfc3339` keeps the offset a caller wrote and range-checks only
+/// the local date-time. The UTC form of this `effective_at` is year 10000, which
+/// `time` cannot hold, so before `domain::instant::rfc3339` the body parsed and
+/// `overwrite_header` → `to_naive_date` panicked the posting handler on its first
+/// line. The boundary answers the canonical JSON 400 instead.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_receipt_instant_with_no_utc_form_is_a_400_not_a_panic() {
+    let (_c, raw, provider) = boot().await;
+    let s = setup_seller(&raw, &provider).await;
+    let mut body = settle_body(&s, "PAY-UTC-1", 1000, 30);
+    body["effective_at"] = serde_json::json!("9999-12-31T23:00:00-05:00");
+
+    let (status, problem) = send(
+        router_with_db(provider).layer(axum::Extension(authed_context())),
+        "POST",
+        "/bss-ledger/v1/payments",
+        Some(body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+    assert!(
+        problem.to_string().contains("invalid_json_body")
+            && problem.to_string().contains("no UTC representation"),
+        "the canonical rejection carries the machine code and the reason: {problem}"
+    );
+}
+
 /// `POST /payments` settles 1000/30 → 201 fresh; re-settling the SAME
 /// `payment_id` replays → 200 with the prior posting reference.
 #[tokio::test]
@@ -837,7 +867,7 @@ async fn allocate_payment_returns_201_with_computed_splits() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(2),
+        OffsetDateTime::now_utc() - time::Duration::hours(2),
     )
     .await;
     seed_ar_invoice(
@@ -845,7 +875,7 @@ async fn allocate_payment_returns_201_with_computed_splits() {
         &s,
         "INV-B",
         800,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -914,7 +944,7 @@ async fn allocate_over_cap_returns_409_exceeds_settled() {
         &s,
         "INV-CAP",
         200,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -1024,7 +1054,7 @@ async fn caller_split_over_open_returns_400_split_invalid() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -1098,7 +1128,7 @@ async fn list_allocations_and_read_unallocated() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(2),
+        OffsetDateTime::now_utc() - time::Duration::hours(2),
     )
     .await;
     seed_ar_invoice(
@@ -1106,7 +1136,7 @@ async fn list_allocations_and_read_unallocated() {
         &s,
         "INV-B",
         800,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -1222,7 +1252,7 @@ async fn allocate_unsettled_returns_202_queued() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     let allocation_id = Uuid::now_v7();

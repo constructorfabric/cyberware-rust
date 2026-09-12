@@ -44,10 +44,12 @@ use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::entity::{audit_log, plan};
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewPlanDraft, PlanRepo, PlanShapeRepo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureUpdateExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -875,8 +877,8 @@ async fn publish(provider: &DBProvider<DbError>, scope: &AccessScope, plan_id: P
     assert_eq!(result.rows_affected, 1, "the seed must have moved one row");
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, hour, 0, 0)
 }
 
 fn draft_of(plan_id: PlanId, tenant_id: Uuid) -> NewPlanDraft {
@@ -907,6 +909,7 @@ fn chain() -> Vec<PlanPhase> {
         PlanPhase {
             phase_id: PhaseId::new(Uuid::from_u128(0xf1a)),
             kind: PhaseKind::Trial,
+            display_name: None,
             ordinal: 0,
             converts_to_phase_id: Some(PhaseId::new(Uuid::from_u128(0xf1b))),
             phase_duration_days: Some(14),
@@ -915,6 +918,7 @@ fn chain() -> Vec<PlanPhase> {
         PlanPhase {
             phase_id: PhaseId::new(Uuid::from_u128(0xf1b)),
             kind: PhaseKind::Evergreen,
+            display_name: None,
             ordinal: 1,
             converts_to_phase_id: None,
             phase_duration_days: None,
@@ -938,7 +942,8 @@ async fn a_shared_ordinal_still_reads_back_in_one_fixed_order() {
     let terminal = PhaseId::new(Uuid::from_u128(0xf1c));
     let later = PlanPhase {
         phase_id: PhaseId::new(Uuid::from_u128(0xf1b)),
-        kind: PhaseKind::Intro,
+        kind: PhaseKind::Interim,
+        display_name: None,
         ordinal: 0,
         converts_to_phase_id: Some(terminal),
         phase_duration_days: Some(7),
@@ -946,11 +951,12 @@ async fn a_shared_ordinal_still_reads_back_in_one_fixed_order() {
     };
     let earlier = PlanPhase {
         phase_id: PhaseId::new(Uuid::from_u128(0xf1a)),
-        ..later
+        ..later.clone()
     };
     let last = PlanPhase {
         phase_id: terminal,
         kind: PhaseKind::Evergreen,
+        display_name: None,
         ordinal: 1,
         converts_to_phase_id: None,
         phase_duration_days: None,
@@ -968,7 +974,7 @@ async fn a_shared_ordinal_still_reads_back_in_one_fixed_order() {
             plan_id,
             0,
             RowVersion::new(0),
-            vec![last, later, earlier],
+            vec![last.clone(), later.clone(), earlier.clone()],
             stamp(),
         )
         .await
@@ -1071,6 +1077,7 @@ async fn a_stale_version_replaces_nothing_and_leaves_the_chain_standing() {
     let replacement = vec![PlanPhase {
         phase_id: PhaseId::new(Uuid::from_u128(0xf1c)),
         kind: PhaseKind::Evergreen,
+        display_name: None,
         ordinal: 0,
         converts_to_phase_id: None,
         phase_duration_days: None,
@@ -1242,6 +1249,7 @@ async fn seeding_the_terminal_phase_does_not_bump_the_revision_or_record_an_edit
     let terminal = PlanPhase {
         phase_id: PhaseId::new(Uuid::from_u128(0xf1b)),
         kind: PhaseKind::Evergreen,
+        display_name: None,
         ordinal: 0,
         converts_to_phase_id: None,
         phase_duration_days: None,
@@ -1252,7 +1260,7 @@ async fn seeding_the_terminal_phase_does_not_bump_the_revision_or_record_an_edit
         // create's transaction" and takes the type that says so.
         let seed_scope = scope.clone();
         let seed_revision = revision.clone();
-        let seed_terminal = terminal;
+        let seed_terminal = terminal.clone();
         let (_, seeded) = provider
             .db()
             .in_transaction::<(), bss_pricing::infra::storage::RepoError, _>(move |txn| {
@@ -1296,7 +1304,7 @@ async fn seeding_the_terminal_phase_does_not_bump_the_revision_or_record_an_edit
 fn stamp() -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: uuid::Uuid::from_u128(0xac_10),
-        recorded_at: chrono::Utc::now(),
+        recorded_at: OffsetDateTime::now_utc(),
         correlation_id: TEST_CORRELATION,
     }
 }
@@ -1377,6 +1385,7 @@ async fn the_stored_grant_set_and_phase_chain_map_to_the_analyzers_totals() {
                 PlanPhase {
                     phase_id: trial,
                     kind: PhaseKind::Trial,
+                    display_name: None,
                     ordinal: 0,
                     converts_to_phase_id: Some(terminal),
                     phase_duration_days: Some(14),
@@ -1385,6 +1394,7 @@ async fn the_stored_grant_set_and_phase_chain_map_to_the_analyzers_totals() {
                 PlanPhase {
                     phase_id: terminal,
                     kind: PhaseKind::Evergreen,
+                    display_name: None,
                     ordinal: 1,
                     converts_to_phase_id: None,
                     phase_duration_days: None,

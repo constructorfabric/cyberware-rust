@@ -155,7 +155,7 @@ use crate::domain::scope_key::{PriceEligibility, Region};
 use crate::domain::tax_display::{
     MarketBasisUniform, RegionTaxReadiness, TaxBasisComplete, TaxDisplayPolicy,
 };
-use crate::domain::taxonomy::{RegionsDeclared, RoundingPolicyDeclared};
+use crate::domain::taxonomy::{GlCodeDeclared, RegionsDeclared, RoundingPolicyDeclared};
 use crate::domain::validation::{ValidationPipeline, ValidationReport, ValidationRule};
 
 /// A published row resolves neither its own `rounding_policy_ref` nor a tenant
@@ -265,6 +265,10 @@ pub struct PublishRuleParams {
     referencing_markets: Vec<ReferencingMarket>,
     declared_regions: BTreeSet<Region>,
     declared_rounding_policies: BTreeSet<String>,
+    /// The tenant's declared GL codes (D-356). Empty means **unconstrained**, as
+    /// the rounding vocabulary's does and for its reason — see
+    /// [`Self::with_declared_gl_codes`].
+    declared_gl_codes: BTreeSet<String>,
     addon_coverage: AddonCoverage,
     tax_display_policy: TaxDisplayPolicy,
     region_readiness: RegionTaxReadiness,
@@ -344,6 +348,7 @@ impl PublishRuleParams {
             referencing_markets: Vec::new(),
             declared_regions: BTreeSet::new(),
             declared_rounding_policies: BTreeSet::new(),
+            declared_gl_codes: BTreeSet::new(),
             // Empty is fail-closed here too: an add-on nobody resolved covers
             // nothing, so a required one blocks. See `AddonCoverage`.
             addon_coverage: AddonCoverage::empty(),
@@ -405,6 +410,21 @@ impl PublishRuleParams {
     #[must_use]
     pub fn with_declared_rounding_policies(mut self, values: BTreeSet<String>) -> Self {
         self.declared_rounding_policies = values;
+        self
+    }
+
+    /// Attach the tenant's declared GL-code vocabulary (D-356).
+    ///
+    /// [`Self::with_declared_rounding_policies`]' reading of the empty set —
+    /// **unconstrained** — and its reason: a tenant that has declared no GL
+    /// codes has not opted into the check, and refusing there would have failed
+    /// every existing plan the day the vocabulary landed. The caller resolves the
+    /// set from `taxonomy_repo::active_gl_codes`; the rule never learns whether a
+    /// tenant or a future ERP gear wrote it, which is the provider seam D-356
+    /// names.
+    #[must_use]
+    pub fn with_declared_gl_codes(mut self, values: BTreeSet<String>) -> Self {
+        self.declared_gl_codes = values;
         self
     }
 
@@ -616,6 +636,16 @@ fn foundation_plan_rules(params: &PublishRuleParams) -> ValidationPipeline<PlanS
         .with_rule(Box::new(RoundingPolicyDeclared {
             declared: params.declared_rounding_policies.clone(),
             tenant_default: params.default_rounding_policy.clone(),
+        }))
+        // D-356's GL-code vocabulary check, beside the other two vocabulary rules
+        // and for `RegionsDeclared`'s reason: it reads a tenant-declared set the
+        // Foundation resolves, so registering it inside the Slice-2 descriptor
+        // set would be a rule bolted on at a call site. It judges the
+        // descriptor's one `glCode` — a present value only; absence is
+        // `inst-ds-required`'s finding — and a tenant who declared no vocabulary
+        // is not constrained by it.
+        .with_rule(Box::new(GlCodeDeclared {
+            declared: params.declared_gl_codes.clone(),
         }))
         // Slice 4's tax-display pair. In the Foundation set for
         // `RegionsDeclared`'s reason: `tax_inclusive` is a column on every price

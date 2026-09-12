@@ -52,10 +52,15 @@ pub struct Model {
     /// copy-forward both need, since both supply an id the server did not mint.
     #[sea_orm(primary_key, auto_increment = false)]
     pub plan_id: Uuid,
-    /// `trial` | `intro` | `evergreen`, `CHECK`-constrained to those three; the
+    /// `trial` | `interim` | `evergreen`, `CHECK`-constrained to those three; the
     /// value set is `domain::plan_shape::PhaseKind`. It is **not** terminality
-    /// (C-4) — see [`Model::converts_to_phase_id`].
+    /// (C-4) — see [`Model::converts_to_phase_id`]. `interim` was spelled `intro`
+    /// until D-358; frozen snapshots taken before it still carry the old token.
     pub kind: String,
+    /// The operator's label for the phase (D-357): optional, free-form, no
+    /// uniqueness, no behaviour. Versions with the revision like every column
+    /// here.
+    pub display_name: Option<String>,
     /// The phase's position in the chain. The lowest ordinal is the entry
     /// phase (`inst-ph-graph`).
     pub ordinal: i32,

@@ -40,11 +40,13 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
+
 use toolkit_odata::PageInfo;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::instant::from_unix;
+use time::OffsetDateTime;
 
 /// Rows per page when the caller names no `limit` (D-125).
 pub const DEFAULT_LIMIT: u64 = 100;
@@ -193,7 +195,7 @@ pub struct IntervalPageRequest {
     pub limit: u64,
     /// The `(instant, id)` pair the previous page ended at; the walk resumes
     /// strictly after it.
-    pub after: Option<(DateTime<Utc>, Uuid)>,
+    pub after: Option<(OffsetDateTime, Uuid)>,
 }
 
 impl IntervalPageRequest {
@@ -233,7 +235,7 @@ impl IntervalPageRequest {
 /// silently **truncates** an instant the store holds at finer resolution, and a
 /// truncated cursor sorts *before* the row it names — so the next page would open
 /// by serving that row a second time. The pair round-trips every value a
-/// [`DateTime<Utc>`] can hold, exactly.
+/// [`OffsetDateTime`] can hold, exactly.
 ///
 /// # One encoder, two callers, and why that needed saying
 ///
@@ -251,12 +253,12 @@ impl IntervalPageRequest {
 /// primitives — the same reading under which `history` already takes
 /// [`DEFAULT_LIMIT`] and [`MAX_LIMIT`] from here.
 #[must_use]
-pub fn encode_instant_and_id(at: DateTime<Utc>, id: Uuid) -> String {
+pub fn encode_instant_and_id(at: OffsetDateTime, id: Uuid) -> String {
     let raw: Vec<u8> = at
-        .timestamp()
+        .unix_timestamp()
         .to_be_bytes()
         .into_iter()
-        .chain(at.timestamp_subsec_nanos().to_be_bytes())
+        .chain(at.nanosecond().to_be_bytes())
         .chain(*id.as_bytes())
         .collect();
     URL_SAFE_NO_PAD.encode(raw)
@@ -267,10 +269,10 @@ pub fn encode_instant_and_id(at: DateTime<Utc>, id: Uuid) -> String {
 /// # Errors
 /// [`DomainError::InvalidRequest`] when the token is not URL-safe base64, is not
 /// exactly the 28 bytes [`encode_instant_and_id`] writes, or names an instant
-/// outside the range a [`DateTime<Utc>`] holds. All three are one refusal, because
+/// outside the range a [`OffsetDateTime`] holds. All three are one refusal, because
 /// a caller can act no differently on any of them: the token did not come from this
 /// surface. No new wire code, for [`decode`]'s reason.
-pub fn decode_instant_and_id(raw: &str) -> Result<(DateTime<Utc>, Uuid), DomainError> {
+pub fn decode_instant_and_id(raw: &str) -> Result<(OffsetDateTime, Uuid), DomainError> {
     let refuse = || {
         DomainError::InvalidRequest(
             "cursor: the token is not one this surface issued; \
@@ -284,8 +286,8 @@ pub fn decode_instant_and_id(raw: &str) -> Result<(DateTime<Utc>, Uuid), DomainE
     // Fixes the total length as well as the last field: a longer token leaves more
     // than sixteen bytes here and is refused.
     let id: [u8; 16] = id.try_into().map_err(|_| refuse())?;
-    let at = DateTime::from_timestamp(i64::from_be_bytes(*seconds), u32::from_be_bytes(*nanos))
-        .ok_or_else(refuse)?;
+    let at =
+        from_unix(i64::from_be_bytes(*seconds), u32::from_be_bytes(*nanos)).ok_or_else(refuse)?;
     Ok((at, Uuid::from_bytes(id)))
 }
 
@@ -348,7 +350,7 @@ pub fn revision_page_info(next: Option<(Uuid, u64)>, limit: u64) -> PageInfo {
 /// [`page_info`]'s reading, over the pair: `next` is `Some` only while the walk can
 /// continue.
 #[must_use]
-pub fn interval_page_info(next: Option<(DateTime<Utc>, Uuid)>, limit: u64) -> PageInfo {
+pub fn interval_page_info(next: Option<(OffsetDateTime, Uuid)>, limit: u64) -> PageInfo {
     PageInfo {
         next_cursor: next.map(|(at, id)| encode_instant_and_id(at, id)),
         prev_cursor: None,

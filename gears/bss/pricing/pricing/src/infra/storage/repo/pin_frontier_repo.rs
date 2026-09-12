@@ -59,10 +59,11 @@
 //! code the design set has already reasoned about, for no observable gain.
 
 use bss_pricing_sdk::{CatalogVersion, PinFrontier};
-use chrono::{DateTime, Utc};
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
@@ -224,7 +225,7 @@ pub async fn advance(
     scope: &AccessScope,
     tenant_id: Uuid,
     to: CatalogVersion,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let target = i64::try_from(to.get()).map_err(|e| {
         RepoError::CorruptRow(format!(

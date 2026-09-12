@@ -28,9 +28,12 @@ use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::migration_repo::{self, NewMigration};
-use chrono::{DateTime, Duration, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
+use time::Duration;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -44,8 +47,8 @@ const ACTOR: Uuid = Uuid::from_u128(0x_ac_11);
 const SOURCE: Uuid = Uuid::from_u128(0x_50_04_ce);
 const TARGET: Uuid = Uuid::from_u128(0x_7a_46_e7);
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 7, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 7, hour, 0, 0)
 }
 
 fn scope() -> AccessScope {
@@ -163,7 +166,7 @@ async fn two_tenants_may_hold_one_migration_id_and_neither_can_deny_the_other() 
 /// `effectiveAt` arrives on the schedule request, is carried back in a contract
 /// field and is *compared* — D-49's notice floor is `effective_at - announced_at`
 /// — so it is inside the rule the whole gate exists for. `announcedAt` is the
-/// scheduling commit instant the gear mints from `Utc::now()`, so applying the
+/// scheduling commit instant the gear mints from `OffsetDateTime::now_utc()`, so applying the
 /// quantum to it would refuse **every** schedule; `window_repo::transition`
 /// measured exactly that on its flip timestamp and says so.
 ///
@@ -189,7 +192,7 @@ async fn an_effective_instant_finer_than_the_quantum_is_refused_and_the_announce
     );
 
     // The announcement instant is the commit's own and is **not** subject to the
-    // rule: a schedule whose `announced_at` carries the microseconds `Utc::now()`
+    // rule: a schedule whose `announced_at` carries the microseconds `OffsetDateTime::now_utc()`
     // hands every caller still lands.
     let mut machine_stamped = new_migration(Uuid::now_v7());
     machine_stamped.announced_at += Duration::microseconds(137);

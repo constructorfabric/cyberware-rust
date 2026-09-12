@@ -5,11 +5,12 @@
 //! unit, so writing it into a frozen `CatalogVersion` would be the in-place
 //! mutation D-85 / D-99 forbid. Clearing a flag deletes the row.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_operator_flag")]
@@ -28,7 +29,7 @@ pub struct Model {
     /// `meter_binding_divergent`.
     #[sea_orm(primary_key, auto_increment = false)]
     pub flag: String,
-    pub set_at: DateTime<Utc>,
+    pub set_at: OffsetDateTime,
     pub set_by: Uuid,
     pub detail: JsonValue,
 }

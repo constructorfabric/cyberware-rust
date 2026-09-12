@@ -34,6 +34,7 @@ use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::payment::queue_apply::QueueApplier;
 use crate::infra::storage::repo::PendingQueueRepo;
+use time::OffsetDateTime;
 
 /// The allocation deferred-apply queue flow this job sweeps — the
 /// `PAYMENT_ALLOCATE` literal (kept in lockstep with
@@ -165,7 +166,7 @@ impl QueueApplierJob {
     /// swallowed within the pass.
     pub async fn run(&self) -> anyhow::Result<QueueApplierReport> {
         let repo = PendingQueueRepo::new(self.db.clone());
-        let now = chrono::Utc::now();
+        let now = OffsetDateTime::now_utc();
 
         // Cross-tenant candidate feed (UNSCOPED, system-context). Collapse to the
         // distinct tenant set — the per-tenant `drain` re-claims under SKIP LOCKED

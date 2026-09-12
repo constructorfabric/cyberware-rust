@@ -22,17 +22,23 @@
 mod common;
 mod rest_support;
 
+#[path = "rest_plans/list_query.rs"]
+mod list_query;
+
 use axum::http::StatusCode;
-use bss_pricing::api::rest::plans::PLANS;
+use bss_pricing::api::rest::plans::{PLANS, PLANS_COUNTS};
+use std::collections::HashMap;
 
 fn clone_path(plan_id: Uuid) -> String {
     format!("{PLANS}/{plan_id}/clone")
 }
 use rest_support::{
-    Harness, audit_rows, body_json, code_in, denial_reason, etag_of, location_of, not_found_code,
-    plan_count, plan_row_version, plan_state, problem_code, problem_family, refused_by, request,
-    seed_current_plan, seed_draft_plan, seed_foreign_plan, seed_price, violation_for, with_headers,
+    Harness, approval_rows, audit_rows, body_json, code_in, denial_reason, etag_of, location_of,
+    not_found_code, plan_count, plan_row_version, plan_state, problem_code, problem_family,
+    refused_by, request, seed_current_plan, seed_draft_plan, seed_foreign_plan, seed_price,
+    seed_publishable_plan, violation_for, with_headers,
 };
+use serde_json::json;
 use uuid::Uuid;
 
 fn plan_path(plan_id: Uuid) -> String {
@@ -4032,8 +4038,8 @@ async fn a_patch_whose_availability_window_ends_before_it_starts_is_refused_at_t
             &plan_path(plan_id),
             Some(serde_json::json!({
                 "shape": {
-                    "available_from": "2026-09-01T00:00:00Z",
-                    "available_to": "2026-08-01T00:00:00Z"
+                    "available_from": "2026-09-01T00:00:00.000000Z",
+                    "available_to": "2026-08-01T00:00:00.000000Z"
                 }
             })),
             &[("if-match", "\"0-0\"")],
@@ -4072,8 +4078,8 @@ async fn a_patch_whose_availability_window_opens_and_closes_at_one_instant_is_re
             &plan_path(plan_id),
             Some(serde_json::json!({
                 "shape": {
-                    "available_from": "2026-09-01T00:00:00Z",
-                    "available_to": "2026-09-01T00:00:00Z"
+                    "available_from": "2026-09-01T00:00:00.000000Z",
+                    "available_to": "2026-09-01T00:00:00.000000Z"
                 }
             })),
             &[("if-match", "\"0-0\"")],
@@ -4160,7 +4166,7 @@ async fn a_patch_sending_one_availability_bound_against_the_stored_other_is_refu
             "PATCH",
             &plan_path(plan_id),
             Some(serde_json::json!({
-                "shape": { "available_from": "2026-09-01T00:00:00Z" }
+                "shape": { "available_from": "2026-09-01T00:00:00.000000Z" }
             })),
             &[("if-match", "\"0-0\"")],
         ))
@@ -4173,7 +4179,7 @@ async fn a_patch_sending_one_availability_bound_against_the_stored_other_is_refu
             "PATCH",
             &plan_path(plan_id),
             Some(serde_json::json!({
-                "shape": { "available_to": "2026-08-01T00:00:00Z" }
+                "shape": { "available_to": "2026-08-01T00:00:00.000000Z" }
             })),
             &[("if-match", "\"0-1\"")],
         ))
@@ -4364,8 +4370,8 @@ async fn an_availability_window_that_opens_before_it_closes_lands() {
             &plan_path(plan_id),
             Some(serde_json::json!({
                 "shape": {
-                    "available_from": "2026-08-01T00:00:00Z",
-                    "available_to": "2026-09-01T00:00:00Z"
+                    "available_from": "2026-08-01T00:00:00.000000Z",
+                    "available_to": "2026-09-01T00:00:00.000000Z"
                 }
             })),
             &[("if-match", "\"0-0\"")],
@@ -4376,7 +4382,7 @@ async fn an_availability_window_that_opens_before_it_closes_lands() {
     let body = body_json(landed).await;
     assert_eq!(
         body["available_to"],
-        serde_json::json!("2026-09-01T00:00:00Z"),
+        serde_json::json!("2026-09-01T00:00:00.000000Z"),
         "{body}"
     );
 }
@@ -4710,5 +4716,731 @@ async fn two_period_bounds_on_two_markets_land_together() {
         body["period_floor_caps"].as_array().map(Vec::len),
         Some(2),
         "one currency in two regions is two markets: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /plans — AM-style OData (D-125 amendment).
+// ---------------------------------------------------------------------------
+
+fn plan_ids(body: &serde_json::Value) -> Vec<String> {
+    body["items"]
+        .as_array()
+        .expect("plans ride `items`")
+        .iter()
+        .map(|row| {
+            row["plan_id"]
+                .as_str()
+                .expect("each summary names plan_id")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Named `lifecycle_state=` is retired. The page is narrowed only through `$filter`.
+#[tokio::test]
+async fn a_named_lifecycle_state_key_on_the_plan_list_is_refused() {
+    let harness = Harness::new().await;
+    seed_draft_plan(&harness, Uuid::now_v7()).await;
+
+    let named = harness
+        .allowed()
+        .send(request(
+            "GET",
+            &format!("{PLANS}?lifecycle_state=draft"),
+            None,
+        ))
+        .await;
+    assert_eq!(named.status(), StatusCode::BAD_REQUEST);
+    refused_by(
+        &body_json(named).await,
+        "invalid_argument",
+        "unrecognized query parameter `lifecycle_state`",
+    );
+
+    let extra = harness
+        .allowed()
+        .send(request("GET", &format!("{PLANS}?status=draft"), None))
+        .await;
+    assert_eq!(extra.status(), StatusCode::BAD_REQUEST);
+    refused_by(
+        &body_json(extra).await,
+        "invalid_argument",
+        "unrecognized query parameter `status`",
+    );
+}
+
+/// Omit `lifecycle_state` → one authoring revision per plan (draft if any, else current).
+#[tokio::test]
+async fn omitting_lifecycle_on_the_plan_list_keeps_the_authoring_default() {
+    let harness = Harness::new().await;
+    let draft = Uuid::now_v7();
+    let published = Uuid::now_v7();
+    seed_draft_plan(&harness, draft).await;
+    seed_current_plan(&harness, published).await;
+
+    let page = body_json(harness.allowed().send(request("GET", PLANS, None)).await).await;
+    let ids = plan_ids(&page);
+    assert!(
+        ids.contains(&draft.to_string()) && ids.contains(&published.to_string()),
+        "a listing over current revisions alone would hide the open draft: {page}"
+    );
+
+    let only_draft = body_json(
+        harness
+            .allowed()
+            .send(request(
+                "GET",
+                &format!("{PLANS}?$filter=lifecycle_state%20eq%20'draft'"),
+                None,
+            ))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        plan_ids(&only_draft),
+        vec![draft.to_string()],
+        "$filter=lifecycle_state eq 'draft' must drop the published plan: {only_draft}"
+    );
+
+    let only_published = body_json(
+        harness
+            .allowed()
+            .send(request(
+                "GET",
+                &format!("{PLANS}?$filter=lifecycle_state%20eq%20'published'"),
+                None,
+            ))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        plan_ids(&only_published),
+        vec![published.to_string()],
+        "$filter=lifecycle_state eq 'published' must drop the draft: {only_published}"
+    );
+}
+
+/// `$top` is `limit`. A bounded page names a cursor the next request resumes from
+/// without repeating `$orderby` (the extractor forbids the pair).
+#[tokio::test]
+async fn the_plan_list_walks_with_top_and_a_cursor() {
+    let harness = Harness::new().await;
+    let mut authored = Vec::new();
+    for _ in 0..3 {
+        let plan_id = Uuid::now_v7();
+        seed_draft_plan(&harness, plan_id).await;
+        authored.push(plan_id.to_string());
+    }
+
+    let first = body_json(
+        harness
+            .allowed()
+            .send(request("GET", &format!("{PLANS}?$top=2"), None))
+            .await,
+    )
+    .await;
+    let page_one = plan_ids(&first);
+    assert_eq!(page_one.len(), 2, "$top=2 bounds the page: {first}");
+    assert_eq!(first["page_info"]["limit"], serde_json::json!(2));
+    let token = first["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a page with more behind it names where to resume")
+        .to_owned();
+
+    let second = body_json(
+        harness
+            .allowed()
+            .send(request(
+                "GET",
+                &format!("{PLANS}?limit=2&cursor={token}"),
+                None,
+            ))
+            .await,
+    )
+    .await;
+    let page_two = plan_ids(&second);
+    assert!(
+        page_one.iter().all(|id| !page_two.contains(id)),
+        "the walk must not repeat a row: {page_one:?} ∩ {page_two:?}"
+    );
+    let mut seen = page_one;
+    seen.extend(page_two);
+    seen.sort();
+    authored.sort();
+    assert_eq!(
+        seen, authored,
+        "every seeded plan appears exactly once across the two pages"
+    );
+}
+
+/// A cursor is valid only for the same `$filter`. Reusing it under another is 400.
+#[tokio::test]
+async fn a_plan_list_cursor_is_invalid_under_a_different_filter() {
+    let harness = Harness::new().await;
+    seed_draft_plan(&harness, Uuid::now_v7()).await;
+    seed_draft_plan(&harness, Uuid::now_v7()).await;
+
+    let first = body_json(
+        harness
+            .allowed()
+            .send(request(
+                "GET",
+                &format!("{PLANS}?$filter=lifecycle_state%20eq%20'draft'&limit=1"),
+                None,
+            ))
+            .await,
+    )
+    .await;
+    let token = first["page_info"]["next_cursor"]
+        .as_str()
+        .expect("two drafts and limit=1 leave a cursor")
+        .to_owned();
+
+    let reused = harness
+        .allowed()
+        .send(request(
+            "GET",
+            &format!("{PLANS}?$filter=lifecycle_state%20eq%20'published'&cursor={token}"),
+            None,
+        ))
+        .await;
+    assert_eq!(
+        reused.status(),
+        StatusCode::BAD_REQUEST,
+        "a cursor walked under one $filter must not continue under another: {}",
+        body_json(reused).await
+    );
+}
+
+/// The old timestamp spelling is not a silent alias for a changed time semantic.
+#[tokio::test]
+async fn the_plan_list_refuses_the_retired_timestamp_sort_key() {
+    let harness = Harness::new().await;
+    let response = harness
+        .allowed()
+        .send(request(
+            "GET",
+            &format!("{PLANS}?$orderby=created_at_utc%20desc"),
+            None,
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    refused_by(
+        &body_json(response).await,
+        "invalid_argument",
+        "created_at_utc",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-359: the plan reads report the unit a revision waits on.
+// ---------------------------------------------------------------------------
+
+/// The submitter of the units below. A named principal rather than the default
+/// client's, because `independent_approver` refuses a self-decision and the
+/// withdraw case needs the submitter specifically.
+const SUBMITTER: Uuid = Uuid::from_u128(0x5_c0);
+
+/// Open a unit over a publishable plan through the publish route, and hand back
+/// its id — `rest_approvals::a_pending_unit`'s arrangement, kept here so this
+/// suite does not depend on that file's helpers.
+async fn a_unit_over(h: &Harness, plan_id: Uuid, etag: &str) -> Uuid {
+    let submitted = h
+        .allowed_as(SUBMITTER)
+        .send(with_headers(
+            "POST",
+            &format!("/bss-pricing/v1/plans/{plan_id}/publish"),
+            None,
+            &[("if-match", etag)],
+        ))
+        .await;
+    assert_eq!(
+        submitted.status(),
+        StatusCode::ACCEPTED,
+        "the submit must open a unit for anything below to be about the read"
+    );
+    let rows = approval_rows(h).await;
+    assert_eq!(rows.len(), 1, "one unit, so the id below is unambiguous");
+    rows[0].approval_id
+}
+
+/// D-359: a revision waiting on a unit reads that unit; before the submit it
+/// reads `[]`; and the plan's `ETag` does not move when the unit opens.
+///
+/// The tag assertion is the load-bearing one. A pending unit is not plan
+/// content, so a tag that tracked it would stale every author's `If-Match` for
+/// a change they did not make — and the field is only safe to add to this body
+/// because `plan_tag` digests the revision and its `row_version` alone.
+#[tokio::test]
+async fn the_plan_read_reports_its_pending_unit_and_its_tag_does_not_move() {
+    let harness = Harness::new().await;
+    let plan_id = Uuid::now_v7();
+    let seeded = seed_publishable_plan(&harness, plan_id).await;
+
+    let before = harness
+        .allowed_as(SUBMITTER)
+        .send(request("GET", &plan_path(plan_id), None))
+        .await;
+    let tag_before = etag_of(&before).expect("the read carries a tag");
+    assert_eq!(
+        body_json(before).await["pending_approvals"],
+        json!([]),
+        "nothing is pending before the submit"
+    );
+
+    let unit = a_unit_over(&harness, plan_id, &seeded.etag()).await;
+
+    let after = harness
+        .allowed_as(SUBMITTER)
+        .send(with_headers(
+            "GET",
+            &plan_path(plan_id),
+            None,
+            &[("if-none-match", &tag_before)],
+        ))
+        .await;
+    assert_eq!(
+        after.status(),
+        StatusCode::OK,
+        "pending changes must not return 304"
+    );
+    assert_eq!(after.headers()["cache-control"], "private, no-store");
+    assert_eq!(
+        etag_of(&after).expect("tag"),
+        tag_before,
+        "a pending unit is not plan content, so the tag must not move"
+    );
+    let body = body_json(after).await;
+    assert_eq!(
+        body["lifecycle_state"], "draft",
+        "no plan state was added: the revision itself stays draft"
+    );
+    assert_eq!(
+        body["pending_approvals"][0]["approval_id"],
+        unit.to_string(),
+        "{body}"
+    );
+    assert_eq!(
+        body["pending_approvals"]
+            .as_array()
+            .expect("pending units")
+            .len(),
+        1
+    );
+    assert!(body.get("pending_approval").is_none());
+    assert_eq!(
+        body["pending_approvals"][0]["subject_kind"],
+        "plan_revision"
+    );
+    assert!(
+        body["pending_approvals"][0]["submitted_at"].is_string(),
+        "and when it was opened: {body}"
+    );
+    assert!(
+        body["pending_approvals"][0]
+            .get("submitter_principal")
+            .is_none(),
+        "who submitted it is `approval x read`'s fact, not `plan x read`'s: {body}"
+    );
+    assert!(
+        body["pending_approvals"][0].get("materiality").is_none(),
+        "and so is why it was material: {body}"
+    );
+}
+
+/// D-359: the field follows the unit rather than a state of its own — a withdraw
+/// clears it with nothing written to the plan.
+#[tokio::test]
+async fn a_withdrawn_unit_clears_the_pending_field() {
+    let harness = Harness::new().await;
+    let plan_id = Uuid::now_v7();
+    let seeded = seed_publishable_plan(&harness, plan_id).await;
+    let unit = a_unit_over(&harness, plan_id, &seeded.etag()).await;
+    let before = harness
+        .allowed_as(SUBMITTER)
+        .send(request("GET", &plan_path(plan_id), None))
+        .await;
+    let tag = etag_of(&before).expect("tag");
+
+    let withdrawn = harness
+        .allowed_as(SUBMITTER)
+        .send(with_headers(
+            "POST",
+            &format!("/bss-pricing/v1/approvals/{unit}/withdraw"),
+            None,
+            &[],
+        ))
+        .await;
+    assert_eq!(withdrawn.status(), StatusCode::OK);
+
+    let after = harness
+        .allowed_as(SUBMITTER)
+        .send(with_headers(
+            "GET",
+            &plan_path(plan_id),
+            None,
+            &[("if-none-match", &tag)],
+        ))
+        .await;
+    assert_eq!(after.status(), StatusCode::OK);
+    assert_eq!(after.headers()["cache-control"], "private, no-store");
+    assert_eq!(etag_of(&after), Some(tag));
+    let body = body_json(after).await;
+    assert_eq!(body["pending_approvals"], json!([]), "{body}");
+    assert_eq!(
+        body["lifecycle_state"], "draft",
+        "the revision was draft throughout"
+    );
+}
+
+/// D-359: the list marks exactly the plans a `plan_revision` unit is open over.
+///
+/// Two plans in one page, because a flag that answered the same thing for every
+/// row would satisfy an assertion on either one alone.
+#[tokio::test]
+async fn the_plan_list_marks_the_plans_in_review() {
+    let harness = Harness::new().await;
+    let reviewed = Uuid::now_v7();
+    let idle = Uuid::now_v7();
+    let seeded = seed_publishable_plan(&harness, reviewed).await;
+    seed_publishable_plan(&harness, idle).await;
+    let unit = a_unit_over(&harness, reviewed, &seeded.etag()).await;
+
+    let response = harness
+        .allowed_as(SUBMITTER)
+        .send(request("GET", "/bss-pricing/v1/plans", None))
+        .await;
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let page = body_json(response).await;
+    let by_id: std::collections::HashMap<String, &serde_json::Value> = page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|plan| (plan["plan_id"].as_str().expect("plan_id").to_owned(), plan))
+        .collect();
+    assert_eq!(
+        by_id[&reviewed.to_string()]["pending_approvals"][0]["approval_id"],
+        unit.to_string(),
+        "the plan with an open unit: {page}"
+    );
+    assert_eq!(
+        by_id[&idle.to_string()]["pending_approvals"],
+        json!([]),
+        "and not the one without: {page}"
+    );
+    assert!(by_id[&reviewed.to_string()].get("in_review").is_none());
+    let detail = body_json(
+        harness
+            .allowed_as(SUBMITTER)
+            .send(request("GET", &plan_path(reviewed), None))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        by_id[&reviewed.to_string()]["pending_approvals"],
+        detail["pending_approvals"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-357 / D-358: the phase label, and the middle kind spelled `interim`.
+// ---------------------------------------------------------------------------
+
+/// A phase carries its operator label through the `phases` facet and back, and
+/// the middle kind is spelled `interim` (D-357, D-358).
+///
+/// Both the write's response and a fresh read are asserted: the response says
+/// what the parser kept, the read says what the store kept, and D-357 is only
+/// landed when the two agree.
+#[tokio::test]
+async fn a_phase_label_round_trips_and_the_middle_kind_is_interim() {
+    let harness = Harness::new().await;
+    let plan_id = Uuid::now_v7();
+    seed_draft_plan(&harness, plan_id).await;
+    // A bare draft carries no phase yet, so this facet write authors the whole
+    // chain, terminal included.
+    let steady = Uuid::now_v7();
+    let onboarding = Uuid::now_v7();
+
+    let response = harness
+        .allowed()
+        .send(with_headers(
+            "PATCH",
+            &plan_path(plan_id),
+            Some(serde_json::json!({
+                "phases": [
+                    {
+                        "phase_id": onboarding,
+                        "kind": "interim",
+                        "display_name": "Onboarding",
+                        "ordinal": 0,
+                        "converts_to_phase_id": steady,
+                        "phase_duration_days": 30
+                    },
+                    { "phase_id": steady, "kind": "evergreen", "ordinal": 1 }
+                ]
+            })),
+            &[("if-match", "\"0-0\"")],
+        ))
+        .await;
+    let status = response.status();
+    let written = body_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{written}");
+    assert_eq!(written["phases"][0]["kind"], serde_json::json!("interim"));
+    assert_eq!(
+        written["phases"][0]["display_name"],
+        serde_json::json!("Onboarding")
+    );
+    assert!(
+        written["phases"][1]["display_name"].is_null(),
+        "an unlabelled phase carries no label key at all: {written}"
+    );
+
+    let read = body_json(
+        harness
+            .allowed()
+            .send(with_headers("GET", &plan_path(plan_id), None, &[]))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        read["phases"], written["phases"],
+        "the store kept what the parser kept"
+    );
+}
+
+/// `intro` is not accepted as a legacy spelling (D-358): the write refuses it,
+/// names the field, and writes nothing.
+#[tokio::test]
+async fn the_old_intro_token_is_refused_by_name_and_writes_nothing() {
+    let harness = Harness::new().await;
+    let plan_id = Uuid::now_v7();
+    seed_draft_plan(&harness, plan_id).await;
+    let steady = Uuid::now_v7();
+
+    let response = harness
+        .allowed()
+        .send(with_headers(
+            "PATCH",
+            &plan_path(plan_id),
+            Some(serde_json::json!({
+                "phases": [
+                    {
+                        "phase_id": Uuid::now_v7(),
+                        "kind": "intro",
+                        "ordinal": 0,
+                        "converts_to_phase_id": steady,
+                        "phase_duration_days": 30
+                    },
+                    { "phase_id": steady, "kind": "evergreen", "ordinal": 1 }
+                ]
+            })),
+            &[("if-match", "\"0-0\"")],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let problem = body_json(response).await.to_string();
+    assert!(
+        problem.contains("phases.kind")
+            && problem.contains("`intro`")
+            && problem.contains("interim"),
+        "the refusal names the field, the token sent and the tokens accepted: {problem}"
+    );
+
+    let read = body_json(
+        harness
+            .allowed()
+            .send(with_headers("GET", &plan_path(plan_id), None, &[]))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        read["phases"].as_array().map(Vec::len),
+        Some(0),
+        "a refused facet write leaves the bare draft as it was: {read}"
+    );
+}
+
+/// A blank label is an absence wearing a value's shape: it reads back as no
+/// label, so `""` and `"   "` never become a second spelling of "unlabelled".
+#[tokio::test]
+async fn a_blank_phase_label_reads_back_as_no_label() {
+    let harness = Harness::new().await;
+    let plan_id = Uuid::now_v7();
+    seed_draft_plan(&harness, plan_id).await;
+    let steady = Uuid::now_v7();
+
+    let response = harness
+        .allowed()
+        .send(with_headers(
+            "PATCH",
+            &plan_path(plan_id),
+            Some(serde_json::json!({
+                "phases": [
+                    { "phase_id": steady, "kind": "evergreen", "display_name": "   ", "ordinal": 0 }
+                ]
+            })),
+            &[("if-match", "\"0-0\"")],
+        ))
+        .await;
+    let status = response.status();
+    let written = body_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{written}");
+    // `null`, not an absent key: the field renders like its three optional
+    // siblings on this view, so a client reads one shape for a labelled and an
+    // unlabelled phase. What is asserted here is that whitespace does not become
+    // a label, which is unchanged.
+    assert!(
+        written["phases"][0]["display_name"].is_null(),
+        "whitespace is not a label: {written}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-360: the list carries each plan's row facts; a counts read feeds the tabs.
+// ---------------------------------------------------------------------------
+
+/// Each list row carries `price_row_count`, `model_kinds` and `currencies` over
+/// its `draft` + `published` rows, and the count **is** the prices list's own
+/// unfiltered page length - the definition, not a coincidence. A plan with no
+/// rows renders zero and two empty lists rather than omitting the fields.
+#[tokio::test]
+async fn the_list_carries_each_plans_row_facts_and_they_match_the_prices_list() {
+    let harness = Harness::new().await;
+    let seeded_id = Uuid::now_v7();
+    seed_publishable_plan(&harness, seeded_id).await;
+    let created = body_json(
+        harness
+            .allowed()
+            .send(with_headers(
+                "POST",
+                PLANS,
+                Some(create_body("gold")),
+                &keyed("k-d360-empty"),
+            ))
+            .await,
+    )
+    .await;
+    let empty_id: Uuid = created["plan_id"]
+        .as_str()
+        .expect("plan_id")
+        .parse()
+        .expect("uuid");
+
+    let page = body_json(harness.allowed().send(request("GET", PLANS, None)).await).await;
+    let by_id: HashMap<String, &serde_json::Value> = page["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|item| (item["plan_id"].as_str().expect("plan_id").to_owned(), item))
+        .collect();
+    let seeded = by_id[&seeded_id.to_string()];
+    assert_eq!(seeded["price_row_count"], 1, "{seeded}");
+    assert_eq!(
+        seeded["model_kinds"],
+        serde_json::json!(["flat"]),
+        "{seeded}"
+    );
+    assert_eq!(seeded["currencies"], serde_json::json!(["EUR"]), "{seeded}");
+    let fresh = by_id[&empty_id.to_string()];
+    assert_eq!(fresh["price_row_count"], 0, "{fresh}");
+    assert_eq!(fresh["model_kinds"], serde_json::json!([]), "{fresh}");
+    assert_eq!(fresh["currencies"], serde_json::json!([]), "{fresh}");
+
+    let prices = body_json(
+        harness
+            .allowed()
+            .send(request("GET", &format!("{PLANS}/{seeded_id}/prices"), None))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        prices["items"].as_array().map(Vec::len),
+        Some(1),
+        "the count is the prices list's unfiltered page length: {prices}"
+    );
+}
+
+/// `GET /plans/counts` folds the list's authoring collapse over the whole
+/// catalogue: a plan with an open draft is `draft`, else its current state -
+/// so opening a successor draft over a published plan moves it from
+/// `published` to `draft`, exactly as the list's row does.
+#[tokio::test]
+async fn the_counts_read_folds_the_authoring_state_over_the_whole_catalogue() {
+    let harness = Harness::new().await;
+    let (d1, d2, p1) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    seed_publishable_plan(&harness, d1).await;
+    seed_publishable_plan(&harness, d2).await;
+    let published = seed_publishable_plan(&harness, p1).await;
+    harness.publish(p1, published.revision).await;
+
+    let counts = body_json(
+        harness
+            .allowed()
+            .send(request("GET", PLANS_COUNTS, None))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        counts,
+        serde_json::json!({ "total": 3, "draft": 2, "published": 1, "retired": 0 }),
+        "{counts}"
+    );
+
+    // **A second tenant reads zeros over the same three plans.**
+    //
+    // The route answers "over the whole catalogue", and the only proof that the
+    // catalogue is the *caller's* was one tenant deep in `sqlite_plan_repo`, which
+    // cannot see which tenant id the handler passes. A handler folding the counts
+    // unscoped, or over the wrong tenant, answered `{3,2,1,0}` here and stayed
+    // green — the sibling `/approvals/counts` carries this case for that reason.
+    let foreign = body_json(
+        harness
+            .other_tenant()
+            .send(request("GET", PLANS_COUNTS, None))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        foreign,
+        serde_json::json!({ "total": 0, "draft": 0, "published": 0, "retired": 0 }),
+        "another tenant's catalogue is empty, not this one: {foreign}"
+    );
+
+    // Open a successor draft over p1 through the surface: a PATCH on a published
+    // plan opens the next revision (D-170).
+    let read = harness
+        .allowed()
+        .send(with_headers("GET", &plan_path(p1), None, &[]))
+        .await;
+    let tag = etag_of(&read).expect("the published plan carries a tag");
+    let patched = harness
+        .allowed()
+        .send(with_headers(
+            "PATCH",
+            &plan_path(p1),
+            Some(serde_json::json!({ "shape": { "plan_tier": "silver" } })),
+            &[("if-match", &tag)],
+        ))
+        .await;
+    let status = patched.status();
+    assert!(
+        status.is_success(),
+        "the successor opens: {status} {}",
+        body_json(patched).await
+    );
+
+    let counts = body_json(
+        harness
+            .allowed()
+            .send(request("GET", PLANS_COUNTS, None))
+            .await,
+    )
+    .await;
+    assert_eq!(
+        counts,
+        serde_json::json!({ "total": 3, "draft": 3, "published": 0, "retired": 0 }),
+        "the plan with an open draft counts as draft: {counts}"
     );
 }

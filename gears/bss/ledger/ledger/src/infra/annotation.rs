@@ -34,6 +34,7 @@ use crate::infra::audit::store::SecuredAuditStore;
 use crate::infra::pii::PiiMinimizer;
 use crate::infra::posting::service::infra;
 use crate::infra::storage::entity::{entry_annotation, journal_entry, journal_line};
+use time::OffsetDateTime;
 
 /// `'ENTRY'` / `'LINE'` literals for the `target_kind` column (CHECK-constrained
 /// in migration 000015).
@@ -291,7 +292,7 @@ async fn set_in_txn(
         target_period_id: Set(target_period_id.to_owned()),
         description: Set(description),
         actor_ref: Set(actor_ref.to_owned()),
-        updated_at: Set(chrono::Utc::now()),
+        updated_at: Set(OffsetDateTime::now_utc()),
     };
     let on_conflict = OnConflict::columns([
         entry_annotation::Column::TenantId,

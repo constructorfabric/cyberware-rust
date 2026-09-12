@@ -16,7 +16,7 @@
 //!     reason_code: Option<&str>,
 //!     before_after: &serde_json::Value,
 //!     correlation_id: Option<Uuid>,
-//!     retain_until: Option<DateTime<Utc>>,
+//!     retain_until: Option<OffsetDateTime>,
 //! ) -> Result<Uuid, DbError>;
 //! ```
 //!
@@ -44,7 +44,7 @@
 //! variant Slice 6 stamps for a governed disposition / write-off — re-using it
 //! avoids touching Slice 6's secured-audit migration enum at merge, design §2.1).
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 use toolkit_db::DbError;
 use toolkit_db::secure::{AccessScope, DbTx};
 use uuid::Uuid;
@@ -130,7 +130,7 @@ pub trait SecuredAuditSink: Send + Sync {
         reason_code: Option<&str>,
         before_after: &serde_json::Value,
         correlation_id: Option<Uuid>,
-        retain_until: Option<DateTime<Utc>>,
+        retain_until: Option<OffsetDateTime>,
     ) -> Result<Uuid, DbError>;
 }
 
@@ -167,7 +167,7 @@ impl SecuredAuditSink for NoopSecuredAuditSink {
         reason_code: Option<&str>,
         before_after: &serde_json::Value,
         correlation_id: Option<Uuid>,
-        _retain_until: Option<DateTime<Utc>>,
+        _retain_until: Option<OffsetDateTime>,
     ) -> Result<Uuid, DbError> {
         let record_id = Uuid::now_v7();
         // No PII in the structured fields — ids + enum codes only. `before_after`

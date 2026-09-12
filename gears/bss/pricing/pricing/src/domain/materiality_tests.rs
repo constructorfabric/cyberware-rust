@@ -21,7 +21,6 @@
 //! test changes exactly the one fact its rule is named for. A test whose fixture is
 //! material for two reasons at once proves neither.
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::triggers::Trigger;
@@ -30,6 +29,7 @@ use super::{
     ThresholdEntry, ThresholdPolicy, ThresholdRefusal, ThresholdVersion, evaluate,
 };
 use crate::domain::concurrency::RowVersion;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use crate::domain::price_record::PriceRecord;
@@ -37,6 +37,7 @@ use crate::domain::price_row::{ModelKind, PriceRow, TierBand};
 use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
+use time::OffsetDateTime;
 
 /// A published `flat` row on `currency`, at an amount the case may move.
 ///
@@ -59,10 +60,7 @@ fn row(currency: &str, amount: i64) -> PriceRecord {
         supersedes_price_id: None,
         lifecycle_state: LifecycleState::Published,
         created_by: Uuid::from_u128(0xac_01),
-        created_at_utc: Utc
-            .with_ymd_and_hms(2026, 8, 2, 10, 0, 0)
-            .single()
-            .expect("a real instant"),
+        created_at_utc: utc_ymd_hms(2026, 8, 2, 10, 0, 0),
         row_version: RowVersion::new(1),
     }
 }
@@ -893,10 +891,8 @@ fn every_reason_carries_a_distinct_token() {
 // ---------------------------------------------------------------------------
 
 /// An authored instant, quantized as D-144 requires.
-fn at_utc(hour: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, hour, 0, 0)
-        .single()
-        .expect("a real instant")
+fn at_utc(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, hour, 0, 0)
 }
 
 /// One entry, spelled compactly.

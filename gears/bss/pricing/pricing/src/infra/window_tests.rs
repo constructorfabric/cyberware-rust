@@ -15,9 +15,8 @@
 //! and never the classification itself. Here the classification is the whole subject,
 //! which is what keeps a shadowed guard from being an unasserted one.
 
-use chrono::{TimeDelta, TimeZone};
-
 use super::{Op, PlanContext, Planned, WindowState, pending_approval, window_state_value};
+use crate::domain::instant::{format_rfc3339, utc_ymd_hms};
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{MaterialityReason, MaterialityVerdict};
@@ -29,15 +28,12 @@ use crate::domain::scope_key::{
 use crate::domain::window::KeyWindows;
 use crate::infra::storage::repo::approval_repo::ApprovalRecord;
 use crate::infra::storage::repo::window_repo::WindowRecord;
+use time::OffsetDateTime;
 
 /// The window scale, fixed at 2099 for `common::COVERAGE_FROM_UTC`'s reason: an
 /// instant no clock reaches cannot make a case mean something different tomorrow.
-fn at(day: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::Utc
-        .with_ymd_and_hms(2099, 8, 4, 0, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
-        + TimeDelta::days(day)
+fn at(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 4, 0, 0, 0) + time::Duration::days(day)
 }
 
 fn plan() -> PlanId {
@@ -120,7 +116,7 @@ fn planned(op: Op, current: Option<WindowRecord>, effective_to: Option<i64>) -> 
                 scope_key: key(),
                 intervals: Vec::new(),
             },
-            margin: Some(TimeDelta::days(31)),
+            margin: Some(time::Duration::days(31)),
             plane: Vec::new(),
             published: Vec::new(),
             shape: PlanShape::new(plan(), 3, at(0)),
@@ -332,8 +328,8 @@ fn the_audited_state_is_the_interval_and_where_it_stands() {
         window_state_value(&record),
         serde_json::json!({
             "state": "scheduled",
-            "effectiveFrom": at(0),
-            "effectiveTo": at(30),
+            "effectiveFrom": format_rfc3339(at(0)),
+            "effectiveTo": format_rfc3339(at(30)),
             "priceId": record.price_id,
         })
     );

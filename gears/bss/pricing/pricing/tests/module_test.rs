@@ -68,25 +68,26 @@ fn every_migration_name_is_unique() {
 /// literal is, and this binds the two spellings together.
 fn declared_paths() -> Vec<(&'static str, &'static str)> {
     use bss_pricing::api::rest::approvals::{
-        APPROVAL, APPROVAL_APPROVE, APPROVAL_REJECT, APPROVAL_WITHDRAW, APPROVALS,
+        APPROVAL, APPROVAL_APPROVE, APPROVAL_COUNTS, APPROVAL_REJECT, APPROVAL_WITHDRAW, APPROVALS,
     };
     use bss_pricing::api::rest::audit::AUDIT;
     use bss_pricing::api::rest::bulk_imports::{BULK_IMPORT, BULK_IMPORT_ABORT, BULK_IMPORTS};
     use bss_pricing::api::rest::bundles::{BUNDLE_BY_ID, BUNDLE_PUBLISH, BUNDLES};
-    use bss_pricing::api::rest::catalog_skus::CATALOG_SKUS;
+    use bss_pricing::api::rest::catalog_skus::{CATALOG_SKUS, CATALOG_TAX_CATEGORIES};
     use bss_pricing::api::rest::customer_groups::{
         CUSTOMER_GROUP_MEMBER, CUSTOMER_GROUP_MEMBER_MOVE, CUSTOMER_GROUP_MEMBERS,
-        CUSTOMER_GROUP_TAXONOMY,
+        CUSTOMER_GROUP_MEMBERS_MOVE, CUSTOMER_GROUP_TAXONOMY,
     };
     use bss_pricing::api::rest::cutovers::{PLAN_CUTOVERS, PRICE_GRANDFATHER_UNTIL};
-    use bss_pricing::api::rest::frontier::FRONTIER;
+    use bss_pricing::api::rest::frontier::{CATALOG_VERSION_REF, FRONTIER};
+    use bss_pricing::api::rest::gl_codes::GL_CODES;
     use bss_pricing::api::rest::history::{HISTORY, HISTORY_EXPORT};
     use bss_pricing::api::rest::migrated_origin_snapshots::MIGRATED_ORIGIN_SNAPSHOT;
     use bss_pricing::api::rest::migrations::{MIGRATION_BY_ID, MIGRATIONS};
     use bss_pricing::api::rest::overlays::{
         PRICE_OVERLAY_BY_ID, PRICE_OVERLAY_SUBMIT, PRICE_OVERLAYS,
     };
-    use bss_pricing::api::rest::plans::{PLAN, PLAN_ABANDON, PLAN_CLONE, PLANS};
+    use bss_pricing::api::rest::plans::{PLAN, PLAN_ABANDON, PLAN_CLONE, PLANS, PLANS_COUNTS};
     use bss_pricing::api::rest::preview::PLAN_PREVIEW;
     use bss_pricing::api::rest::prices::{PLAN_PRICE, PLAN_PRICES};
     use bss_pricing::api::rest::publish::PLAN_PUBLISH;
@@ -98,13 +99,14 @@ fn declared_paths() -> Vec<(&'static str, &'static str)> {
     use bss_pricing::api::rest::rounding_policy::ROUNDING_POLICY;
     use bss_pricing::api::rest::supersessions::PLAN_SUPERSESSIONS;
     use bss_pricing::api::rest::tax_display_policy::TAX_DISPLAY_POLICY;
-    use bss_pricing::api::rest::taxonomies::TAXONOMY;
+    use bss_pricing::api::rest::taxonomies::{TAXONOMY, TAXONOMY_VALUE, TAXONOMY_VALUES};
     use bss_pricing::api::rest::threshold_policy::APPROVAL_THRESHOLD_POLICY;
     use bss_pricing::api::rest::windows::{
         PLAN_COVERAGE, PLAN_SELLABILITY, PRICE_WINDOW, PRICE_WINDOWS, PRICE_WINDOWS_LIST,
     };
     vec![
         ("GET", FRONTIER),
+        ("GET", CATALOG_VERSION_REF),
         ("GET", HISTORY),
         // §5's export. A `POST` that is a **read** — `inst-he-nostore` leaves it
         // nothing to write — so it is here beside its sibling rather than among
@@ -114,6 +116,9 @@ fn declared_paths() -> Vec<(&'static str, &'static str)> {
         ("GET", AUDIT),
         ("GET", PLAN),
         ("GET", PLANS),
+        // D-360: the counts read beside the list, a static segment ahead of
+        // `{planId}`.
+        ("GET", PLANS_COUNTS),
         ("POST", PLANS),
         ("PATCH", PLAN),
         ("POST", PLAN_ABANDON),
@@ -136,6 +141,7 @@ fn declared_paths() -> Vec<(&'static str, &'static str)> {
         ("POST", REPRICING_RUN_ABORT),
         ("POST", PLAN_PRICES),
         ("GET", PLAN_PRICES),
+        ("GET", PLAN_PRICE),
         ("PATCH", PLAN_PRICE),
         ("DELETE", PLAN_PRICE),
         // Slice 8's three (`design/08-bundles.md` §5). The publish answers 202
@@ -149,9 +155,12 @@ fn declared_paths() -> Vec<(&'static str, &'static str)> {
         // is mounted per-resource rather than on the collection §5 spells,
         // because a precondition addresses a resource — the divergence Slice 8
         // reported for its own composition route and this one inherits. The
-        // submit answers 202: it opens the always-material approval unit (D-50).
+        // by-id `GET` is the authoring read (draft else published); create's
+        // `Location` is that path. The submit answers 202: it opens the
+        // always-material approval unit (D-50).
         ("POST", PRICE_OVERLAYS),
         ("GET", PRICE_OVERLAYS),
+        ("GET", PRICE_OVERLAY_BY_ID),
         ("PATCH", PRICE_OVERLAY_BY_ID),
         ("POST", PRICE_OVERLAY_SUBMIT),
         // Slice 4's config plane: the four scope-value taxonomies, as one route
@@ -163,7 +172,17 @@ fn declared_paths() -> Vec<(&'static str, &'static str)> {
         // `plan × preview` — deliberately not `plan × read`.
         ("GET", PLAN_PREVIEW),
         ("GET", TAXONOMY),
-        ("PUT", TAXONOMY),
+        // D-353: the whole-set `PUT` is gone — it could retire or re-label a value
+        // without a second principal — and the per-value routes stand in its place.
+        // The `POST` takes
+        // **no** idempotency header — the value is the resource's natural key, so a
+        // repeat with the same body replays and one with other content is `409`
+        // `TAXONOMY_VALUE_EXISTS` — and is deliberately absent from
+        // `idempotency_key_routes()` below, as `PLAN_SUPERSESSIONS` is. The `PATCH`
+        // asserts the value's own tag and is in `if_match_routes()`.
+        ("POST", TAXONOMY_VALUES),
+        ("GET", TAXONOMY_VALUE),
+        ("PATCH", TAXONOMY_VALUE),
         // Slice 9's own taxonomy (`inst-cg-taxonomy`), on its own route and its
         // own `customer_group` gate — see `api::rest::customer_groups`'s module
         // doc for why this is not a fifth arm of `TAXONOMY` above.
@@ -177,13 +196,19 @@ fn declared_paths() -> Vec<(&'static str, &'static str)> {
         ("POST", CUSTOMER_GROUP_MEMBERS),
         ("PATCH", CUSTOMER_GROUP_MEMBER),
         ("POST", CUSTOMER_GROUP_MEMBER_MOVE),
+        ("POST", CUSTOMER_GROUP_MEMBERS_MOVE),
         ("GET", TAX_DISPLAY_POLICY),
         ("PUT", TAX_DISPLAY_POLICY),
         ("GET", ROUNDING_POLICY),
         ("PUT", ROUNDING_POLICY),
         ("GET", ROUNDING_POLICIES),
         ("PUT", ROUNDING_POLICIES),
+        // D-356: the GL-code vocabulary, the third single-table taxonomy on the
+        // `config` gate.
+        ("GET", GL_CODES),
+        ("PUT", GL_CODES),
         ("GET", CATALOG_SKUS),
+        ("GET", CATALOG_TAX_CATEGORIES),
         ("POST", BUNDLES),
         ("GET", BUNDLES),
         // D-310: the composition's reader. It was unreadable through any surface,
@@ -234,6 +259,7 @@ fn declared_paths() -> Vec<(&'static str, &'static str)> {
         // Slice 5's entrance: the publish mount and the approval surface.
         ("POST", PLAN_PUBLISH),
         ("GET", APPROVALS),
+        ("GET", APPROVAL_COUNTS),
         ("GET", APPROVAL),
         ("POST", APPROVAL_APPROVE),
         ("POST", APPROVAL_REJECT),
@@ -287,6 +313,10 @@ fn config_routers(
             Arc::clone(authoring),
             openapi,
         ))
+        .merge(bss_pricing::api::rest::gl_codes::router(
+            Arc::clone(authoring),
+            openapi,
+        ))
         .merge(bss_pricing::api::rest::catalog_skus::router(
             std::sync::Arc::new(bss_pricing::api::rest::catalog_skus::ApiState {
                 catalog: std::sync::Arc::new(
@@ -316,6 +346,7 @@ async fn registered_operations() -> OpenApiRegistryImpl {
 
     let frontier_state = Arc::new(bss_pricing::api::rest::frontier::ApiState {
         pin_frontier: PinFrontierRepo::new(db.clone()),
+        db: db.clone(),
     });
     let history_db = db.clone();
     let audit_db = db.clone();
@@ -348,6 +379,9 @@ async fn registered_operations() -> OpenApiRegistryImpl {
     // request. Wiring a working pair would be wiring a publish this test does
     // not perform.
     let governance = Arc::new(GovernanceState {
+        participants: bss_pricing::infra::approval_participants::ApprovalParticipants::new(
+            Arc::new(toolkit::ClientHub::new()),
+        ),
         // The lane an accepted repricing run's apply would leave on. Its applier is
         // dropped with the rest of this harness: registration happens while the
         // router is built and nothing here sends a request, so nothing is enqueued.
@@ -813,9 +847,10 @@ fn if_match_routes() -> Vec<(&'static str, &'static str)> {
     use bss_pricing::api::rest::bundles::{BUNDLE_BY_ID, BUNDLES};
     use bss_pricing::api::rest::customer_groups::{
         CUSTOMER_GROUP_MEMBER, CUSTOMER_GROUP_MEMBER_MOVE, CUSTOMER_GROUP_MEMBERS,
-        CUSTOMER_GROUP_TAXONOMY,
+        CUSTOMER_GROUP_MEMBERS_MOVE, CUSTOMER_GROUP_TAXONOMY,
     };
     use bss_pricing::api::rest::cutovers::PRICE_GRANDFATHER_UNTIL;
+    use bss_pricing::api::rest::gl_codes::GL_CODES;
     use bss_pricing::api::rest::overlays::{PRICE_OVERLAY_BY_ID, PRICE_OVERLAYS};
     use bss_pricing::api::rest::plans::{PLAN, PLAN_ABANDON, PLAN_CLONE, PLANS};
     use bss_pricing::api::rest::prices::{PLAN_PRICE, PLAN_PRICES};
@@ -823,7 +858,7 @@ fn if_match_routes() -> Vec<(&'static str, &'static str)> {
     use bss_pricing::api::rest::rounding_policies::ROUNDING_POLICIES;
     use bss_pricing::api::rest::rounding_policy::ROUNDING_POLICY;
     use bss_pricing::api::rest::tax_display_policy::TAX_DISPLAY_POLICY;
-    use bss_pricing::api::rest::taxonomies::TAXONOMY;
+    use bss_pricing::api::rest::taxonomies::TAXONOMY_VALUE;
     use bss_pricing::api::rest::threshold_policy::APPROVAL_THRESHOLD_POLICY;
     use bss_pricing::api::rest::windows::{PRICE_WINDOW, PRICE_WINDOWS};
     vec![
@@ -880,13 +915,16 @@ fn if_match_routes() -> Vec<(&'static str, &'static str)> {
         // The membership adjust: `preconditions::if_match` over the membership row's
         // own version.
         ("PATCH", CUSTOMER_GROUP_MEMBER),
-        // The four whole-document config `PUT`s, each asserting a `PolicyTag` over
+        // The five whole-document config `PUT`s, each asserting a `PolicyTag` over
         // the representation its own `GET` serves rather than a row version.
         ("PUT", CUSTOMER_GROUP_TAXONOMY),
-        ("PUT", TAXONOMY),
+        // D-353: the per-value `PATCH` asserts the **value's own** tag (the set's
+        // whole-set `PUT`, which asserted the set tag, is removed).
+        ("PATCH", TAXONOMY_VALUE),
         ("PUT", TAX_DISPLAY_POLICY),
         ("PUT", ROUNDING_POLICY),
         ("PUT", ROUNDING_POLICIES),
+        ("PUT", GL_CODES),
         // The creates the derived census brought in, listed here for the same reason
         // the four above them are: they assert through the idempotency gate.
         ("POST", BUNDLES),
@@ -894,6 +932,7 @@ fn if_match_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", BULK_IMPORTS),
         ("POST", CUSTOMER_GROUP_MEMBERS),
         ("POST", CUSTOMER_GROUP_MEMBER_MOVE),
+        ("POST", CUSTOMER_GROUP_MEMBERS_MOVE),
         // The abort is the one row here that reads a key and binds nothing —
         // deliberately, as its refusal rather than as a value. It is in the roster
         // because it *declares* the header and a client must send one; it is out of
@@ -914,7 +953,7 @@ fn idempotency_key_routes() -> Vec<(&'static str, &'static str)> {
     use bss_pricing::api::rest::bulk_imports::{BULK_IMPORT_ABORT, BULK_IMPORTS};
     use bss_pricing::api::rest::bundles::BUNDLES;
     use bss_pricing::api::rest::customer_groups::{
-        CUSTOMER_GROUP_MEMBER_MOVE, CUSTOMER_GROUP_MEMBERS,
+        CUSTOMER_GROUP_MEMBER_MOVE, CUSTOMER_GROUP_MEMBERS, CUSTOMER_GROUP_MEMBERS_MOVE,
     };
     use bss_pricing::api::rest::overlays::PRICE_OVERLAYS;
     use bss_pricing::api::rest::plans::{PLAN_CLONE, PLANS};
@@ -931,6 +970,7 @@ fn idempotency_key_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", BULK_IMPORT_ABORT),
         ("POST", CUSTOMER_GROUP_MEMBERS),
         ("POST", CUSTOMER_GROUP_MEMBER_MOVE),
+        ("POST", CUSTOMER_GROUP_MEMBERS_MOVE),
     ]
 }
 
@@ -1015,73 +1055,77 @@ fn query_reading_routes() -> Vec<QueryReadingRoute> {
     use bss_pricing::api::rest::prices::PLAN_PRICES;
     use bss_pricing::api::rest::windows::{PLAN_SELLABILITY, PRICE_WINDOWS_LIST};
     vec![
-        // D-125's cursor walks. `limit` and `cursor` are one contract spelled once
-        // (`history::limit_param`), so every row here owes both.
+        // D-125's cursor walks. Collection GETs take `Query<HashMap>` plus the
+        // OData extractor; named filter keys are retired. `limit` and `cursor`
+        // stay on the wire (AM tenants). The unique-set census collapses every
+        // HashMap row to one extractor name.
         (
             "GET",
             PRICE_OVERLAYS,
-            "ListOverlaysQuery",
-            vec!["cursor", "limit", "scope_class"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
-        ("GET", HISTORY, "HistoryQuery", vec!["cursor", "limit"]),
-        // The export takes the **same** extractor, which is why the source scan
-        // above finds no new type: one spelling of D-125's contract, and a chunk
-        // is a page whose size the export SLO is stated per. The row is here
-        // because the roster is per route, not per extractor — a declaration this
-        // route dropped would otherwise be invisible.
+        (
+            "GET",
+            HISTORY,
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
+        ),
+        // The export is **not** an OData list: same `{limit, cursor}` spelling,
+        // HistoryQuery, no `$filter` / `$orderby`.
         (
             "POST",
             HISTORY_EXPORT,
             "HistoryQuery",
             vec!["cursor", "limit"],
         ),
-        ("GET", AUDIT, "AuditQuery", vec!["cursor", "limit"]),
+        (
+            "GET",
+            AUDIT,
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
+        ),
         (
             "GET",
             PLANS,
-            "PlanPageQuery",
-            vec!["cursor", "lifecycle_state", "limit"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
         (
             "GET",
             PLAN_PRICES,
-            "PricePageQuery",
-            vec!["cursor", "limit"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
         (
             "GET",
             APPROVALS,
-            "ApprovalPageQuery",
-            vec!["cursor", "limit", "state"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
         (
             "GET",
             BUNDLES,
-            "BundlePageQuery",
-            vec!["cursor", "limit", "plan_id"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
         (
             "GET",
             PRICE_WINDOWS_LIST,
-            "WindowPageQuery",
-            vec!["cursor", "limit", "price_id"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
         (
             "GET",
             MIGRATIONS,
-            "MigrationPageQuery",
-            vec!["cursor", "limit", "state"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
-        // D4-4's repair: this read declared **no** query parameter and read none,
-        // so its response was every membership ever recorded in the group — over a
-        // table whose ended rows are deliberately kept for a >=7-year retention.
-        // `payer_id` is also the mitigation the read-shape statement asks of a
-        // family with no by-id read, which this one had been missing entirely.
         (
             "GET",
             CUSTOMER_GROUP_MEMBERS,
-            "MembershipPageQuery",
-            vec!["cursor", "limit", "payer_id"],
+            "HashMap",
+            vec!["$filter", "$orderby", "cursor", "limit"],
         ),
         // The reads whose query is not a page. `plan_revision` was the last
         // undeclared parameter in the gear: the description *narrated* it ("absent,
@@ -1112,7 +1156,7 @@ fn query_reading_routes() -> Vec<QueryReadingRoute> {
 ///
 /// Asserted against the emitted document rather than against the handler, because
 /// the document is the only half a generated client sees: `GET /price-overlays`
-/// took `Query<ListOverlaysQuery>` — `limit`, `cursor`, `scope_class` — and
+/// took `Query<HashMap>` plus `$filter` / `$orderby` — `limit`, `cursor` — and
 /// declared **none** of the three, so the endpoint D-125's pagination work had just
 /// paginated could not be paged by any generated client, and the narrowing filter
 /// could not be sent at all (Z13-10).
@@ -1149,6 +1193,9 @@ fn query_extractor_fields() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
+            if name == "HashMap" {
+                continue;
+            }
             let Some(body) = text
                 .split_once(&format!("struct {name} {{"))
                 .and_then(|(_, rest)| rest.split_once('}'))
@@ -1179,6 +1226,39 @@ fn query_extractor_fields() -> (BTreeMap<String, Vec<String>>, Vec<String>) {
     (fields, unresolved)
 }
 
+/// Handlers that read the raw query map without taking the `OData` extractor.
+///
+/// A `Query<HashMap<String, String>>` row in the roster is an `OData` collection
+/// GET: the map is there only so the extra-key guard can see retired named
+/// filters, and `$filter` / `$orderby` are read by the `OData` extractor beside
+/// it. The roster's fourth column claims those parameters, and `OpenAPI` declares
+/// them — but both are declarations. A handler that dropped `OData(_)` would
+/// keep them declared and silently ignore a `$filter`, answering 200 with an
+/// unfiltered page, which is `Query<ListOverlaysQuery>`'s defect one seam over.
+///
+/// Scanned per signature rather than per file: two handlers in one module would
+/// satisfy a file-level count while leaving the list one unchecked.
+fn raw_query_handlers_without_odata() -> Vec<String> {
+    let mut offenders = Vec::new();
+    for source in rest_sources() {
+        let text = scannable(&source);
+        for after in text.split("async fn ").skip(1) {
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let Some((signature, _)) = after.split_once(") -> ") else {
+                continue;
+            };
+            if signature.contains("Query<HashMap<String, String>>") && !signature.contains("OData(")
+            {
+                offenders.push(format!("{name} (in {})", source.display()));
+            }
+        }
+    }
+    offenders
+}
+
 #[tokio::test]
 async fn every_query_reading_route_declares_the_parameters_it_reads() {
     let openapi = registered_operations().await;
@@ -1195,18 +1275,35 @@ async fn every_query_reading_route_declares_the_parameters_it_reads() {
         "this scan could not find the declaration of these `Query<…>` types, so it would have \
          cleared their routes without reading a member: {unresolved:?}"
     );
+    let map_only = raw_query_handlers_without_odata();
+    assert!(
+        map_only.is_empty(),
+        "these handlers read the raw query map but take no `OData` extractor, so the `$filter` \
+         their route declares is ignored rather than applied: {map_only:?}"
+    );
 
     for (method, path, extractor, expected) in query_reading_routes() {
         let mut expected = expected;
         expected.sort_unstable();
-        let read = fields
-            .get(extractor)
-            .unwrap_or_else(|| panic!("{extractor} is extracted by no source under src/api/rest"));
-        assert_eq!(
-            read, &expected,
-            "the roster says {method} {path} reads {expected:?}, and {extractor} has members \
-             {read:?}"
-        );
+        if extractor == "HashMap" {
+            // A raw-map row has no members to scan, so its read side is checked
+            // by `raw_query_handlers_without_odata` below rather than skipped -
+            // leaving it unchecked cleared all ten OData collection GETs.
+            assert!(
+                expected.contains(&"$filter"),
+                "{method} {path} is rostered with the raw query map but claims no `$filter`; the \
+                 map exists for the extra-key guard on an OData list"
+            );
+        } else {
+            let read = fields.get(extractor).unwrap_or_else(|| {
+                panic!("{extractor} is extracted by no source under src/api/rest")
+            });
+            assert_eq!(
+                read, &expected,
+                "the roster says {method} {path} reads {expected:?}, and {extractor} has members \
+                 {read:?}"
+            );
+        }
         assert_eq!(
             declared_query_params(&openapi, method, path),
             expected,
@@ -1294,6 +1391,9 @@ fn no_query_struct_lets_the_extractor_answer() {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
+            if name == "HashMap" {
+                continue;
+            }
             // No `pub` in the needle: it matches `pub struct X {` and `struct X {`
             // alike, and the trailing ` {` is what stops `struct Foo {` matching
             // `struct FooBar {`.
@@ -1891,8 +1991,15 @@ fn routes_asserting_no_precondition() -> Vec<(&'static str, &'static str)> {
     use bss_pricing::api::rest::repricing_runs::{REPRICING_RUN_ABORT, REPRICING_RUNS};
     use bss_pricing::api::rest::retirement::PLAN_RETIRE;
     use bss_pricing::api::rest::supersessions::PLAN_SUPERSESSIONS;
+    use bss_pricing::api::rest::taxonomies::TAXONOMY_VALUES;
     use bss_pricing::api::rest::windows::PRICE_WINDOW;
     vec![
+        // D-353: the per-value taxonomy `POST`. The value is the resource's natural
+        // key, so the create is idempotent on it without a header — a repeat with
+        // the same body replays (200), other content is `409 TAXONOMY_VALUE_EXISTS`
+        // — and asserting an `If-Match` would make a *create* assert the version of
+        // a set it does not replace. `PLAN_SUPERSESSIONS`' reasoning, one value wide.
+        ("POST", TAXONOMY_VALUES),
         // Argued and guarded: an approval carries no version column, and the
         // compare-and-swap carries `state = 'submitted'` in its own predicate, so a
         // retry is refused `APPROVAL_NOT_PENDING` whether or not a header was sent.

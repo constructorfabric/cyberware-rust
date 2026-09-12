@@ -8,6 +8,7 @@ use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::odata::sea_orm_filter::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{AccessScope, DBRunner, DbTx, SecureEntityExt, secure_insert};
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::filter::FilterField;
 use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, Page, SortDir};
 use uuid::Uuid;
 
@@ -68,6 +69,30 @@ pub(crate) fn query_with_default_order(query: &ODataQuery, field: &str) -> OData
         }]));
     }
     out
+}
+
+/// Append the key halves a walk needs to land on a unique row.
+///
+/// `paginate_odata` appends exactly one tiebreaker, which is enough only where
+/// that tiebreaker is the table's whole primary key. On a composite key it is
+/// not: a caller's `$orderby` leaves the effective order `[field, tiebreaker]`,
+/// and two rows sharing that pair collide in the keyset predicate, so one of
+/// them is dropped at the page boundary and never appears on any page.
+/// Pricing's `query_with_unique_order`, for the same reason.
+///
+/// The extractor refuses `$orderby` beside a cursor, so page 2 rebuilds its
+/// order from `cursor.s` — which already carries this suffix, and
+/// [`ODataOrderBy::ensure_tiebreaker`] skips a field already present, so
+/// applying this after [`query_with_default_order`] is idempotent.
+pub(crate) fn query_with_unique_order<F: FilterField>(
+    query: &ODataQuery,
+    suffix: &[F],
+) -> ODataQuery {
+    let mut order = query.order.clone();
+    for field in suffix {
+        order = order.ensure_tiebreaker(field.name(), SortDir::Asc);
+    }
+    query.clone().with_order(order)
 }
 
 /// Error of an `OData`-paginated list read. The two arms keep the caller-facing
@@ -607,6 +632,12 @@ impl JournalRepo {
             .filter(Condition::all().add(account_balance::Column::TenantId.eq(tenant_id)));
 
         let query = query_with_default_order(query, "account_id");
+        // `account_id` is the tiebreaker below and only the middle third of the
+        // `(tenant_id, account_id, currency)` key: an account carried in two
+        // currencies has two rows sharing it, so a caller's `$orderby` would
+        // leave `[field, account_id]` — the pair collides in the keyset
+        // predicate and the second currency falls out at the page boundary.
+        let query = query_with_unique_order(&query, &[BalanceFilterField::Currency]);
         paginate_odata::<
             BalanceFilterField,
             BalanceODataMapper,
@@ -822,3 +853,7 @@ fn line_to_record(row: journal_line::Model) -> LineRecord {
         ar_status: row.ar_status,
     }
 }
+
+#[cfg(test)]
+#[path = "journal_repo_tests.rs"]
+mod tests;

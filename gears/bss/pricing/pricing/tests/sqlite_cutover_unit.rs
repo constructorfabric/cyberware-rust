@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use bss_pricing::config::LimitsConfig;
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use bss_pricing::domain::price_record::PriceContent;
@@ -35,7 +36,8 @@ use bss_pricing::infra::cutover::{CutoverOutcome, CutoverRequest, CutoverService
 use bss_pricing::infra::fixture_gate::FixtureGate;
 use bss_pricing::infra::storage::entity::price;
 use bss_pricing::infra::storage::repo::{NewPriceDraft, approval_repo, plan_repo};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use rest_support::{Harness, Publishable};
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
@@ -46,13 +48,13 @@ const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_5c_c0);
 
 /// Inside `common`'s coverage window `[2099-08-04, 2099-09-01)` and well before the
 /// cutover.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 5, 0, 0, 0).unwrap()
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 5, 0, 0, 0)
 }
 
 /// The cutover instant: inside the predecessor's coverage and clear of both floors.
-fn cutover_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn cutover_at() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 fn stamp_of(actor: Uuid) -> bss_pricing::domain::audit::AuditStamp {
@@ -803,7 +805,7 @@ async fn a_dormant_key_is_refused_before_anything_is_staged() {
     let key = key_of(plan_id, &seeded);
     // Past the fixture's coverage window entirely.
     let mut request = request_of(&key, 12_000);
-    request.cutover_at = Utc.with_ymd_and_hms(2099, 12, 1, 0, 0, 0).unwrap();
+    request.cutover_at = utc_ymd_hms(2099, 12, 1, 0, 0, 0);
     let staged_successor = request.successor_price_id;
 
     let err = cut_over(&h, request, SUBMITTER)
@@ -1101,8 +1103,7 @@ async fn the_cutover_announces_the_succession_and_names_the_row_it_replaces() {
     assert_eq!(
         payload["changeover"]
             .as_str()
-            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-            .map(|at| at.with_timezone(&Utc)),
+            .and_then(|at| bss_pricing::domain::instant::parse_rfc3339(at).ok()),
         Some(cutover_at()),
         "coverage hands over at the cutover instant, not at the request's"
     );
@@ -1145,7 +1146,7 @@ async fn price_updated_payload(h: &Harness, floor: i64) -> serde_json::Value {
 async fn window_scheduled_payloads(
     h: &Harness,
     floor: i64,
-) -> Vec<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> {
+) -> Vec<(Uuid, OffsetDateTime, Option<OffsetDateTime>)> {
     use bss_pricing::infra::storage::entity::outbox;
     use sea_orm::Order;
     let conn = h.db.conn().expect("conn");
@@ -1172,13 +1173,11 @@ async fn window_scheduled_payloads(
                     .expect("the payload names its row"),
                 payload["effectiveFrom"]
                     .as_str()
-                    .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                    .map(|at| at.with_timezone(&Utc))
+                    .and_then(|at| bss_pricing::domain::instant::parse_rfc3339(at).ok())
                     .expect("the payload carries its start"),
                 payload["effectiveTo"]
                     .as_str()
-                    .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-                    .map(|at| at.with_timezone(&Utc)),
+                    .and_then(|at| bss_pricing::domain::instant::parse_rfc3339(at).ok()),
             )
         })
         .collect()
@@ -1203,7 +1202,7 @@ async fn a_draft_on_another_generation_is_not_adopted_as_this_act_s_copy() {
     // A stranger's grandfathered draft, on a generation a day past this cutover.
     let other_generation = bss_pricing::domain::cutover::generation_key(
         &predecessor,
-        cutover_at() + chrono::Duration::days(1),
+        cutover_at() + time::Duration::days(1),
     )
     .expect("the generation key is legal");
     h.state

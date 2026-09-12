@@ -103,19 +103,20 @@
 //! material path, is where a void call would first have a subject shape to
 //! target; inventing one now would risk guessing that shape wrong.
 
-use chrono::{DateTime, Utc};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::audit::AuditStamp;
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::ports::CatalogVersionRegistryV1;
 use crate::infra::registry_deadline::request_version_now;
 use crate::infra::storage::repo::{
     NewMembership, PendingVersionRow, catalog_version_ref_repo, group_membership_repo,
 };
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// What one membership publish unit produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,7 +212,7 @@ pub async fn end_in(
     scope: &AccessScope,
     tenant_id: Uuid,
     membership_id: Uuid,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
     expected_version: u64,
     stamp: AuditStamp,
 ) -> Result<MembershipPublishReceipt, DomainError> {
@@ -281,7 +282,7 @@ pub async fn move_payer_in(
     payer_tenant_id: Uuid,
     new_membership_id: Uuid,
     target_group: String,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<MembershipMoveReceipt, DomainError> {
     let request_id = move_request_id(tenant_id, new_membership_id);
@@ -441,7 +442,7 @@ async fn record_ref(
     tenant_id: Uuid,
     membership: &group_membership_repo::MembershipRow,
     pending_ref: &str,
-    requested_at: DateTime<Utc>,
+    requested_at: OffsetDateTime,
 ) -> Result<(), DomainError> {
     catalog_version_ref_repo::record_pending(
         runner,
@@ -478,10 +479,10 @@ fn enroll_request_id(tenant_id: Uuid, membership_id: Uuid) -> String {
 /// instants are two different acts, and a retry of one must not collide with
 /// the other's handle.
 #[must_use]
-fn end_request_id(tenant_id: Uuid, membership_id: Uuid, at: DateTime<Utc>) -> String {
+fn end_request_id(tenant_id: Uuid, membership_id: Uuid, at: OffsetDateTime) -> String {
     format!(
         "membership-end/{tenant_id}/{membership_id}/{}",
-        at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        format_rfc3339(at)
     )
 }
 

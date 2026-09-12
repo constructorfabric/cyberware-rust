@@ -52,6 +52,7 @@ use bss_pricing::domain::contracts::{
 };
 use bss_pricing::domain::error::DomainError;
 use bss_pricing::domain::evaluation_policy::EVALUATION_POLICY_GENERATION;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::plan::PlanShapePatch;
@@ -84,7 +85,8 @@ use bss_pricing_sdk::catalog_version::CatalogVersion;
 use bss_pricing_sdk::catalog_version_registry::{
     CatalogVersionRegistryV1, PendingVersionRef, UnconfiguredCatalogVersionRegistryV1,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use std::path::{Path, PathBuf};
@@ -184,8 +186,8 @@ fn terminal_phase() -> PhaseId {
     PhaseId::new(Uuid::from_u128(0xfa_5e))
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 fn ctx() -> SecurityContext {
@@ -335,6 +337,7 @@ async fn seed_publishable(h: &Harness) -> (u64, RowVersion, Uuid) {
             vec![PlanPhase {
                 phase_id: terminal_phase(),
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -1466,17 +1469,14 @@ async fn a_row_authored_after_the_precheck_is_judged_by_the_second_run() {
 fn stamp() -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: uuid::Uuid::from_u128(0xac_10),
-        recorded_at: chrono::Utc::now(),
+        recorded_at: OffsetDateTime::now_utc(),
         correlation_id: TEST_CORRELATION,
     }
 }
 
 /// The stamp a decision is taken under: who acted, when, and the request's
 /// correlation.
-fn stamp_of(
-    actor: uuid::Uuid,
-    when: chrono::DateTime<chrono::Utc>,
-) -> bss_pricing::domain::audit::AuditStamp {
+fn stamp_of(actor: uuid::Uuid, when: OffsetDateTime) -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -1711,9 +1711,7 @@ async fn drive_the_window_plane(h: &Harness) {
             // 2099 is a fact rather than a date off the clock: a window dated today
             // races the activation sweep, which is a defect this program has already
             // paid for once.
-            Utc.with_ymd_and_hms(2099, 9, 1, 0, 0, 0)
-                .single()
-                .expect("a real instant"),
+            utc_ymd_hms(2099, 9, 1, 0, 0, 0),
             None,
             "audited-window-writer".to_owned(),
             bss_pricing::api::rest::windows::verdict_json,
@@ -1862,6 +1860,32 @@ async fn drive_the_bulk_operation_plane(h: &Harness) {
         })
         .await;
     outcome.expect("the run opens and records itself");
+}
+
+/// The scope-value taxonomy plane — the writer of the `taxonomy_value` subject
+/// kind (D-353). A declaration is one `create` record naming the value; the
+/// governed edit's `update` record needs an approved unit and is driven by
+/// `rest_taxonomies`, so only the kind is new here, `create` being produced above.
+async fn drive_the_taxonomy_plane(h: &Harness) {
+    use bss_pricing::domain::overlay::ScopeValue;
+    use bss_pricing::domain::taxonomy::{TaxonomyClass, TaxonomyEntry, TaxonomyState};
+    use bss_pricing::infra::storage::repo::taxonomy_repo::TaxonomyRepo;
+
+    TaxonomyRepo::new(h.provider.clone())
+        .declare_value(
+            &h.scope,
+            TENANT,
+            TaxonomyClass::Brand,
+            TaxonomyEntry {
+                value: ScopeValue::new("acme").expect("a value"),
+                display_name: "Acme".to_owned(),
+                state: TaxonomyState::Active,
+                tax: None,
+            },
+            stamp_of(ACTOR, at(22)),
+        )
+        .await
+        .expect("the value declares, and audited");
 }
 
 /// The customer-group membership plane — the writer of the `membership`
@@ -2034,6 +2058,7 @@ async fn drive_every_audited_path(h: &Harness) -> Vec<audit_log::Model> {
     // position among the drivers is as free as `drive_the_bulk_operation_plane`'s
     // own note says its neighbour's is.
     drive_the_membership_plane(h).await;
+    drive_the_taxonomy_plane(h).await;
     // **Last, and the position is load-bearing.** Retirement is terminal: it
     // flips the plan's current revision to `retired`, after which no plane above
     // can publish anything on it. Driven here so the census sees the `retire`
@@ -2117,7 +2142,7 @@ async fn drive_the_migration_plane(h: &Harness) {
                 migration_id: Uuid::now_v7(),
                 source_plan_id: plan_id(),
                 target_plan_id: target,
-                effective_at: at(17) + chrono::Duration::days(120),
+                effective_at: at(17) + time::Duration::days(120),
                 scope_json: serde_json::json!({ "kind": "all" }),
             },
             stamp_of(ACTOR, at(17)),
@@ -2318,9 +2343,11 @@ async fn the_chain_verifies_across_a_mixed_sequence_of_authoring_and_publish_rec
     );
     assert_eq!(
         policy_rows.len(),
-        2,
+        3,
         "the proposal and its approval, both on the policy segment - the approve joined the \
-         driven set because the window plane below it needs a policy that is actually in force"
+         driven set because the window plane below it needs a policy that is actually in force - \
+         and `drive_the_taxonomy_plane`'s declaration (D-353): a taxonomy value is a row of the \
+         tenant's config object and files on the same singleton segment"
     );
     assert_eq!(
         overlay_rows.len(),
@@ -3149,6 +3176,7 @@ async fn make_two_phased(h: &Harness) {
                 PlanPhase {
                     phase_id: trial_phase(),
                     kind: PhaseKind::Trial,
+                    display_name: None,
                     ordinal: 0,
                     converts_to_phase_id: Some(terminal_phase()),
                     phase_duration_days: Some(14),
@@ -3157,6 +3185,7 @@ async fn make_two_phased(h: &Harness) {
                 PlanPhase {
                     phase_id: terminal_phase(),
                     kind: PhaseKind::Evergreen,
+                    display_name: None,
                     ordinal: 1,
                     converts_to_phase_id: None,
                     phase_duration_days: None,

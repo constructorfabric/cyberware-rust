@@ -18,6 +18,7 @@ use bss_pricing::domain::bundle::{
     Absorber, InvoiceItemization, Party, PartyShare, PriceBasis, RevShareGroup,
 };
 use bss_pricing::domain::concurrency::RowVersion;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::bundle::BundleService;
 use bss_pricing::infra::storage::RepoError;
@@ -26,7 +27,8 @@ use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{
     BundleComponentDraft, BundleRepo, CompositionDraft, NewBundle, NewPlanDraft, PlanRepo,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
@@ -45,10 +47,8 @@ const VENDOR: Uuid = Uuid::from_u128(0x5e_b1);
 const BUNDLE: Uuid = Uuid::from_u128(0xb0_b1);
 const PLAN: Uuid = Uuid::from_u128(0x91_b1);
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 13, hour, 0, 0)
-        .single()
-        .expect("instant")
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 13, hour, 0, 0)
 }
 
 fn scope() -> AccessScope {
@@ -66,7 +66,7 @@ fn stamp() -> AuditStamp {
 /// One operator call's stamp. The correlation and the instant vary per case —
 /// D-178 mints a correlation per request, and two publishes of one revision are
 /// two acts — while the actor does not: nothing here is about who acted.
-fn stamp_at(correlation_id: Uuid, recorded_at: DateTime<Utc>) -> AuditStamp {
+fn stamp_at(correlation_id: Uuid, recorded_at: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: ACTOR,
         recorded_at,

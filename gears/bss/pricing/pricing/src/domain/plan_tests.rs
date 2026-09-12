@@ -9,10 +9,10 @@
 //!
 //! What is left is the patch, and the part of it a compiler can hold.
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::PlanShapePatch;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::plan_shape::{BillingCycle, CustomIntervalUnit, Frequency};
 
 #[test]
@@ -42,8 +42,8 @@ fn the_patch_names_its_columns_and_cannot_mean_clear_any_of_them() {
         purchase_min_qty: Some(2),
         purchase_max_qty: Some(10),
         invoice_grouping_key: Some("emea-bundle".to_owned()),
-        available_from: Some(Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap()),
-        available_to: Some(Utc.with_ymd_and_hms(2028, 1, 1, 0, 0, 0).unwrap()),
+        available_from: Some(utc_ymd_hms(2027, 1, 1, 0, 0, 0)),
+        available_to: Some(utc_ymd_hms(2028, 1, 1, 0, 0, 0)),
         entitlement_grants: Option::default(),
         change_contract: Option::default(),
     };

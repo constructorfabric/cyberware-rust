@@ -184,6 +184,7 @@ use toolkit_macros::domain_model;
 use super::delta::{RowDelta, row_delta};
 use super::{ChangeSet, PublishedPriceBaseline};
 use crate::domain::price_record::PriceRecord;
+use time::OffsetDateTime;
 
 /// One registered always-material trigger.
 ///
@@ -318,6 +319,20 @@ pub enum Trigger {
     /// its own decision; recorded here because a reader of this list would
     /// otherwise believe every member of it is judged on every publish.
     PlanShapeRevisionContent,
+    /// An edit of one declared scope-value taxonomy entry — a relabel, a
+    /// retirement or re-activation, a region's tax markers — through
+    /// `PATCH /config/taxonomies/{class}/values/{value}` (D-353). Always
+    /// material: the value is a universe publish validates against, and the
+    /// region universe is also C4's tax-readiness input, so one principal
+    /// moving it alone is the shape dual control exists to refuse. Declaring a
+    /// **new** value is not this act — nothing references a value nobody has
+    /// published against.
+    ///
+    /// The handler evaluates this trigger only for a **referenced** value: an
+    /// unreferenced edit commits without consulting materiality at all, as a
+    /// declaration does (D-355). "Always material" is therefore a statement
+    /// about this trigger once evaluated, not about every `PATCH`.
+    TaxonomyValueMutation,
 }
 
 impl Trigger {
@@ -340,6 +355,7 @@ impl Trigger {
         Self::PlanRetirement,
         Self::NoComputableRowDelta,
         Self::PlanShapeRevisionContent,
+        Self::TaxonomyValueMutation,
     ];
 
     /// The design document that owns the trigger's subject.
@@ -358,7 +374,9 @@ impl Trigger {
     pub const fn owning_slice(self) -> &'static str {
         match self {
             Self::GrandfatherHorizonTightening => "design/01-foundation.md",
-            Self::GaGateClearingRepublish => "design/04-currency-tax.md",
+            Self::GaGateClearingRepublish | Self::TaxonomyValueMutation => {
+                "design/04-currency-tax.md"
+            }
             Self::ThresholdPolicyDiff
             | Self::NoComputableRowDelta
             | Self::PlanShapeRevisionContent => "design/05-governance.md",
@@ -444,13 +462,16 @@ impl Trigger {
             | Self::BundleComposition
             | Self::GrandfatheringCutover
             | Self::PriceOverlayMutation
-            // The customer-group plane's **one** declared act.
+            // The customer-group plane's one-payer act.
             // `api::rest::customer_groups::immediate_membership_materiality`
             // builds `ChangeSet::of_act(Trigger::ImmediateMembershipReresolution,
-            // …)` on every arrival of `POST …/move`, which is the same
-            // "declared, not merely stored" bar `GrandfatheringCutover`'s note
-            // states. Its sibling is **not** here: see below.
+            // …)` on every arrival of `POST …/members/{payerId}/move`.
             | Self::ImmediateMembershipReresolution
+            // The bulk door: `api::rest::customer_groups::bulk_membership_materiality`
+            // builds `ChangeSet::of_act(Trigger::BulkGroupMove, …)` on every
+            // arrival of `POST …/members/move`. The route is the declaration;
+            // `MembershipMoveSet` being able to hold many proposals is not.
+            | Self::BulkGroupMove
             // **D-104's second bundle act, declared.** It is on this side because
             // `infra::bundle::rev_share_change_set` has a caller:
             // `infra::bundle::declared_act`, which diffs the composition being
@@ -478,31 +499,9 @@ impl Trigger {
             // reference check, an approval unit of its own and a window sweep.
             // The `false` said this crate has no surface for retirement while a
             // route was serving one.
-            | Self::PlanRetirement => true,
-            // `inst-mm-bulk`'s subject is not built, and the comment that said
-            // otherwise is the reason this arm now carries an argument.
-            //
-            // It read: *"… `MembershipMoveSet` is this
-            // crate's subject for both, and `ApprovalService::submit_membership_move_on`
-            // is the writer that now declares one or the other via
-            // `ChangeSet::of_act`"*. Measured against the tree, every clause of
-            // that is false. `submit_membership_move_on` contains no `of_act`
-            // call — no writer in `infra::approval` does; the only `of_act` on
-            // this plane is the route's, and it passes
-            // `ImmediateMembershipReresolution` unconditionally; and
-            // `move_membership_immediate` builds a **single-payer**
-            // `MembershipMoveSet`, so no surface in the crate ever constructs the
-            // many-payer act `inst-mm-bulk` is about. The only other occurrence
-            // of the variant in the tree was a test.
-            //
-            // `MembershipMoveSet` being *able* to hold many proposals is exactly
-            // the distinction `GrandfatheringCutover` waited three commits on:
-            // **the predicate is about a declaration, not about a table.** So
-            // this answers `false` — the honest value — and the bulk surface
-            // (a many-payer route, its idempotency contract and its approval
-            // unit) is owed to Slice 9 rather than quietly attested to here.
-            Self::BulkGroupMove
-            | Self::RetirementUnwindingACutover
+            | Self::PlanRetirement
+            | Self::TaxonomyValueMutation => true,
+            Self::RetirementUnwindingACutover
             | Self::GaGateClearingRepublish
             | Self::PrepaidGateClearingRepublish
             | Self::GrantNonPriceField => false,
@@ -554,6 +553,7 @@ impl Trigger {
             Self::PlanRetirement => "planRetirement",
             Self::NoComputableRowDelta => "noComputableRowDelta",
             Self::PlanShapeRevisionContent => "planShapeRevisionContent",
+            Self::TaxonomyValueMutation => "taxonomyValueMutation",
         }
     }
 }
@@ -659,10 +659,7 @@ fn moves_no_row(change: &ChangeSet, baseline: &PublishedPriceBaseline) -> bool {
 /// tightening of infinity. Loosening is not here: `GRANDFATHER_LOOSEN_FORBIDDEN`
 /// refuses it outright at publish, so a rule that also called it material would be
 /// a second owner of a refusal.
-fn tightens_horizon(
-    proposed: Option<chrono::DateTime<chrono::Utc>>,
-    published: Option<chrono::DateTime<chrono::Utc>>,
-) -> bool {
+fn tightens_horizon(proposed: Option<OffsetDateTime>, published: Option<OffsetDateTime>) -> bool {
     match (proposed, published) {
         (Some(proposed), Some(published)) => proposed < published,
         (Some(_), None) => true,

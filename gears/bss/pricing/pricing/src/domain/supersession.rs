@@ -46,14 +46,16 @@
 //! hand-maintained second copy is how the two mechanisms come to disagree about
 //! the same SLO.
 
-use chrono::{DateTime, Duration, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::price_row::PriceRow;
 use crate::domain::rules::SupersessionPair;
 use crate::domain::window::{OCCUPYING_STATES, WindowInterval, WindowState};
+use time::Duration;
+use time::OffsetDateTime;
 
 /// The wire code §5 declares for a changeover instant that has fallen behind its
 /// floor (architectural 422, rendered 400 — Foundation §3.3).
@@ -98,7 +100,7 @@ impl ChangeoverMoment {
     /// checking the code against it should find the divergence named.
     const fn margin(self) -> Duration {
         match self {
-            Self::Submit => Duration::zero(),
+            Self::Submit => Duration::ZERO,
             Self::Commit => MAX_BATCHING_DELAY,
         }
     }
@@ -115,7 +117,7 @@ impl ChangeoverMoment {
             Self::Submit => "name a future changeover instant".to_owned(),
             Self::Commit => format!(
                 "the unit must be recomposed against a changeover at least {}s ahead",
-                MAX_BATCHING_DELAY.num_seconds()
+                MAX_BATCHING_DELAY.whole_seconds()
             ),
         }
     }
@@ -127,8 +129,8 @@ impl ChangeoverMoment {
 /// [`DomainError::SupersessionInstantPassed`] naming the instant, the floor it
 /// missed and the remedy for that moment.
 pub fn check_changeover_instant(
-    changeover: DateTime<Utc>,
-    now: DateTime<Utc>,
+    changeover: OffsetDateTime,
+    now: OffsetDateTime,
     moment: ChangeoverMoment,
 ) -> Result<(), DomainError> {
     changeover_floor(changeover, now, moment, "changeover")
@@ -155,8 +157,8 @@ pub fn check_changeover_instant(
 ///
 /// The refusal **sentence**, for the caller to wrap in its own code.
 pub fn changeover_floor(
-    instant: DateTime<Utc>,
-    now: DateTime<Utc>,
+    instant: OffsetDateTime,
+    now: OffsetDateTime,
     moment: ChangeoverMoment,
     noun: &str,
 ) -> Result<(), String> {
@@ -166,8 +168,8 @@ pub fn changeover_floor(
     }
     Err(format!(
         "{noun} instant {} is not strictly after {} at {}; {}",
-        instant.to_rfc3339(),
-        floor.to_rfc3339(),
+        format_rfc3339(instant),
+        format_rfc3339(floor),
         match moment {
             ChangeoverMoment::Submit => "submit",
             ChangeoverMoment::Commit => "approval commit",
@@ -203,7 +205,7 @@ pub struct WindowShorten {
     /// The window being shortened — the one that covers the changeover.
     pub window_id: Uuid,
     /// Its new end: the changeover instant itself.
-    pub effective_to: DateTime<Utc>,
+    pub effective_to: OffsetDateTime,
 }
 
 /// The two window operations `inst-su-compose` composes, proven adjacent.
@@ -276,7 +278,7 @@ pub struct ComposedWindows {
 /// with.
 pub fn compose_windows(
     plane: &[NamedWindow],
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
 ) -> Result<ComposedWindows, DomainError> {
     let occupying = || {
         plane
@@ -292,7 +294,7 @@ pub fn compose_windows(
                  that instant, and a supersession presupposes current coverage. Schedule a window \
                  on the key's current row to revive it; the publish half of that remedy applies \
                  only where the key carries no published row at all",
-                changeover.to_rfc3339()
+                format_rfc3339(changeover)
             ))
         })?;
 
@@ -318,7 +320,7 @@ pub fn compose_windows(
              successor to take over from. Adjust or reschedule that window instead of superseding \
              across it",
             covering.window_id,
-            changeover.to_rfc3339()
+            format_rfc3339(changeover)
         )));
     }
 
@@ -332,8 +334,8 @@ pub fn compose_windows(
             "window {} begins at {}, which the successor's open-ended interval from {} already \
              covers; the key carries later coverage that this supersession would not replace",
             collision.window_id,
-            collision.interval.effective_from.to_rfc3339(),
-            changeover.to_rfc3339()
+            format_rfc3339(collision.interval.effective_from),
+            format_rfc3339(changeover)
         )));
     }
 
@@ -358,7 +360,7 @@ pub fn compose_windows(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SupersessionPlan {
     /// The changeover — the one input the unit's payload must preserve.
-    pub changeover: DateTime<Utc>,
+    pub changeover: OffsetDateTime,
     /// The two window operations, as they stand against the plane just read.
     pub windows: ComposedWindows,
 }
@@ -407,8 +409,8 @@ pub fn plan_supersession(
     predecessor: &PriceRow,
     successor: &PriceRow,
     plane: &[NamedWindow],
-    changeover: DateTime<Utc>,
-    now: DateTime<Utc>,
+    changeover: OffsetDateTime,
+    now: OffsetDateTime,
     moment: ChangeoverMoment,
 ) -> Result<SupersessionPlan, DomainError> {
     // D-144's quantum, **before** the distance is compared: a malformed instant is not

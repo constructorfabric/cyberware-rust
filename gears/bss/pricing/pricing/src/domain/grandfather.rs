@@ -44,9 +44,9 @@
 //! in this crate at all** — every writer of the column wrote a draft or an insert,
 //! neither of which the trigger's `OLD.lifecycle_state <> 'draft'` arm sees.
 
-use chrono::{DateTime, Utc};
-
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
+use time::OffsetDateTime;
 
 /// Refuse a horizon that does not move earlier (`inst-gs-bound`,
 /// `inst-gs-tighten`).
@@ -62,8 +62,8 @@ use crate::domain::error::DomainError;
 /// [`DomainError::GrandfatherLoosenForbidden`] naming both instants, so the author
 /// corrects one value rather than resubmitting and guessing which end was wrong.
 pub fn check_tightening(
-    published: Option<DateTime<Utc>>,
-    proposed: DateTime<Utc>,
+    published: Option<OffsetDateTime>,
+    proposed: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let Some(published) = published else {
         // `inst-gs-bound`: setting a horizon on an indefinite generation is a
@@ -80,8 +80,8 @@ pub fn check_tightening(
          is the instant retained subscribers stop being eligible, so it only ever moves earlier - \
          a later one re-grants an eligibility a second principal already approved the end of, and \
          an equal one is a transition that moves nothing",
-        published.to_rfc3339(),
-        proposed.to_rfc3339()
+        format_rfc3339(published),
+        format_rfc3339(proposed)
     )))
 }
 

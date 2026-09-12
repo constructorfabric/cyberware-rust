@@ -15,6 +15,7 @@ use sea_orm::entity::prelude::*;
 use uuid::Uuid;
 
 use toolkit_db_macros::Scopable;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_bulk_operation")]
@@ -49,11 +50,11 @@ pub struct Model {
     /// the trigger lets move.
     pub report: Json,
     pub submitted_by: Uuid,
-    pub submitted_at: DateTimeUtc,
+    pub submitted_at: OffsetDateTime,
     /// Set exactly on the terminal states — `rejected` among them since D-267,
     /// a refused batch approval ending the run — and the `CHECK` keeps the two
     /// from disagreeing about whether the run is over.
-    pub completed_at: Option<DateTimeUtc>,
+    pub completed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

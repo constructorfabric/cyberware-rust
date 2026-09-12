@@ -39,6 +39,7 @@
 //! envelope, one violation per failing rule — which is what makes a composition
 //! remediable in one pass. No route here declares a 422 response.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -46,8 +47,10 @@ use axum::extract::{Extension, Path, Query};
 use axum::http::header::{ETAG, LOCATION};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
-use chrono::Utc;
+use bss_pricing_sdk::odata::BundleFilterField;
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::DbTx;
 use toolkit_odata::Page;
@@ -57,8 +60,8 @@ use uuid::Uuid;
 use crate::api::rest::approvals::ApprovalView;
 use crate::api::rest::auth_context::{audit_stamp, require_authenticated};
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
-use crate::api::rest::cursor::{self, PageRequest};
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::preconditions;
 use crate::api::rest::state::AuthoringState;
 use crate::domain::bundle::{
@@ -71,6 +74,7 @@ use crate::domain::money::CurrencyCode;
 use crate::domain::scope_key::{PlanId, Region};
 use crate::infra::idempotent::{self, Guarded, GuardedRequest, TxFuture};
 use crate::infra::storage::repo::{BundleComponentDraft, CompositionDraft, NewBundle, bundle_repo};
+use time::OffsetDateTime;
 
 const TAG: &str = "BSS Pricing Bundles";
 
@@ -220,28 +224,6 @@ pub struct CompositionAcceptedView {
     pub bundle_id: Uuid,
     /// The revision it now stands at.
     pub plan_revision: u64,
-}
-
-/// The two pagination query parameters plus the plan filter (D-125).
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct BundlePageQuery {
-    /// Bundles per page; server default 100, hard cap 1,000.
-    pub limit: Option<String>,
-    /// The opaque token a previous page returned.
-    pub cursor: Option<String>,
-    /// Narrow the page to the bundle riding one plan.
-    ///
-    /// **`lifecycle_state` is not offered, and the reason is the store rather
-    /// than taste**: `pricing_bundle` carries the bundle's identity — its plan,
-    /// its price basis and its invoice layout — and no lifecycle column at all,
-    /// because the composition is revision-scoped and a bundle's state is its
-    /// plan revision's. Answering a `lifecycle_state` filter here would mean
-    /// joining the revision chain and calling the plan's state the bundle's.
-    ///
-    /// A plan carries at most one bundle (`uq_pricing_bundle_plan`), so a
-    /// filtered page is the answer to *"does this plan carry a bundle, and what
-    /// is its id"* — which nothing on this surface could ask before.
-    pub plan_id: Option<String>,
 }
 
 /// `GET /bss-pricing/v1/bundles/{bundleId}` — the query half.
@@ -433,7 +415,7 @@ async fn create_bundle(
 
     let plan_id = PlanId::new(body.plan_id);
     let wire_plan_id = body.plan_id;
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = audit_stamp(&ctx, now, correlation);
     let mutation_scope = scope.clone();
 
@@ -578,7 +560,7 @@ async fn replace_composition(
             id: bundle_id.to_string(),
         })?;
 
-    let stamp = audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp = audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let revision = state
         .bundles
         .replace_composition(
@@ -694,7 +676,7 @@ async fn publish_bundle(
     // shape: `priceOverlayMutation` was a mounted surface writing its materiality
     // token as a literal while nothing built its change set, and it was closed the
     // same way.
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let conn = state.db.conn().map_err(|e| {
         CanonicalError::from(DomainError::Internal(format!(
             "bss-pricing: bundle publish subject: {e}"
@@ -882,13 +864,16 @@ fn bundle_publish_materiality(act: &ChangeSet) -> MaterialityVerdict {
 /// split `list_approvals` and `get_approval` make: a composition is three further
 /// queries per bundle, so a page of a hundred would be three hundred round trips
 /// to show a basis and an invoice layout.
+#[allow(clippy::implicit_hasher)]
 async fn list_bundles(
     Extension(state): Extension<Arc<AuthoringState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<BundlePageQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Json<Page<BundleView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let tenant = ctx.subject_tenant_id();
     let scope = crate::authz::access_scope(
         &enforcer,
@@ -901,35 +886,14 @@ async fn list_bundles(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    let page = PageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )?;
-    // One row more than the page, so "is there another page" needs no second
-    // query and no page whose `next_cursor` points at nothing.
-    let probe = page.limit.saturating_add(1);
-    let plan_filter = cursor::parse_uuid_param("plan_id", query.plan_id.as_deref())?;
-    let mut records = state
+    let page = state
         .bundles
-        .list(
-            &scope,
-            tenant,
-            plan_filter.map(PlanId::new),
-            page.after,
-            probe,
-        )
+        .list_odata(&scope, tenant, &odata)
         .await
-        .map_err(|e| CanonicalError::from(crate::infra::storage::repo_failure(&e)))?;
-
-    let has_more = u64::try_from(records.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        records.pop();
-    }
-    let next = has_more
-        .then(|| records.last().map(|record| record.bundle_id))
-        .flatten();
+        .map_err(map_odata_page_err)?;
     Ok(Json(Page {
-        items: records
+        items: page
+            .items
             .iter()
             .map(|record| BundleView {
                 bundle_id: record.bundle_id,
@@ -938,7 +902,7 @@ async fn list_bundles(
                 invoice_itemization: record.invoice_itemization.as_str().to_owned(),
             })
             .collect(),
-        page_info: cursor::page_info(next, page.limit),
+        page_info: page.page_info,
     }))
 }
 
@@ -1108,15 +1072,16 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
         .operation_id("bss_pricing.list_bundles")
         .summary("List the tenant's bundles (cursor-paginated)")
         .description(
-            "One page of the tenant's bundles in `bundleId` order, with an opaque `cursor` and a \
-             `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). `plan_id` \
-             narrows the page to the bundle riding one plan, which a plan carries at most one \
-             of. There is no `lifecycle_state` filter: a bundle row is an identity and its \
-             composition is revision-scoped, so a bundle's state is its plan revision's state \
-             and belongs to the plan surface. The composition is **not** on this page - a \
-             bundle's components and revenue shares are three further queries each - so a caller \
-             opens `GET /bss-pricing/v1/bundles/{bundleId}` for one bundle's composition. Gates \
-             on `bundle` x `read`, which is the pair the by-id read already asks for.",
+            "One page of the tenant's bundles in `bundle_id` order, with an opaque `cursor` and a \
+             `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Narrow \
+             with `$filter=plan_id eq <uuid>` to the bundle riding one plan, which a plan \
+             carries at most one of. There is no `lifecycle_state` filter: a bundle row is an \
+             identity and its composition is revision-scoped, so a bundle's state is its plan \
+             revision's state and belongs to the plan surface. The composition is **not** on \
+             this page - a bundle's components and revenue shares are three further queries \
+             each - so a caller opens `GET /bss-pricing/v1/bundles/{bundleId}` for one bundle's \
+             composition. Gates on `bundle` x `read`, which is the pair the by-id read already \
+             asks for.",
         )
         .tag(TAG)
         .authenticated()
@@ -1128,8 +1093,9 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
             "integer",
         )
         .query_param("cursor", false, "Opaque base64url pagination cursor")
-        .query_param("plan_id", false, "Narrow the page to one plan's bundle")
         .handler(list_bundles)
+        .with_odata_filter::<BundleFilterField>()
+        .with_odata_orderby::<BundleFilterField>()
         .json_response_with_schema::<Page<BundleView>>(
             openapi,
             StatusCode::OK,

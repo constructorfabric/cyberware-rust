@@ -37,6 +37,7 @@
 use std::sync::Arc;
 
 use bss_ledger::config::{FxConfig, RecognitionConfig};
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::invoice::builder::{InvoiceItem, PostedInvoice};
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
@@ -51,10 +52,11 @@ use bss_ledger::infra::payment::settle::SettlementService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{FxRepo, NewFxRate, ReferenceRepo};
 use bss_ledger_sdk::AccountClass;
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -127,8 +129,8 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
     let cash = Uuid::now_v7();
     let unallocated = Uuid::now_v7();
     let fx_gl = Uuid::now_v7();
-    let now = Utc::now();
-    let period_id = format!("{:04}{:02}", now.year(), now.month());
+    let now = OffsetDateTime::now_utc();
+    let period_id = bss_ledger::domain::instant::yyyymm(now);
 
     let reference = ReferenceRepo::new(provider.clone());
     // Both the transaction (EUR) and functional (USD) scales must be registered.
@@ -220,7 +222,7 @@ async fn cross_currency_allocate_realizes_fx_and_closes_both_grains() {
         payer_tenant_id: payer,
         resource_tenant_id: None,
         seller_tenant_id: tenant,
-        effective_at: now.date_naive(),
+        effective_at: to_naive_date(now),
         due_date: Some(naive(2026, 12, 1)),
         period_id: period_id.clone(),
         items: vec![InvoiceItem {

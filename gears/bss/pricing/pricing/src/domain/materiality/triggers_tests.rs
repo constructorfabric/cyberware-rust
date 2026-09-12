@@ -5,11 +5,11 @@
 //! in which no trigger fires, every assertion here passes against a
 //! `triggered_by_content` that answered `Some(..)` unconditionally.
 
-use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{Trigger, triggered, triggered_by_content, triggered_by_row};
 use crate::domain::concurrency::RowVersion;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::materiality::{ChangeSet, PublishedPriceBaseline};
 use crate::domain::money::{CurrencyCode, MinorAmount};
@@ -19,11 +19,10 @@ use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
 use crate::source_scan::{blank_comments_and_literals, matching_brace};
+use time::OffsetDateTime;
 
-fn at(year: i32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0)
-        .single()
-        .expect("a real instant")
+fn at(year: i32) -> OffsetDateTime {
+    utc_ymd_hms(year, 1, 1, 0, 0, 0)
 }
 
 fn key(currency: &str) -> ScopeKey {
@@ -936,6 +935,7 @@ fn only_the_triggers_with_a_subject_in_this_crate_answer_true() {
             "grandfatherHorizonTightening",
             "grandfatheringCutover",
             "immediateMembershipReresolution",
+            "bulkGroupMove",
             "thresholdPolicyDiff",
             "priceOverlayMutation",
             "windowCancellation",
@@ -945,6 +945,7 @@ fn only_the_triggers_with_a_subject_in_this_crate_answer_true() {
             "planRetirement",
             "noComputableRowDelta",
             "planShapeRevisionContent",
+            "taxonomyValueMutation",
         ]
     );
 }
@@ -977,14 +978,13 @@ fn only_the_triggers_with_no_subject_in_this_crate_answer_false() {
         absent,
         [
             "retirementUnwindingACutover",
-            "bulkGroupMove",
             "gaGateClearingRepublish",
             "prepaidGateClearingRepublish",
             "grantNonPriceField",
         ]
     );
     assert_eq!(
-        absent.len() + 12,
+        absent.len() + 14,
         Trigger::ALL.len(),
         "the two sides partition the roster, so a variant added to neither census is a variant \
          this pair stopped covering"

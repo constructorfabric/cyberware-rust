@@ -1,8 +1,7 @@
 //! Tests for the pure period-id math.
 
-use chrono::TimeZone;
-
 use super::*;
+use crate::domain::instant::utc_ymd_hms;
 
 #[test]
 fn next_period_id_advances_within_year() {
@@ -27,7 +26,7 @@ fn next_period_id_rejects_out_of_range_month() {
 
 #[test]
 fn period_id_for_formats_year_month() {
-    let now = Utc.with_ymd_and_hms(2026, 6, 19, 0, 0, 0).unwrap();
+    let now = utc_ymd_hms(2026, 6, 19, 0, 0, 0);
     assert_eq!(period_id_for(now), "202606");
 }
 
@@ -87,7 +86,7 @@ fn previous_period_id_is_inverse_of_next() {
 fn period_start_utc_is_first_instant_of_month() {
     assert_eq!(
         period_start_utc("202606"),
-        Some(Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap())
+        Some(utc_ymd_hms(2026, 6, 1, 0, 0, 0))
     );
     assert_eq!(period_start_utc("2026"), None);
     assert_eq!(period_start_utc("202613"), None);
@@ -98,12 +97,12 @@ fn period_end_utc_is_first_instant_of_next_month() {
     // End of 2026-06 is the first instant of 2026-07.
     assert_eq!(
         period_end_utc("202606"),
-        Some(Utc.with_ymd_and_hms(2026, 7, 1, 0, 0, 0).unwrap())
+        Some(utc_ymd_hms(2026, 7, 1, 0, 0, 0))
     );
     // December rolls into next January.
     assert_eq!(
         period_end_utc("202612"),
-        Some(Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap())
+        Some(utc_ymd_hms(2027, 1, 1, 0, 0, 0))
     );
     assert_eq!(period_end_utc("bad"), None);
 }

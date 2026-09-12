@@ -27,7 +27,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::Utc;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult, QuerySelect};
 use serde_json::json;
 use toolkit_db::secure::{AccessScope, DbTx, SecureEntityExt};
@@ -53,6 +52,7 @@ use crate::infra::storage::entity::journal_entry;
 use crate::infra::storage::repo::{
     ExceptionQueueRepo, JournalRepo, RecognitionRepo, ReconciliationRunRepo,
 };
+use time::OffsetDateTime;
 
 /// `reconciliation_run.check_type` for the AR-ledger ↔ derived-projection tie-out (AC #7).
 pub const CHECK_AR_DERIVED: &str = "AR_DERIVED";
@@ -683,7 +683,7 @@ impl ReconciliationFramework {
                     check_type: check_type.to_owned(),
                     variance_minor,
                     within_tolerance,
-                    at_utc: Utc::now(),
+                    at_utc: OffsetDateTime::now_utc(),
                 },
             )
             .await

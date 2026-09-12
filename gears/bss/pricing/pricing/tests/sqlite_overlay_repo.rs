@@ -15,6 +15,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use bss_pricing::domain::audit::AuditStamp;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::CurrencyCode;
 use bss_pricing::domain::overlay::{
     Adjustment, AmountSet, Disclosure, LineKey, Magnitude, OverlayInterval, OverlayLifecycle,
@@ -27,7 +28,7 @@ use bss_pricing::infra::storage::entity::{
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewOverlay, OverlayRepo, audit_repo};
 use bss_pricing::infra::storage::{RepoError, repo_failure};
-use chrono::{TimeZone, Utc};
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::EntityTrait;
 use sea_orm::sea_query::Expr;
@@ -102,10 +103,7 @@ fn plan(n: u128) -> PlanId {
 fn stamp() -> AuditStamp {
     AuditStamp {
         actor_principal_id: Uuid::from_u128(0x4444),
-        recorded_at: Utc
-            .with_ymd_and_hms(2099, 1, 1, 0, 0, 0)
-            .single()
-            .expect("a valid instant"),
+        recorded_at: utc_ymd_hms(2099, 1, 1, 0, 0, 0),
         correlation_id: Uuid::from_u128(0x5555),
     }
 }
@@ -444,6 +442,67 @@ async fn a_draft_only_overlay_has_no_current_revision() {
     );
 }
 
+/// The authoring read is the open draft when that is the only revision.
+#[tokio::test]
+async fn authoring_prefers_the_open_draft() {
+    let (repo, scope) = seeded().await;
+    let record = repo
+        .authoring(&scope, TENANT, OVERLAY)
+        .await
+        .expect("the read succeeds")
+        .expect("a draft-only overlay has an authoring revision");
+    assert_eq!(record.lifecycle_state, OverlayLifecycle::Draft);
+    assert_eq!(record.revision, 0);
+}
+
+/// With no draft, the published revision is the one an author can act on.
+#[tokio::test]
+async fn authoring_falls_back_to_published_when_there_is_no_draft() {
+    let (repo, scope) = seeded().await;
+    repo.publish_revision(&scope, TENANT, OVERLAY, 0, stamp())
+        .await
+        .expect("revision 0 publishes");
+    let record = repo
+        .authoring(&scope, TENANT, OVERLAY)
+        .await
+        .expect("the read succeeds")
+        .expect("a published overlay is authorable");
+    assert_eq!(record.lifecycle_state, OverlayLifecycle::Published);
+    assert_eq!(record.revision, 0);
+}
+
+/// A successor draft wins over its published predecessor — same rule as
+/// `GET /plans/{id}`.
+#[tokio::test]
+async fn authoring_picks_the_successor_draft_over_the_published_predecessor() {
+    let (repo, scope) = seeded().await;
+    repo.publish_revision(&scope, TENANT, OVERLAY, 0, stamp())
+        .await
+        .expect("revision 0 publishes");
+    repo.open_revision(&scope, TENANT, OVERLAY, stamp())
+        .await
+        .expect("a successor opens");
+    let record = repo
+        .authoring(&scope, TENANT, OVERLAY)
+        .await
+        .expect("the read succeeds")
+        .expect("the open draft is the authoring revision");
+    assert_eq!(record.lifecycle_state, OverlayLifecycle::Draft);
+    assert_eq!(record.revision, 1);
+}
+
+/// Missing overlay: no authoring revision, no existence leak into `Err`.
+#[tokio::test]
+async fn authoring_is_none_when_the_overlay_does_not_exist() {
+    let (repo, scope) = repo().await;
+    assert!(
+        repo.authoring(&scope, TENANT, OVERLAY)
+            .await
+            .expect("the read succeeds")
+            .is_none()
+    );
+}
+
 /// A `fixed` line's per-currency values round-trip through the amount table.
 #[tokio::test]
 async fn an_amount_lines_values_round_trip() {
@@ -524,11 +583,8 @@ async fn a_line_naming_the_nil_plan_id_is_refused() {
 #[tokio::test]
 async fn a_cohort_finer_than_the_quantum_is_refused_on_both_line_write_paths() {
     let (repo, scope) = repo().await;
-    let generation = Utc
-        .with_ymd_and_hms(2099, 3, 4, 5, 6, 7)
-        .single()
-        .expect("a valid instant");
-    let unquantized = generation + chrono::TimeDelta::microseconds(123);
+    let generation = utc_ymd_hms(2099, 3, 4, 5, 6, 7);
+    let unquantized = generation + time::Duration::microseconds(123);
     let cohort_line = |cohort| {
         percent_line(
             LINE_A,
@@ -623,14 +679,8 @@ async fn a_cohort_finer_than_the_quantum_is_refused_on_both_line_write_paths() {
 #[tokio::test]
 async fn an_overlay_interval_bound_finer_than_the_quantum_is_refused() {
     let (repo, scope) = repo().await;
-    let opens = Utc
-        .with_ymd_and_hms(2099, 3, 4, 5, 6, 7)
-        .single()
-        .expect("a valid instant");
-    let closes = Utc
-        .with_ymd_and_hms(2099, 5, 6, 7, 8, 9)
-        .single()
-        .expect("a valid instant");
+    let opens = utc_ymd_hms(2099, 3, 4, 5, 6, 7);
+    let closes = utc_ymd_hms(2099, 5, 6, 7, 8, 9);
     let interval = |from, to| {
         let mut overlay = new_overlay(OVERLAY, 10);
         overlay.interval = OverlayInterval {
@@ -644,7 +694,7 @@ async fn an_overlay_interval_bound_finer_than_the_quantum_is_refused() {
     let refusal = repo
         .create(
             &scope,
-            interval(opens + chrono::TimeDelta::microseconds(456), closes),
+            interval(opens + time::Duration::microseconds(456), closes),
             lines(),
             stamp(),
         )
@@ -661,7 +711,7 @@ async fn an_overlay_interval_bound_finer_than_the_quantum_is_refused() {
     let refusal = repo
         .create(
             &scope,
-            interval(opens, closes + chrono::TimeDelta::microseconds(789)),
+            interval(opens, closes + time::Duration::microseconds(789)),
             lines(),
             stamp(),
         )
@@ -1270,10 +1320,7 @@ async fn seed_plan(provider: &DBProvider<DbError>, plan_id: PlanId, revision: i6
         tenant_id: Set(TENANT),
         lifecycle_state: Set(state.to_owned()),
         created_by: Set(Uuid::from_u128(0x4444)),
-        created_at_utc: Set(Utc
-            .with_ymd_and_hms(2099, 1, 1, 0, 0, 0)
-            .single()
-            .expect("a valid instant")),
+        created_at_utc: Set(utc_ymd_hms(2099, 1, 1, 0, 0, 0)),
         ..Default::default()
     };
     plan::Entity::insert(row.clone())

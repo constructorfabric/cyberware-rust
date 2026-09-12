@@ -6,12 +6,12 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{PlanSummaryView, PlanView};
 use crate::domain::concurrency::RowVersion;
 use crate::domain::contracts::{EntitlementGrants, PlanChangeContract};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::plan::PlanRevision;
 use crate::domain::plan_shape::{BillingCycle, CustomIntervalUnit, DescriptorSet, Frequency};
@@ -39,7 +39,7 @@ fn revision(plan_id: PlanId) -> PlanRevision {
         change_contract: PlanChangeContract::default(),
         lifecycle_state: LifecycleState::Draft,
         created_by: Uuid::from_u128(0xac_12),
-        created_at_utc: Utc.with_ymd_and_hms(2026, 8, 3, 9, 0, 0).unwrap(),
+        created_at_utc: utc_ymd_hms(2026, 8, 3, 9, 0, 0),
         cloned_from: None,
         row_version: RowVersion::new(4),
     }
@@ -59,6 +59,7 @@ fn an_unattached_descriptor_set_is_null_and_an_empty_one_is_an_object() {
 
     let unattached = PlanView::new(
         revision(plan_id),
+        utc_ymd_hms(2026, 8, 1, 0, 0, 0),
         Vec::new(),
         Vec::new(),
         None,
@@ -73,6 +74,7 @@ fn an_unattached_descriptor_set_is_null_and_an_empty_one_is_an_object() {
 
     let attached = PlanView::new(
         revision(plan_id),
+        utc_ymd_hms(2026, 8, 1, 0, 0, 0),
         Vec::new(),
         Vec::new(),
         Some(DescriptorSet::default()),
@@ -97,6 +99,7 @@ fn the_view_names_which_revision_it_answered() {
     // current revision - the next PATCH depends on it.
     let rendered = body(&PlanView::new(
         revision(PlanId::new(Uuid::now_v7())),
+        utc_ymd_hms(2026, 8, 1, 0, 0, 0),
         Vec::new(),
         Vec::new(),
         None,
@@ -117,6 +120,7 @@ fn a_custom_frequency_carries_its_interval_and_a_fixed_one_carries_none() {
     fixed.frequency = Some(Frequency::Monthly);
     let rendered = body(&PlanView::new(
         fixed,
+        utc_ymd_hms(2026, 8, 1, 0, 0, 0),
         Vec::new(),
         Vec::new(),
         None,
@@ -128,6 +132,7 @@ fn a_custom_frequency_carries_its_interval_and_a_fixed_one_carries_none() {
 
     let custom = body(&PlanView::new(
         revision(PlanId::new(Uuid::now_v7())),
+        utc_ymd_hms(2026, 8, 1, 0, 0, 0),
         Vec::new(),
         Vec::new(),
         None,
@@ -166,7 +171,10 @@ fn the_summary_view_carries_the_revision_it_answered_and_its_row_version() {
     row.revision = 5;
     row.lifecycle_state = LifecycleState::Draft;
 
-    let view = PlanSummaryView::from(&row);
+    let view = PlanSummaryView::from(&crate::infra::storage::repo::plan_repo::PlanListEntry {
+        revision: row.clone(),
+        created_at: utc_ymd_hms(2026, 8, 1, 0, 0, 0),
+    });
 
     assert_eq!(view.plan_id, plan_id.get());
     assert_eq!(view.revision, 5);

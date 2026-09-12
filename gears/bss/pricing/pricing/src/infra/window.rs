@@ -195,11 +195,11 @@
 //! [`crate::domain::materiality::evaluate`]'s answer over the tenant's configured
 //! policy, read inside this transaction through
 //! [`crate::infra::threshold::effective_policy_at`] — the `_at` form, at the instant
-//! the act's own stamp carries, never the `Utc::now()` wrapper. Under D-188 a version
+//! the act's own stamp carries, never the `OffsetDateTime::now_utc()` wrapper. Under D-188 a version
 //! is not the policy before its `effective_from`, so a mutation that read the wall
 //! clock while stamping some other instant could decide a verdict against a policy
 //! the record it wrote says was not yet in force. `api::rest::windows` stamps from
-//! `Utc::now()`, so no route reaches that; an in-process caller holding a fixed stamp
+//! `OffsetDateTime::now_utc()`, so no route reaches that; an in-process caller holding a fixed stamp
 //! does, and every service-level suite is one. `infra::threshold`'s own doc states
 //! the rule this obeys, and `api::rest::publish` obeys it with the submit's instant.
 //!
@@ -241,7 +241,6 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value as JsonValue;
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
@@ -251,6 +250,7 @@ use uuid::Uuid;
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use crate::domain::coverage::{self, WINDOW_TRAILING_VOID};
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{self, ChangeSet, MaterialityVerdict, PublishedPriceBaseline};
@@ -273,6 +273,7 @@ use crate::infra::storage::repo::{
     window_repo,
 };
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// What a window mutation answers with — the pending handle and the row as it
 /// now stands.
@@ -294,9 +295,9 @@ pub struct WindowMutationReceipt {
     /// The registry handle the projector resolves.
     pub pending_version_ref: String,
     /// The interval as stored after the mutation.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// The end as stored after the mutation; `None` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// The state as stored after the mutation.
     pub state: WindowState,
     /// The act sequence the window stands at **after** this act — the entity tag the
@@ -343,9 +344,9 @@ pub struct PendingApproval {
     /// The plan revision the act would freeze — the current one.
     pub revision: u64,
     /// The interval as it **still** stands, unmoved.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// The end as it **still** stands, unmoved.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// The state as it **still** stands, unmoved.
     pub state: WindowState,
     /// Why a second principal is required — the evaluator's own reason, carried as
@@ -440,8 +441,8 @@ impl WindowService {
         tenant_id: Uuid,
         price_id: Uuid,
         window_id: Uuid,
-        effective_from: DateTime<Utc>,
-        effective_to: Option<DateTime<Utc>>,
+        effective_from: OffsetDateTime,
+        effective_to: Option<OffsetDateTime>,
         reason_code: String,
         verdict_json: VerdictJson,
         stamp: AuditStamp,
@@ -493,8 +494,8 @@ impl WindowService {
         tenant_id: Uuid,
         price_id: Uuid,
         window_id: Uuid,
-        effective_from: DateTime<Utc>,
-        effective_to: Option<DateTime<Utc>>,
+        effective_from: OffsetDateTime,
+        effective_to: Option<OffsetDateTime>,
         reason_code: String,
         verdict_json: VerdictJson,
         stamp: AuditStamp,
@@ -563,7 +564,7 @@ impl WindowService {
         scope: &AccessScope,
         tenant_id: Uuid,
         window_id: Uuid,
-        effective_to: Option<DateTime<Utc>>,
+        effective_to: Option<OffsetDateTime>,
         expected_seq: u64,
         verdict_json: VerdictJson,
         stamp: AuditStamp,
@@ -848,7 +849,7 @@ struct PlanContext {
     before: KeyWindows,
     /// W6's margin on the key's market: `Some(zero)` when the plan sells no
     /// recurring row there, `None` when the term has no value at all.
-    margin: Option<TimeDelta>,
+    margin: Option<time::Duration>,
     /// Every window of the plan with its id, as stored.
     plane: Vec<(Uuid, ScopeKey, WindowInterval)>,
     /// The plan's **published** price rows — the row set the mutation's
@@ -873,8 +874,8 @@ struct PlanContext {
 /// What a mutation resolved to, once its own domain check has passed.
 struct Planned {
     price_id: Uuid,
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
     reason_code: String,
     op: Op,
     plan: PlanContext,
@@ -952,9 +953,13 @@ pub fn parse_unit_subject(subject_ref: &str) -> Option<ProposedAct> {
 ///
 /// Shared by the act token and the subject builder so the two cannot spell an
 /// instant two ways — a subject spelled differently at open and at resolve is a
-/// unit the retry never finds.
-fn interval_end(at: Option<DateTime<Utc>>) -> String {
-    at.map_or_else(|| "open".to_owned(), |t| t.to_rfc3339())
+/// unit the retry never finds. The spelling is chrono's `to_rfc3339()` (`AutoSi`,
+/// `+00:00`), because that is what every window-act subject and request id
+/// already in the register was written with; the millisecond `Z` form would
+/// spell the same act differently after this migration than before it — the
+/// exact miss this comment warns about, across a deploy instead of a retry.
+fn interval_end(at: Option<OffsetDateTime>) -> String {
+    at.map_or_else(|| "open".to_owned(), format_rfc3339)
 }
 
 impl Planned {
@@ -1095,8 +1100,8 @@ impl WindowService {
 /// carries for being extracted from `create_draft` rather than copied out of it.
 fn schedule_plan(
     price_id: Uuid,
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
     reason_code: String,
 ) -> impl FnOnce(PlanContext) -> Result<Planned, DomainError> + Send {
     move |plan| {
@@ -1558,8 +1563,8 @@ fn refuse_interior_gap(key: &ScopeKey, after: &KeyWindows) -> Result<(), DomainE
             key.to_string(),
             format!(
                 "[{}, {}) is uncovered between two of the key's windows",
-                start.to_rfc3339(),
-                end.to_rfc3339()
+                format_rfc3339(start),
+                format_rfc3339(end)
             ),
         );
     }
@@ -1588,7 +1593,7 @@ fn refuse_interior_gap(key: &ScopeKey, after: &KeyWindows) -> Result<(), DomainE
 fn refuse_trailing_void(
     planned: &Planned,
     after: &KeyWindows,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let Some(margin) = planned.plan.margin else {
         return Err(DomainError::WindowTrailingVoid(format!(
@@ -1598,7 +1603,7 @@ fn refuse_trailing_void(
             planned.plan.key
         )));
     };
-    let Some(horizon) = now.checked_add_signed(margin) else {
+    let Some(horizon) = now.checked_add(margin) else {
         return Err(DomainError::WindowTrailingVoid(format!(
             "{}: now plus the longest billing cycle sold on the key is not a representable \
              instant, so {WINDOW_TRAILING_VOID}'s floor has no value, and the coverage this \
@@ -1620,7 +1625,7 @@ fn refuse_trailing_void(
                 planned.plan.key,
                 after_end
                     .at()
-                    .map_or_else(|| "the key's start".to_owned(), |at| at.to_rfc3339())
+                    .map_or_else(|| "the key's start".to_owned(), format_rfc3339)
             )))
         }
         before => {
@@ -1638,10 +1643,10 @@ fn refuse_trailing_void(
                  and now plus the longest billing cycle sold on it - and this leaves {} the first \
                  uncovered instant",
                 planned.plan.key,
-                until.to_rfc3339(),
+                format_rfc3339(until),
                 after_end
                     .at()
-                    .map_or_else(|| "every instant".to_owned(), |at| at.to_rfc3339())
+                    .map_or_else(|| "every instant".to_owned(), format_rfc3339)
             )))
         }
     }
@@ -1753,7 +1758,7 @@ fn refuse_trailing_void(
 fn refuse_horizon_uncovered(
     planned: &Planned,
     after: &KeyWindows,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     if planned.plan.key.price_eligibility() != PriceEligibility::ExistingGrandfathered {
         return Ok(());
@@ -1801,10 +1806,10 @@ fn refuse_horizon_uncovered(
 /// walk could reach.
 pub(crate) fn refuse_horizon_span_uncovered(
     key: &ScopeKey,
-    horizon: Option<DateTime<Utc>>,
-    margin: Option<TimeDelta>,
+    horizon: Option<OffsetDateTime>,
+    margin: Option<time::Duration>,
     after: &KeyWindows,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let after_end = after.coverage_end();
     // The generation's own first instant, never earlier than the clock this
@@ -1835,8 +1840,8 @@ pub(crate) fn refuse_horizon_span_uncovered(
             "{key}: the generation's grandfatherUntil is null, so its eligibility is indefinite \
              and its coverage must run unbroken from {} and never end; this leaves {} the first \
              uncovered instant",
-            anchor.to_rfc3339(),
-            uncovered_at.to_rfc3339()
+            format_rfc3339(anchor),
+            format_rfc3339(uncovered_at)
         )));
     };
 
@@ -1868,7 +1873,7 @@ pub(crate) fn refuse_horizon_span_uncovered(
     // millisecond **precision** rather than range, and runs three steps later, on
     // the write this rule stands in front of. So `DateTime::<Utc>::MAX_UTC`, and
     // every millisecond-quantised instant near it, reaches here. chrono's
-    // `impl Add<TimeDelta> for DateTime<Tz>` is
+    // `impl Add<time::Duration> for DateTime<Tz>` is
     // `checked_add_signed(rhs).expect("… overflowed")`, which aborts a **release**
     // build too, so this was a panic on an authenticated request path.
     //
@@ -1882,12 +1887,12 @@ pub(crate) fn refuse_horizon_span_uncovered(
     // `BoundSpan::Incomputable`, which its caller reads as *keep*: that is the two
     // surfaces' standing disagreement over an absent operand — this one refuses the
     // act, that one refuses to strand a generation for it — and not a third reading.
-    let Some(floor) = horizon.checked_add_signed(margin) else {
+    let Some(floor) = horizon.checked_add(margin) else {
         return Err(DomainError::WindowTrailingVoid(format!(
             "{key}: this generation's grandfatherUntil {} plus the longest billing cycle sold on \
              the key is not a representable instant, so D-04's bound has no value and this \
              generation's coverage cannot be shown to reach it",
-            horizon.to_rfc3339()
+            format_rfc3339(horizon)
         )));
     };
 
@@ -1910,14 +1915,14 @@ pub(crate) fn refuse_horizon_span_uncovered(
          {} through {} - that horizon plus the longest billing cycle sold on the key - so that \
          every bound period stays rateable until its renewal re-bind; this leaves {} the first \
          uncovered instant",
-        horizon.to_rfc3339(),
-        anchor.to_rfc3339(),
-        floor.to_rfc3339(),
+        format_rfc3339(horizon),
+        format_rfc3339(anchor),
+        format_rfc3339(floor),
         uncovered_at.map_or_else(
             || after_end
                 .at()
-                .map_or_else(|| "every instant".to_owned(), |at| at.to_rfc3339()),
-            |at| at.to_rfc3339()
+                .map_or_else(|| "every instant".to_owned(), format_rfc3339),
+            format_rfc3339
         )
     )))
 }
@@ -1929,7 +1934,7 @@ async fn read_plan_context(
     tenant_id: Uuid,
     window_id: Uuid,
     subject: Subject,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<PlanContext, DomainError> {
     // The key first, because it carries the plan and everything else is
     // plan-scoped. Which read answers it depends on what the surface addressed.
@@ -2115,8 +2120,8 @@ fn unit_request_id(tenant_id: Uuid, unit: PlanPublishUnit, planned: &Planned) ->
 fn window_state_value(record: &WindowRecord) -> JsonValue {
     serde_json::json!({
         "state": record.state.as_str(),
-        "effectiveFrom": record.effective_from,
-        "effectiveTo": record.effective_to,
+        "effectiveFrom": format_rfc3339(record.effective_from),
+        "effectiveTo": record.effective_to.map(format_rfc3339),
         "priceId": record.price_id,
     })
 }
@@ -2167,8 +2172,8 @@ fn window_state_value(record: &WindowRecord) -> JsonValue {
 pub(crate) fn shortened_window_state_value(record: &WindowRecord) -> JsonValue {
     serde_json::json!({
         "scopeKey": record.scope_key.to_string(),
-        "effectiveFrom": record.effective_from,
-        "effectiveTo": record.effective_to,
+        "effectiveFrom": format_rfc3339(record.effective_from),
+        "effectiveTo": record.effective_to.map(format_rfc3339),
         "state": record.state.as_str(),
     })
 }

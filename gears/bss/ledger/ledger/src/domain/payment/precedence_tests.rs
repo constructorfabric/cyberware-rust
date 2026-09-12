@@ -1,14 +1,11 @@
 use super::*;
+use time::OffsetDateTime;
 
-fn ts(y: i32, m: u32, d: u32) -> DateTime<Utc> {
-    chrono::NaiveDate::from_ymd_opt(y, m, d)
-        .unwrap()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc()
+fn ts(y: i32, m: u32, d: u32) -> OffsetDateTime {
+    crate::domain::instant::utc_ymd_hms(y, m, d, 0, 0, 0)
 }
 
-fn cand(id: &str, open: i64, at: Option<DateTime<Utc>>) -> Candidate {
+fn cand(id: &str, open: i64, at: Option<OffsetDateTime>) -> Candidate {
     Candidate {
         invoice_id: id.to_owned(),
         open_minor: open,

@@ -76,10 +76,13 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{Expr, SimpleExpr};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, ExprTrait, JsonValue, Order};
+use sea_orm::{
+    ColumnTrait, Condition, EntityTrait, ExprTrait, JsonValue, Order, QueryFilter, QuerySelect,
+    QueryTrait,
+};
+use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, DBRunner, DbConn, DbTx, SecureEntityExt, SecureInsertExt, SecureUpdateExt, TxError,
 };
@@ -107,7 +110,14 @@ use crate::infra::storage::repo::plan_shape_repo::{
     delete_phases,
 };
 use crate::infra::storage::repo::{NewAuditEntry, audit_repo, outbox_repo};
+use toolkit_odata::{ODataQuery, Page};
+
+use crate::infra::storage::odata_mapping::OdataPageError;
 use crate::infra::storage::{RepoError, contention_or_db};
+
+#[path = "plan_list.rs"]
+mod plan_list;
+pub use plan_list::PlanListEntry;
 
 /// The noun every **compare-and-swap** refusal names, so a caller that failed
 /// to edit revision 3 and a caller that failed to delete it are told about the
@@ -146,7 +156,7 @@ pub struct NewPlanDraft {
     /// Pseudonymous principal id of the authoring actor.
     pub created_by: Uuid,
     /// When the request was authored, UTC.
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// The catalog SKU this plan realizes, when one is bound.
     pub sku_id: Option<Uuid>,
     /// The plan's tier.
@@ -167,9 +177,9 @@ pub struct NewPlanDraft {
     /// The Billing invoice-layout hint (D-96).
     pub invoice_grouping_key: Option<String>,
     /// Start of the availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    pub available_from: Option<OffsetDateTime>,
     /// End of the availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
+    pub available_to: Option<OffsetDateTime>,
     /// The plan this one is being cloned from (`inst-cl-copy`), or `None` for an
     /// authored plan. Provenance, set once at create and frozen thereafter.
     pub cloned_from: Option<PlanId>,
@@ -321,6 +331,56 @@ impl PlanRepo {
         limit: u64,
     ) -> Result<Vec<PlanRevision>, RepoError> {
         list_authoring_page(&self.conn()?, scope, tenant_id, states, after, limit).await
+    }
+
+    /// One `OData` page: choose the authoring revision, then filter, sort and
+    /// paginate. Derived values belong to the read projection, not stored pins.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor.
+    pub async fn list_authoring_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<PlanListEntry>, OdataPageError> {
+        plan_list::list(
+            &self.conn().map_err(OdataPageError::Repo)?,
+            scope,
+            tenant_id,
+            query,
+        )
+        .await
+    }
+
+    /// Original plan creation time, from the earliest retained revision.
+    ///
+    /// # Errors
+    /// Scope/storage failures and an absent plan fail the read.
+    pub async fn created_at(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        plan_id: PlanId,
+    ) -> Result<OffsetDateTime, RepoError> {
+        let row = plan::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(plan::Column::TenantId.eq(tenant_id))
+                    .add(plan::Column::PlanId.eq(plan_id.get())),
+            )
+            .order_by(plan::Column::Revision, Order::Asc)
+            .one(&self.conn()?)
+            .await
+            .map_err(|e| RepoError::Db(format!("read plan creation time: {e}")))?
+            .ok_or_else(|| RepoError::NotFound {
+                subject: "plan".to_owned(),
+                id: plan_id.get().to_string(),
+            })?;
+        Ok(row.created_at_utc)
     }
 
     /// Apply `patch` to an open draft revision, under the caller's row version.
@@ -1559,6 +1619,191 @@ pub async fn load_open_draft(
         .await
         .map_err(|e| RepoError::Db(format!("read open plan draft: {e}")))?;
     row.map(to_domain).transpose()
+}
+
+/// How many plans the tenant holds in each **authoring** state (D-360).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlanCounts {
+    /// The number of distinct plans in the authoring set; the three states sum
+    /// to it.
+    pub total: u64,
+    /// Plans holding an open draft — whatever their current revision's state.
+    pub draft: u64,
+    /// Plans whose current revision is `published` and that hold no draft.
+    pub published: u64,
+    /// Plans whose current revision is `retired` and that hold no draft.
+    pub retired: u64,
+}
+
+/// [`PlanCounts`] over the **whole** catalogue — what the list shows per row,
+/// counted rather than paged (D-360).
+///
+/// The row set is [`list_authoring_page`]'s empty-filter set — `current_tokens()`
+/// plus `draft` — and the fold is its collapse, stated once: a plan with an open
+/// draft **is** `draft` (the draft is the revision an author holds; its number is
+/// `max + 1`), else it is its current revision's state. At most two rows per
+/// plan reach this read (`uq_pricing_plan_current` admits one current revision,
+/// `OPEN_DRAFT_REVISION_EXISTS` one open draft), so it is bounded by 2 × plans,
+/// and `total` is the number of distinct plans. `abandoned` and `superseded`
+/// revisions are outside the set, as they are outside the list.
+///
+/// A tab strip built from one page of `GET /plans` is wrong past that page; this
+/// is the read that is not.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure; [`RepoError::CorruptRow`] on
+/// a state token outside the enumeration.
+/// The plans of one tenant that hold an open draft — the anti-join
+/// [`count_plans_by_authoring_state`] needs to keep its own count at
+/// `O(states)`.
+///
+/// A subquery rather than a second round trip, and **not** scope-narrowed, for
+/// `window_repo::projected_price_rows`' reason: it yields `plan_id`s of one
+/// named tenant, `plan_id` is the table's own key, and it is intersected with a
+/// **scoped** outer read — so it cannot admit a plan the outer scope did not
+/// already admit.
+fn plans_holding_a_draft(tenant_id: Uuid) -> sea_orm::sea_query::SelectStatement {
+    plan::Entity::find()
+        .select_only()
+        .column(plan::Column::PlanId)
+        .filter(
+            Condition::all()
+                .add(plan::Column::TenantId.eq(tenant_id))
+                .add(plan::Column::LifecycleState.eq(LifecycleState::Draft.as_str())),
+        )
+        .into_query()
+}
+
+/// [`PlanCounts`] for the whole catalogue, counted **in SQL**.
+///
+/// # Why two grouped reads and not one fold in Rust
+///
+/// `GET /plans/counts` is a tab strip: it fires on every plan-screen open. An
+/// earlier version selected every `(plan_id, lifecycle_state)` row of the
+/// tenant's authoring set — no `LIMIT`, no cursor, no aggregate — and collapsed
+/// them into a `BTreeMap` here, so the transfer grew with the catalogue on a
+/// route whose whole answer is four integers, while every other list read in the
+/// crate is capped at D-125's 1 000. Both reads below return **at most one row
+/// per lifecycle state**.
+///
+/// # Why `COUNT(*)` per state is already the distinct-plan count
+///
+/// The schema says so, not a convention: `uq_pricing_plan_open_draft` is unique
+/// on `plan_id` where the state is `draft`, and `uq_pricing_plan_current` is
+/// unique on `plan_id` across `('published','retired')` **together**. So inside
+/// this filter a plan contributes at most one draft row and at most one current
+/// row, and no `DISTINCT` is needed to count plans.
+///
+/// # The collapse, expressed as a subtraction
+///
+/// A plan holding an open draft counts as `draft` whatever its current revision
+/// says (`PlanCounts`' own contract). The first read counts plans per state
+/// independently; the second counts, per **current** state, the plans that also
+/// hold a draft — the ones the first read has already counted under `draft`. So
+/// `published` and `retired` are their totals minus that shadow, `draft` stands,
+/// and the three sum to `total` because every plan lands in exactly one bucket.
+///
+/// # Errors
+/// [`RepoError::Db`] on a scope or storage failure, or when a tally names a state
+/// this function's own filter excludes.
+pub async fn count_plans_by_authoring_state(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+) -> Result<PlanCounts, RepoError> {
+    #[derive(sea_orm::FromQueryResult)]
+    struct Tally {
+        lifecycle_state: String,
+        cnt: i64,
+    }
+
+    let mut tokens = current_tokens();
+    tokens.push(LifecycleState::Draft.as_str());
+    let per_state = plan::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(plan::Column::TenantId.eq(tenant_id))
+                .add(plan::Column::LifecycleState.is_in(tokens)),
+        )
+        .project_all(runner, |q| {
+            q.select_only()
+                .column(plan::Column::LifecycleState)
+                .column_as(Expr::col(plan::Column::PlanId).count(), "cnt")
+                .group_by(plan::Column::LifecycleState)
+                .into_model::<Tally>()
+        })
+        .await
+        .map_err(|e| RepoError::Db(format!("count plans by authoring state: {e}")))?;
+
+    let shadowed = plan::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(plan::Column::TenantId.eq(tenant_id))
+                .add(plan::Column::LifecycleState.is_in(current_tokens()))
+                .add(plan::Column::PlanId.in_subquery(plans_holding_a_draft(tenant_id))),
+        )
+        .project_all(runner, |q| {
+            q.select_only()
+                .column(plan::Column::LifecycleState)
+                .column_as(Expr::col(plan::Column::PlanId).count(), "cnt")
+                .group_by(plan::Column::LifecycleState)
+                .into_model::<Tally>()
+        })
+        .await
+        .map_err(|e| RepoError::Db(format!("count plans shadowed by a draft: {e}")))?;
+
+    let tallied = |tally: &Tally| -> Result<(LifecycleState, u64), RepoError> {
+        let state = read_token(
+            "pricing_plan.lifecycle_state",
+            &tally.lifecycle_state,
+            LifecycleState::ALL,
+            LifecycleState::as_str,
+        )?;
+        Ok((state, u64::try_from(tally.cnt).unwrap_or(0)))
+    };
+    // **Every variant named, and no wildcard.** The token has already been
+    // validated against `LifecycleState::ALL` and selected by this function's own
+    // filter, so a state outside the authoring set is not a corrupt row - it is
+    // this function disagreeing with its own filter. Spelling the arms out makes
+    // a sixth state a compile error here instead of a runtime alarm on a tab
+    // strip.
+    let mut counts = PlanCounts::default();
+    for tally in &per_state {
+        match tallied(tally)? {
+            (LifecycleState::Draft, n) => counts.draft = n,
+            (LifecycleState::Published, n) => counts.published = n,
+            (LifecycleState::Retired, n) => counts.retired = n,
+            (state @ (LifecycleState::Abandoned | LifecycleState::Superseded), _) => {
+                return Err(RepoError::Db(format!(
+                    "pricing_plan authoring tally met `{state}`, which this read's own \
+                    lifecycle_state filter excludes"
+                )));
+            }
+        }
+    }
+    for tally in &shadowed {
+        match tallied(tally)? {
+            (LifecycleState::Published, n) => counts.published = counts.published.saturating_sub(n),
+            (LifecycleState::Retired, n) => counts.retired = counts.retired.saturating_sub(n),
+            (
+                state @ (LifecycleState::Draft
+                | LifecycleState::Abandoned
+                | LifecycleState::Superseded),
+                _,
+            ) => {
+                return Err(RepoError::Db(format!(
+                    "pricing_plan draft-shadow tally met `{state}`, which this read's own \
+                    current-state filter excludes"
+                )));
+            }
+        }
+    }
+    counts.total = counts.draft + counts.published + counts.retired;
+    Ok(counts)
 }
 
 /// One page of the tenant's plans, each rendered as its **authoring** revision.

@@ -81,28 +81,22 @@ def _declare_region(client, headers, region="EU"):
     needs two things this module has to arrange before it can exist — a phase on
     the plan and a declared region — and neither is implied by the create body.
 
-    The ``PUT`` is itself conditional: a tenant with no taxonomy at all is
-    answered 200 by the ``GET`` and carries an ``ETag``, so the tag is read rather
-    than guessed. Idempotent, so every case may call it.
+    Declared through ``POST .../taxonomies/region/values`` (D-353): the value is
+    its own key, so the first call answers 201 and every repeat with the same body
+    answers 200 as the create's replay. Idempotent, so every case may call it.
     """
-    read = client.get(f"/bss-pricing/v1/config/taxonomies/region", headers=headers)
-    assert read.status_code == 200, read.text
-    put = client.put(
-        f"/bss-pricing/v1/config/taxonomies/region",
-        headers={**headers, "If-Match": read.headers["etag"]},
+    declared = client.post(
+        "/bss-pricing/v1/config/taxonomies/region/values",
+        headers=headers,
         json={
-            "values": [
-                {
-                    "value": region,
-                    "display_name": region,
-                    "state": "active",
-                    "tax_category": "standard",
-                    "tax_rate_present": True,
-                }
-            ]
+            "value": region,
+            "display_name": region,
+            "state": "active",
+            "tax_category": "standard",
+            "tax_rate_present": True,
         },
     )
-    assert put.status_code == 200, put.text
+    assert declared.status_code in (200, 201), declared.text
     return region
 
 

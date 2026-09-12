@@ -91,7 +91,7 @@
 //! where nothing asked it to.
 //!
 //! **Where the clock comes from.** [`effective_version_at`] takes the instant, and
-//! [`effective_version`] is the `Utc::now()` wrapper over it. The comparison is
+//! [`effective_version`] is the `OffsetDateTime::now_utc()` wrapper over it. The comparison is
 //! against "now" at read time by design — the same rows answer differently before and
 //! after the instant, which is what an authored start *means* — and taking it as an
 //! argument is what keeps the walk idempotent: one clock, one answer, however many
@@ -123,7 +123,6 @@
 //! a cached effective policy is a threshold that keeps applying after the unit
 //! authorizing it was withdrawn.
 
-use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
@@ -138,6 +137,7 @@ use crate::infra::approval::read_threshold_version;
 use crate::infra::storage::repo::approval_repo::ApprovalRecord;
 use crate::infra::storage::repo::{ThresholdEntryRow, approval_repo, threshold_repo};
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// The tenant's threshold policy as the evaluator compares against it, or `None`.
 ///
@@ -158,7 +158,7 @@ pub async fn effective_policy(
     scope: &AccessScope,
     tenant_id: Uuid,
 ) -> Result<Option<ThresholdPolicy>, DomainError> {
-    effective_policy_at(runner, scope, tenant_id, Utc::now()).await
+    effective_policy_at(runner, scope, tenant_id, OffsetDateTime::now_utc()).await
 }
 
 /// [`effective_policy`] as of `now`.
@@ -170,7 +170,7 @@ pub async fn effective_policy_at(
     runner: &impl DBRunner,
     scope: &AccessScope,
     tenant_id: Uuid,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<Option<ThresholdPolicy>, DomainError> {
     Ok(effective_version_at(runner, scope, tenant_id, now)
         .await?
@@ -191,7 +191,7 @@ pub async fn effective_version(
     scope: &AccessScope,
     tenant_id: Uuid,
 ) -> Result<Option<ThresholdVersion>, DomainError> {
-    effective_version_at(runner, scope, tenant_id, Utc::now()).await
+    effective_version_at(runner, scope, tenant_id, OffsetDateTime::now_utc()).await
 }
 
 /// [`effective_version`] as of `now`.
@@ -208,7 +208,7 @@ pub async fn effective_version_at(
     runner: &impl DBRunner,
     scope: &AccessScope,
     tenant_id: Uuid,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<Option<ThresholdVersion>, DomainError> {
     let versions = threshold_repo::versions_desc(runner, scope, tenant_id)
         .await
@@ -324,7 +324,7 @@ pub async fn state_at(
     runner: &impl DBRunner,
     scope: &AccessScope,
     tenant_id: Uuid,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<ThresholdState, DomainError> {
     Ok(ThresholdState {
         effective: effective_version_at(runner, scope, tenant_id, now).await?,
@@ -350,7 +350,7 @@ pub struct AssertedPolicy {
     pub tag: PolicyTag,
     /// The instant the whole act is about — the handler's `now`, the same one its
     /// [`AuditStamp`] carries.
-    pub now: DateTime<Utc>,
+    pub now: OffsetDateTime,
 }
 
 impl ThresholdService {
@@ -374,7 +374,9 @@ impl ThresholdService {
             .db
             .db()
             .in_transaction::<ThresholdState, DomainError, _>(move |txn| {
-                Box::pin(async move { state_at(txn, &scope, tenant_id, Utc::now()).await })
+                Box::pin(async move {
+                    state_at(txn, &scope, tenant_id, OffsetDateTime::now_utc()).await
+                })
             })
             .await;
         outcome.map_err(into_domain)
@@ -459,7 +461,7 @@ impl ThresholdService {
         scope: &AccessScope,
         tenant_id: Uuid,
         approval_id: Uuid,
-        effective_from: DateTime<Utc>,
+        effective_from: OffsetDateTime,
         entries: Vec<ThresholdEntry>,
         asserted: AssertedPolicy,
         materiality: JsonValue,
@@ -594,7 +596,7 @@ impl ThresholdService {
         scope: &AccessScope,
         tenant_id: Uuid,
         approval_id: Uuid,
-        effective_from: DateTime<Utc>,
+        effective_from: OffsetDateTime,
         asserted: AssertedPolicy,
         materiality: JsonValue,
         stamp: AuditStamp,

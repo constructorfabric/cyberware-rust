@@ -2,10 +2,11 @@
 //! Handlers build balanced lines from these; the foundation persists them.
 //! All amounts are `i64` minor units.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use uuid::Uuid;
 
 use crate::enums::{AccountClass, MappingStatus, Side, SourceDocType};
+use time::OffsetDateTime;
 
 /// One balanced journal line to post. Mirrors the `journal_line` columns a
 /// handler supplies; the foundation fills DB-generated/derived fields.
@@ -93,7 +94,7 @@ pub struct EntryView {
     pub source_business_id: String,
     pub reverses_entry_id: Option<Uuid>,
     pub reverses_period_id: Option<String>,
-    pub posted_at_utc: DateTime<Utc>,
+    pub posted_at_utc: OffsetDateTime,
     pub effective_at: NaiveDate,
     pub posted_by_actor_id: Uuid,
     pub origin: String,
@@ -183,7 +184,7 @@ pub struct SettlePayment {
     pub fee_minor: i64,
     pub currency: String,
     pub scale: u8,
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// A settlement to claw back (the **reversal of a money-in**). Records that the
@@ -204,7 +205,7 @@ pub struct ReturnPayment {
     pub amount_minor: i64,
     pub currency: String,
     pub scale: u8,
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// A chargeback dispute phase to record (the dispute state machine, §4.5). One
@@ -245,7 +246,7 @@ pub struct RecordDisputePhase {
     pub currency: String,
     /// Advisory currency scale; the ledger resolves the authoritative one.
     pub scale: u8,
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// The outcome of a dispute-phase record that POSTED inline (the dispute had its
@@ -272,7 +273,7 @@ pub struct DisputeQueued {
     /// The queue/dedup business id — `dispute_id:cycle:phase`.
     pub business_id: String,
     /// When the intake durably enqueued the request.
-    pub queued_at: DateTime<Utc>,
+    pub queued_at: OffsetDateTime,
 }
 
 /// The result of `LedgerClientV1::record_dispute_phase`: either the phase posted
@@ -328,7 +329,7 @@ pub struct AllocationView {
     pub invoice_id: String,
     pub amount_minor: i64,
     pub currency: String,
-    pub allocated_at_utc: DateTime<Utc>,
+    pub allocated_at_utc: OffsetDateTime,
     pub precedence_policy_ref: String,
 }
 
@@ -364,7 +365,7 @@ pub struct AllocationQueued {
     /// The queue/dedup business id — the allocation's `allocation_id`.
     pub business_id: String,
     /// When the intake durably enqueued the request.
-    pub queued_at: DateTime<Utc>,
+    pub queued_at: OffsetDateTime,
 }
 
 /// The result of `LedgerClientV1::allocate_payment`: either the allocation posted

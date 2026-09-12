@@ -20,15 +20,16 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use bss_pricing::config::LimitsConfig;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::infra::storage::entity::idempotency_dedup;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{ClaimOutcome, IdempotencyGate};
 use bss_pricing::infra::storage::{RepoError, repo_failure};
-use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
+use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
@@ -60,7 +61,7 @@ struct Request {
     operation: String,
     client_key: String,
     hash: Vec<u8>,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 }
 
 impl Request {
@@ -94,8 +95,8 @@ impl Request {
 }
 
 /// Hours after the suite's fixed origin instant.
-fn at(hours: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, 10, 0, 0).unwrap() + TimeDelta::hours(hours)
+fn at(hours: i64) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, 10, 0, 0) + time::Duration::hours(hours)
 }
 
 /// A migrated in-memory database and a gate carrying the shipped window.

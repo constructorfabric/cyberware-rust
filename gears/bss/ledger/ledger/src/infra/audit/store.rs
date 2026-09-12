@@ -23,7 +23,6 @@
 //! abort the loser (which retries from a fresh tip); the `tenant_id` primary key
 //! makes the `ON CONFLICT` upsert itself atomic regardless.
 
-use chrono::{DateTime, Utc};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::DbError;
@@ -34,6 +33,7 @@ use crate::domain::audit_chain::{AuditHashInput, audit_genesis_prev_hash, audit_
 use crate::infra::audit::event_type::AuditEventType;
 use crate::infra::posting::service::infra;
 use crate::infra::storage::entity::{audit_chain_state, secured_audit_record};
+use time::OffsetDateTime;
 
 /// Map a [`ScopeError`] to [`DbError`] **preserving the inner `sea_orm::DbErr`
 /// variant** (mirrors `period_close::scope_to_db`). This is load-bearing for
@@ -84,10 +84,10 @@ impl SecuredAuditStore {
         reason_code: Option<&str>,
         before_after: &serde_json::Value,
         correlation_id: Option<Uuid>,
-        retain_until: Option<DateTime<Utc>>,
+        retain_until: Option<OffsetDateTime>,
     ) -> Result<Uuid, DbError> {
         let audit_id = Uuid::now_v7();
-        let at_utc = Utc::now();
+        let at_utc = OffsetDateTime::now_utc();
 
         // 1. Read the current tip (None at genesis).
         let tip = self.read_tip(txn, scope, tenant).await?;

@@ -1,15 +1,15 @@
-//! The approval surface's pure pieces: the state filter, the digest rendering,
+//! The approval surface's pure pieces: the digest rendering,
 //! the pinned-content projection, and the one rule this surface **cannot**
 //! enforce.
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
     MaterialityView, PinnedContentView, hex, region_grant_of_this_surface,
-    report_region_grant_transport, state_filter,
+    report_region_grant_transport,
 };
-use crate::domain::approval::{ApprovalState, content_hash};
+use crate::domain::approval::content_hash;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::materiality::delta::MoveScale;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{MaterialityReason, MaterialityVerdict, TrippedRow};
@@ -23,9 +23,10 @@ use crate::domain::scope_key::{
 };
 use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
 use crate::infra::approval::RegionGrant;
+use time::OffsetDateTime;
 
-fn instant(day: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, day, 0, 0, 0).unwrap()
+fn instant(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, day, 0, 0, 0)
 }
 
 /// The scope key the window group below is filed under.
@@ -46,7 +47,7 @@ fn shape() -> PlanShape {
     let mut shape = PlanShape::new(
         PlanId::new(Uuid::from_u128(0x9_1a4)),
         3,
-        Utc.with_ymd_and_hms(2026, 8, 4, 10, 0, 0).unwrap(),
+        utc_ymd_hms(2026, 8, 4, 10, 0, 0),
     );
     shape.sku_id = Some(Uuid::from_u128(0x5_c1));
     shape.plan_tier = Some("gold".to_owned());
@@ -60,35 +61,6 @@ fn shape() -> PlanShape {
         )],
     }];
     shape
-}
-
-#[test]
-fn an_absent_state_filter_is_every_state_and_not_none() {
-    // A caller that named no filter asked for everything. Answering an empty
-    // page would be a filter nobody applied — and the queue's whole purpose is
-    // "pending **and** decided".
-    assert!(state_filter(None).expect("no filter").is_empty());
-}
-
-#[test]
-fn a_named_state_narrows_and_an_unknown_one_is_refused() {
-    assert_eq!(
-        state_filter(Some("submitted")).expect("a known token"),
-        vec![ApprovalState::Submitted]
-    );
-    state_filter(Some("pending")).expect_err("`pending` is not a state of this machine");
-}
-
-#[test]
-fn every_state_the_machine_has_is_reachable_through_the_filter() {
-    // Ranged over `ALL` rather than over four literals: a state added later
-    // arrives here rather than being silently unfilterable.
-    for state in ApprovalState::ALL {
-        assert_eq!(
-            state_filter(Some(state.as_str())).expect("a known token"),
-            vec![*state]
-        );
-    }
 }
 
 #[test]

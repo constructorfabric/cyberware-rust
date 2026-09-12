@@ -20,6 +20,7 @@ pub mod exceptions;
 pub mod fx;
 pub mod fx_revaluation_mode;
 pub mod journal_entries;
+pub(crate) mod odata_list;
 pub mod payers;
 pub mod payments;
 pub mod posting_policy;

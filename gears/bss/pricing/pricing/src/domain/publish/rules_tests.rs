@@ -3,7 +3,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
@@ -14,6 +13,7 @@ use super::{
 use crate::domain::bundle_rules::BUNDLE_TAX_BASIS_MIXED;
 use crate::domain::concurrency::RowVersion;
 use crate::domain::contracts::{BillingAnchorPolicy, ProrationBasis, ProrationContract};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use crate::domain::plan_rules::{
@@ -29,17 +29,16 @@ use crate::domain::scope_key::{
 };
 use crate::domain::tax_display::{RegionReadiness, RegionTaxReadiness, TaxDisplayPolicy};
 use crate::domain::taxonomy::REGION_UNKNOWN;
-use crate::domain::taxonomy::ROUNDING_POLICY_UNKNOWN;
+use crate::domain::taxonomy::{GL_CODE_UNKNOWN, ROUNDING_POLICY_UNKNOWN};
 use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 fn plan() -> PlanId {
     PlanId::new(Uuid::from_u128(0x91a4))
 }
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, 12, 0, 0)
 }
 
 fn params(default_rounding_policy: Option<&str>) -> PublishRuleParams {
@@ -405,6 +404,52 @@ fn a_blank_tenant_default_is_no_default_and_the_rows_are_still_judged() {
     }
 }
 
+/// The descriptor's `glCode` is judged against the declared GL-code vocabulary
+/// at publish, and **only** once one is declared (D-356).
+///
+/// Three runs over one clean plan, because each alone is satisfied by a wrong
+/// registration: a rule that refused every code passes the first, a rule nobody
+/// registered passes the second and third, and a rule that treated the empty set
+/// as "nothing is declared, so nothing is allowed" passes the first two and fails
+/// every existing catalog on landing.
+#[test]
+fn a_gl_code_outside_the_declared_vocabulary_is_refused_at_publish_and_only_then() {
+    let shape = clean_plan();
+    // `clean_plan` authors `4000`.
+    assert_eq!(
+        shape
+            .descriptor_set
+            .as_ref()
+            .and_then(|set| set.gl_code.as_deref()),
+        Some("4000"),
+        "the fixture premise this case reads"
+    );
+
+    let refused = run_publish_rules(
+        &shape,
+        &params(Some("half_up"))
+            .with_declared_gl_codes(declared_policies(&["4000-REV", "4010-TAX"])),
+    );
+    assert_eq!(codes(&refused), [GL_CODE_UNKNOWN]);
+
+    let declared = run_publish_rules(
+        &shape,
+        &params(Some("half_up")).with_declared_gl_codes(declared_policies(&["4000", "4010-TAX"])),
+    );
+    assert!(
+        declared.is_publishable(),
+        "the declared code clears the rule: {:?}",
+        codes(&declared)
+    );
+
+    let unconstrained = run_publish_rules(&shape, &params(Some("half_up")));
+    assert!(
+        unconstrained.is_publishable(),
+        "a tenant that declared no GL codes has not opted in: {:?}",
+        codes(&unconstrained)
+    );
+}
+
 #[test]
 fn a_tenant_default_outside_the_declared_vocabulary_is_refused() {
     // The default escaped **both** rules at once, which is why nothing caught it.
@@ -590,6 +635,7 @@ fn clean_plan() -> PlanShape {
     shape.phases = PhaseGraph::new(vec![PlanPhase {
         phase_id: terminal,
         kind: PhaseKind::Evergreen,
+        display_name: None,
         ordinal: 0,
         converts_to_phase_id: None,
         phase_duration_days: None,
@@ -1284,6 +1330,9 @@ const FOUNDATION_REGISTERED: &[&str] = &[
     // axis and `rounding_policy_ref` resolves through the tenant default.
     "inst-tx-region",
     "inst-tx-rounding",
+    // D-356's GL-code vocabulary: the descriptor's one `glCode` against the
+    // tenant's declared set, beside the other two vocabulary rules.
+    "inst-ds-glcode",
     // Slice 4's tax-display pair: `TAX_BASIS_INCOMPLETE` and
     // `TAX_BASIS_MIXED_MARKET`.
     "inst-td-policy",

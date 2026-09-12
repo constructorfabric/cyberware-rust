@@ -56,6 +56,7 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use bss_pricing::api::rest::history::{ApiState, router};
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::price_record::PriceContent;
 use bss_pricing::domain::price_row::{ModelKind, PriceRow};
@@ -64,7 +65,7 @@ use bss_pricing::domain::scope_key::{
 };
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewPriceDraft, PriceRepo};
-use chrono::{TimeZone, Utc};
+
 use sea_orm_migration::MigratorTrait;
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit::api::canonical_prelude::CanonicalError;
@@ -301,7 +302,7 @@ async fn seed_row(db: &DBProvider<DbError>, tenant: Uuid, actor: Uuid, region: &
     let prices = PriceRepo::new(db.clone());
     let mut row = PriceRow::new(ChargeKind::Recurring, Some(ModelKind::Flat));
     row.amount_minor = Some(MinorAmount::new(9_900).expect("a non-negative amount"));
-    let at = Utc.with_ymd_and_hms(2026, 8, 8, hour, 0, 0).unwrap();
+    let at = utc_ymd_hms(2026, 8, 8, hour, 0, 0);
     prices
         .create_draft(
             &AccessScope::for_tenant(tenant),
@@ -468,6 +469,63 @@ async fn the_cursor_the_wire_hands_back_opens_the_next_page() {
     );
 }
 
+/// Default commit order is oldest-first; `$orderby=authored_at desc` reverses
+/// and the cursor continues that order without repeating `$orderby`.
+#[tokio::test]
+async fn history_orderby_desc_reverses_and_the_cursor_continues_it() {
+    let tenant = Uuid::now_v7();
+    let db = provider().await;
+    seed_row(&db, tenant, Uuid::now_v7(), "eu", 10).await;
+    seed_row(&db, tenant, Uuid::now_v7(), "us", 11).await;
+
+    let enforcer = PolicyEnforcer::new(Arc::new(FlatInResolver {
+        allowed: vec![tenant],
+    }));
+    let all = body_json(
+        get_at(
+            history_router(db.clone(), enforcer.clone(), Some(ctx_for(tenant))),
+            "",
+        )
+        .await,
+    )
+    .await;
+    let entries = all["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2);
+    let oldest = entries[0]["price_id"].clone();
+    let newest = entries[1]["price_id"].clone();
+    assert_ne!(oldest, newest);
+
+    let desc = body_json(
+        get_at(
+            history_router(db.clone(), enforcer.clone(), Some(ctx_for(tenant))),
+            "?$orderby=authored_at%20desc&limit=1",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        desc["entries"][0]["price_id"], newest,
+        "desc starts at the newest row: {desc}"
+    );
+    let cursor = desc["next_cursor"]
+        .as_str()
+        .expect("a desc page with more hands back a cursor")
+        .to_owned();
+
+    let next = body_json(
+        get_at(
+            history_router(db, enforcer, Some(ctx_for(tenant))),
+            &format!("?limit=1&cursor={cursor}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        next["entries"][0]["price_id"], oldest,
+        "the cursor continues the desc walk: {next}"
+    );
+}
+
 /// **The scope that filters is the PDP's, not the subject's tenant** — and this
 /// case exists because a probe found nothing without it.
 ///
@@ -589,24 +647,43 @@ async fn the_export_chunk_is_the_same_walk_the_read_serves() {
     )
     .await;
     assert_eq!(
-        chunk, read,
-        "one chunk of the export is one page of the read, cursor included: {chunk}"
+        chunk["entries"], read["entries"],
+        "one chunk of the export is the same records the read serves: {chunk}"
     );
 
-    let cursor = chunk["next_cursor"]
+    // GET mints an OData CursorV1; export still mints the history-engine token
+    // (`infra::history::encode`). Same walk, different encodings — each token
+    // must open the same next record; the bytes are not a shared contract.
+    let export_cursor = chunk["next_cursor"]
         .as_str()
         .expect("a chunk with more behind it hands back a cursor")
         .to_owned();
-    let next = body_json(
+    let read_cursor = read["next_cursor"]
+        .as_str()
+        .expect("a read page with more behind it hands back a cursor")
+        .to_owned();
+    let export_next = body_json(
         post_at(
-            history_router(db, enforcer, Some(ctx_for(tenant))),
-            &format!("?limit=1&cursor={cursor}"),
+            history_router(db.clone(), enforcer.clone(), Some(ctx_for(tenant))),
+            &format!("?limit=1&cursor={export_cursor}"),
         )
         .await,
     )
     .await;
+    let read_next = body_json(
+        get_at(
+            history_router(db, enforcer, Some(ctx_for(tenant))),
+            &format!("?limit=1&cursor={read_cursor}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        export_next["entries"][0]["price_id"], read_next["entries"][0]["price_id"],
+        "each surface's token must open the same next record: export={export_next} read={read_next}"
+    );
     assert_ne!(
-        next["entries"][0]["price_id"], chunk["entries"][0]["price_id"],
-        "and the token the export hands back opens the next chunk, not the same one: {next}"
+        export_next["entries"][0]["price_id"], chunk["entries"][0]["price_id"],
+        "and that next record is not the one already served: {export_next}"
     );
 }

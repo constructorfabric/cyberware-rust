@@ -14,7 +14,7 @@
 //! the next source instead of storing the bad value.
 
 use bss_ledger_sdk::RateProviderError;
-use chrono::{DateTime, TimeDelta, Utc};
+use time::{Duration, OffsetDateTime};
 
 /// How far ahead of our own clock a publication timestamp may legitimately sit.
 ///
@@ -36,19 +36,20 @@ pub const MAX_FUTURE_SKEW_HOURS: i64 = 26;
 /// Reject a document whose publication time runs more than
 /// [`MAX_FUTURE_SKEW_HOURS`] ahead of `now`.
 ///
-/// `now` is a parameter rather than an internal `Utc::now()` so the bound is
-/// directly testable; callers on the fetch path pass `Utc::now()`.
+/// `now` is a parameter rather than an internal `OffsetDateTime::now_utc()` so
+/// the bound is directly testable; callers on the fetch path pass
+/// `OffsetDateTime::now_utc()`.
 ///
 /// # Errors
 /// [`RateProviderError::Internal`] naming both timestamps when `as_of` is beyond
 /// the bound — matching every other parse-stage rejection in the source plugins,
 /// and keeping a misbehaving feed visible on `fx_provider_fetch_errors_total`.
 pub fn reject_future_publication_time(
-    as_of: DateTime<Utc>,
-    now: DateTime<Utc>,
+    as_of: OffsetDateTime,
+    now: OffsetDateTime,
     provider_id: &str,
 ) -> Result<(), RateProviderError> {
-    let bound = now + TimeDelta::hours(MAX_FUTURE_SKEW_HOURS);
+    let bound = now + Duration::hours(MAX_FUTURE_SKEW_HOURS);
     if as_of <= bound {
         return Ok(());
     }

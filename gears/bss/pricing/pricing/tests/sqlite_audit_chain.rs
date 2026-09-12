@@ -82,11 +82,13 @@
 use bss_pricing::domain::audit::{
     AuditAction, AuditRecord, AuditSubjectKind, audit_row_hash, genesis_prev_hash,
 };
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::entity::audit_log;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewAuditEntry, audit_repo};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::{ColumnTrait, Condition, DatabaseConnection, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
@@ -120,10 +122,9 @@ async fn provider() -> DBProvider<DbError> {
 /// the second would leave the one column whose round trip could silently lose
 /// precision (`timestamptz` on Postgres, `text` on `SQLite`) untested by the
 /// re-walk that exists to catch exactly that.
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 17, 42)
-        .unwrap()
-        .checked_add_signed(chrono::TimeDelta::microseconds(123_456))
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 17, 42)
+        .checked_add(time::Duration::microseconds(123_456))
         .expect("a fixed instant plus a fixed offset")
 }
 

@@ -41,6 +41,7 @@ use crate::domain::error::DomainError;
 use crate::domain::fx::revaluation_mode::RevaluationMode;
 use crate::infra::fx::revaluation_run::{ScopeOutcome, ScopeStatus, UnrealizedRevaluationRun};
 use crate::infra::storage::repo::{FxRepo, FxRevaluationModeRepo, NewFxRate};
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the FX operations.
 const TAG: &str = "BSS Ledger FX";
@@ -314,7 +315,7 @@ async fn trigger_revaluation(
     // → every scope reports `disabled` (no double-count); Mode B runs the revaluation.
     let revalue = state
         .fx_revaluation_mode
-        .read_effective_mode(&scope, tenant_id, chrono::Utc::now())
+        .read_effective_mode(&scope, tenant_id, OffsetDateTime::now_utc())
         .await
         .map_err(|e| {
             CanonicalError::from(DomainError::Internal(format!(

@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::{chain_checkpoint, journal_entry};
+use time::OffsetDateTime;
 
 /// Writer over `bss.chain_checkpoint`. Stateless over one [`DBProvider`]
 /// (mirrors [`crate::infra::audit::retrieval::AuditRetrievalReader`]).
@@ -103,7 +104,7 @@ impl CheckpointWriter {
             covered_entry_count: Set(covered_entry_count),
             // Signing / WORM is post-MVP (Bucket A) — an MVP checkpoint is unsigned.
             signature: Set(None),
-            created_at_utc: Set(chrono::Utc::now()),
+            created_at_utc: Set(OffsetDateTime::now_utc()),
         };
 
         chain_checkpoint::Entity::insert(am.clone())

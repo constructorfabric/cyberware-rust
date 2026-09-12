@@ -3,8 +3,9 @@
 //! carry the typed literals, stored as their canonical strings.
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -42,7 +43,7 @@ pub struct NewEntry {
     pub source_business_id: String,
     pub reverses_entry_id: Option<Uuid>,
     pub reverses_period_id: Option<String>,
-    pub posted_at_utc: DateTime<Utc>,
+    pub posted_at_utc: OffsetDateTime,
     pub effective_at: NaiveDate,
     pub origin: String,
     pub posted_by_actor_id: Uuid,
@@ -109,7 +110,7 @@ pub struct EntryRecord {
     pub source_business_id: String,
     pub reverses_entry_id: Option<Uuid>,
     pub reverses_period_id: Option<String>,
-    pub posted_at_utc: DateTime<Utc>,
+    pub posted_at_utc: OffsetDateTime,
     pub effective_at: NaiveDate,
     pub origin: String,
     pub posted_by_actor_id: Uuid,

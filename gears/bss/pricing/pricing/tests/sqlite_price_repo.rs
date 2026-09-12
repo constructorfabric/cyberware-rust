@@ -46,6 +46,7 @@ use bss_pricing::domain::contracts::{
     AnchorDay, BillingAnchorPolicy, ProrationBasis, ProrationContract,
 };
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use bss_pricing::domain::price_record::{PriceContent, PriceRecord};
@@ -60,9 +61,11 @@ use bss_pricing::domain::scope_key::{
 use bss_pricing::domain::tax_display::{RegionReadiness, RegionTaxReadiness};
 use bss_pricing::infra::storage::entity::{audit_log, price, price_tier_band, price_window};
 use bss_pricing::infra::storage::migrations::Migrator;
+use bss_pricing::infra::storage::repo::price_repo::aggregate_authoring_rows_for_plans;
 use bss_pricing::infra::storage::repo::{NewPriceDraft, PriceRepo};
 use bss_pricing::infra::storage::{RepoError, repo_failure};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
@@ -137,8 +140,8 @@ fn plan() -> PlanId {
     PlanId::new(Uuid::from_u128(0x9_1a4))
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, hour, 0, 0)
 }
 
 fn money(units: i64) -> MinorAmount {
@@ -204,7 +207,7 @@ fn new_subscriptions_key(charge_kind: ChargeKind) -> ScopeKey {
 /// `price_eligibility = existing_grandfathered`, enforced by the domain
 /// constructor and again by `chk_pricing_price_cohort_eligibility`. So the two
 /// axes move together here, which is what a real cutover does.
-fn grandfathered_key(charge_kind: ChargeKind, cutover: DateTime<Utc>) -> ScopeKey {
+fn grandfathered_key(charge_kind: ChargeKind, cutover: OffsetDateTime) -> ScopeKey {
     ScopeKey::new(
         plan(),
         CurrencyCode::new("USD").expect("three letters"),
@@ -972,7 +975,7 @@ async fn an_authored_instant_finer_than_the_quantum_is_refused_on_both_write_pat
     // silence, which is exactly how a truncating producer and a non-truncating
     // consumer end up agreeing until the day they do not (D-144).
     let mut content = flat_content();
-    content.grandfather_until = Some(at(23) + chrono::TimeDelta::microseconds(1));
+    content.grandfather_until = Some(at(23) + time::Duration::microseconds(1));
     let err = repo
         .create_draft(
             &scope,
@@ -1026,7 +1029,7 @@ async fn an_authored_instant_finer_than_the_quantum_is_refused_on_both_write_pat
     // leave the store one `PATCH` away from a column holding an instant finer
     // than the one the catalog compares at — and `timestamptz` takes it in
     // silence, so nothing downstream would ever report it.
-    content.grandfather_until = Some(at(20) + chrono::TimeDelta::microseconds(1));
+    content.grandfather_until = Some(at(20) + time::Duration::microseconds(1));
     let err = repo
         .update_draft(
             &scope,
@@ -1072,7 +1075,7 @@ async fn an_authored_instant_finer_than_the_quantum_is_refused_on_both_write_pat
         PhaseId::new(Uuid::from_u128(0xfa_5e)),
         PriceEligibility::ExistingGrandfathered,
         ChargeKind::Recurring,
-        Cohort::Generation(at(9) + chrono::TimeDelta::nanoseconds(1)),
+        Cohort::Generation(at(9) + time::Duration::nanoseconds(1)),
     )
     .expect_err("a sub-millisecond cutover cannot become an axis value");
     assert!(matches!(err, DomainError::TimestampPrecisionExceeded(_)));
@@ -3862,7 +3865,7 @@ async fn the_keyset_page_walks_the_same_total_order_the_list_declares() {
 fn stamp() -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: uuid::Uuid::from_u128(0xac_10),
-        recorded_at: chrono::Utc::now(),
+        recorded_at: OffsetDateTime::now_utc(),
         correlation_id: TEST_CORRELATION,
     }
 }
@@ -4565,7 +4568,7 @@ async fn cutover_rows(
     predecessor: Uuid,
     successor: (Uuid, RowVersion),
     copy: (Uuid, RowVersion),
-    cutover_at: DateTime<Utc>,
+    cutover_at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let scope = scope.clone();
     let (_, outcome) = provider
@@ -4608,7 +4611,7 @@ async fn seeded_cutover(
     provider: &DBProvider<DbError>,
     scope: &AccessScope,
     meter: Option<&str>,
-    cutover_at: DateTime<Utc>,
+    cutover_at: OffsetDateTime,
 ) -> (Uuid, (Uuid, RowVersion), (Uuid, RowVersion)) {
     let key = usage_key(meter, "");
     let predecessor = Uuid::from_u128(0xc0_01);
@@ -4930,7 +4933,7 @@ async fn the_cross_plane_commit_moves_three_windows_and_three_rows_together() {
     // instant's generation: the row-plane cases can use any instant, but here the
     // window the shorten moves and the cohort the copy carries are two halves of
     // one act and cannot be built from two different clocks.
-    let cutover_at = common::coverage_from() + chrono::Duration::days(3);
+    let cutover_at = common::coverage_from() + time::Duration::days(3);
     let (predecessor, successor, copy) = Box::pin(seeded_cutover(
         &repo,
         &provider,
@@ -5044,7 +5047,7 @@ fn market_key_in(currency: &str, region: &str) -> ScopeKey {
 /// exclusion unobservable — removing it from the query changed no count, so the
 /// clause was asserted by a fixture that could not reach the state it claimed to
 /// cover. Found by a probe that reddened **nothing**.
-fn grandfathered_market_key(region: &str, cutover: DateTime<Utc>) -> ScopeKey {
+fn grandfathered_market_key(region: &str, cutover: OffsetDateTime) -> ScopeKey {
     ScopeKey::new(
         plan(),
         CurrencyCode::new("USD").expect("three letters"),
@@ -5845,5 +5848,153 @@ async fn a_supersession_whose_tenant_lost_its_default_is_refused_at_the_commit()
         LifecycleState::Published.as_str(),
         "and the predecessor is still the key's current row - a refusal after the flip would \
          leave the key with no published row at all"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-360: the list page's row facts, one grouped read for the whole page.
+// ---------------------------------------------------------------------------
+
+/// A key on `plan` in `currency`, on its own phase so several rows of one plan
+/// and one currency do not collide on the scope key.
+fn key_on(plan: PlanId, currency: &str, phase: u128, charge_kind: ChargeKind) -> ScopeKey {
+    ScopeKey::new(
+        plan,
+        CurrencyCode::new(currency).expect("three letters"),
+        Region::new("EU").expect("a non-blank region"),
+        PhaseId::new(Uuid::from_u128(phase)),
+        PriceEligibility::AllSubscriptions,
+        charge_kind,
+        Cohort::None,
+    )
+    .expect("all_subscriptions pairs with cohort none")
+}
+
+/// A recurring row that names **no** model kind - the "tiered (unspecified)"
+/// row the Studio counts and does not list as a model.
+fn kindless_content() -> PriceContent {
+    let mut row = PriceRow::new(ChargeKind::Recurring, None);
+    row.amount_minor = Some(money(500));
+    PriceContent {
+        row,
+        ..flat_content()
+    }
+}
+
+/// The three facts the list page carries per plan (D-360): the count is over
+/// `draft` + `published` rows only, the two vocabularies are distinct and
+/// sorted, a `NULL` model kind counts but names no kind, and a plan with no
+/// authoring row has no entry at all.
+///
+/// One grouped read answers for every plan asked about, which is the point: the
+/// Studio derived these by reading every plan's rows, one request each.
+#[tokio::test]
+async fn the_page_aggregate_counts_authoring_rows_and_lists_kinds_and_currencies_sorted() {
+    let (repo, provider) = harness().await;
+    let scope = AccessScope::for_tenant(tenant());
+    let a = PlanId::new(Uuid::from_u128(0xa1));
+    let b = PlanId::new(Uuid::from_u128(0xb1));
+    let c = PlanId::new(Uuid::from_u128(0xc1));
+
+    // Plan A: draft EUR flat, published USD graduated, published EUR flat,
+    // superseded EUR flat.
+    let a_rows = [
+        (
+            0xa_01_u128,
+            "EUR",
+            0xf_01_u128,
+            flat_content(),
+            LifecycleState::Draft,
+        ),
+        (
+            0xa_02,
+            "USD",
+            0xf_02,
+            graduated_content(),
+            LifecycleState::Published,
+        ),
+        (
+            0xa_03,
+            "EUR",
+            0xf_03,
+            flat_content(),
+            LifecycleState::Published,
+        ),
+        (
+            0xa_04,
+            "EUR",
+            0xf_04,
+            flat_content(),
+            LifecycleState::Superseded,
+        ),
+    ];
+    for (price, currency, phase, mut content, state) in a_rows {
+        // The graduated fixture carries a grandfathering horizon, which an
+        // `all_subscriptions` key refuses (`GrandfatherHorizonOffClass`); the
+        // horizon is not what this case is about.
+        content.grandfather_until = None;
+        let charge_kind = content.row.charge_kind;
+        let price_id = Uuid::from_u128(price);
+        repo.create_draft(
+            &scope,
+            tenant(),
+            draft(price_id, key_on(a, currency, phase, charge_kind), content),
+        )
+        .await
+        .expect("author plan A's row");
+        // `published` first: the append-only trigger sanctions `draft -> published`
+        // and `published -> superseded`, never the jump.
+        if state != LifecycleState::Draft {
+            flip_state(&provider, &scope, price_id, LifecycleState::Published).await;
+        }
+        if state == LifecycleState::Superseded {
+            flip_state(&provider, &scope, price_id, state).await;
+        }
+    }
+    // Plan B: one published GBP row with no model kind.
+    let b_price = Uuid::from_u128(0xb_01);
+    repo.create_draft(
+        &scope,
+        tenant(),
+        draft(
+            b_price,
+            key_on(b, "GBP", 0xf_11, ChargeKind::Recurring),
+            kindless_content(),
+        ),
+    )
+    .await
+    .expect("author plan B's row");
+    flip_state(&provider, &scope, b_price, LifecycleState::Published).await;
+    // Plan C: nothing.
+
+    let conn = provider.conn().expect("conn");
+    let out = aggregate_authoring_rows_for_plans(&conn, &scope, tenant(), &[a, b, c])
+        .await
+        .expect("aggregate");
+
+    let a_agg = &out[&a];
+    assert_eq!(
+        a_agg.price_row_count, 3,
+        "superseded is not an authoring row: {a_agg:?}"
+    );
+    assert_eq!(a_agg.model_kinds, ["flat", "graduated"], "sorted, distinct");
+    assert_eq!(a_agg.currencies, ["EUR", "USD"], "sorted, distinct");
+    let b_agg = &out[&b];
+    assert_eq!(b_agg.price_row_count, 1);
+    assert!(
+        b_agg.model_kinds.is_empty(),
+        "a NULL model_kind is the absence of one, not a kind: {b_agg:?}"
+    );
+    assert_eq!(b_agg.currencies, ["GBP"]);
+    assert!(
+        !out.contains_key(&c),
+        "a plan with no rows has no entry; the caller renders zero and empty"
+    );
+    assert!(
+        aggregate_authoring_rows_for_plans(&conn, &scope, tenant(), &[])
+            .await
+            .expect("aggregate nothing")
+            .is_empty(),
+        "an empty page asks the store nothing"
     );
 }

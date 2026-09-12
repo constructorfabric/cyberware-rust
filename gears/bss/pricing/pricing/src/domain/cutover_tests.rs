@@ -1,13 +1,13 @@
 //! Tests for the grandfathering cutover's compose-time refusals.
 
-use chrono::{DateTime, TimeZone, Utc};
-
 use uuid::Uuid;
 
 use super::{
     CUTOVER_INSTANT_PASSED, check_cutover_instant, compose_cutover_windows, grandfathered_copy_key,
 };
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::money::CurrencyCode;
 use crate::domain::scope_key::{
     ChargeKind, Cohort, DimensionKey, Meter, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
@@ -17,11 +17,10 @@ use crate::domain::supersession::{
     changeover_floor, check_changeover_instant,
 };
 use crate::domain::window::{WindowInterval, WindowState};
+use time::OffsetDateTime;
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0)
-        .single()
-        .expect("a fixed instant")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 6, 12, 0, 0)
 }
 
 fn message(err: &DomainError) -> String {
@@ -50,14 +49,14 @@ fn an_instant_inside_the_batching_delay_is_refused_at_commit() {
     // and warm lag activates the successor's window while its row is not yet
     // addressable at any completed `CatalogVersion`, so renewals and arrears on
     // the key just closed fail transiently.
-    let inside = now() + MAX_BATCHING_DELAY - chrono::Duration::seconds(1);
+    let inside = now() + MAX_BATCHING_DELAY - time::Duration::seconds(1);
 
     let err = check_cutover_instant(inside, now(), ChangeoverMoment::Commit)
         .expect_err("an instant inside the batching delay must be refused at commit");
 
     assert!(matches!(err, DomainError::CutoverInstantPassed(_)));
     assert!(
-        message(&err).contains(&MAX_BATCHING_DELAY.num_seconds().to_string()),
+        message(&err).contains(&MAX_BATCHING_DELAY.whole_seconds().to_string()),
         "the remedy formats the constant rather than restating the number: {}",
         message(&err)
     );
@@ -67,7 +66,7 @@ fn an_instant_inside_the_batching_delay_is_refused_at_commit() {
 fn an_instant_clear_of_the_delay_commits() {
     assert!(
         check_cutover_instant(
-            now() + MAX_BATCHING_DELAY + chrono::Duration::seconds(1),
+            now() + MAX_BATCHING_DELAY + time::Duration::seconds(1),
             now(),
             ChangeoverMoment::Commit,
         )
@@ -82,7 +81,7 @@ fn the_two_units_share_one_floor_and_answer_two_codes() {
     // So the bound is one spelling — a second copy is how two mechanisms come to
     // disagree about one SLO — while the code stays each unit's own, because an
     // operator reading a refusal is told which act they were performing.
-    let inside = now() + MAX_BATCHING_DELAY - chrono::Duration::seconds(1);
+    let inside = now() + MAX_BATCHING_DELAY - time::Duration::seconds(1);
 
     let cutover = check_cutover_instant(inside, now(), ChangeoverMoment::Commit)
         .expect_err("the cutover refuses");
@@ -139,16 +138,14 @@ fn the_two_units_share_one_floor_and_answer_two_codes() {
 // The three window operations (`inst-co-shorten` / `inst-co-copy` / `inst-co-successor`)
 // ---------------------------------------------------------------------------
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 6, hour, 0, 0)
-        .single()
-        .expect("a fixed future instant")
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 6, hour, 0, 0)
 }
 
 fn window(
     id: u128,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
     state: WindowState,
 ) -> NamedWindow {
     NamedWindow {
@@ -187,7 +184,7 @@ fn a_dormant_key_is_refused_by_the_cutovers_own_code() {
 
     assert!(matches!(err, DomainError::CutoverGap(_)), "{err:?}");
     assert!(
-        message(&err).contains("dormant") && message(&err).contains(&at(10).to_rfc3339()),
+        message(&err).contains("dormant") && message(&err).contains(&format_rfc3339(at(10))),
         "the refusal names the instant with no coverage: {}",
         message(&err)
     );
@@ -326,7 +323,7 @@ fn a_generation_that_already_exists_is_refused_at_compose() {
 
     assert!(matches!(err, DomainError::DuplicateScopeKey(_)), "{err:?}");
     assert!(
-        message(&err).contains(&at(10).to_rfc3339()),
+        message(&err).contains(&format_rfc3339(at(10))),
         "the refusal names the instant already taken: {}",
         message(&err)
     );

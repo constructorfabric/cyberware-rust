@@ -477,6 +477,9 @@ impl From<DomainError> for CanonicalError {
             D::TaxonomyValueInUse(detail) => {
                 aborted(detail, crate::domain::taxonomy::TAXONOMY_VALUE_IN_USE)
             }
+            D::TaxonomyValueExists(detail) => {
+                aborted(detail, crate::domain::taxonomy::TAXONOMY_VALUE_EXISTS)
+            }
             D::PriceRowAbsent(detail) => PlanResource::not_found(detail)
                 .with_resource(crate::api::rest::preview::PRICE_ROW_ABSENT)
                 .create(),

@@ -43,6 +43,7 @@ use bss_pricing::domain::concurrency::RowVersion;
 use bss_pricing::domain::contracts::{
     AnchorDay, BillingAnchorPolicy, ProrationBasis, ProrationContract,
 };
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::CurrencyCode;
 use bss_pricing::domain::money::{MinorAmount, RateMinor};
@@ -77,7 +78,8 @@ use bss_pricing::infra::storage::repo::{
 use bss_pricing::infra::window::WindowService;
 use bss_pricing_sdk::catalog_version::CatalogVersion;
 use bss_pricing_sdk::catalog_version_registry::{CatalogVersionRegistryV1, PendingVersionRef};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
@@ -146,10 +148,7 @@ const TEST_CORRELATION: uuid::Uuid = uuid::Uuid::from_u128(0x_c0_11_a7_10);
 /// doc), and `seed_stamp`'s `SEED_ACTOR` would make submitter and approver the same
 /// principal wherever the approver is a third identity — which `inst-tp-distinct`
 /// refuses on identity rather than on role.
-pub fn stamp_of(
-    actor: uuid::Uuid,
-    when: chrono::DateTime<chrono::Utc>,
-) -> bss_pricing::domain::audit::AuditStamp {
+pub fn stamp_of(actor: uuid::Uuid, when: OffsetDateTime) -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -581,6 +580,9 @@ impl Harness {
             compensation,
         );
         let governance = Arc::new(GovernanceState {
+            participants: bss_pricing::infra::approval_participants::ApprovalParticipants::new(
+                Arc::new(toolkit::ClientHub::new()),
+            ),
             apply_lane: apply_lane.clone(),
             db: db.clone(),
             plans: PlanRepo::new(db.clone()),
@@ -649,6 +651,7 @@ impl Harness {
         });
         let frontier = Arc::new(FrontierState {
             pin_frontier: PinFrontierRepo::new(db.clone()),
+            db: db.clone(),
         });
         let history = Arc::new(HistoryState {
             history: bss_pricing::infra::history::HistoryExporter::new(db.clone()),
@@ -744,7 +747,11 @@ impl Harness {
     /// which is right for the authoring suites and would make a submitter and
     /// an approver accidentally distinct here — a self-approval test that could
     /// never stage a self-approval.
-    fn client_as(&self, resolver: Arc<dyn AuthZResolverApi>, ctx: Option<(Uuid, Uuid)>) -> Client {
+    pub fn client_as(
+        &self,
+        resolver: Arc<dyn AuthZResolverApi>,
+        ctx: Option<(Uuid, Uuid)>,
+    ) -> Client {
         let openapi = OpenApiRegistryImpl::new();
         let router = bss_pricing::api::rest::frontier::router(Arc::clone(&self.frontier), &openapi)
             // Slice 12's bulk import and its history read. Both merged here
@@ -820,6 +827,10 @@ impl Harness {
                 &openapi,
             ))
             .merge(bss_pricing::api::rest::rounding_policies::router(
+                Arc::clone(&self.state),
+                &openapi,
+            ))
+            .merge(bss_pricing::api::rest::gl_codes::router(
                 Arc::clone(&self.state),
                 &openapi,
             ))
@@ -1256,6 +1267,7 @@ impl Harness {
                 vec![PlanPhase {
                     phase_id: seeded_phase(),
                     kind: PhaseKind::Evergreen,
+                    display_name: None,
                     ordinal: 0,
                     converts_to_phase_id: None,
                     phase_duration_days: None,
@@ -1585,8 +1597,8 @@ pub fn violation_for(body: &serde_json::Value, subject: &str) -> Option<String> 
 }
 
 /// A seeded instant, quantized to the millisecond the catalog compares at.
-pub fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+pub fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 /// A draft plan carrying enough shape to be recognizable, seeded straight
@@ -1663,6 +1675,7 @@ pub async fn seed_current_plan_with_phase(harness: &Harness, plan_id: Uuid) {
             vec![PlanPhase {
                 phase_id: seeded_phase(),
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -2016,7 +2029,7 @@ pub async fn seed_price_keyed_with_horizon(
     region: &str,
     price_eligibility: PriceEligibility,
     cohort: Cohort,
-    grandfather_until: Option<DateTime<Utc>>,
+    grandfather_until: Option<OffsetDateTime>,
 ) -> PriceRecord {
     let key = ScopeKey::new(
         PlanId::new(plan_id),
@@ -2290,12 +2303,9 @@ pub async fn retire_customer_group(harness: &Harness, value: &str) {
 /// ages past it.
 pub async fn seed_window(harness: &Harness, price_id: Uuid) -> Uuid {
     /// Far enough out that no wall clock reaches it and no sweep activates the
-    /// row mid-suite. A **fact**, not a date derived from `Utc::now()`.
+    /// row mid-suite. A **fact**, not a date derived from `OffsetDateTime::now_utc()`.
     const SEEDED_WINDOW_YEAR: i32 = 2099;
-    let effective_from =
-        chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, SEEDED_WINDOW_YEAR, 1, 1, 0, 0, 0)
-            .single()
-            .expect("a real instant");
+    let effective_from = utc_ymd_hms(SEEDED_WINDOW_YEAR, 1, 1, 0, 0, 0);
     let window_id = Uuid::now_v7();
     let conn = harness.db.conn().expect("conn");
     bss_pricing::infra::storage::repo::window_repo::schedule(
@@ -2362,7 +2372,7 @@ pub fn seed_stamp() -> bss_pricing::domain::audit::AuditStamp {
 
 /// **A fixed instant, not the wall clock.** Every other instant this file seeds is
 /// `at(hour)`, and the neighbouring `stamp_of` takes the instant explicitly; a
-/// `Utc::now()` here put a different value on every audit row and shape mutation
+/// `OffsetDateTime::now_utc()` here put a different value on every audit row and shape mutation
 /// the harness seeds, so no suite could assert the recorded instant by equality
 /// and every fixture computed from it asserted something different each day it
 /// ran.
@@ -2479,6 +2489,7 @@ pub async fn seed_publishable_shape(harness: &Harness, plan_id: Uuid) -> Publish
             vec![PlanPhase {
                 phase_id: phase,
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -3119,6 +3130,7 @@ async fn planes_of_taxonomies_and_policy(harness: &Harness, out: &mut Planes) {
     plane!(out, &conn, harness, partner_taxonomy);
     plane!(out, &conn, harness, region_taxonomy);
     plane!(out, &conn, harness, rounding_policy_taxonomy);
+    plane!(out, &conn, harness, gl_code_taxonomy);
     plane!(out, &conn, harness, group_membership);
     plane!(out, &conn, harness, policy_object);
 }

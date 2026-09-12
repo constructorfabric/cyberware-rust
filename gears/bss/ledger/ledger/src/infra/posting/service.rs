@@ -21,7 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use bss_ledger_sdk::{PostingRef, Side};
-use chrono::Utc;
 use sea_orm::DbErr;
 use toolkit_db::secure::{AccessScope, DbTx, TxConfig};
 use toolkit_db::{DBProvider, DbError};
@@ -42,6 +41,7 @@ use crate::infra::posting::idempotency::{
 use crate::infra::posting::period::{FiscalPeriodGuard, PeriodError};
 use crate::infra::posting::projector::{BalanceProjector, ProjectError};
 use crate::infra::storage::repo::{JournalRepo, ReferenceRepo};
+use time::OffsetDateTime;
 
 /// Maximum number of lines a single entry may carry.
 const MAX_LINES: usize = 1000;
@@ -375,7 +375,10 @@ impl PostingService {
         // wall clock is quarantined (`CLOCK_SKEW_QUARANTINE`), re-submittable via
         // the material-backdating exception path; skew beyond ±15 min posts but
         // raises a `CLOCK_SKEW` Warn alarm out-of-band (no rollback).
-        match crate::infra::posting::period::classify_clock_skew(entry.posted_at_utc, Utc::now()) {
+        match crate::infra::posting::period::classify_clock_skew(
+            entry.posted_at_utc,
+            OffsetDateTime::now_utc(),
+        ) {
             crate::infra::posting::period::ClockSkewVerdict::Ok => {}
             crate::infra::posting::period::ClockSkewVerdict::Warn => {
                 tracing::warn!(

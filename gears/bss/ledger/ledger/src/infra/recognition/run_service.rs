@@ -34,7 +34,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bss_ledger_sdk::{RecognitionRunOutcome, RecognitionRunQueued, RecognitionRunRef};
-use chrono::Utc;
 use coord::{CoordError, LeaseGuard, LeaseManager};
 use futures::FutureExt as _;
 use toolkit_db::secure::AccessScope;
@@ -47,6 +46,7 @@ use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::recognition::runner::RecognitionRunner;
 use crate::infra::storage::repo::RecognitionRepo;
+use time::OffsetDateTime;
 
 /// Lease TTL for a recognition run. Comfortably longer than the renewal period
 /// so one missed heartbeat (a transient DB blip) does not drop the lease, yet
@@ -191,7 +191,7 @@ impl RecognitionRunService {
         run_id: Uuid,
     ) -> Result<RecognitionRunOutcome, DomainError> {
         self.recognition
-            .insert_run(scope, tenant, run_id, period_id, Utc::now())
+            .insert_run(scope, tenant, run_id, period_id, OffsetDateTime::now_utc())
             .await
             .map_err(|e| DomainError::Internal(format!("insert recognition_run: {e}")))?;
 

@@ -55,6 +55,7 @@
 //! `ledger_credit_note_total{,_blocked}` / `ledger_debit_note_total` — are wired in
 //! Group F; this Group-E surface emits none yet.)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
@@ -79,6 +80,7 @@ use crate::api::rest::error::{
     authz_error_to_canonical, credit_note_not_found, debit_note_not_found,
     invoice_exposure_not_found,
 };
+use crate::api::rest::odata_list::{list_seller_tenant, reject_non_odata_list_params};
 use crate::infra::adjustment::credit_note_service::CreditNoteHandler;
 use crate::infra::adjustment::debit_note_service::DebitNoteHandler;
 use crate::infra::adjustment::manual_adjustment_service::ManualAdjustmentHandler;
@@ -340,21 +342,17 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_ledger.list_credit_notes")
         .summary("List recorded credit notes (cursor-paginated)")
         .description(
-            "Cursor-paginated list of the recorded credit notes for the `tenant_id` \
-             query (the caller's own by default). Supports OData `$filter` over \
-             `origin_invoice_id`, `revenue_stream`, and `reason_code`. The `$filter` \
-             ANDs the caller's authorized subtree, so credit notes outside it are \
-             never returned (SQL-level BOLA). Each item is the same `CreditNoteView` \
-             the by-id read returns. Mirrors `list_refunds`.",
+            "Cursor-paginated list of the recorded credit notes for the seller \
+             named by `$filter=tenant_id eq <uuid>` (the caller's own by default). \
+             Supports OData `$filter` over `tenant_id`, `origin_invoice_id`, \
+             `revenue_stream`, and `reason_code`. The `$filter` ANDs the caller's \
+             authorized subtree, so credit notes outside it are never returned \
+             (SQL-level BOLA). Each item is the same `CreditNoteView` the by-id \
+             read returns. Mirrors `list_refunds`.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "The credit notes' owning seller tenant (defaults to the caller's own).",
-        )
         .query_param_typed(
             "limit",
             false,
@@ -364,6 +362,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_credit_notes)
         .with_odata_filter::<CreditNoteFilterField>()
+        .with_odata_orderby::<CreditNoteFilterField>()
         .json_response_with_schema::<Page<CreditNoteView>>(
             openapi,
             StatusCode::OK,
@@ -413,21 +412,17 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("bss_ledger.list_debit_notes")
         .summary("List recorded debit notes (cursor-paginated)")
         .description(
-            "Cursor-paginated list of the recorded debit notes for the `tenant_id` \
-             query (the caller's own by default). Supports OData `$filter` over \
-             `origin_invoice_id`. The `$filter` ANDs the caller's authorized \
-             subtree, so debit notes outside it are never returned (SQL-level BOLA). \
-             Each item is the same `DebitNoteView` the by-id read returns. Mirrors \
+            "Cursor-paginated list of the recorded debit notes for the seller \
+             named by `$filter=tenant_id eq <uuid>` (the caller's own by default). \
+             Supports OData `$filter` over `tenant_id` and `origin_invoice_id`. \
+             The `$filter` ANDs the caller's authorized subtree, so debit notes \
+             outside it are never returned (SQL-level BOLA). Each item is the \
+             same `DebitNoteView` the by-id read returns. Mirrors \
              `list_credit_notes`.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "The debit notes' owning seller tenant (defaults to the caller's own).",
-        )
         .query_param_typed(
             "limit",
             false,
@@ -437,6 +432,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_debit_notes)
         .with_odata_filter::<DebitNoteFilterField>()
+        .with_odata_orderby::<DebitNoteFilterField>()
         .json_response_with_schema::<Page<DebitNoteView>>(
             openapi,
             StatusCode::OK,
@@ -721,24 +717,18 @@ async fn get_credit_note(
     Ok(Json(CreditNoteView::from(note)))
 }
 
-/// `GET /credit-notes` non-OData query: the credit notes' owning tenant (the
-/// caller's own when omitted). The `OData` `$filter` / `$orderby` / `limit` /
-/// `cursor` are parsed separately by the `OData` extractor from the same query
-/// string; `tenant_id` stays a plain param alongside them (the list convention).
-#[derive(Debug, serde::Deserialize)]
-struct CreditNoteListQuery {
-    tenant_id: Option<Uuid>,
-}
-
+/// `GET /credit-notes`: seller from `$filter=tenant_id eq`, else the caller.
+#[allow(clippy::implicit_hasher)]
 async fn list_credit_notes(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<CreditNoteListQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<CreditNoteView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params(&extras)?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     // (entry, read) PEP gate against the credit notes' owning tenant — the SAME
     // action the by-id read / balances run under. The returned scope is the
     // SQL-level BOLA filter the repo binds, so the page never contains a
@@ -808,24 +798,18 @@ async fn get_debit_note(
     Ok(Json(DebitNoteView::from(note)))
 }
 
-/// `GET /debit-notes` non-OData query: the debit notes' owning tenant (the
-/// caller's own when omitted). The `OData` `$filter` / `$orderby` / `limit` /
-/// `cursor` are parsed separately by the `OData` extractor from the same query
-/// string; `tenant_id` stays a plain param alongside them (the list convention).
-#[derive(Debug, serde::Deserialize)]
-struct DebitNoteListQuery {
-    tenant_id: Option<Uuid>,
-}
-
+/// `GET /debit-notes`: seller from `$filter=tenant_id eq`, else the caller.
+#[allow(clippy::implicit_hasher)]
 async fn list_debit_notes(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<DebitNoteListQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<DebitNoteView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params(&extras)?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     // (entry, read) PEP gate against the debit notes' owning tenant — the SAME
     // action the by-id read / balances run under. The returned scope is the
     // SQL-level BOLA filter the repo binds, so the page never contains a

@@ -79,7 +79,7 @@ use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_security::SecurityContext;
@@ -94,11 +94,13 @@ use crate::api::rest::prices::{PriceContentView, content_of};
 use crate::api::rest::state::GovernanceState;
 use crate::api::rest::windows::verdict_json;
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::domain::scope_key::PlanId;
 use crate::infra::storage::repo::price_repo;
 use crate::infra::supersession::{
     SupersessionOutcome, SupersessionPending, SupersessionReceipt, SupersessionRequest,
 };
+use time::OffsetDateTime;
 
 /// The route's registered path template.
 ///
@@ -143,7 +145,8 @@ pub struct SupersedeRequest {
     pub predecessor_price_id: Uuid,
     /// When coverage hands over. Strictly future at submit, and at least D-47's max
     /// batching delay ahead at the approval commit (`inst-su-instant`).
-    pub changeover: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub changeover: OffsetDateTime,
     /// The successor row's whole content, in the authoring vocabulary.
     pub successor: PriceContentView,
     /// The operator-supplied change reason the **scheduled** window is recorded under.
@@ -179,7 +182,8 @@ pub struct SupersessionOutcomeView {
     /// discarded.
     pub successor_price_id: Uuid,
     /// The changeover, echoed so a retry can be built from the answer.
-    pub changeover: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub changeover: OffsetDateTime,
     /// The window whose end moves, or would move, to the changeover.
     pub shortened_window_id: Uuid,
     /// The successor's open-ended window. `null` on the controlled arm, where no window
@@ -341,7 +345,8 @@ async fn supersede_price(
         .into());
     }
 
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     // Ahead of the call, for the reason `cutovers` gives: the column is frozen by
     // the table's append-only trigger.
     crate::api::rest::require_reason_code(&request.reason_code)?;

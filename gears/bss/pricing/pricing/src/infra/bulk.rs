@@ -75,7 +75,6 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
@@ -91,6 +90,7 @@ use crate::infra::storage::repo::{
     BulkOperationRecord, NewPriceDraft, PriceRepo, bulk_repo, price_repo,
 };
 use crate::infra::storage::{RepoError, repo_failure};
+use time::OffsetDateTime;
 
 /// §5's per-row conflict code, reported in the operation report.
 ///
@@ -178,7 +178,7 @@ pub async fn abandon_committing_run(
     tenant_id: Uuid,
     operation_id: Uuid,
     note: &str,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<BulkOperationRecord, RepoError> {
     let run = bulk_repo::read(runner, scope, tenant_id, operation_id)
         .await?
@@ -239,7 +239,7 @@ pub async fn abandon_validating_run(
     tenant_id: Uuid,
     operation_id: Uuid,
     note: &str,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<BulkOperationRecord, RepoError> {
     let run = bulk_repo::read(runner, scope, tenant_id, operation_id)
         .await?
@@ -387,7 +387,7 @@ impl Drop for CommitLockGuard {
                 tenant_id,
                 operation_id,
                 INTERRUPTED_NOTE,
-                Utc::now(),
+                OffsetDateTime::now_utc(),
             )
             .await
             {
@@ -540,7 +540,7 @@ impl Drop for ValidationGuard {
                 BulkState::Validating,
                 BulkState::ValidationFailed,
                 report,
-                Utc::now(),
+                OffsetDateTime::now_utc(),
             )
             .await
             {
@@ -630,7 +630,7 @@ pub async fn commit_batch(
     operation_id: Uuid,
     rows: &[ImportRow],
     stamp: AuditStamp,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<CommitReceipt, DomainError> {
     let conn = db
         .conn()
@@ -869,7 +869,7 @@ async fn commit_rows(
     rows: &[ImportRow],
     drafts: &HashMap<ScopeKey, PriceRecord>,
     stamp: AuditStamp,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> (CommitReceipt, Option<DomainError>) {
     let mut receipt = CommitReceipt::default();
     for (index, row) in rows.iter().enumerate() {

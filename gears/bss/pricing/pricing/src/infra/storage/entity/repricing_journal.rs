@@ -16,6 +16,7 @@ use sea_orm::entity::prelude::*;
 use uuid::Uuid;
 
 use toolkit_db_macros::Scopable;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_repricing_journal")]
@@ -47,7 +48,7 @@ pub struct Model {
     /// itself.
     pub applied_price_id: Option<Uuid>,
     /// When the apply committed. Present exactly on `applied`.
-    pub applied_at: Option<DateTimeUtc>,
+    pub applied_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

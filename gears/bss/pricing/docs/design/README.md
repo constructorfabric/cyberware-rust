@@ -26,6 +26,9 @@ decision rationale in [`../ADR/`](../ADR/).
 
 ## Slice documents
 
+The cross-slice [UI read-contract amendment](./ui-read-contracts.md) records the
+2026-09-10 implementation and remaining decisions for slices 02, 04 and 05.
+
 - [`01-foundation.md`](./01-foundation.md) — **shared engine**: `Plan`/`Price` model, canonical scope key, draft→publish state machine, fail-closed validation pipeline, append-only history + versioning/supersession, read-model projection + `pricingSnapshotRef`, event fan-out + `CatalogVersion` request, tenant isolation, ISO 4217 money, idempotency/ETag. Carries the catalog-wide normative statements (§4).
 - [`02-plan-definition.md`](./02-plan-definition.md) — billing cycles, custom frequency, per-seat quantity provenance (`quantitySource` persisted/validated in Slice 3), one-time-setup row, mandatory `PlanTier`, meter injectivity, add-on rules, phases + `convertsToPhaseId`, billing descriptors (PRD §6.1, §6.3)
 - [`03-price-structure.md`](./03-price-structure.md) — explicit `modelKind`, tier-band validation, `package` pricing, evaluation-policy placement, level-based aggregation (`aggregationFunction`/`aggregationGranularity`/`maxHoldGranules`, D-44), joint golden-fixture conformance gate (PRD §6.2)

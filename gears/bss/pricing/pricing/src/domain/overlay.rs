@@ -74,13 +74,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::money::CurrencyCode;
 use crate::domain::scope_key::{PlanId, PriceEligibility};
+use time::OffsetDateTime;
 
 /// The six scope classes of §1.1, in the **class-specificity order** the read
 /// model publishes as `inst-plv-class-tiebreak`'s tie-break:
@@ -480,7 +480,7 @@ impl fmt::Display for TargetSku {
 pub struct LineKey {
     plan_id: Option<PlanId>,
     target_sku: Option<TargetSku>,
-    cohort: Option<DateTime<Utc>>,
+    cohort: Option<OffsetDateTime>,
 }
 
 /// Every field of a [`LineKey`] at once, for a caller that must account for
@@ -500,7 +500,7 @@ pub struct LineKeyParts<'a> {
     /// The line's SKU narrowing.
     pub target_sku: Option<&'a TargetSku>,
     /// The generation this line filters to.
-    pub cohort: Option<DateTime<Utc>>,
+    pub cohort: Option<OffsetDateTime>,
 }
 
 impl LineKey {
@@ -542,7 +542,7 @@ impl LineKey {
     /// is refused, which is §6's `CHECK (cohort IS NULL OR plan_id IS NOT NULL)`
     /// with no `CHECK`.
     #[must_use]
-    pub fn for_cohort(self, cohort: DateTime<Utc>) -> Option<Self> {
+    pub fn for_cohort(self, cohort: OffsetDateTime) -> Option<Self> {
         self.plan_id.is_some().then_some(Self {
             cohort: Some(cohort),
             ..self
@@ -564,7 +564,7 @@ impl LineKey {
     /// The generation this line filters to, or `None` for the ordinary
     /// eligibility classes.
     #[must_use]
-    pub const fn cohort(&self) -> Option<DateTime<Utc>> {
+    pub const fn cohort(&self) -> Option<OffsetDateTime> {
         self.cohort
     }
 
@@ -615,7 +615,7 @@ impl LineKey {
     pub fn eligible_for(
         &self,
         eligibility: PriceEligibility,
-        cohort: Option<DateTime<Utc>>,
+        cohort: Option<OffsetDateTime>,
     ) -> bool {
         match self.cohort {
             None => eligibility != PriceEligibility::ExistingGrandfathered,
@@ -905,9 +905,9 @@ impl TargetRef {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OverlayInterval {
     /// Inclusive start, or `None` for "from the beginning of time".
-    pub from: Option<DateTime<Utc>>,
+    pub from: Option<OffsetDateTime>,
     /// Exclusive end, or `None` for open-ended.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<OffsetDateTime>,
 }
 
 impl OverlayInterval {
@@ -955,7 +955,7 @@ pub fn resolve_line<'a>(
     plan: PlanId,
     sku: Option<&TargetSku>,
     eligibility: PriceEligibility,
-    cohort: Option<DateTime<Utc>>,
+    cohort: Option<OffsetDateTime>,
 ) -> Option<&'a OverlayLine> {
     lines
         .iter()

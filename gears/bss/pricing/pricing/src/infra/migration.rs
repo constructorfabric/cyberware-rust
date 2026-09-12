@@ -53,10 +53,10 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
 use toolkit_db::secure::{AccessScope, DBRunner, DbTx};
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::{ODataQuery, Page};
 use uuid::Uuid;
 
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
@@ -68,6 +68,7 @@ use crate::domain::migration_delta::{
     Boundary, ContractLockSet, DeltaReport, SubscriptionFacts, TargetShape, analyze, grant_totals,
 };
 use crate::domain::scope_key::PlanId;
+use crate::infra::storage::odata_mapping::OdataPageError;
 use crate::infra::storage::repo::audit_repo::NewAuditEntry;
 use crate::infra::storage::repo::migration_repo::{MigrationRecord, NewMigration};
 use crate::infra::storage::repo::{
@@ -75,6 +76,7 @@ use crate::infra::storage::repo::{
     plan_repo, plan_shape_repo, policy_repo, price_repo,
 };
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// One scheduled migration, as the surfaces render it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +189,23 @@ impl MigrationService {
             .map_err(|e| repo_failure(&e))
     }
 
+    /// One `OData` page of the tenant's migration schedules.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on a connection or storage failure;
+    /// [`OdataPageError::Odata`] on a malformed `$filter` / `$orderby` / cursor.
+    pub async fn list_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<MigrationRecord>, OdataPageError> {
+        let conn = self.db.conn().map_err(|e| {
+            OdataPageError::Db(format!("bss-pricing: migration listing connection: {e}"))
+        })?;
+        migration_repo::list_odata(&conn, scope, tenant_id, query).await
+    }
+
     /// Cancel a `scheduled` or `in_progress` run (`inst-mst-cancel`,
     /// `inst-mst-cancel-inflight`, `inst-mg-cancel`, D-34, M3).
     ///
@@ -232,7 +251,7 @@ pub struct ScheduleRequest {
     /// The published target.
     pub target_plan_id: PlanId,
     /// When the migration takes effect.
-    pub effective_at: DateTime<Utc>,
+    pub effective_at: OffsetDateTime,
     /// `all`, or a subscription filter.
     pub scope_json: JsonValue,
 }

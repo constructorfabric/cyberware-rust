@@ -5,9 +5,9 @@
 //! `PENDING → APPROVED | REJECTED | NEEDS_REWORK | CANCELLED | EXPIRED`; `intent`
 //! is the deterministic replay payload executed on `approve`.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -32,11 +32,11 @@ pub struct Model {
     pub threshold_snapshot: JsonValue,
     pub reason_code: String,
     pub prepared_by: Uuid,
-    pub prepared_at: DateTime<Utc>,
+    pub prepared_at: OffsetDateTime,
     pub approved_by: Option<Uuid>,
-    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_at: Option<OffsetDateTime>,
     pub correlation_id: Uuid,
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

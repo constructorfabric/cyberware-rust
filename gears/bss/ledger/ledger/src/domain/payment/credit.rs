@@ -43,12 +43,16 @@
 //! — when `effective_at` is `None` — `effective_at`).
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, PostEntry, PostLine, Side, SourceDocType};
-use chrono::{DateTime, Utc};
+
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use chrono::NaiveDate;
+
 use crate::domain::error::DomainError;
+use crate::domain::instant::to_naive_date;
 use crate::domain::payment::precedence::{Allocated, Candidate};
+use time::OffsetDateTime;
 
 /// A credit grant to post: how much pool cash to park into which wallet
 /// sub-grain.
@@ -71,7 +75,7 @@ pub struct GrantInput {
     pub credit_grant_event_type: String,
     /// Grant instant. `None` ⇒ a placeholder effective date the orchestrator
     /// overwrites before posting (see module docs).
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// A wallet sub-grain available to spend. The caller supplies these in
@@ -188,10 +192,10 @@ pub fn build_grant_entry(input: &GrantInput) -> Result<PostEntry, DomainError> {
         entry_currency: input.currency.clone(),
         source_doc_type: SourceDocType::CreditApply,
         source_business_id: input.credit_application_id.clone(),
-        effective_at: input
-            .effective_at
-            .unwrap_or(DateTime::UNIX_EPOCH)
-            .date_naive(),
+        effective_at: input.effective_at.map_or(
+            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or(NaiveDate::MIN),
+            to_naive_date,
+        ),
         posted_by_actor_id: Uuid::nil(),
         correlation_id: Uuid::nil(),
         reverses_entry_id: None,
@@ -354,7 +358,7 @@ pub struct ApplyInput {
     pub targets: Vec<Allocated>,
     /// Application instant. `None` ⇒ a placeholder effective date the orchestrator
     /// overwrites before posting (see module docs).
-    pub effective_at: Option<DateTime<Utc>>,
+    pub effective_at: Option<OffsetDateTime>,
 }
 
 /// Build the balanced reusable-credit apply entry for `input`.
@@ -486,10 +490,10 @@ pub fn build_apply_entry(input: &ApplyInput) -> Result<PostEntry, DomainError> {
         entry_currency: input.currency.clone(),
         source_doc_type: SourceDocType::CreditApply,
         source_business_id: input.credit_application_id.clone(),
-        effective_at: input
-            .effective_at
-            .unwrap_or(DateTime::UNIX_EPOCH)
-            .date_naive(),
+        effective_at: input.effective_at.map_or(
+            NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or(NaiveDate::MIN),
+            to_naive_date,
+        ),
         posted_by_actor_id: Uuid::nil(),
         correlation_id: Uuid::nil(),
         reverses_entry_id: None,

@@ -44,8 +44,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bss_pricing::domain::read_model::SubjectRef;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{PendingVersionRow, catalog_version_ref_repo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::secure::DBRunner;
@@ -112,10 +114,8 @@ impl Visit for StatementText {
     }
 }
 
-fn at(minute: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 1, 1, 9, minute, 0)
-        .single()
-        .expect("a valid instant")
+fn at(minute: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 1, 1, 9, minute, 0)
 }
 
 /// Tenant ids that ascend with `n`, so the walk's ordering claim is checkable.

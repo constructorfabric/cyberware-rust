@@ -68,23 +68,19 @@
 //!   so the sweep can evaluate that itself. A second query returning "the overdue
 //!   ones" would put the threshold — a config value — inside a SQL predicate,
 //!   where the job that owns the threshold cannot see it.
-//! - **A per-plan read for the publish status API.** §3.6 says a pending ref
-//!   "surfaces on the publish status API" — and there is no such path anywhere
-//!   in the design set: no slice §5 table declares one, and the publish endpoint
-//!   it would accompany cannot be built until Slice 5 supplies an approval
-//!   record (see `module::PricingRuntime::publish`). So the debt is **not** a
-//!   surface group's; it belongs to whoever lands the publish plane, and minting
-//!   a path no table declares would be inventing surface — the same discipline
-//!   as inventing a code. `find` therefore still has no caller outside the
-//!   commit and the sweep, which is the honest state and not an oversight.
+//! - **`list_for_pending_ref`** is the handle-wide read `GET
+//!   /catalog-version/refs/{pendingRef}` uses. `find` stays the four-column
+//!   identity for finalize. The surface is declared in
+//!   `docs/superpowers/specs/2026-09-02-pending-ref-status-design.md`.
 
 use std::collections::BTreeMap;
 
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{DateTime, Utc};
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
+use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
@@ -162,9 +158,9 @@ pub struct PendingVersionRow {
     /// [`PendingVersionRow::subject_revision`] carries the row version on that
     /// kind and the projector refuses a membership subject that arrives without
     /// one, so the pin's presence is never inferred from this field.
-    pub subject_effective_to: Option<DateTime<Utc>>,
+    pub subject_effective_to: Option<OffsetDateTime>,
     /// When addressability was requested, UTC.
-    pub requested_at: DateTime<Utc>,
+    pub requested_at: OffsetDateTime,
     /// When this gear **first saw** the registry's answer for the handle
     /// (D-166), UTC — and the start instant every post-commit clause in the set
     /// was written against and none of them had.
@@ -180,7 +176,7 @@ pub struct PendingVersionRow {
     /// false. [`observe_commit`] writes it once and never moves it forward, so
     /// the degraded clock starts at the first sighting rather than resetting
     /// every pass.
-    pub commit_observed_at: Option<DateTime<Utc>>,
+    pub commit_observed_at: Option<OffsetDateTime>,
     /// The committed version, once the registry has assigned one.
     ///
     /// `None` is the pending state — the only one the publish commit can write
@@ -192,7 +188,7 @@ pub struct PendingVersionRow {
     /// [`PendingVersionRow::catalog_version`] and never separately —
     /// `chk_pricing_catalog_version_ref_commit` enforces the pairing
     /// physically, on both backends.
-    pub committed_at: Option<DateTime<Utc>>,
+    pub committed_at: Option<OffsetDateTime>,
 }
 
 impl PendingVersionRow {
@@ -214,7 +210,7 @@ impl PendingVersionRow {
         subject: &SubjectRef,
         subject_revision: Option<u64>,
         subject_lifecycle_state: Option<LifecycleState>,
-        requested_at: DateTime<Utc>,
+        requested_at: OffsetDateTime,
     ) -> Self {
         Self {
             tenant_id,
@@ -254,8 +250,8 @@ impl PendingVersionRow {
         pending_ref: String,
         membership_id: Uuid,
         row_version: u64,
-        effective_to: Option<DateTime<Utc>>,
-        requested_at: DateTime<Utc>,
+        effective_to: Option<OffsetDateTime>,
+        requested_at: OffsetDateTime,
     ) -> Self {
         let subject = SubjectRef::GroupMembership(membership_id);
         Self {
@@ -460,7 +456,7 @@ pub async fn observe_commit(
     scope: &AccessScope,
     tenant_id: Uuid,
     pending_ref: &str,
-    observed_at: DateTime<Utc>,
+    observed_at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     catalog_version_ref::Entity::update_many()
         .secure()
@@ -514,7 +510,7 @@ pub async fn finalize(
     scope: &AccessScope,
     id: RefIdentity<'_>,
     version: CatalogVersion,
-    committed_at: DateTime<Utc>,
+    committed_at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let target = stored_version(version)?;
     let outcome = catalog_version_ref::Entity::update_many()
@@ -708,6 +704,40 @@ pub async fn list_pending_for_tenant(
         .all(runner)
         .await
         .map_err(|e| RepoError::Db(format!("list pending catalog version refs: {e}")))?;
+    rows.into_iter().map(to_domain).collect()
+}
+
+/// Every subject row of one pending handle.
+///
+/// A handle names one registry assignment and a publish unit records one, two
+/// or three subjects against it (D-234). The status route has only the handle
+/// the receipt carried, so this is the read — [`find`] stays the four-column
+/// identity finalize uses.
+///
+/// Empty is a legitimate answer: unknown handle, or a handle this tenant
+/// (under this scope) does not hold.
+///
+/// # Errors
+/// As [`list_pending_for_tenant`].
+pub async fn list_for_pending_ref(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    pending_ref: &str,
+) -> Result<Vec<PendingVersionRow>, RepoError> {
+    let rows = catalog_version_ref::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(catalog_version_ref::Column::TenantId.eq(tenant_id))
+                .add(catalog_version_ref::Column::PendingRef.eq(pending_ref)),
+        )
+        .order_by(catalog_version_ref::Column::SubjectKind, Order::Asc)
+        .order_by(catalog_version_ref::Column::SubjectRef, Order::Asc)
+        .all(runner)
+        .await
+        .map_err(|e| RepoError::Db(format!("list catalog version refs by handle: {e}")))?;
     rows.into_iter().map(to_domain).collect()
 }
 

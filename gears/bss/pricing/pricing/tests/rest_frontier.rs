@@ -33,10 +33,12 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use bss_pricing::api::rest::frontier::{ApiState, router};
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{PinFrontierRepo, pin_frontier_repo};
 use bss_pricing_sdk::CatalogVersion;
-use chrono::{TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm_migration::MigratorTrait;
 use toolkit::api::OpenApiRegistryImpl;
 use toolkit::api::canonical_prelude::CanonicalError;
@@ -133,7 +135,7 @@ async fn seed_frontier(
     db: &DBProvider<DbError>,
     tenant: Uuid,
     to: CatalogVersion,
-    at: chrono::DateTime<Utc>,
+    at: OffsetDateTime,
 ) {
     let conn = db.conn().expect("conn");
     pin_frontier_repo::advance(&conn, &AccessScope::for_tenant(tenant), tenant, to, at)
@@ -155,7 +157,8 @@ fn frontier_router(
     ctx: Option<SecurityContext>,
 ) -> Router {
     let state = Arc::new(ApiState {
-        pin_frontier: PinFrontierRepo::new(db),
+        pin_frontier: PinFrontierRepo::new(db.clone()),
+        db,
     });
     let openapi = OpenApiRegistryImpl::new();
     let router = router(state, &openapi)
@@ -266,7 +269,7 @@ async fn a_denied_request_is_refused_with_403() {
 async fn an_authorized_read_of_an_advanced_frontier_is_200_with_the_version() {
     let tenant = Uuid::now_v7();
     let db = provider().await;
-    let advanced_at = Utc.with_ymd_and_hms(2026, 8, 1, 9, 30, 0).unwrap();
+    let advanced_at = utc_ymd_hms(2026, 8, 1, 9, 30, 0);
     seed_frontier(&db, tenant, CatalogVersion::new(7), advanced_at).await;
 
     let router = frontier_router(
@@ -325,7 +328,7 @@ async fn a_foreign_tenants_frontier_is_not_readable() {
         &db,
         theirs,
         CatalogVersion::new(9),
-        Utc.with_ymd_and_hms(2026, 8, 1, 9, 30, 0).unwrap(),
+        utc_ymd_hms(2026, 8, 1, 9, 30, 0),
     )
     .await;
 

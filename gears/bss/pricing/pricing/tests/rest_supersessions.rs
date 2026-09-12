@@ -28,8 +28,10 @@ use axum::http::StatusCode;
 use bss_pricing::api::rest::supersessions::PLAN_SUPERSESSIONS;
 use bss_pricing::domain::approval::{DecisionBy, WithdrawAuthority};
 use bss_pricing::infra::approval::{DecideRequest, RegionGrant};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use rest_support::{Harness, Publishable, body_json, request, seed_publishable_plan};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const SUBMITTER: Uuid = Uuid::from_u128(0x_5c_11);
@@ -37,8 +39,8 @@ const REVIEWER: Uuid = Uuid::from_u128(0x_5c_22);
 
 /// Inside `common`'s `[2099-08-04, 2099-09-01)` coverage window, and clear of both of
 /// `inst-su-instant`'s floors against a wall clock that is nowhere near 2099.
-fn changeover() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn changeover() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 fn path(plan_id: Uuid) -> String {
@@ -48,7 +50,9 @@ fn path(plan_id: Uuid) -> String {
 fn supersede_body(predecessor: Uuid, amount: i64) -> serde_json::Value {
     serde_json::json!({
         "predecessor_price_id": predecessor.to_string(),
-        "changeover": changeover(),
+        "changeover": changeover()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339"),
         "successor": {
             "model_kind": "flat",
             "amount_minor": amount,
@@ -93,10 +97,10 @@ async fn approve(h: &Harness, approval_id: Uuid) {
                     // A fixed instant, not the wall clock. This suite's whole
                     // premise is that every instant sits in 2099, and the approve is
                     // the step that makes the commit arm reachable - so a
-                    // `Utc::now()` here put a 2026 stamp inside the sequence
+                    // `OffsetDateTime::now_utc()` here put a 2026 stamp inside the sequence
                     // `changeover()`'s own doc places entirely in 2099, and nothing
                     // could assert the decision instant.
-                    recorded_at: changeover() - chrono::Duration::days(1),
+                    recorded_at: changeover() - time::Duration::days(1),
                     correlation_id: Uuid::from_u128(0x_5c_c0),
                 },
                 withdraw_authority: WithdrawAuthority::OwnUnitsOnly,
@@ -320,7 +324,7 @@ async fn a_dormant_changeover_is_400_carrying_its_code() {
     // is that rule's other half.
     //
     // The refusal staged is **dormancy** and not the changeover floor, and that is a
-    // limit of the wire rather than a preference. The route stamps `Utc::now()`, so an
+    // limit of the wire rather than a preference. The route stamps `OffsetDateTime::now_utc()`, so an
     // instant inside `MAX_BATCHING_DELAY` of it is a 2026 instant, and the fixtures'
     // coverage window is in 2099 — `plan_supersession` answers the plane before the
     // commit floor is ever asked, so the floor is unreachable from here. It is pinned at
@@ -328,13 +332,17 @@ async fn a_dormant_changeover_is_400_carrying_its_code() {
     // (`sqlite_supersession_unit::the_commit_floor_is_answered_before_any_catalog_version_is_requested`),
     // and the first version of this case asserted the floor and was answered by
     // dormancy — then, one fix earlier, by `TIMESTAMP_PRECISION_EXCEEDED`, because
-    // `Utc::now()` carries microseconds and D-144's quantum is checked first.
+    // `OffsetDateTime::now_utc()` carries microseconds and D-144's quantum is checked first.
     let h = Harness::new().await;
     rest_support::approve_threshold_policy(&h, &[("EUR", 1_000_000)]).await;
     let (plan_id, seeded) = published(&h).await;
 
     let mut body = supersede_body(seeded.price_id, 10_000);
-    body["changeover"] = serde_json::json!(common::coverage_to() + chrono::Duration::days(30));
+    body["changeover"] = serde_json::json!(
+        (common::coverage_to() + time::Duration::days(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339")
+    );
     let response = h
         .allowed_as(SUBMITTER)
         .send(request("POST", &path(plan_id), Some(body)))

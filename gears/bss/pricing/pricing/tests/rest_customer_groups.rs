@@ -26,7 +26,7 @@ use axum::http::StatusCode;
 use bss_pricing::api::rest::approvals::APPROVAL_APPROVE;
 use bss_pricing::api::rest::customer_groups::{
     CUSTOMER_GROUP_MEMBER, CUSTOMER_GROUP_MEMBER_MOVE, CUSTOMER_GROUP_MEMBERS,
-    CUSTOMER_GROUP_TAXONOMY,
+    CUSTOMER_GROUP_MEMBERS_MOVE, CUSTOMER_GROUP_TAXONOMY,
 };
 use bss_pricing::authz::{actions, labels};
 use bss_pricing::config::JobsConfig;
@@ -45,6 +45,7 @@ use rest_support::{
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use serde_json::json;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
 use uuid::Uuid;
 
@@ -426,7 +427,7 @@ async fn enroll(harness: &Harness, payer_tenant_id: Uuid) -> (StatusCode, serde_
             &CUSTOMER_GROUP_MEMBERS.replace("{group}", "gold"),
             Some(json!({
                 "payer_tenant_id": payer_tenant_id,
-                "effective_from": "2026-01-01T00:00:00Z"
+                "effective_from": "2026-01-01T00:00:00.000000Z"
             })),
             &[("idempotency-key", "enroll-1")],
         ))
@@ -440,7 +441,7 @@ async fn enroll(harness: &Harness, payer_tenant_id: Uuid) -> (StatusCode, serde_
 /// provider and the **same** registry double the route's publish unit
 /// requested its handle from, so a ref this test recorded and a ref the
 /// sweep resolves are the same act's two halves.
-async fn sweep(harness: &Harness, now: chrono::DateTime<chrono::Utc>) -> u64 {
+async fn sweep(harness: &Harness, now: OffsetDateTime) -> u64 {
     let job = ReadModelWarmJob::new(
         harness.db.clone(),
         Arc::clone(&harness.registry) as Arc<dyn CatalogVersionRegistryV1>,
@@ -534,7 +535,7 @@ async fn a_route_level_enrollment_is_a_real_publish_unit() {
     // 3. The projector can run on the ref this route recorded: commit the
     // handle on the registry double and sweep.
     harness.registry.commit(&pending_ref, 9);
-    let projected = sweep(&harness, chrono::Utc::now()).await;
+    let projected = sweep(&harness, OffsetDateTime::now_utc()).await;
     assert_eq!(
         projected, 1,
         "the projector must land exactly one warm delta off this route's own pending ref"
@@ -600,7 +601,7 @@ async fn a_pending_approval_unit_is_visible_through_the_same_readback() {
             materiality: json!({ "material": true, "reason": "positive-control" }),
             held_keys: std::collections::BTreeSet::new(),
         },
-        stamp_of(MEMBERSHIP_ADMIN, chrono::Utc::now()),
+        stamp_of(MEMBERSHIP_ADMIN, OffsetDateTime::now_utc()),
     )
     .await
     .expect("seed a pending unit unrelated to any membership route");
@@ -636,7 +637,7 @@ async fn a_move_records_both_membership_subjects_against_one_pending_ref() {
             // Future-dated, so this case stays on the renewal-aligned arm it is
             // about: D-350 routes a move landing now or in the past to the
             // material arm, which writes no membership row for this to read.
-            Some(json!({ "effective_from": "2099-06-01T00:00:00Z" })),
+            Some(json!({ "effective_from": "2099-06-01T00:00:00.000000Z" })),
             &[("idempotency-key", "move-1")],
         ))
         .await;
@@ -706,7 +707,7 @@ async fn adjusting_a_membership_is_also_its_own_publish_unit() {
             &CUSTOMER_GROUP_MEMBER
                 .replace("{group}", "gold")
                 .replace("{id}", &membership_id),
-            Some(json!({ "effective_to": "2026-03-01T00:00:00Z" })),
+            Some(json!({ "effective_to": "2026-03-01T00:00:00.000000Z" })),
             &[("if-match", &expected_tag)],
         ))
         .await;
@@ -784,7 +785,7 @@ async fn two_route_level_mutations_of_one_membership_freeze_two_different_interv
             &CUSTOMER_GROUP_MEMBER
                 .replace("{group}", "gold")
                 .replace("{id}", &membership_id),
-            Some(json!({ "effective_to": "2026-03-01T00:00:00Z" })),
+            Some(json!({ "effective_to": "2026-03-01T00:00:00.000000Z" })),
             &[("if-match", &expected_tag)],
         ))
         .await;
@@ -802,7 +803,7 @@ async fn two_route_level_mutations_of_one_membership_freeze_two_different_interv
     harness.registry.commit(&ended_ref, 10);
 
     assert_eq!(
-        sweep(&harness, chrono::Utc::now()).await,
+        sweep(&harness, OffsetDateTime::now_utc()).await,
         2,
         "one warm delta per publish unit"
     );
@@ -825,7 +826,7 @@ async fn two_route_level_mutations_of_one_membership_freeze_two_different_interv
     );
     assert_eq!(
         at_10.get("effectiveTo"),
-        Some(&json!("2026-03-01T00:00:00Z")),
+        Some(&json!("2026-03-01T00:00:00.000000Z")),
         "and version 10 froze the end, which is the state its own publish judged: {at_10}"
     );
 }
@@ -858,7 +859,7 @@ async fn enrolling_into_an_undeclared_group_is_refused_group_unknown_and_writes_
             &CUSTOMER_GROUP_MEMBERS.replace("{group}", "nonexistent"),
             Some(json!({
                 "payer_tenant_id": Uuid::now_v7(),
-                "effective_from": "2026-01-01T00:00:00Z"
+                "effective_from": "2026-01-01T00:00:00.000000Z"
             })),
             &[("idempotency-key", "undeclared-1")],
         ))
@@ -895,7 +896,7 @@ async fn enrolling_into_a_retired_group_is_refused_group_unknown_and_writes_noth
             &CUSTOMER_GROUP_MEMBERS.replace("{group}", "silver-tier"),
             Some(json!({
                 "payer_tenant_id": Uuid::now_v7(),
-                "effective_from": "2026-01-01T00:00:00Z"
+                "effective_from": "2026-01-01T00:00:00.000000Z"
             })),
             &[("idempotency-key", "retired-1")],
         ))
@@ -925,7 +926,7 @@ async fn moving_a_payer_into_an_undeclared_group_is_refused_group_unknown_and_wr
             &CUSTOMER_GROUP_MEMBER_MOVE
                 .replace("{group}", "nonexistent")
                 .replace("{payerId}", &payer_tenant_id.to_string()),
-            Some(json!({ "effective_from": "2026-06-01T00:00:00Z" })),
+            Some(json!({ "effective_from": "2026-06-01T00:00:00.000000Z" })),
             &[("idempotency-key", "move-undeclared-1")],
         ))
         .await;
@@ -985,7 +986,7 @@ async fn moving_a_payer_without_immediate_still_opens_no_approval_unit() {
             // by any reading — committed with one principal. The renewal-aligned
             // arm is the one where the effect lands at a future renewal, and that
             // is what this fixture has to express.
-            Some(json!({ "effective_from": "2099-06-01T00:00:00Z" })),
+            Some(json!({ "effective_from": "2099-06-01T00:00:00.000000Z" })),
             &[("idempotency-key", "move-renewal-1")],
         ))
         .await;
@@ -1046,7 +1047,7 @@ async fn a_replayed_renewal_aligned_move_answers_the_same_shape_the_first_call_d
             &CUSTOMER_GROUP_MEMBER_MOVE
                 .replace("{group}", "silver")
                 .replace("{payerId}", &payer_tenant_id.to_string()),
-            Some(json!({ "effective_from": "2099-06-01T00:00:00Z" })),
+            Some(json!({ "effective_from": "2099-06-01T00:00:00.000000Z" })),
             &[("idempotency-key", "move-replay-1")],
         )
     };
@@ -1099,7 +1100,7 @@ async fn a_backdated_move_is_material_even_though_the_body_does_not_say_immediat
             &CUSTOMER_GROUP_MEMBER_MOVE
                 .replace("{group}", "silver")
                 .replace("{payerId}", &payer_tenant_id.to_string()),
-            Some(json!({ "effective_from": "2026-06-01T00:00:00Z" })),
+            Some(json!({ "effective_from": "2026-06-01T00:00:00.000000Z" })),
             &[("idempotency-key", "move-backdated-1")],
         ))
         .await;
@@ -1140,7 +1141,7 @@ async fn re_enrolling_a_payer_immediately_is_refused_by_the_audit_only_door() {
             &CUSTOMER_GROUP_MEMBERS.replace("{group}", "silver"),
             Some(json!({
                 "payer_tenant_id": payer_tenant_id,
-                "effective_from": "2026-06-01T00:00:00Z"
+                "effective_from": "2026-06-01T00:00:00.000000Z"
             })),
             &[("idempotency-key", "side-door-1")],
         ))
@@ -1189,7 +1190,7 @@ async fn a_first_enrollment_landing_now_is_onboarding_and_still_lands() {
             &CUSTOMER_GROUP_MEMBERS.replace("{group}", "silver"),
             Some(json!({
                 "payer_tenant_id": Uuid::now_v7(),
-                "effective_from": "2026-06-01T00:00:00Z"
+                "effective_from": "2026-06-01T00:00:00.000000Z"
             })),
             &[("idempotency-key", "onboarding-1")],
         ))
@@ -1209,7 +1210,7 @@ fn enrollment_request(payer_tenant_id: Uuid) -> axum::http::Request<axum::body::
         &CUSTOMER_GROUP_MEMBERS.replace("{group}", "gold"),
         Some(json!({
             "payer_tenant_id": payer_tenant_id,
-            "effective_from": "2026-01-01T00:00:00Z"
+            "effective_from": "2026-01-01T00:00:00.000000Z"
         })),
         &[("idempotency-key", "enroll-retry-1")],
     )
@@ -1311,7 +1312,7 @@ async fn moving_a_payer_immediately_is_material_and_writes_no_membership_row_unt
                 .replace("{group}", "gold")
                 .replace("{payerId}", &payer_tenant_id.to_string()),
             Some(json!({
-                "effective_from": "2026-06-01T00:00:00Z",
+                "effective_from": "2026-06-01T00:00:00.000000Z",
                 "immediate": true
             })),
             &[("idempotency-key", "move-immediate-1")],
@@ -1396,7 +1397,7 @@ async fn an_immediately_moved_payer_commits_once_a_second_principal_approves() {
                 .replace("{group}", "gold")
                 .replace("{payerId}", &payer_tenant_id.to_string()),
             Some(json!({
-                "effective_from": "2026-06-01T00:00:00Z",
+                "effective_from": "2026-06-01T00:00:00.000000Z",
                 "immediate": true
             })),
             &[("idempotency-key", "move-immediate-commit-1")],
@@ -1433,7 +1434,7 @@ async fn an_immediately_moved_payer_commits_once_a_second_principal_approves() {
                 .replace("{group}", "gold")
                 .replace("{payerId}", &payer_tenant_id.to_string()),
             Some(json!({
-                "effective_from": "2026-06-01T00:00:00Z",
+                "effective_from": "2026-06-01T00:00:00.000000Z",
                 "immediate": true
             })),
             &[("idempotency-key", "move-immediate-commit-2")],
@@ -1469,7 +1470,7 @@ async fn an_immediately_moved_payer_commits_once_a_second_principal_approves() {
                 .replace("{group}", "gold")
                 .replace("{payerId}", &payer_tenant_id.to_string()),
             Some(json!({
-                "effective_from": "2026-06-01T00:00:00Z",
+                "effective_from": "2026-06-01T00:00:00.000000Z",
                 "immediate": true
             })),
             &[("idempotency-key", "move-immediate-commit-3")],
@@ -1548,7 +1549,7 @@ async fn patching_a_membership_through_the_wrong_group_is_refused_and_writes_not
             &CUSTOMER_GROUP_MEMBER
                 .replace("{group}", "wrong-group")
                 .replace("{id}", &membership_id.to_string()),
-            Some(json!({ "effective_to": "2026-03-01T00:00:00Z" })),
+            Some(json!({ "effective_to": "2026-03-01T00:00:00.000000Z" })),
             &[("if-match", "\"0\"")],
         ))
         .await;
@@ -1647,7 +1648,7 @@ async fn an_ended_membership_is_still_listed() {
             &CUSTOMER_GROUP_MEMBER
                 .replace("{group}", "gold")
                 .replace("{id}", &membership_id),
-            Some(json!({ "effective_to": "2026-06-01T00:00:00Z" })),
+            Some(json!({ "effective_to": "2026-06-01T00:00:00.000000Z" })),
             &[("if-match", &format!("\"{version}\""))],
         ))
         .await;
@@ -1657,7 +1658,7 @@ async fn an_ended_membership_is_still_listed() {
     assert_eq!(body["memberships"].as_array().map(Vec::len), Some(1));
     assert_eq!(
         body["memberships"][0]["effective_to"],
-        json!("2026-06-01T00:00:00Z"),
+        json!("2026-06-01T00:00:00.000000Z"),
         "the ended interval is shown rather than filtered away"
     );
 }
@@ -1695,12 +1696,14 @@ async fn the_membership_list_pages_and_the_walk_loses_no_row() {
                 &CUSTOMER_GROUP_MEMBERS.replace("{group}", "gold"),
                 Some(json!({
                     "payer_tenant_id": payer,
-                    "effective_from": "2026-01-01T00:00:00Z"
+                    "effective_from": "2026-01-01T00:00:00.000000Z"
                 })),
                 &[("idempotency-key", &format!("page-enroll-{n}"))],
             ))
             .await;
-        assert_eq!(response.status(), StatusCode::CREATED, "seed {n}");
+        let status = response.status();
+        let seed_body = body_json(response).await;
+        assert_eq!(status, StatusCode::CREATED, "seed {n}: {seed_body}");
     }
 
     let members_of = async |query: String| -> serde_json::Value {
@@ -1763,7 +1766,7 @@ async fn the_membership_list_pages_and_the_walk_loses_no_row() {
     );
 }
 
-/// **The `payer_id` filter is the by-id read this family owes.**
+/// **The `payer_tenant_id` filter is the by-id read this family owes.**
 ///
 /// `api/rest.rs` holds every read-shape deviation to a stated mitigation, and this
 /// family's was the only one with none: there is no `GET …/members/{id}`, and
@@ -1787,7 +1790,7 @@ async fn the_membership_list_narrows_to_one_payer() {
                 &CUSTOMER_GROUP_MEMBERS.replace("{group}", "gold"),
                 Some(json!({
                     "payer_tenant_id": payer,
-                    "effective_from": "2026-01-01T00:00:00Z"
+                    "effective_from": "2026-01-01T00:00:00.000000Z"
                 })),
                 &[("idempotency-key", &format!("filter-enroll-{n}"))],
             ))
@@ -1800,7 +1803,7 @@ async fn the_membership_list_narrows_to_one_payer() {
         .send(request(
             "GET",
             &format!(
-                "{}?payer_id={wanted}",
+                "{}?$filter=payer_tenant_id%20eq%20{wanted}",
                 CUSTOMER_GROUP_MEMBERS.replace("{group}", "gold")
             ),
             None,
@@ -1821,7 +1824,28 @@ async fn the_membership_list_narrows_to_one_payer() {
         "the filter narrows to the payer asked for and excludes the other: {filtered}"
     );
 
-    // And a malformed filter is this gear's refusal rather than the extractor's.
+    // The filter key is `payer_tenant_id`, the name the rows above read back and
+    // the name of the column. `payer_id` was the key until this surface shipped,
+    // and it is refused rather than accepted as an alias: one value answering to
+    // two filter names is what let a caller filter on a name it never read.
+    let stale = h
+        .allowed_as(MEMBERSHIP_ADMIN)
+        .send(request(
+            "GET",
+            &format!(
+                "{}?$filter=payer_id%20eq%20{wanted}",
+                CUSTOMER_GROUP_MEMBERS.replace("{group}", "gold")
+            ),
+            None,
+        ))
+        .await;
+    assert_eq!(
+        stale.status(),
+        StatusCode::BAD_REQUEST,
+        "`payer_id` is not a filter field on this collection"
+    );
+
+    // A retired named key is 400, not a silent ignore and not an OData parse.
     let refused = h
         .allowed_as(MEMBERSHIP_ADMIN)
         .send(request(
@@ -1838,8 +1862,8 @@ async fn the_membership_list_narrows_to_one_payer() {
     assert!(
         problem["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("payer_id")),
-        "the refusal names the parameter: {problem}"
+            .is_some_and(|detail| { detail.contains("payer_id") && detail.contains("$filter") }),
+        "the refusal names the retired key and points at `$filter`: {problem}"
     );
 }
 
@@ -1900,9 +1924,15 @@ async fn the_membership_list_is_ordered_by_effective_date_and_not_by_write_time(
     let later = Uuid::now_v7();
     let backdated = Uuid::now_v7();
     // Written first, effective second.
-    enroll_from(&h, later, "2026-06-01T00:00:00Z", "order-later").await;
+    enroll_from(&h, later, "2026-06-01T00:00:00.000000Z", "order-later").await;
     // Written second, effective first — the backdating an operator does routinely.
-    enroll_from(&h, backdated, "2026-01-01T00:00:00Z", "order-backdated").await;
+    enroll_from(
+        &h,
+        backdated,
+        "2026-01-01T00:00:00.000000Z",
+        "order-backdated",
+    )
+    .await;
 
     let (status, body) = list_members(&h, "gold").await;
     assert_eq!(status, StatusCode::OK);
@@ -1915,7 +1945,7 @@ async fn the_membership_list_is_ordered_by_effective_date_and_not_by_write_time(
         .collect();
     assert_eq!(
         dates,
-        vec!["2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z"],
+        vec!["2026-01-01T00:00:00.000000Z", "2026-06-01T00:00:00.000000Z"],
         "the list is ordered by the effective date the decision names: {body}"
     );
 }
@@ -1941,9 +1971,9 @@ async fn the_membership_walk_holds_the_effective_date_order_across_pages() {
 
     // Written newest-effective-first, so write order and effective order are
     // reverses of one another and a walk resuming on the wrong key loses a row.
-    enroll_from(&h, Uuid::now_v7(), "2026-09-01T00:00:00Z", "walk-3").await;
-    enroll_from(&h, Uuid::now_v7(), "2026-05-01T00:00:00Z", "walk-2").await;
-    enroll_from(&h, Uuid::now_v7(), "2026-02-01T00:00:00Z", "walk-1").await;
+    enroll_from(&h, Uuid::now_v7(), "2026-09-01T00:00:00.000000Z", "walk-3").await;
+    enroll_from(&h, Uuid::now_v7(), "2026-05-01T00:00:00.000000Z", "walk-2").await;
+    enroll_from(&h, Uuid::now_v7(), "2026-02-01T00:00:00.000000Z", "walk-1").await;
 
     let mut dates: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
@@ -1988,9 +2018,9 @@ async fn the_membership_walk_holds_the_effective_date_order_across_pages() {
     assert_eq!(
         dates,
         vec![
-            "2026-02-01T00:00:00Z".to_owned(),
-            "2026-05-01T00:00:00Z".to_owned(),
-            "2026-09-01T00:00:00Z".to_owned()
+            "2026-02-01T00:00:00.000000Z".to_owned(),
+            "2026-05-01T00:00:00.000000Z".to_owned(),
+            "2026-09-01T00:00:00.000000Z".to_owned()
         ],
         "one row per page, every row once, in the decision's order"
     );
@@ -2032,7 +2062,7 @@ async fn the_members_of_a_retired_group_are_still_listed() {
             &CUSTOMER_GROUP_MEMBER
                 .replace("{group}", "gold")
                 .replace("{id}", &membership_id),
-            Some(json!({ "effective_to": "2026-06-01T00:00:00Z" })),
+            Some(json!({ "effective_to": "2026-06-01T00:00:00.000000Z" })),
             &[("if-match", &format!("\"{version}\""))],
         ))
         .await;
@@ -2102,7 +2132,7 @@ async fn a_foreign_tenant_cannot_adjust_this_tenants_membership() {
             &CUSTOMER_GROUP_MEMBER
                 .replace("{group}", "gold")
                 .replace("{id}", &id.to_string()),
-            Some(json!({ "effective_to": "2026-03-01T00:00:00Z" })),
+            Some(json!({ "effective_to": "2026-03-01T00:00:00.000000Z" })),
             &[("if-match", "\"0\"")],
         )
     };
@@ -2135,4 +2165,204 @@ async fn a_foreign_tenant_cannot_adjust_this_tenants_membership() {
             .is_some(),
         "and it is the owner's call that moved the end the two refused ones did not"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Bulk move: `POST …/members/move` (`inst-mm-bulk`).
+// ---------------------------------------------------------------------------
+
+fn bulk_move_path(group: &str) -> String {
+    CUSTOMER_GROUP_MEMBERS_MOVE.replace("{group}", group)
+}
+
+#[tokio::test]
+async fn a_bulk_move_with_no_payers_is_400() {
+    let harness = Harness::new().await;
+    rest_support::declare_customer_group(&harness, "silver").await;
+    let response = harness
+        .allowed_as(MEMBERSHIP_ADMIN)
+        .send(with_headers(
+            "POST",
+            &bulk_move_path("silver"),
+            Some(json!({
+                "payer_ids": [],
+                "effective_from": "2026-06-01T00:00:00.000000Z"
+            })),
+            &[("idempotency-key", "bulk-empty-1")],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_bulk_move_opens_one_unit_and_writes_no_membership_row_until_approved() {
+    let harness = Harness::new().await;
+    rest_support::declare_customer_group(&harness, "silver").await;
+    let first = Uuid::now_v7();
+    let second = Uuid::now_v7();
+    let before = approval_rows(&harness).await.len();
+
+    let response = harness
+        .allowed_as(MEMBERSHIP_ADMIN)
+        .send(with_headers(
+            "POST",
+            &bulk_move_path("silver"),
+            Some(json!({
+                "payer_ids": [first, second],
+                "effective_from": "2026-06-01T00:00:00.000000Z"
+            })),
+            &[("idempotency-key", "bulk-submit-1")],
+        ))
+        .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "body: {body}");
+    assert_eq!(body["outcome"], "submitted_for_approval");
+    assert!(body["moved"].is_null(), "nothing has committed yet: {body}");
+    assert_eq!(body["materiality"]["trigger"], "bulkGroupMove", "{body}");
+    assert_eq!(approval_rows(&harness).await.len(), before + 1);
+
+    let approval_id: Uuid = body["approval"]["approval_id"]
+        .as_str()
+        .expect("approval.approval_id")
+        .parse()
+        .expect("a UUID");
+    let stored = approval_row(&harness, approval_id).await;
+    assert_eq!(stored.subject_kind, AuditSubjectKind::Membership);
+    assert_eq!(
+        stored.materiality["trigger"], "bulkGroupMove",
+        "the store must carry the act the route declared: {:?}",
+        stored.materiality
+    );
+
+    let conn = harness.db.conn().expect("conn");
+    for payer in [first, second] {
+        let intervals = group_membership_repo::intervals_for_payer(
+            &conn,
+            &harness.scope(),
+            harness.tenant,
+            payer,
+        )
+        .await
+        .expect("read");
+        assert!(
+            intervals.is_empty(),
+            "no membership row may exist before the unit is approved: {payer}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_payer_on_the_bulk_door_is_still_always_material() {
+    let harness = Harness::new().await;
+    rest_support::declare_customer_group(&harness, "silver").await;
+    let response = harness
+        .allowed_as(MEMBERSHIP_ADMIN)
+        .send(with_headers(
+            "POST",
+            &bulk_move_path("silver"),
+            Some(json!({
+                "payer_ids": [Uuid::now_v7()],
+                "effective_from": "2099-06-01T00:00:00.000000Z"
+            })),
+            &[("idempotency-key", "bulk-one-future-1")],
+        ))
+        .await;
+    let status = response.status();
+    let body = body_json(response).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the bulk door does not take the renewal-aligned arm: {body}"
+    );
+    assert_eq!(
+        body["materiality"]["trigger"], "bulkGroupMove",
+        "one payer on the bulk door is still the bulk act: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_bulk_move_commits_every_payer_once_a_second_principal_approves() {
+    let harness = Harness::new().await;
+    rest_support::declare_customer_group(&harness, "silver").await;
+    let first = Uuid::now_v7();
+    let second = Uuid::now_v7();
+    let body = json!({
+        "payer_ids": [first, second],
+        "effective_from": "2026-06-01T00:00:00.000000Z"
+    });
+
+    let submit = harness
+        .allowed_as(MEMBERSHIP_ADMIN)
+        .send(with_headers(
+            "POST",
+            &bulk_move_path("silver"),
+            Some(body.clone()),
+            &[("idempotency-key", "bulk-commit-1")],
+        ))
+        .await;
+    assert_eq!(submit.status(), StatusCode::ACCEPTED);
+    let submit_body = body_json(submit).await;
+    let approval_id: Uuid = submit_body["approval"]["approval_id"]
+        .as_str()
+        .expect("approval.approval_id")
+        .parse()
+        .expect("a UUID");
+
+    let approve = harness
+        .allowed_as(MOVE_APPROVER)
+        .send(request(
+            "POST",
+            &APPROVAL_APPROVE.replace("{approvalId}", &approval_id.to_string()),
+            None,
+        ))
+        .await;
+    assert_eq!(approve.status(), StatusCode::OK);
+
+    let commit = harness
+        .allowed_as(MEMBERSHIP_ADMIN)
+        .send(with_headers(
+            "POST",
+            &bulk_move_path("silver"),
+            Some(body),
+            &[("idempotency-key", "bulk-commit-2")],
+        ))
+        .await;
+    let status = commit.status();
+    let body = body_json(commit).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["outcome"], "committed");
+    let moved = body["moved"].as_array().expect("moved[]");
+    assert_eq!(moved.len(), 2, "{body}");
+    let payers: Vec<_> = moved
+        .iter()
+        .map(|row| row["enrolled"]["payer_tenant_id"].as_str().expect("payer"))
+        .collect();
+    assert!(payers.contains(&first.to_string().as_str()), "{body}");
+    assert!(payers.contains(&second.to_string().as_str()), "{body}");
+    assert!(
+        moved
+            .iter()
+            .all(|row| row["enrolled"]["group_value"] == "silver"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_bulk_move_into_an_undeclared_group_is_refused_group_unknown() {
+    let harness = Harness::new().await;
+    let response = harness
+        .allowed_as(MEMBERSHIP_ADMIN)
+        .send(with_headers(
+            "POST",
+            &bulk_move_path("nonexistent"),
+            Some(json!({
+                "payer_ids": [Uuid::now_v7()],
+                "effective_from": "2026-06-01T00:00:00.000000Z"
+            })),
+            &[("idempotency-key", "bulk-undeclared-1")],
+        ))
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(problem_code(response).await, "GROUP_UNKNOWN");
 }

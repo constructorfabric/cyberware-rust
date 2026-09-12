@@ -5,13 +5,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
     AddonCoverage, CURRENCY_NOT_COVERED, Market, RequiredAddonsCoverMarkets, sold_markets,
 };
 use crate::domain::concurrency::RowVersion;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount};
 use crate::domain::plan_shape::{AddonRule, PlanShape};
@@ -21,6 +21,7 @@ use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
 use crate::domain::validation::{ValidationReport, ValidationRule};
+use time::OffsetDateTime;
 
 /// One add-on and the markets a fixture gives it.
 type CoverageSpec<'a> = (Uuid, &'a [(&'a str, &'a str)]);
@@ -28,10 +29,8 @@ type CoverageSpec<'a> = (Uuid, &'a [(&'a str, &'a str)]);
 const ADDON_A: Uuid = Uuid::from_u128(0x0add_000a);
 const ADDON_B: Uuid = Uuid::from_u128(0x0add_000b);
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 6, 12, 0, 0)
 }
 
 fn plan() -> PlanId {

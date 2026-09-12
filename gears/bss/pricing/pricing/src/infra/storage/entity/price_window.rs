@@ -25,10 +25,11 @@
 //! The `resource_col` is `window_id`, so a scope naming one window reaches that
 //! row and no other — `pricing_approval`'s shape.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_price_window")]
@@ -47,26 +48,26 @@ pub struct Model {
     /// migration's frozen-column whitelist holds.
     pub price_id: Uuid,
     /// Inclusive start of the half-open interval, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// **Exclusive** end, UTC. `None` is open-ended. Exclusive is what makes
     /// `effective_to = next.effective_from` adjacency rather than an overlap and
     /// rather than a gap (§9).
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// `scheduled` | `active` | `expired` | `cancelled` (§4's machine).
     pub state: String,
     /// The operator-supplied change reason carried for the audit trail.
     pub reason_code: String,
     /// **Pseudonymous** principal id of whoever scheduled the window.
     pub created_by: Uuid,
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
     /// Set exactly on an `active` or `expired` window — an expired one **was**
     /// active, so it keeps the instant it became so.
-    pub activated_at: Option<DateTime<Utc>>,
+    pub activated_at: Option<OffsetDateTime>,
     /// Set exactly on an `expired` window.
-    pub expired_at: Option<DateTime<Utc>>,
+    pub expired_at: Option<OffsetDateTime>,
     /// Set exactly on a `cancelled` window, which — since only a `scheduled`
     /// window cancels — never carries an `activated_at`.
-    pub cancelled_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<OffsetDateTime>,
     /// How many **operator acts** this window has been the subject of: `0` at its
     /// own schedule, `+1` per adjustment and per cancellation, and **unmoved by the
     /// activation and expiry sweeps** (D-190, `pricing_price_window`).

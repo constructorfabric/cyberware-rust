@@ -28,6 +28,7 @@ use bss_pricing::domain::approval::ApprovalState;
 use rest_support::{
     Harness, approval_rows, audit_rows, body_json, policy_etag_of, problem_code, with_headers,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// The principal who proposes. Distinct from [`REVIEWER`] because
@@ -42,18 +43,18 @@ const REVIEWER: Uuid = Uuid::from_u128(0xa_d0);
 /// An instant that has **arrived** — the date every case asserting a policy is *in
 /// force* has to carry.
 ///
-/// It was `2099-03-01T00:00:00Z` until D-188, on the window suites' convention that
+/// It was `2099-03-01T00:00:00.000000Z` until D-188, on the window suites' convention that
 /// a fixture instant should be far enough out that no clock reaches it. That
 /// convention is right for a window, whose `effectiveFrom` must be in the future
 /// when it is authored, and exactly wrong here: a threshold version is not effective
 /// **before** its instant, so a suite dated 2099 asserted "the approved version is
 /// the tenant's policy" over a version that must not be. Those assertions passed
 /// only because the walk compared the instant against nothing.
-const EFFECTIVE_FROM: &str = "2020-01-01T00:00:00Z";
+const EFFECTIVE_FROM: &str = "2020-01-01T00:00:00.000000Z";
 
 /// An instant that has **not** arrived — the same date the file used to give every
 /// case, kept for the two that are about a version whose start is still ahead.
-const NOT_YET: &str = "2099-03-01T00:00:00Z";
+const NOT_YET: &str = "2099-03-01T00:00:00.000000Z";
 
 /// A well-formed proposal body over one currency, starting at [`EFFECTIVE_FROM`].
 fn proposal(currency: &str, absolute_minor: i64) -> serde_json::Value {
@@ -141,7 +142,7 @@ async fn asserted_now(h: &Harness) -> bss_pricing::infra::threshold::AssertedPol
         .expect("the policy state reads");
     bss_pricing::infra::threshold::AssertedPolicy {
         tag: held.tag(),
-        now: chrono::Utc::now(),
+        now: OffsetDateTime::now_utc(),
     }
 }
 
@@ -737,7 +738,7 @@ async fn a_sub_millisecond_effective_from_is_refused_on_its_own_code() {
         &h,
         PROPOSER,
         serde_json::json!({
-            "effective_from": "2099-03-01T00:00:00.0005Z",
+            "effective_from": "2099-03-01T00:00:00.000500Z",
             "entries": [{ "currency": "EUR", "absolute_minor": 500 }]
         }),
     )
@@ -907,9 +908,7 @@ async fn a_version_widened_after_approval_stops_being_the_effective_policy() {
         &h.scope(),
         h.tenant,
         0,
-        chrono::DateTime::parse_from_rfc3339(EFFECTIVE_FROM)
-            .expect("a real instant")
-            .with_timezone(&chrono::Utc),
+        bss_pricing::domain::instant::parse_rfc3339(EFFECTIVE_FROM).expect("a real instant"),
         &[bss_pricing::infra::storage::repo::ThresholdEntryRow {
             currency: "USD".to_owned(),
             absolute_minor: Some(1),
@@ -951,7 +950,8 @@ async fn a_policy_unit_whose_id_is_taken_is_a_retriable_conflict_and_not_a_stora
         currency: bss_pricing::domain::money::CurrencyCode::new("EUR").expect("a valid code"),
         basis: bss_pricing::domain::materiality::ThresholdBasis::Absolute { minor: 500 },
     };
-    let effective_from = EFFECTIVE_FROM.parse().expect("an RFC 3339 instant");
+    let effective_from =
+        bss_pricing::domain::instant::parse_rfc3339(EFFECTIVE_FROM).expect("an RFC 3339 instant");
     let taken = Uuid::now_v7();
     let materiality = serde_json::json!({ "material": true, "reason": "alwaysMaterialTrigger" });
 
@@ -1998,10 +1998,10 @@ async fn a_version_whose_start_is_still_ahead_is_not_in_the_tag_until_it_arrives
     );
 
     let conn = h.db.conn().expect("a scoped connection");
-    let before: chrono::DateTime<chrono::Utc> =
-        "2099-02-01T00:00:00Z".parse().expect("an RFC 3339 instant");
-    let after: chrono::DateTime<chrono::Utc> =
-        "2099-04-01T00:00:00Z".parse().expect("an RFC 3339 instant");
+    let before = bss_pricing::domain::instant::parse_rfc3339("2099-02-01T00:00:00.000000Z")
+        .expect("an RFC 3339 instant");
+    let after = bss_pricing::domain::instant::parse_rfc3339("2099-04-01T00:00:00.000000Z")
+        .expect("an RFC 3339 instant");
 
     let ahead = bss_pricing::infra::threshold::state_at(&conn, &h.scope(), h.tenant, before)
         .await

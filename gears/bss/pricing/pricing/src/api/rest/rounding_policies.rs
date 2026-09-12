@@ -62,6 +62,7 @@ use crate::domain::overlay::ScopeValue;
 use crate::domain::taxonomy::{TAXONOMY_VALUE_IN_USE, TaxonomyEntry, TaxonomyState};
 use crate::infra::storage::repo::taxonomy_repo;
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag (DE0205).
 const TAG: &str = "BSS Pricing Configuration";
@@ -261,7 +262,7 @@ async fn put_values(
             tenant,
             entries,
             &asserted,
-            audit_stamp(&ctx, chrono::Utc::now(), correlation),
+            audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation),
         )
         .await
         .map_err(|e| CanonicalError::from(repo_failure(&e)))?;

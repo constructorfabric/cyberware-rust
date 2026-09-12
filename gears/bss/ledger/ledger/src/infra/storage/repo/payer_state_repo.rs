@@ -9,7 +9,6 @@
 //! (SQL-level BOLA). The closure upsert is a single idempotent statement
 //! (`INSERT … ON CONFLICT DO UPDATE`), so it needs no explicit transaction.
 
-use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt, SecureOnConflict};
@@ -19,6 +18,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::status::PAYER_LIFECYCLE_CLOSED;
 use crate::infra::storage::entity::{ar_payer_balance, payer_state};
+use time::OffsetDateTime;
 
 /// SeaORM-backed payer-lifecycle repository.
 #[derive(Clone)]
@@ -109,7 +109,7 @@ impl PayerStateRepo {
             .db
             .conn()
             .map_err(|e| DomainError::Internal(format!("conn: {e}")))?;
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let am = payer_state::ActiveModel {
             tenant_id: Set(tenant),
             payer_tenant_id: Set(payer_tenant_id),

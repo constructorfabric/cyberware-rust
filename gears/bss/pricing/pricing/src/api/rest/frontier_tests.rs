@@ -4,9 +4,8 @@
 //! database) is `tests/rest_frontier.rs`; what is worth pinning here is the
 //! discrimination the wire shape has to carry.
 
-use chrono::{TimeZone, Utc};
-
 use super::PinFrontierView;
+use crate::domain::instant::utc_ymd_hms;
 use bss_pricing_sdk::{CatalogVersion, PinFrontier};
 
 #[test]
@@ -14,7 +13,7 @@ fn no_frontier_yet_is_distinguishable_from_a_frontier_at_version_zero() {
     let nothing = PinFrontierView::none_yet();
     let at_zero = PinFrontierView::from(PinFrontier {
         catalog_version: CatalogVersion::new(0),
-        advanced_at: Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0).unwrap(),
+        advanced_at: utc_ymd_hms(2026, 8, 1, 12, 0, 0),
     });
 
     // The whole reason this is a 200 and not a 404: a consumer reading version
@@ -32,7 +31,7 @@ fn no_frontier_yet_is_distinguishable_from_a_frontier_at_version_zero() {
 
 #[test]
 fn a_present_frontier_carries_the_version_and_the_instant_verbatim() {
-    let advanced_at = Utc.with_ymd_and_hms(2026, 8, 1, 9, 30, 0).unwrap();
+    let advanced_at = utc_ymd_hms(2026, 8, 1, 9, 30, 0);
     let view = PinFrontierView::from(PinFrontier {
         catalog_version: CatalogVersion::new(42),
         advanced_at,

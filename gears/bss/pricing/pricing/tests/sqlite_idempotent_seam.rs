@@ -22,13 +22,15 @@ use bss_pricing::infra::idempotent::{Guarded, GuardedRequest, TxFuture, guarded}
 use bss_pricing::infra::storage::entity::{idempotency_dedup, plan};
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{IdempotencyGate, NewPlanDraft, plan_repo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use serde_json::{Value as JsonValue, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, DbTx, SecureEntityExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -55,8 +57,8 @@ async fn provider() -> DBProvider<DbError> {
     DBProvider::<DbError>::new(db)
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 fn new_draft(plan_id: PlanId, tenant_id: Uuid) -> NewPlanDraft {
@@ -290,7 +292,7 @@ async fn a_failed_mutation_leaves_no_claim_behind_so_the_retry_claims_afresh() {
     // refused by the repository (D-144), after the claim row is written.
     let doomed = {
         let mut draft = new_draft(plan_id, tenant);
-        draft.available_from = Some(at(9) + chrono::TimeDelta::microseconds(1));
+        draft.available_from = Some(at(9) + time::Duration::microseconds(1));
         let scope_for_body = scope.clone();
         guarded::<PlanRevision, _, _>(
             &db,

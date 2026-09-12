@@ -41,7 +41,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{OVERLAY_PIN_DOMAIN_SEP, overlay_content_hash};
@@ -52,6 +51,7 @@ use crate::domain::contracts::{
     AnchorDay, BillingAnchorPolicy, GrantSet, ProrationBasis, ProrationContract,
     UsageCounterOnPlanChange,
 };
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::materiality::{ThresholdBasis, ThresholdEntry, ThresholdVersion};
 use crate::domain::money::{CurrencyCode, MinorAmount, RateMinor};
@@ -74,6 +74,7 @@ use crate::domain::scope_key::{
     ChargeKind, Cohort, DimensionKey, Meter, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
 use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
 // A maximal shape: every option present, every collection non-empty.
@@ -85,10 +86,8 @@ fn rate(minor_units: i64) -> RateMinor {
     RateMinor::from_minor_units(minor_units).expect("a non-negative rate")
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 fn plan() -> PlanId {
@@ -214,6 +213,9 @@ fn maximal_phase(seed: u128, ordinal: i32, converts_to: Option<PhaseId>) -> Plan
     PlanPhase {
         phase_id: phase_id(seed),
         kind: PhaseKind::Trial,
+        // Non-empty, so the golden vector covers the label's **value** and not
+        // only its presence (the `tax_category_ref` argument on the frozen test).
+        display_name: Some("Onboarding".to_owned()),
         ordinal,
         converts_to_phase_id: converts_to,
         phase_duration_days: Some(14),
@@ -495,7 +497,7 @@ fn child_mutators() -> Vec<Mutator> {
         }),
         ("phase.kind", |s| {
             let mut phases = s.phases.phases().to_vec();
-            phases[0].kind = PhaseKind::Intro;
+            phases[0].kind = PhaseKind::Interim;
             s.phases = PhaseGraph::new(phases);
         }),
         ("phase.ordinal", |s| {
@@ -516,6 +518,24 @@ fn child_mutators() -> Vec<Mutator> {
         ("phase.display_trial_days", |s| {
             let mut phases = s.phases.phases().to_vec();
             phases[0].display_trial_days = Some(30);
+            s.phases = PhaseGraph::new(phases);
+        }),
+        // D-357: the label is framed, and all three transitions move the pin —
+        // another value, absence, and the empty string (which the REST parser
+        // never produces but the encoder must still tell from absence).
+        ("phase.display_name", |s| {
+            let mut phases = s.phases.phases().to_vec();
+            phases[0].display_name = Some("Ramp".to_owned());
+            s.phases = PhaseGraph::new(phases);
+        }),
+        ("phase.display_name -> None", |s| {
+            let mut phases = s.phases.phases().to_vec();
+            phases[0].display_name = None;
+            s.phases = PhaseGraph::new(phases);
+        }),
+        ("phase.display_name -> empty", |s| {
+            let mut phases = s.phases.phases().to_vec();
+            phases[0].display_name = Some(String::new());
             s.phases = PhaseGraph::new(phases);
         }),
         // AddonRule
@@ -1373,10 +1393,20 @@ fn the_clock_may_flip_a_window_but_not_the_pin() {
 /// exactly like the other kind from a failing run: a diff that moves this
 /// constant is either "the preimage function changed, invalidate every pending
 /// unit" or "the fixture got wider, cover more of the preimage", and only one of
-/// them is an edit. `CONTENT_PIN_DOMAIN_SEP` stays at `v15`, and the proof it is
-/// the second kind is that `the_overlay_encoding_is_frozen` and
-/// `the_threshold_encoding_is_frozen` — over fixtures that did not move — are
-/// unchanged.
+/// them is an edit. `CONTENT_PIN_DOMAIN_SEP` stayed at `v15` through that
+/// widening, and the proof it was the second kind is that
+/// `the_overlay_encoding_is_frozen` and `the_threshold_encoding_is_frozen` — over
+/// fixtures that did not move — were unchanged.
+///
+/// **2026-09-09 (D-357, D-358) was the first kind, and the constant moved to
+/// `v16`:** `put_plan_phase` now frames `PlanPhase::display_name`, and
+/// `PhaseKind::as_str` renders `interim` where it rendered `intro`, so every
+/// pending unit's digest is stale by construction. `maximal_phase` widened in the
+/// same edit (`display_name: Some("Onboarding")`) so the vector covers the label's
+/// value and not only its presence — the `tax_category_ref` argument below — and
+/// the three `phase.display_name` mutators hold the transitions apart. The overlay
+/// and threshold vectors are again unchanged, which is what separates the two
+/// kinds when both happen at once.
 ///
 /// `maximal_record`'s `tax_category_ref` carries an authored token (`standard`)
 /// rather than an ABSENT marker, which is what puts the field's *value* into the
@@ -1389,7 +1419,7 @@ fn the_clock_may_flip_a_window_but_not_the_pin() {
 fn the_encoding_is_frozen() {
     assert_eq!(
         hex32(&content_hash(&base())),
-        "c0bfb81c7588a5b40e44d871dae880786683abee0171dc9d888c1603565f4c70"
+        "25f4aab2a71e21213582e588091483efc5148eab9576d4e514d6103cd8904236"
     );
 }
 
@@ -1400,7 +1430,7 @@ fn the_encoding_is_frozen() {
 /// One version, built from the parts the pin frames.
 fn threshold_version(
     version: u64,
-    effective_from: DateTime<Utc>,
+    effective_from: OffsetDateTime,
     entries: Vec<(&str, ThresholdBasis)>,
 ) -> ThresholdVersion {
     ThresholdVersion::new(
@@ -1549,7 +1579,7 @@ fn the_two_pin_domains_are_disjoint_and_each_names_its_own_generation() {
     );
     assert_eq!(
         super::CONTENT_PIN_DOMAIN_SEP,
-        b"VHP-BSS-PRICING-APPROVAL-PIN-v15\x1f"
+        b"VHP-BSS-PRICING-APPROVAL-PIN-v16\x1f"
     );
     assert_eq!(
         super::THRESHOLD_PIN_DOMAIN_SEP,

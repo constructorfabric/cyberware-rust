@@ -62,6 +62,7 @@ use bss_pricing::domain::approval::{ApprovalState, DecisionBy, WithdrawAuthority
 use bss_pricing::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use bss_pricing::domain::concurrency::RowVersion;
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::plan::PlanShapePatch;
@@ -82,7 +83,9 @@ use bss_pricing::infra::storage::repo::approval_repo::{self, ApprovalRecord, New
 use bss_pricing::infra::storage::repo::plan_repo::NewPlanDraft;
 use bss_pricing::infra::storage::repo::price_repo::NewPriceDraft;
 use bss_pricing::infra::storage::repo::{PlanRepo, PlanShapeRepo, PriceRepo};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
+use bss_pricing::domain::instant::format_rfc3339;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
@@ -118,8 +121,8 @@ fn terminal_phase() -> PhaseId {
     PhaseId::new(Uuid::from_u128(0xfa_5e))
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 fn stamp() -> AuditStamp {
@@ -132,7 +135,7 @@ fn stamp() -> AuditStamp {
 
 /// The stamp a decision is taken under: who acted, when, and the request's
 /// correlation.
-fn stamp_of(actor: uuid::Uuid, when: DateTime<Utc>) -> AuditStamp {
+fn stamp_of(actor: uuid::Uuid, when: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -247,6 +250,7 @@ async fn seed(h: &Harness) -> Seeded {
             vec![PlanPhase {
                 phase_id: terminal_phase(),
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -1071,6 +1075,7 @@ async fn replacing_the_phase_graph_voids_the_pending_unit() {
             vec![PlanPhase {
                 phase_id: terminal_phase(),
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -1886,6 +1891,7 @@ async fn a_second_unit_over_a_rowless_revision_is_refused_by_the_plan_prefix() {
             vec![PlanPhase {
                 phase_id: terminal_phase(),
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -1945,8 +1951,8 @@ async fn a_second_unit_over_a_rowless_revision_is_refused_by_the_plan_prefix() {
 
 /// The changeover every case below opens a unit at — well clear of both of
 /// `inst-su-instant`'s floors against this suite's fixed clock.
-fn changeover() -> DateTime<Utc> {
-    at(10) + chrono::Duration::days(30)
+fn changeover() -> OffsetDateTime {
+    at(10) + time::Duration::days(30)
 }
 
 /// The world a supersession is composed against: a plan whose revision is **current**.
@@ -1977,7 +1983,7 @@ async fn submit_supersession(
     h: &Harness,
     approval_id: Uuid,
     market: &str,
-    at_instant: DateTime<Utc>,
+    at_instant: OffsetDateTime,
 ) -> Result<ApprovalRecord, DomainError> {
     let conn = h.provider.conn().expect("conn");
     ApprovalService::submit_supersession_on(
@@ -2060,7 +2066,7 @@ async fn a_second_submit_of_one_supersession_is_refused_by_the_subject_guard_spe
         "the subject guard's own sentence, which neither sibling produces: {detail}"
     );
     assert!(
-        detail.contains(&changeover().to_rfc3339()),
+        detail.contains(&format_rfc3339(changeover())),
         "and it names the act, not just the key: {detail}"
     );
     assert!(
@@ -2095,7 +2101,7 @@ async fn two_changeovers_on_one_key_are_two_acts_but_the_key_admits_only_one_uni
         &h,
         Uuid::from_u128(0xa_5002),
         "eu",
-        changeover() + chrono::Duration::days(1),
+        changeover() + time::Duration::days(1),
     )
     .await
     .expect_err("the key already has a pending unit");
@@ -2188,7 +2194,7 @@ async fn submit_cutover(
     h: &Harness,
     approval_id: Uuid,
     market: &str,
-    at_instant: DateTime<Utc>,
+    at_instant: OffsetDateTime,
 ) -> Result<ApprovalRecord, DomainError> {
     let conn = h.provider.conn().expect("conn");
     ApprovalService::submit_cutover_on(

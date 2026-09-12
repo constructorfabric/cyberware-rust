@@ -1,7 +1,7 @@
 //! `SeaORM` entity for `bss.ledger_reusable_credit_subbalance` (reusable-credit cache).
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -26,7 +26,7 @@ pub struct Model {
     pub currency: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub credit_grant_event_type: String,
-    pub first_granted_at: Option<DateTime<Utc>>,
+    pub first_granted_at: Option<OffsetDateTime>,
     pub balance_minor: i64,
     pub functional_balance_minor: Option<i64>,
     pub functional_currency: Option<String>,

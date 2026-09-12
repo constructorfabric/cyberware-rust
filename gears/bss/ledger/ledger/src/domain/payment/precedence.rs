@@ -13,7 +13,7 @@
 
 use std::cmp::Ordering;
 
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 
 /// The default precedence policy id stamped on an allocation when none is chosen.
@@ -75,7 +75,7 @@ pub struct Candidate {
     pub open_minor: i64,
     /// When the invoice was originally posted — the oldest-first sort key. `None`
     /// sorts after every `Some` (treated as the newest / last to be paid).
-    pub original_posted_at: Option<DateTime<Utc>>,
+    pub original_posted_at: Option<OffsetDateTime>,
 }
 
 /// One invoice's share of a lump: it receives `amount_minor` (always `> 0` — the

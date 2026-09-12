@@ -39,7 +39,7 @@ const SUBMITTER: Uuid = Uuid::from_u128(0x5_c0);
 /// **Every seeded audit row carries the fixture's instant, not the wall clock.**
 ///
 /// `rest_support::stamp` is reached by every seeder in the harness, and it read
-/// `Utc::now()`: each run wrote a different `recorded_at`, so no suite could assert
+/// `OffsetDateTime::now_utc()`: each run wrote a different `recorded_at`, so no suite could assert
 /// the recorded instant by equality and a seeder that dropped the stamp entirely
 /// was indistinguishable from one that kept it. The instant is a fact of the
 /// fixture like `plan_id` is, and this is what makes it one.
@@ -254,6 +254,62 @@ async fn a_one_row_walk_visits_every_record_exactly_once_and_in_order() {
     for _ in 0..=expected.len() {
         let query = match cursor.as_deref() {
             None => "limit=1".to_owned(),
+            Some(token) => format!("limit=1&cursor={token}"),
+        };
+        let page = page(&harness, &query).await;
+        walked.extend(keys(&page));
+        match page["next_cursor"].as_str() {
+            None => break,
+            Some(token) => cursor = Some(token.to_owned()),
+        }
+    }
+
+    assert_eq!(
+        walked, expected,
+        "the walk must visit the same records in the same order as the single page"
+    );
+    let distinct: std::collections::BTreeSet<&(String, i64)> = walked.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        walked.len(),
+        "and no record twice: {walked:?}"
+    );
+}
+
+/// **The same walk under a caller's `$orderby`.** `seq` counts within a chain
+/// segment, so `recorded_at` plus the `seq` tiebreaker alone is not unique —
+/// entries on different chains share both. `query_with_unique_order` names
+/// `chain_id`; this is the boundary it repairs, one row a page, with the single
+/// page under the same order as the referent.
+#[tokio::test]
+async fn a_one_row_walk_under_recorded_at_visits_every_record_exactly_once() {
+    let harness = Harness::new().await;
+    let approval_id = a_pending_unit(&harness).await;
+    harness
+        .allowed_as(SUBMITTER)
+        .send(with_headers(
+            "POST",
+            &format!("/bss-pricing/v1/approvals/{approval_id}/approve"),
+            None,
+            &[],
+        ))
+        .await;
+    seed_publishable_plan(&harness, Uuid::now_v7()).await;
+
+    let whole = page(&harness, "$orderby=recorded_at&limit=1000").await;
+    let expected = keys(&whole);
+    let segments: std::collections::BTreeSet<&String> =
+        expected.iter().map(|(chain, _)| chain).collect();
+    assert!(
+        segments.len() > 1,
+        "the seed must span more than one chain segment, or nothing collides: {expected:?}"
+    );
+
+    let mut walked: Vec<(String, i64)> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..=expected.len() {
+        let query = match cursor.as_deref() {
+            None => "$orderby=recorded_at&limit=1".to_owned(),
             Some(token) => format!("limit=1&cursor={token}"),
         };
         let page = page(&harness, &query).await;

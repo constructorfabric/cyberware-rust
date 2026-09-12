@@ -8,8 +8,8 @@
 //! operator PII. Typing the column makes that structural rather than a
 //! convention a later writer could break.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
@@ -28,7 +28,7 @@ pub struct Model {
     pub seq: i64,
     /// `mutation` | `rollup`. A roll-up row chains the tenant's segment heads.
     pub entry_kind: String,
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: OffsetDateTime,
     /// Pseudonymous principal id. Never a name, never an email.
     pub actor_principal_id: Uuid,
     pub action: String,

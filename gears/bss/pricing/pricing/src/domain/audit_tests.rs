@@ -2,7 +2,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -10,6 +9,8 @@ use super::{
     AUDIT_DOMAIN_SEP, AuditAction, AuditRecord, AuditSubjectKind, audit_row_hash,
     genesis_prev_hash, hex32, subject_state,
 };
+use crate::domain::instant::utc_ymd_hms;
+use time::OffsetDateTime;
 
 const TENANT: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0001);
 const CHAIN: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0002);
@@ -17,8 +18,8 @@ const ACTOR: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0003);
 const APPROVAL: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0004);
 const CORRELATION: Uuid = Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0005);
 
-fn at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0).unwrap()
+fn at() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, 12, 0, 0)
 }
 
 fn record<'a>(
@@ -102,6 +103,7 @@ fn the_persisted_subject_kind_tokens_are_asserted_against_literals() {
     assert_eq!(AuditSubjectKind::Overlay.as_str(), "overlay");
     assert_eq!(AuditSubjectKind::BulkOperation.as_str(), "bulk_operation");
     assert_eq!(AuditSubjectKind::Membership.as_str(), "membership");
+    assert_eq!(AuditSubjectKind::TaxonomyValue.as_str(), "taxonomy_value");
     assert_eq!(
         AuditSubjectKind::ALL,
         &[
@@ -112,6 +114,7 @@ fn the_persisted_subject_kind_tokens_are_asserted_against_literals() {
             AuditSubjectKind::Overlay,
             AuditSubjectKind::BulkOperation,
             AuditSubjectKind::Membership,
+            AuditSubjectKind::TaxonomyValue,
         ]
     );
 }
@@ -186,7 +189,8 @@ fn every_subject_kind_is_in_the_roster() {
             | AuditSubjectKind::Policy
             | AuditSubjectKind::Overlay
             | AuditSubjectKind::BulkOperation
-            | AuditSubjectKind::Membership => AuditSubjectKind::ALL.contains(&kind),
+            | AuditSubjectKind::Membership
+            | AuditSubjectKind::TaxonomyValue => AuditSubjectKind::ALL.contains(&kind),
         }
     }
 
@@ -198,6 +202,7 @@ fn every_subject_kind_is_in_the_roster() {
         AuditSubjectKind::Overlay,
         AuditSubjectKind::BulkOperation,
         AuditSubjectKind::Membership,
+        AuditSubjectKind::TaxonomyValue,
     ];
     for kind in every {
         assert!(rostered(kind), "{kind:?} is not in AuditSubjectKind::ALL");
@@ -476,7 +481,7 @@ fn changing_any_single_field_changes_the_hash() {
         (
             "recorded_at",
             AuditRecord {
-                recorded_at: at() + chrono::TimeDelta::milliseconds(1),
+                recorded_at: at() + time::Duration::milliseconds(1),
                 ..base
             },
         ),
@@ -583,7 +588,10 @@ fn the_action_and_the_subject_kind_are_in_the_hash() {
     super::put_uuid(&mut buf, rec.tenant_id);
     super::put_uuid(&mut buf, rec.chain_id);
     super::put_u64(&mut buf, rec.seq);
-    super::put_i64(&mut buf, rec.recorded_at.timestamp_micros());
+    super::put_i64(
+        &mut buf,
+        crate::domain::instant::timestamp_micros(rec.recorded_at),
+    );
     super::put_uuid(&mut buf, rec.actor_principal_id);
     // The two tokens deliberately omitted.
     super::put_str(&mut buf, rec.subject_ref);

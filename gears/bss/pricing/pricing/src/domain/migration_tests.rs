@@ -1,7 +1,6 @@
 //! Unit cases for [`super`] — §4's four edges, D-34's rescoped cancel, D-49's
 //! notice floor, `inst-mg-target`'s target predicate and D-39's entry phase.
 
-use chrono::{Duration, TimeZone as _, Utc};
 use uuid::Uuid;
 
 use crate::domain::plan_shape::PhaseKind;
@@ -11,10 +10,13 @@ use super::{
     ensure_target_publishable, entry_phase_index,
 };
 use crate::domain::error::DomainError;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
+use time::Duration;
+use time::OffsetDateTime;
 
-fn at(year: i32, month: u32, day: u32) -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).unwrap()
+fn at(year: i32, month: u32, day: u32) -> OffsetDateTime {
+    utc_ymd_hms(year, month, day, 0, 0, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -306,12 +308,12 @@ fn a_migration_onto_the_source_plan_itself_is_refused() {
 fn a_migrated_subscription_enters_the_first_non_trial_phase() {
     // D-39, CONFIRMED 2026-08-07: a migration never grants a new `trial`.
     assert_eq!(
-        entry_phase_index(&[PhaseKind::Trial, PhaseKind::Intro, PhaseKind::Evergreen]),
+        entry_phase_index(&[PhaseKind::Trial, PhaseKind::Interim, PhaseKind::Evergreen]),
         Some(1)
     );
-    // ...and **does** grant `intro`, which is the half that is easy to lose.
+    // ...and **does** grant `interim`, which is the half that is easy to lose.
     assert_eq!(
-        entry_phase_index(&[PhaseKind::Intro, PhaseKind::Evergreen]),
+        entry_phase_index(&[PhaseKind::Interim, PhaseKind::Evergreen]),
         Some(0)
     );
     assert_eq!(entry_phase_index(&[PhaseKind::Evergreen]), Some(0));

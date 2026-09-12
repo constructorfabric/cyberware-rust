@@ -10,11 +10,12 @@
 //! module doc. `None` reads as "claimed, not yet answered", and the two columns
 //! move together or not at all.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_idempotency_dedup")]
@@ -40,7 +41,7 @@ pub struct Model {
     pub response_body: Option<JsonValue>,
     /// When the claim was taken. Read at claim time to decide whether the key
     /// has outlived its TTL and may be taken over.
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -86,7 +86,6 @@
 //! `inst-cl-windows` leaves its billable rows without coverage; that is reported
 //! rather than prevented.
 
-use chrono::{DateTime, Utc};
 use toolkit_db::secure::{AccessScope, DBRunner, DbTx};
 use uuid::Uuid;
 
@@ -104,6 +103,7 @@ use crate::infra::storage::repo::{
 };
 use crate::infra::storage::repo_failure;
 use std::collections::{BTreeMap, BTreeSet};
+use time::OffsetDateTime;
 
 /// The states a source row is copied from.
 ///
@@ -308,7 +308,7 @@ pub async fn clone_plan_on(
     tenant_id: Uuid,
     source: PlanId,
     target: PlanId,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<CloneReceipt, DomainError> {
     let current = plan_repo::load_current(runner, scope, tenant_id, source)
@@ -728,6 +728,7 @@ fn seeded_terminal_phase(travelling: &[PriceRecord]) -> (PlanPhase, SeededPhaseO
         PlanPhase {
             phase_id,
             kind: PhaseKind::Evergreen,
+            display_name: None,
             ordinal: 0,
             converts_to_phase_id: None,
             phase_duration_days: None,
@@ -915,7 +916,7 @@ async fn copy_rows_on(
     target: PlanId,
     travelling: &[PriceRecord],
     remap: &BTreeMap<Uuid, PhaseId>,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<(), DomainError> {
     for row in travelling {
@@ -952,7 +953,7 @@ fn phase_remap(phases: &[PlanPhase]) -> BTreeMap<Uuid, PhaseId> {
 /// than dropped: the chain is `PhaseGraph`'s to judge, and a cloner that silently
 /// repaired a broken source chain would hide the fault instead of copying it.
 fn remapped_phase(phase: &PlanPhase, remap: &BTreeMap<Uuid, PhaseId>) -> PlanPhase {
-    let mut copy = *phase;
+    let mut copy = phase.clone();
     if let Some(new_id) = remap.get(&phase.phase_id.get()) {
         copy.phase_id = *new_id;
     }

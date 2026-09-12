@@ -55,7 +55,7 @@ pub mod window_activation;
 ///
 /// Every alarm in these jobs is "this thing is older than `<knob>`", and every
 /// one of them reaches its comparison through
-/// `chrono::Duration::from_std(self.jobs.<knob>())`. Four of those conversions
+/// `time::Duration::try_from(self.jobs.<knob>())`. Four of those conversions
 /// were `let Ok(..) else { return; }` with no log, no counter and no report
 /// member: a deployment whose knob will not convert simply stopped raising
 /// that Critical or Warn, and the pass looked exactly like a pass with nothing
@@ -75,7 +75,7 @@ pub mod window_activation;
 /// judged at all. `frontier_ages` names the same distinction and this is the
 /// same field.
 pub(crate) fn unconvertible_threshold(
-    error: chrono::OutOfRangeError,
+    error: time::error::ConversionRange,
     knob: &'static str,
     guarded: &str,
 ) {

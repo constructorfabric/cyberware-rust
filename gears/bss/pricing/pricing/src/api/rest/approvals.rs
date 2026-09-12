@@ -66,13 +66,17 @@
 //! of the two the transition names. Gating on `read` instead would let anyone
 //! who can see a unit close it, which is worse and is not what the map says.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{Extension, Path, Query};
+use axum::extract::{Extension, Path, Query, RawQuery};
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
-use chrono::{DateTime, Utc};
+use bss_pricing_sdk::odata::ApprovalFilterField;
+
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
 use toolkit_odata::Page;
@@ -81,8 +85,8 @@ use uuid::Uuid;
 
 use crate::api::rest::auth_context::{audit_stamp, require_authenticated};
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
-use crate::api::rest::cursor::{self, PageRequest};
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::plans::{
     AddonRuleView, DescriptorSetView, FrequencyView, PeriodFloorCapView, PlanPhaseView,
 };
@@ -90,7 +94,9 @@ use crate::api::rest::preconditions;
 use crate::api::rest::prices::{PriceRowView, ScopeKeyView};
 use crate::api::rest::state::GovernanceState;
 use crate::api::rest::windows::WindowIntervalView;
+use crate::domain::instant::rfc3339;
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 
 use crate::domain::approval::{ApprovalState, DecisionBy, WithdrawAuthority};
 use crate::domain::audit::AuditSubjectKind;
@@ -104,6 +110,7 @@ use crate::domain::materiality::{
 use crate::domain::plan_shape::{CompositeMeter, PlanShape};
 use crate::domain::window::KeyWindows;
 use crate::infra::approval::{ApprovalDetail, DecideRequest, PinnedSubject, RegionGrant};
+use crate::infra::approval_participants::ParticipantName;
 use crate::infra::storage::repo::approval_repo::ApprovalRecord;
 use crate::infra::storage::repo::bulk_repo;
 
@@ -117,6 +124,8 @@ const TAG: &str = "BSS Pricing Approvals";
 /// route-shape rule only binds where the literal is; the two spellings are
 /// pinned together by `tests/module_test.rs`'s route census.
 pub const APPROVALS: &str = "/bss-pricing/v1/approvals";
+/// State totals over the full authorized queue.
+pub const APPROVAL_COUNTS: &str = "/bss-pricing/v1/approvals/counts";
 /// One approval record, with the content its pin covers (D-61).
 pub const APPROVAL: &str = "/bss-pricing/v1/approvals/{approvalId}";
 /// The approve action, as a sub-resource segment (D-140: never a colon method).
@@ -129,6 +138,22 @@ pub const APPROVAL_WITHDRAW: &str = "/bss-pricing/v1/approvals/{approvalId}/with
 // ---------------------------------------------------------------------------
 // Views and requests.
 // ---------------------------------------------------------------------------
+
+/// State totals, not the contents of one page. Withdrawals count as `voided`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ApprovalCountsView {
+    /// Total number of visible approvals.
+    pub total: u64,
+    /// Awaiting review.
+    pub submitted: u64,
+    /// Approved.
+    pub approved: u64,
+    /// Rejected.
+    pub rejected: u64,
+    /// Withdrawn or automatically voided.
+    pub voided: u64,
+}
 
 /// The evaluator's verdict, as it is stored and as it is read back.
 ///
@@ -280,7 +305,8 @@ impl From<&MaterialityVerdict> for MaterialityView {
     }
 }
 
-/// One approval record, as §6's columns stand.
+/// One approval record, as §6's columns stand. Mutation responses retain this
+/// shape; GETs add current, independently authorized participant names.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct ApprovalView {
@@ -309,9 +335,11 @@ pub struct ApprovalView {
     /// this shape — a later slice's writer, not an error.
     pub materiality: Option<MaterialityView>,
     /// When it was opened, UTC.
-    pub submitted_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub submitted_at: OffsetDateTime,
     /// When it was decided, UTC; `null` exactly while pending.
-    pub decided_at: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub decided_at: Option<OffsetDateTime>,
 }
 
 impl From<&ApprovalRecord> for ApprovalView {
@@ -330,6 +358,82 @@ impl From<&ApprovalRecord> for ApprovalView {
             decided_at: record.decided_at,
         }
     }
+}
+
+/// Availability of a current participant name, not the approval's state.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub enum ParticipantNameStatus {
+    /// A nonblank name or username was returned by AM/IdP.
+    Resolved,
+    /// The caller is not authorized to read the profile in AM.
+    Restricted,
+    /// No user visible to this caller; does not assert deletion or account kind.
+    NotFound,
+    /// Missing/unsupported provider, source failure, timeout, or invalid profile.
+    Unavailable,
+}
+
+/// Current identity presentation. Never persisted in Pricing or included in pins.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ApprovalParticipantView {
+    /// The same durable id as the corresponding `*_principal` field.
+    pub principal_id: Uuid,
+    /// Current display name, full name, or username from `IdP`; null unless resolved.
+    pub display_name: Option<String>,
+    /// Why a name is present or absent. Never treat null as an anonymous actor.
+    pub name_status: ParticipantNameStatus,
+}
+
+impl ApprovalParticipantView {
+    /// Project only the requested identity; no emails or provider errors escape.
+    fn new(principal_id: Uuid, names: &BTreeMap<Uuid, ParticipantName>) -> Self {
+        let (display_name, name_status) = match names.get(&principal_id) {
+            Some(ParticipantName::Resolved(name)) => {
+                (Some(name.clone()), ParticipantNameStatus::Resolved)
+            }
+            Some(ParticipantName::Restricted) => (None, ParticipantNameStatus::Restricted),
+            Some(ParticipantName::NotFound) => (None, ParticipantNameStatus::NotFound),
+            Some(ParticipantName::Unavailable) | None => (None, ParticipantNameStatus::Unavailable),
+        };
+        Self {
+            principal_id,
+            display_name,
+            name_status,
+        }
+    }
+}
+
+/// The same enriched record in list items and `GET /approvals/{id}.approval`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct ApprovalReadView {
+    /// Stored metadata remains unchanged and flat on the wire.
+    #[serde(flatten)]
+    pub record: ApprovalView,
+    /// Always present, including an explicit name-resolution failure.
+    pub submitter: ApprovalParticipantView,
+    /// Null when no reviewer is recorded, including a voided unit.
+    pub approver: Option<ApprovalParticipantView>,
+}
+
+impl ApprovalReadView {
+    /// Join request-local names onto an already-authorized record.
+    fn new(record: &ApprovalRecord, names: &BTreeMap<Uuid, ParticipantName>) -> Self {
+        Self {
+            record: ApprovalView::from(record),
+            submitter: ApprovalParticipantView::new(record.submitter_principal, names),
+            approver: record
+                .approver_principal
+                .map(|id| ApprovalParticipantView::new(id, names)),
+        }
+    }
+}
+
+/// The identities stored on one record, without inventing a reviewer on a void.
+fn participant_ids(record: &ApprovalRecord) -> impl Iterator<Item = Uuid> {
+    std::iter::once(record.submitter_principal).chain(record.approver_principal)
 }
 
 /// The stored verdict, or `None` — and the two are told apart in the log.
@@ -497,9 +601,11 @@ pub struct PinnedContentView {
     /// override.
     pub plan_tier_override: bool,
     /// Start of the availability window, UTC.
-    pub available_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_from: Option<OffsetDateTime>,
     /// End of the availability window, UTC.
-    pub available_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub available_to: Option<OffsetDateTime>,
     /// Minimum purchasable quantity.
     pub purchase_min_qty: Option<u64>,
     /// Maximum purchasable quantity.
@@ -651,7 +757,7 @@ impl From<&PlanShape> for PinnedContentView {
             phases: phases
                 .phases()
                 .iter()
-                .copied()
+                .cloned()
                 .map(PlanPhaseView::from)
                 .collect(),
             addon_rules: addon_rules
@@ -689,7 +795,8 @@ pub struct PinnedThresholdPolicyView {
     /// Which version of the tenant's policy this proposal is.
     pub version: u64,
     /// When its thresholds start applying, once approved.
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// The per-currency entries, in the order the pin frames them.
     pub entries: Vec<ThresholdEntryView>,
 }
@@ -740,6 +847,31 @@ pub struct ThresholdEntryView {
 /// silently omit unless somebody adds it.
 ///
 /// [`From<&PlanShape>`]: PinnedContentView
+/// One taxonomy value before and after a proposed edit (D-353).
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct PinnedTaxonomyValueView {
+    /// The universe: `region`, `brand`, `partner` or `org_tier`.
+    pub class: String,
+    /// The value being edited.
+    pub value: String,
+    /// The value as it stands.
+    pub before: crate::api::rest::taxonomies::TaxonomyValueView,
+    /// The value as the edit would leave it.
+    pub after: crate::api::rest::taxonomies::TaxonomyValueView,
+}
+
+impl From<&crate::domain::taxonomy::TaxonomyValueChange> for PinnedTaxonomyValueView {
+    fn from(change: &crate::domain::taxonomy::TaxonomyValueChange) -> Self {
+        Self {
+            class: change.proposal.class.path_segment().to_owned(),
+            value: change.proposal.value.as_str().to_owned(),
+            before: crate::api::rest::taxonomies::view_of(&change.held),
+            after: crate::api::rest::taxonomies::view_of(&change.next()),
+        }
+    }
+}
+
 impl From<&ThresholdVersion> for PinnedThresholdPolicyView {
     fn from(version: &ThresholdVersion) -> Self {
         Self {
@@ -770,7 +902,7 @@ impl From<&ThresholdVersion> for PinnedThresholdPolicyView {
 #[toolkit_macros::api_dto(response)]
 pub struct ApprovalDetailView {
     /// The record.
-    pub approval: ApprovalView,
+    pub approval: ApprovalReadView,
     /// The pinned **plan**, re-derived. `null` when the unit is not about a plan,
     /// and when it is but can no longer be derived at all — the draft published,
     /// or was abandoned.
@@ -820,6 +952,14 @@ pub struct ApprovalDetailView {
     /// second projection of it here would be a second answer to what the run was
     /// accepted as.
     pub pinned_repricing_run: Option<serde_json::Value>,
+    /// The pinned **taxonomy-value edit**, on a `taxonomy_value` unit (D-353).
+    /// `null` on every other kind — and on a taxonomy-value unit whose value is
+    /// no longer declared, in which case `content_matches_pin` is `false`.
+    ///
+    /// `before` is the value as the reviewer must see it stand, `after` as the
+    /// edit would leave it; the pin covers both, so a relabel landing under the
+    /// unit shows here as a mismatch rather than as a silently different `after`.
+    pub pinned_taxonomy_value: Option<PinnedTaxonomyValueView>,
     /// Whether the pinned content above still digests to `approval.content_hash`.
     ///
     /// **Read this before deciding.** `false` means the document above is *not*
@@ -849,18 +989,6 @@ pub struct WithdrawApprovalRequest {
     pub reason: Option<String>,
 }
 
-/// The two pagination query parameters plus the state filter (D-125).
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ApprovalPageQuery {
-    /// Records per page; server default 100, hard cap 1,000.
-    pub limit: Option<String>,
-    /// The opaque token a previous page returned.
-    pub cursor: Option<String>,
-    /// One of `submitted` | `approved` | `rejected` | `voided`. Absent is every
-    /// state, which is what "pending/decided approvals" asks for.
-    pub state: Option<String>,
-}
-
 /// Build the Axum router for the approval surface and register its operations.
 ///
 /// No route declares a 422: §3.3's status-rendering rule makes every
@@ -879,9 +1007,9 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
         .description(
             "One page of the tenant's approval records, in `approval_id` order, with an opaque \
              `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 \
-             (D-125). `state` narrows the page to one of `submitted`, `approved`, `rejected` or \
-             `voided`; omitting it returns every state, which is what a reviewer's queue over \
-             pending **and** decided units asks for. The pinned content is **not** on this \
+             (D-125). Narrow with `$filter=state eq 'submitted'` (or `approved` / `rejected` / \
+             `voided`); omitting `$filter` returns every state, which is what a reviewer's queue \
+             over pending **and** decided units asks for. The pinned content is **not** on this \
              page - a page of a hundred units would be a hundred plan assemblies - so a \
              reviewer opens `GET /bss-pricing/v1/approvals/{approvalId}` before deciding, which \
              is the surface D-61's reviewability invariant binds.",
@@ -896,17 +1024,36 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
             "integer",
         )
         .query_param("cursor", false, "Opaque base64url pagination cursor")
-        .query_param(
-            "state",
-            false,
-            "submitted | approved | rejected | voided; absent is every state",
-        )
         .handler(list_approvals)
-        .json_response_with_schema::<Page<ApprovalView>>(
+        .with_odata_filter::<ApprovalFilterField>()
+        .with_odata_orderby::<ApprovalFilterField>()
+        .json_response_with_schema::<Page<ApprovalReadView>>(
             openapi,
             StatusCode::OK,
-            "One page of the tenant's approval units.",
+            "One page of the tenant's approval units, with live AM/IdP participant names. \
+             Profile access is separately authorized by AM; unresolved names have explicit \
+             name_status. Cache-Control: private, no-store.",
         )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get("/bss-pricing/v1/approvals/counts")
+        .operation_id("bss_pricing.count_approvals")
+        .summary("Count visible approval units by state")
+        .description(
+            "Totals over the whole approval-read scope, including resource ID restrictions. \
+             No filtering or pagination parameters. Withdrawn units count as voided. \
+             No participant profile lookup. Cache-Control: private, no-store.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .handler(count_approvals)
+        .json_response_with_schema::<ApprovalCountsView>(openapi, StatusCode::OK, "State totals")
         .error_400(openapi)
         .error_401(openapi)
         .error_403(openapi)
@@ -925,7 +1072,10 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
              content hash covers, and `content_matches_pin` says whether the subject as it \
              stands still digests to the pin. A record outside the caller's scope reads exactly \
              like an absent one (404, no existence leak) - what a pending unit tells an observer \
-             is that a price change is in flight.",
+             is that a price change is in flight. `approval.submitter` and `approval.approver` \
+             project current AM/IdP names under the caller's profile-read rights, with explicit \
+             name_status on failure. Names are not pinned or stored in Pricing. \
+             Cache-Control: private, no-store.",
         )
         .tag(TAG)
         .authenticated()
@@ -958,9 +1108,12 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
              reviewer can only ever approve exactly what they saw. A record that has already \
              been decided or voided is `APPROVAL_NOT_PENDING` (409). The decision needs no \
              precondition header: the store's compare-and-swap carries `state = 'submitted'`, \
-             so the second arrival is refused whether it is a retry or a race. Approving does \
-             not publish; `POST /bss-pricing/v1/plans/{planId}/publish` does, and it re-verifies \
-             the pin again at the commit.",
+             so the second arrival is refused whether it is a retry or a race. For a \
+             `taxonomy_value` unit, approval also applies the pinned patch and its audit in \
+             this transaction: a stale pin or failed domain guard rolls back the decision. \
+             No second PATCH or additional `config x write` role is required. Plan approvals \
+             still do not publish; `POST /bss-pricing/v1/plans/{planId}/publish` does and \
+             re-verifies the pin at commit.",
         )
         .tag(TAG)
         .authenticated()
@@ -1062,40 +1215,68 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
 // ---------------------------------------------------------------------------
 
 /// `GET /approvals`.
+#[allow(clippy::implicit_hasher)]
 async fn list_approvals(
     Extension(state): Extension<Arc<GovernanceState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<ApprovalPageQuery>,
-) -> Result<Json<Page<ApprovalView>>, CanonicalError> {
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
+) -> Result<(HeaderMap, Json<Page<ApprovalReadView>>), CanonicalError> {
+    let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
+    let scope = read_scope(&enforcer, &ctx, None).await?;
+    let page = state
+        .approvals
+        .list_odata(&scope, ctx.subject_tenant_id(), &odata)
+        .await
+        .map_err(map_odata_page_err)?;
+    let names = state
+        .participants
+        .resolve(&ctx, page.items.iter().flat_map(participant_ids))
+        .await;
+    Ok((
+        participant_read_headers(),
+        Json(Page {
+            items: page
+                .items
+                .iter()
+                .map(|record| ApprovalReadView::new(record, &names))
+                .collect(),
+            page_info: page.page_info,
+        }),
+    ))
+}
+
+/// `GET /approvals/counts`; no list filters and no participant resolution.
+async fn count_approvals(
+    Extension(state): Extension<Arc<GovernanceState>>,
+    Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
+    extension_ctx: Option<Extension<SecurityContext>>,
+    RawQuery(query): RawQuery,
+) -> Result<(HeaderMap, Json<ApprovalCountsView>), CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
     let scope = read_scope(&enforcer, &ctx, None).await?;
-
-    let page = PageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )?;
-    let states = state_filter(query.state.as_deref())?;
-    // One row more than the page, so "is there another page" is answered without
-    // a second query and without a page of `next_cursor` pointing at nothing.
-    let probe = page.limit.saturating_add(1);
-    let mut records = state
-        .approvals
-        .list(&scope, ctx.subject_tenant_id(), &states, page.after, probe)
-        .await
-        .map_err(CanonicalError::from)?;
-
-    let has_more = u64::try_from(records.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        records.pop();
+    if query.is_some_and(|text| !text.is_empty()) {
+        return Err(CanonicalError::from(DomainError::InvalidRequest(
+            "approval counts does not accept query parameters".to_owned(),
+        )));
     }
-    let next = has_more
-        .then(|| records.last().map(|record| record.approval_id))
-        .flatten();
-    Ok(Json(Page {
-        items: records.iter().map(ApprovalView::from).collect(),
-        page_info: cursor::page_info(next, page.limit),
-    }))
+    let counts = state
+        .approvals
+        .counts(&scope, ctx.subject_tenant_id())
+        .await
+        .map_err(|e| CanonicalError::from(crate::infra::storage::repo_failure(&e)))?;
+    Ok((
+        participant_read_headers(),
+        Json(ApprovalCountsView {
+            total: counts.total,
+            submitted: counts.submitted,
+            approved: counts.approved,
+            rejected: counts.rejected,
+            voided: counts.voided,
+        }),
+    ))
 }
 
 /// `GET /approvals/{approvalId}`.
@@ -1104,17 +1285,39 @@ async fn get_approval(
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
     Path(approval_id): Path<Uuid>,
-) -> Result<Json<ApprovalDetailView>, CanonicalError> {
+) -> Result<(HeaderMap, Json<ApprovalDetailView>), CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
     let scope = read_scope(&enforcer, &ctx, Some(approval_id)).await?;
 
     let detail = state
         .approvals
-        .find(&scope, ctx.subject_tenant_id(), approval_id, Utc::now())
+        .find(
+            &scope,
+            ctx.subject_tenant_id(),
+            approval_id,
+            OffsetDateTime::now_utc(),
+        )
         .await
         .map_err(CanonicalError::from)?
         .ok_or_else(|| CanonicalError::from(not_readable(approval_id)))?;
-    Ok(Json(detail_view(&detail)))
+    let names = state
+        .participants
+        .resolve(&ctx, participant_ids(&detail.record))
+        .await;
+    Ok((
+        participant_read_headers(),
+        Json(detail_view(&detail, &names)),
+    ))
+}
+
+/// Current PII and caller-specific visibility must not enter shared/stale caches.
+fn participant_read_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, no-store"),
+    );
+    headers
 }
 
 /// `POST /approvals/{approvalId}/approve`.
@@ -1331,7 +1534,7 @@ async fn decide_record(
     reason: Option<String>,
     withdraw_authority: WithdrawAuthority,
 ) -> Result<ApprovalRecord, CanonicalError> {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let tenant = ctx.subject_tenant_id();
     state
         .approvals
@@ -1444,7 +1647,7 @@ async fn apply_approved_repricing_run(
     };
     let stamp = crate::domain::audit::AuditStamp {
         actor_principal_id: ctx.subject_id(),
-        recorded_at: Utc::now(),
+        recorded_at: OffsetDateTime::now_utc(),
         correlation_id: correlation,
     };
     if let Err(err) = crate::infra::repricing::begin_committing_in(
@@ -1574,7 +1777,7 @@ async fn advance_run_to_rejected(
         run.state,
         BulkState::Rejected,
         run.report.clone(),
-        Utc::now(),
+        OffsetDateTime::now_utc(),
     )
     .await
     .map(|_| ())
@@ -1703,32 +1906,6 @@ pub(crate) fn report_region_grant_transport(
         }
         RegionGrant::Explicit(_) => {}
     }
-}
-
-/// The state filter, read through [`ApprovalState::ALL`] rather than parsed.
-///
-/// One authority for what states exist, so a state added later cannot go missing
-/// from a literal list here while still compiling.
-fn state_filter(token: Option<&str>) -> Result<Vec<ApprovalState>, DomainError> {
-    let Some(token) = token else {
-        return Ok(Vec::new());
-    };
-    ApprovalState::ALL
-        .iter()
-        .copied()
-        .find(|state| state.as_str() == token)
-        .map(|state| vec![state])
-        .ok_or_else(|| {
-            let known: Vec<&str> = ApprovalState::ALL
-                .iter()
-                .copied()
-                .map(ApprovalState::as_str)
-                .collect();
-            DomainError::InvalidRequest(format!(
-                "state `{token}` is not one of {}",
-                known.join(", ")
-            ))
-        })
 }
 
 /// The composition a `bundleComposition` unit is being decided on (D-104, D-61).
@@ -1865,9 +2042,12 @@ impl From<crate::infra::window::ProposedAct> for ProposedActView {
 }
 
 /// Render one detail, pin and all.
-fn detail_view(detail: &ApprovalDetail) -> ApprovalDetailView {
+fn detail_view(
+    detail: &ApprovalDetail,
+    names: &BTreeMap<Uuid, ParticipantName>,
+) -> ApprovalDetailView {
     ApprovalDetailView {
-        approval: ApprovalView::from(&detail.record),
+        approval: ApprovalReadView::new(&detail.record, names),
         pinned_content: detail
             .subject
             .as_ref()
@@ -1895,6 +2075,11 @@ fn detail_view(detail: &ApprovalDetail) -> ApprovalDetailView {
             .as_ref()
             .and_then(PinnedSubject::repricing_run)
             .cloned(),
+        pinned_taxonomy_value: detail
+            .subject
+            .as_ref()
+            .and_then(PinnedSubject::taxonomy_value)
+            .map(PinnedTaxonomyValueView::from),
         content_matches_pin: detail.content_matches_pin,
     }
 }

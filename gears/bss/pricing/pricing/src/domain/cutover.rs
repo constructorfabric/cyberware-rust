@@ -6,13 +6,14 @@
 //! spelling rather than restating it; where the design set gives them different
 //! answers, it says which and why.
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::scope_key::{Cohort, ScopeKey};
 use crate::domain::supersession::{ChangeoverMoment, NamedWindow, WindowShorten, changeover_floor};
 use crate::domain::window::{OCCUPYING_STATES, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 /// Rule code for a cutover instant that has passed, or that no longer clears the
 /// batching delay at approval commit (`07-pricewindow-linkage.md` §5, 422).
@@ -39,8 +40,8 @@ pub const CUTOVER_INSTANT_PASSED: &str = "CUTOVER_INSTANT_PASSED";
 /// [`DomainError::CutoverInstantPassed`] naming the instant, the floor it missed,
 /// which moment asked, and the remedy for that moment.
 pub fn check_cutover_instant(
-    cutover: DateTime<Utc>,
-    now: DateTime<Utc>,
+    cutover: OffsetDateTime,
+    now: OffsetDateTime,
     moment: ChangeoverMoment,
 ) -> Result<(), DomainError> {
     changeover_floor(cutover, now, moment, "cutover").map_err(DomainError::CutoverInstantPassed)
@@ -120,7 +121,7 @@ impl ComposedCutover {
 /// cutover that this unit would not replace.
 pub fn compose_cutover_windows(
     plane: &[NamedWindow],
-    cutover: DateTime<Utc>,
+    cutover: OffsetDateTime,
 ) -> Result<ComposedCutover, DomainError> {
     let occupying = || {
         plane
@@ -135,7 +136,7 @@ pub fn compose_cutover_windows(
                 "the canonical scope key is dormant at {}: no scheduled or active window covers \
                  that instant, and a cutover presupposes current coverage to shorten. Reviving a \
                  dormant key is a plain publish and a window schedule, never a cutover",
-                cutover.to_rfc3339()
+                format_rfc3339(cutover)
             ))
         })?;
 
@@ -146,7 +147,7 @@ pub fn compose_cutover_windows(
              or the grandfathered copy to take over from. Adjust or reschedule that window \
              instead of cutting over across it",
             covering.window_id,
-            cutover.to_rfc3339()
+            format_rfc3339(cutover)
         )));
     }
 
@@ -157,8 +158,8 @@ pub fn compose_cutover_windows(
             "window {} begins at {}, which the successor's open-ended interval from {} already \
              covers; the key carries later coverage that this cutover would not replace",
             collision.window_id,
-            collision.interval.effective_from.to_rfc3339(),
-            cutover.to_rfc3339()
+            format_rfc3339(collision.interval.effective_from),
+            format_rfc3339(cutover)
         )));
     }
 
@@ -204,14 +205,14 @@ pub fn compose_cutover_windows(
 /// cohort/eligibility biconditional this function satisfies by construction).
 pub fn grandfathered_copy_key(
     predecessor: &ScopeKey,
-    cutover: DateTime<Utc>,
+    cutover: OffsetDateTime,
     existing_generations: &[Cohort],
 ) -> Result<ScopeKey, DomainError> {
     if existing_generations.contains(&Cohort::Generation(cutover)) {
         return Err(DomainError::DuplicateScopeKey(format!(
             "a grandfathered generation of this canonical scope key already carries the cutover \
              instant {}; every cutover mints its own generation, so name a different instant",
-            cutover.to_rfc3339()
+            format_rfc3339(cutover)
         )));
     }
     generation_key(predecessor, cutover)
@@ -237,7 +238,7 @@ pub fn grandfathered_copy_key(
 /// (D-144); the cohort/eligibility biconditional is satisfied by construction.
 pub fn generation_key(
     predecessor: &ScopeKey,
-    cutover: DateTime<Utc>,
+    cutover: OffsetDateTime,
 ) -> Result<ScopeKey, DomainError> {
     predecessor.to_generation(cutover)
 }

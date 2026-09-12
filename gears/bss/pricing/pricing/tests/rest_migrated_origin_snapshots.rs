@@ -39,12 +39,14 @@ use bss_pricing::domain::price_row::TierBand;
 use bss_pricing::domain::scope_key::{PlanId, Region};
 use bss_pricing::domain::synthesis::SynthesisTrigger;
 use bss_pricing::infra::synthesis::{FrozenKey, SynthesisRequest};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use rest_support::{
     Harness, body_json, problem_family, request, seed_publishable_manual_quantity_plan,
     seed_publishable_per_unit_plan, seed_publishable_plan, seed_publishable_tiered_usage_plan,
     seed_stamp,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const RATING_SERVICE: Uuid = Uuid::from_u128(0x_4a_71_46);
@@ -54,20 +56,20 @@ fn path(subscription_ref: Uuid) -> String {
 }
 
 /// Inside `[2099-08-04, 2099-09-01)` — the window the publish path schedules.
-fn covered_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 15, 0, 0, 0).unwrap()
+fn covered_at() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 15, 0, 0, 0)
 }
 
 /// A second instant inside the same window, for the idempotency case.
-fn also_covered_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn also_covered_at() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 /// **Before** the window opens, by seven weeks. Deliberately just outside rather
 /// than a century away: what is under test is the interval bound, and a distant
 /// instant would pass against a reader that compared nothing at all.
-fn before_the_window() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 6, 15, 0, 0, 0).unwrap()
+fn before_the_window() -> OffsetDateTime {
+    utc_ymd_hms(2099, 6, 15, 0, 0, 0)
 }
 
 /// The key `rest_support`'s publishable seed files its row under.
@@ -88,7 +90,7 @@ async fn covered_plan(h: &Harness) -> Uuid {
     plan_id
 }
 
-fn synthesis_request(subscription: Uuid, plan_id: Uuid, at: DateTime<Utc>) -> SynthesisRequest {
+fn synthesis_request(subscription: Uuid, plan_id: Uuid, at: OffsetDateTime) -> SynthesisRequest {
     SynthesisRequest {
         subscription_ref: subscription,
         source_plan_id: PlanId::new(plan_id),
@@ -176,7 +178,7 @@ async fn a_snapshot_instant_finer_than_the_quantum_is_refused() {
     let h = Harness::new().await;
     let plan_id = covered_plan(&h).await;
     let subscription = Uuid::now_v7();
-    let unquantized = covered_at() + chrono::TimeDelta::microseconds(137);
+    let unquantized = covered_at() + time::Duration::microseconds(137);
 
     let err = h
         .governance

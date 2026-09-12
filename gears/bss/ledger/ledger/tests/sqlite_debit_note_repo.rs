@@ -31,8 +31,8 @@ use bss_ledger::domain::model::RepoError;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::AdjustmentRepo;
 use bss_ledger::infra::storage::repo::adjustment_repo::NewDebitNote;
-use chrono::Utc;
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -176,7 +176,7 @@ async fn debit_note_row_round_trips() {
         amount_minor: 1100,
         recognized_part_minor: 600,
         deferred_part_minor: 400,
-        created_at_utc: Utc::now(),
+        created_at_utc: OffsetDateTime::now_utc(),
     };
     let scope_a = scope.clone();
     provider
@@ -206,7 +206,7 @@ async fn debit_note_row_round_trips() {
         amount_minor: 1,
         recognized_part_minor: 1,
         deferred_part_minor: 0,
-        created_at_utc: Utc::now(),
+        created_at_utc: OffsetDateTime::now_utc(),
     };
     let scope_b = scope.clone();
     let dup = provider

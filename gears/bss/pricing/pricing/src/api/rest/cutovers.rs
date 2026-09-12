@@ -44,7 +44,7 @@ use axum::extract::{Extension, Path};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
@@ -60,10 +60,12 @@ use crate::api::rest::prices::{PriceContentView, content_of};
 use crate::api::rest::state::GovernanceState;
 use crate::api::rest::windows::verdict_json;
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::domain::scope_key::PlanId;
 use crate::infra::cutover::{CutoverOutcome, CutoverPending, CutoverReceipt, CutoverRequest};
 use crate::infra::grandfather::{HorizonOutcome, HorizonPending, HorizonReceipt};
 use crate::infra::storage::repo::price_repo;
+use time::OffsetDateTime;
 
 /// The route's registered path template.
 ///
@@ -114,7 +116,8 @@ pub struct CutoverBody {
     /// The instant all three window operations pivot on. Strictly future at submit,
     /// and at least D-47's max batching delay ahead at the approval commit
     /// (`inst-gc-compose`).
-    pub cutover_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub cutover_at: OffsetDateTime,
     /// The successor row's whole content, in the authoring vocabulary.
     ///
     /// The **grandfathered copy's** content is not a member and cannot be: the copy
@@ -155,7 +158,8 @@ pub struct CutoverOutcomeView {
     /// resolve to.
     pub copy_key: String,
     /// The cutover instant, echoed so a retry can be built from the answer.
-    pub cutover_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub cutover_at: OffsetDateTime,
     /// The window whose end moves, or would move, to the cutover. `null` on the
     /// controlled arm, where no window moved.
     pub shortened_window_id: Option<Uuid>,
@@ -183,7 +187,7 @@ impl CutoverOutcomeView {
         }
     }
 
-    fn of_pending(pending: &CutoverPending, cutover_at: DateTime<Utc>, predecessor: Uuid) -> Self {
+    fn of_pending(pending: &CutoverPending, cutover_at: OffsetDateTime, predecessor: Uuid) -> Self {
         Self {
             outcome: OUTCOME_SUBMITTED.to_owned(),
             plan_id: pending.plan_id.get(),
@@ -253,7 +257,8 @@ async fn cut_over_key(
         .into());
     }
 
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let cutover_at = request.cutover_at;
     // Ahead of the call, because the value lands in a column the table's append-only
     // trigger freezes: what is written is what an auditor reads forever.
@@ -305,7 +310,8 @@ async fn cut_over_key(
 pub struct GrandfatherUntilBody {
     /// The instant this generation's eligibility ends. Strictly earlier than the
     /// published one, or the first bound on an indefinite generation.
-    pub grandfather_until: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub grandfather_until: OffsetDateTime,
 }
 
 /// What the horizon door answers.
@@ -328,10 +334,12 @@ pub struct GrandfatherUntilView {
     /// That generation's canonical scope key, all ten axes.
     pub scope_key: String,
     /// What the store held before the act. `null` is D-147's indefinite.
-    pub prior_grandfather_until: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub prior_grandfather_until: Option<OffsetDateTime>,
     /// What it holds now on the committed arm, or what was asked for on the
     /// controlled one — which of the two is what `outcome` says.
-    pub grandfather_until: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub grandfather_until: OffsetDateTime,
     /// The registry's pending handle. `null` on the controlled arm: no version is
     /// requested for an act that did not commit (D-156).
     pub pending_version_ref: Option<String>,
@@ -436,7 +444,8 @@ async fn tighten_grandfather_until(
 
     let expected = preconditions::if_match(&headers)?;
     let request: GrandfatherUntilBody = preconditions::parse_body(&body)?;
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let outcome = state
         .grandfather
         .tighten(

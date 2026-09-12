@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use aws_lc_rs::digest::{SHA256, digest as sha256};
-use chrono::{DateTime, Utc};
+
 use toolkit_db::secure::{AccessScope, DBRunner, DbTx};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -42,6 +42,7 @@ use crate::domain::cutover::{
     ComposedCutover, check_cutover_instant, compose_cutover_windows, grandfathered_copy_key,
 };
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{self, ChangeSet, MaterialityVerdict};
@@ -69,6 +70,7 @@ use crate::infra::storage::repo::{
 };
 use crate::infra::storage::repo_failure;
 use crate::infra::window::VerdictJson;
+use time::OffsetDateTime;
 
 /// Everything the cutover's commit writes, named by the orchestrator and **not
 /// separable**.
@@ -146,7 +148,7 @@ impl CutoverCommit {
 
     /// The instant all three operations pivot on.
     #[must_use]
-    pub const fn cutover_at(&self) -> DateTime<Utc> {
+    pub const fn cutover_at(&self) -> OffsetDateTime {
         self.windows.shorten().effective_to
     }
 }
@@ -356,13 +358,13 @@ fn key_set_hash(selected: &[ScopeKey]) -> String {
 pub fn cutover_unit_ref(
     plan_id: PlanId,
     selected: &[ScopeKey],
-    cutover_at: DateTime<Utc>,
+    cutover_at: OffsetDateTime,
 ) -> String {
     format!(
         "{}/cutover/{}/{}",
         plan_id.get(),
         key_set_hash(selected),
-        cutover_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        format_rfc3339(cutover_at)
     )
 }
 
@@ -402,7 +404,7 @@ pub fn cutover_unit_ref_prefix(plan_id: PlanId) -> String {
 ///
 /// # Errors
 /// [`RepoError::CorruptRow`] for a ref under this head that does not decode.
-pub fn cutover_instant_of_unit_ref(subject_ref: &str) -> Result<Option<DateTime<Utc>>, RepoError> {
+pub fn cutover_instant_of_unit_ref(subject_ref: &str) -> Result<Option<OffsetDateTime>, RepoError> {
     let corrupt = || {
         RepoError::CorruptRow(format!(
             "pricing_approval subject_ref `{subject_ref}` is under a cutover head and does not \
@@ -423,9 +425,7 @@ pub fn cutover_instant_of_unit_ref(subject_ref: &str) -> Result<Option<DateTime<
         return Err(corrupt());
     }
     Ok(Some(
-        DateTime::parse_from_rfc3339(instant)
-            .map_err(|_| corrupt())?
-            .with_timezone(&Utc),
+        crate::domain::instant::parse_rfc3339(instant).map_err(|_| corrupt())?,
     ))
 }
 
@@ -452,7 +452,7 @@ pub fn cutover_instant_of_unit_ref(subject_ref: &str) -> Result<Option<DateTime<
 /// the instant, or an axis the constructor will not take.
 pub fn cutover_held_keys(
     predecessor: &ScopeKey,
-    cutover_at: DateTime<Utc>,
+    cutover_at: OffsetDateTime,
     existing_generations: &[Cohort],
 ) -> Result<[ScopeKey; 2], DomainError> {
     Ok([
@@ -485,7 +485,7 @@ pub struct CutoverRequest {
     /// The key being cut over: the `all_subscriptions` row's own.
     pub predecessor_key: ScopeKey,
     /// The instant all three window operations pivot on.
-    pub cutover_at: DateTime<Utc>,
+    pub cutover_at: OffsetDateTime,
     /// The successor's authored content, landing on the predecessor's own key.
     pub successor: PriceContent,
     /// The id the successor draft is authored under, if this call stages it.
@@ -531,7 +531,7 @@ pub struct CutoverReceipt {
     /// The generation the copy was minted on.
     pub copy_key: ScopeKey,
     /// The instant coverage handed over.
-    pub cutover_at: DateTime<Utc>,
+    pub cutover_at: OffsetDateTime,
     /// The predecessor's window, now ending at the cutover.
     pub shortened_window_id: Uuid,
     /// The registry's **pending** handle: a 202 in a value.
@@ -823,10 +823,9 @@ pub async fn cutover_in(
         //    subject. Without this arm the retry reaches `submit_cutover_on` and is
         //    refused `PENDING_CHANGE_UNIT_EXISTS` by its own act — measured, by the
         //    replay case, which failed exactly that way.
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(txn, scope, tenant_id, &subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(txn, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             // The **stored** rows, never the ids this call minted: the drafts belong
             // to the act, and `SupersessionRequest`'s doc makes the same point about
@@ -1021,7 +1020,7 @@ pub async fn cutover_in(
     .await
     .map_err(|e| repo_failure(&e))?;
 
-    let act = format!("cutover/{}", request.cutover_at.to_rfc3339());
+    let act = format!("cutover/{}", format_rfc3339(request.cutover_at));
     for (window, price_id) in [
         (&written.successor_window, successor.price_id),
         (&written.copy_window, copy.price_id),
@@ -1154,7 +1153,7 @@ struct CutoverAudit<'a> {
     shortened: ShortenedWindow<'a>,
     approval_ref: Option<Uuid>,
     stamp: AuditStamp,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 }
 
 /// The record of who performed the cutover — `supersession.rs:995`'s step, and the
@@ -1453,7 +1452,7 @@ fn authored_successor(context: &CutoverContext, request: &CutoverRequest) -> Pri
 fn judge_successor(
     context: &CutoverContext,
     request: &CutoverRequest,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     moment: ChangeoverMoment,
 ) -> Result<(), DomainError> {
     plan_supersession(
@@ -1482,7 +1481,7 @@ async fn cutover_subject(
     scope: &AccessScope,
     tenant_id: Uuid,
     plan_id: PlanId,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<PlanShape, DomainError> {
     let current = plan_repo::load_current(runner, scope, tenant_id, plan_id)
         .await
@@ -1518,7 +1517,7 @@ async fn judge_authored_shapes(
     scope: &AccessScope,
     tenant_id: Uuid,
     plan_id: PlanId,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let shape = cutover_subject(runner, scope, tenant_id, plan_id, now).await?;
     check_fixtures(gate, &shape)
@@ -1543,7 +1542,7 @@ async fn judge_authored_shapes(
 fn compose_and_judge(
     context: &CutoverContext,
     request: &CutoverRequest,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     moment: ChangeoverMoment,
 ) -> Result<(ComposedCutover, ScopeKey), DomainError> {
     check_cutover_instant(request.cutover_at, now, moment)?;
@@ -1597,7 +1596,7 @@ async fn judge_plan_aggregate(
     scope: &AccessScope,
     tenant_id: Uuid,
     plan_id: PlanId,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     let shape = cutover_subject(runner, scope, tenant_id, plan_id, now).await?;
     let params = rule_params(policies, runner, scope, tenant_id, &shape).await?;
@@ -1659,7 +1658,7 @@ async fn stage_and_gate(
     context: &CutoverContext,
     request: &CutoverRequest,
     copy_key: &ScopeKey,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
     stamp: AuditStamp,
 ) -> Result<(PriceRecord, PriceRecord), DomainError> {
     let staged = Box::pin(stage_both(
@@ -1747,8 +1746,8 @@ async fn read_cutover_context(
     scope: &AccessScope,
     tenant_id: Uuid,
     key: &ScopeKey,
-    cutover: DateTime<Utc>,
-    now: DateTime<Utc>,
+    cutover: OffsetDateTime,
+    now: OffsetDateTime,
 ) -> Result<CutoverContext, DomainError> {
     let plan_id = key.plan_id();
     let revision = plan_repo::load_current(runner, scope, tenant_id, plan_id)
@@ -1864,9 +1863,9 @@ async fn read_cutover_context(
 #[cfg(test)]
 mod cutover_ref_tests {
     use super::{cutover_instant_of_unit_ref, cutover_unit_ref};
+    use crate::domain::instant::utc_ymd_hms;
     use crate::domain::scope_key::PlanId;
     use crate::infra::storage::RepoError;
-    use chrono::{TimeZone, Utc};
 
     fn plan() -> PlanId {
         PlanId::new(uuid::Uuid::from_u128(0x9_1a4))
@@ -1879,7 +1878,7 @@ mod cutover_ref_tests {
     /// statement of the format free to agree with neither.
     #[test]
     fn what_the_encoder_writes_is_what_the_decoder_reads() {
-        let at = Utc.with_ymd_and_hms(2099, 8, 4, 9, 30, 0).unwrap();
+        let at = utc_ymd_hms(2099, 8, 4, 9, 30, 0);
 
         let decoded = cutover_instant_of_unit_ref(&cutover_unit_ref(plan(), &[], at))
             .expect("this crate's own ref decodes");

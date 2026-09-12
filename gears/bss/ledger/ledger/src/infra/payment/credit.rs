@@ -49,13 +49,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bss_ledger_sdk::{PostEntry, PostLine, PostingRef, SourceDocType};
-use chrono::{Datelike, Utc};
+use chrono::Datelike;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::instant::to_naive_date;
 use crate::domain::model::{NewEntry, NewLine};
 use crate::domain::payment::credit::{
     ApplyInput, CreditDebit, GrantInput, build_apply_entry, build_grant_entry, plan_wallet_debit,
@@ -69,6 +70,7 @@ use crate::infra::posting::chart::{ChartIndex, load_chart};
 use crate::infra::posting::idempotency::IdempotencyGate;
 use crate::infra::posting::service::{PostSidecar, PostingService};
 use crate::infra::storage::repo::{PaymentRepo, ReferenceRepo};
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service.
 const ORIGIN_SYSTEM: &str = "SYSTEM";
@@ -465,7 +467,7 @@ impl CreditApplicationService {
             source_business_id: entry.source_business_id.clone(),
             reverses_entry_id: entry.reverses_entry_id,
             reverses_period_id: entry.reverses_period_id.clone(),
-            posted_at_utc: Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: entry.effective_at,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: entry.posted_by_actor_id,
@@ -509,7 +511,7 @@ impl CreditApplicationService {
 /// fiscal-period gate, so this overwrite is mandatory (mirrors
 /// `allocate::overwrite_header`).
 fn overwrite_header(entry: &mut PostEntry, ctx: &SecurityContext) {
-    let eff_date = Utc::now().date_naive();
+    let eff_date = to_naive_date(OffsetDateTime::now_utc());
     entry.effective_at = eff_date;
     entry.period_id = format!("{:04}{:02}", eff_date.year(), eff_date.month());
     entry.posted_by_actor_id = ctx.subject_id();

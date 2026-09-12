@@ -42,12 +42,12 @@
 //! ## The terminal phase's kind
 //!
 //! C-4. Terminality is `converts_to_phase_id IS NULL` while `kind` is an
-//! independent column admitting `trial | intro | evergreen`, so without this rule
+//! independent column admitting `trial | interim | evergreen`, so without this rule
 //! nothing rejects a `trial`-terminal chain — which leaves "the first non-trial
 //! phase" undefined for *both* readers above and collides with the
 //! `display_trial_days = phase_duration_days` CHECK, since a terminal phase may
-//! carry no duration at all. **Intro pricing forever is an `evergreen` terminal
-//! phase priced at the intro rate, never an `intro` terminal**; that sentence is
+//! carry no duration at all. **Interim pricing forever is an `evergreen` terminal
+//! phase priced at the interim rate, never an `interim` terminal**; that sentence is
 //! the authoring answer this rule owes, so it is also in the rejection detail.
 //!
 //! ## Usage rows are phase-invariant, and an override inherits the counter
@@ -316,8 +316,8 @@ impl ValidationRule<PlanShape> for TerminalPhaseKind {
                 format!(
                     "the terminal phase has kind {}, and only evergreen is legal there: a \
                      non-evergreen terminal leaves the first non-trial phase undefined for \
-                     setup timing and for migration entry. Intro pricing forever is an \
-                     evergreen terminal phase priced at the intro rate, never an intro \
+                     setup timing and for migration entry. Interim pricing forever is an \
+                     evergreen terminal phase priced at the interim rate, never an interim \
                      terminal",
                     terminal.kind
                 ),

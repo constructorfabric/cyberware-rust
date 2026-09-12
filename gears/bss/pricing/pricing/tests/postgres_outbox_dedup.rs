@@ -23,8 +23,10 @@ mod pg_support;
 use bss_pricing::domain::events::CatalogEvent;
 use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::repo::{NewOutboxEvent, outbox_repo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use pg_support::Pg;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
@@ -33,8 +35,8 @@ const TENANT: Uuid = Uuid::from_u128(0x7e_42);
 const AGGREGATE: Uuid = Uuid::from_u128(0xa6_40);
 const CORRELATION: Uuid = Uuid::from_u128(0xc0_44);
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 9, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 9, hour, 0, 0)
 }
 
 fn scope() -> AccessScope {

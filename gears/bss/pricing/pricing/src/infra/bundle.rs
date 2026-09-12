@@ -170,7 +170,7 @@ pub fn rev_share_change_set() -> ChangeSet {
 ///
 /// The composition is revision-scoped and carries no lifecycle of its own —
 /// `pricing_bundle` holds no state column, *"a bundle's state is its plan
-/// revision's"*, which `BundlePageQuery::plan_id`'s doc states as a decision. So
+/// revision's"*, which the list `$filter=plan_id` contract states as a decision. So
 /// [`plan_repo::load_live_predecessor`] reads the plan chain, and the baseline is
 /// the composition riding the last revision of it that ever published.
 ///

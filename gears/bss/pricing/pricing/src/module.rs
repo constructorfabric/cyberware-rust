@@ -103,7 +103,6 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use axum::Router;
-use chrono::Utc;
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
@@ -131,6 +130,7 @@ use crate::infra::storage::repo::{
     BundleRepo, IdempotencyGate, PinFrontierRepo, PlanRepo, PlanShapeRepo, PriceRepo,
 };
 use crate::infra::window::WindowService;
+use time::OffsetDateTime;
 
 /// The coordination-lease key of the read-model warm sweep.
 ///
@@ -255,7 +255,7 @@ pub(crate) struct PricingRuntime {
     pub metrics: Arc<dyn crate::domain::ports::metrics::PricingMetricsPort>,
 }
 
-#[toolkit::gear(name = "bss-pricing", capabilities = [db, rest, stateful], deps = [types_registry, authz_resolver], lifecycle(entry = "serve", stop_timeout = "30s"))]
+#[toolkit::gear(name = "bss-pricing", capabilities = [db, rest, stateful], deps = [types_registry, authz_resolver, account_management], lifecycle(entry = "serve", stop_timeout = "30s"))]
 pub struct BssPricingGear {
     /// `None` until `init()` completes, and on a boot where the gear is
     /// compiled in but not configured.
@@ -707,7 +707,7 @@ impl BssPricingGear {
         let Some(guard) = Self::take_lease(lease, WARM_LEASE_KEY, ttl).await else {
             return;
         };
-        match job.run(Utc::now()).await {
+        match job.run(OffsetDateTime::now_utc()).await {
             Ok(report) => Self::log_sweep(&report),
             Err(e) => {
                 tracing::error!(error = %e, "bss-pricing: read-model warm sweep tick failed");
@@ -988,7 +988,7 @@ impl BssPricingGear {
         let Some(guard) = Self::take_lease(lease, WINDOW_ACTIVATION_LEASE_KEY, ttl).await else {
             return;
         };
-        match job.run(Utc::now()).await {
+        match job.run(OffsetDateTime::now_utc()).await {
             Ok(report) => Self::log_activation(&report),
             Err(e) => {
                 tracing::error!(error = %e, "bss-pricing: window activation sweep tick failed");
@@ -1129,7 +1129,7 @@ fn resolve_product_catalog(
                 id_prefix = crate::infra::local_dev_catalog::DEV_LOCAL_SKU_PREFIX,
                 code_prefix = crate::infra::local_dev_catalog::DEV_LOCAL_CODE_PREFIX,
                 "bss-pricing: serving a FABRICATED product catalog. Operators are being \
-                     shown SKUs no registry issued, and a plan bound to one carries a made-up \
+                     shown SKUs and DEV-TAX category definitions no registry issued; a plan bound to a SKU carries a made-up \
                      id. Every id is in the reserved namespace above so the rows can be found \
                      later. Never run this beside the Product & SKU registry."
             );
@@ -1357,6 +1357,7 @@ impl Gear for BssPricingGear {
 
         let catalog_version_api = Arc::new(CatalogVersionApiState {
             pin_frontier: PinFrontierRepo::new(db.clone()),
+            db: db.clone(),
         });
 
         // The authoring surface's state. The repositories are cheap clones over
@@ -1443,6 +1444,9 @@ impl Gear for BssPricingGear {
             plans: PlanRepo::new(db.clone()),
             prices: PriceRepo::new(db.clone()),
             approvals,
+            participants: crate::infra::approval_participants::ApprovalParticipants::new(
+                ctx.client_hub(),
+            ),
             publish,
             overlays: crate::infra::storage::repo::OverlayRepo::new(db.clone()),
             // The **fifth** requester of the one registry `Arc` (D-234). Five
@@ -1724,6 +1728,12 @@ impl RestApiCapability for BssPricingGear {
                 openapi,
             ))
             .merge(crate::api::rest::rounding_policies::router(
+                Arc::clone(&rt.authoring_api),
+                openapi,
+            ))
+            // D-356's GL-code vocabulary: the third single-table taxonomy, on its
+            // own route and the `config` gate like the rounding vocabulary above.
+            .merge(crate::api::rest::gl_codes::router(
                 Arc::clone(&rt.authoring_api),
                 openapi,
             ))

@@ -319,7 +319,13 @@ into the pipeline by the Foundation itself),
 no **active** value of the tenant's declared rounding vocabulary; **D-334**, 2026-08-16, and
 registered into the same base set for its sibling's reason — the column is on every price row.
 A tenant that has declared no vocabulary is unconstrained, which is the opposite of
-`REGION_UNKNOWN`'s empty set and is stated on both),
+`REGION_UNKNOWN`'s one-member universe — the seeded `global` a tenant may retire (**D-354**; the
+set was empty before) — and is stated on both),
+`GL_CODE_UNKNOWN` (422 — a plan's billing-descriptor `glCode` names no **active** value of the
+tenant's declared GL-code vocabulary; **D-356**, 2026-09-09, registered into the same base set
+beside the two other vocabulary rules. One finding per revision, since the code is a single
+descriptor field; a present value only — absence stays `DESCRIPTOR_INCOMPLETE`'s; and an empty
+vocabulary is unconstrained, `ROUNDING_POLICY_UNKNOWN`'s reading rather than `REGION_UNKNOWN`'s),
 `PRIMITIVE_RULES_UNBUILT` (422 — a row carries a value in a field that is **declared and not
 yet authorable**: the rules that would judge it are unbuilt, so publish refuses to freeze it
 into an immutable ≥ 7-year version. Today that is `tierQualificationWindow` (D-40) and
@@ -417,6 +423,9 @@ unit the export SLO is expressed in) plus an **opaque `cursor`**, with `next_cur
 on every page until the result is exhausted. Ordering is **stable and append-consistent** —
 commit/append order on history and audit reads, so a cursor walk concurrent with writes never
 skips or duplicates a row at or before the cursor; a deterministic key order on catalog lists.
+The order is the request's `$orderby` when present; when `$orderby` is absent, the defaults
+above apply. The cursor is valid only for the same `$filter` and the same `$orderby` (or the
+same default) — a reused token with a different filter or order is a malformed request (400).
 Offset/`$skip` pagination is not offered (unstable over append-only stores at the ≥ 7-year
 retention). Slice surfaces (`/bss-pricing/v1/plans*`, `…/prices`, `/bss-pricing/v1/price-overlays`,
 `/bss-pricing/v1/approvals`, `/bss-pricing/v1/history`, `/bss-pricing/v1/audit`, batch reports' row lists)

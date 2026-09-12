@@ -19,10 +19,11 @@
 //! that row and no other — the same shape `pricing_policy_object` uses with its
 //! tenant key.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_approval")]
@@ -70,9 +71,9 @@ pub struct Model {
     /// The materiality evaluator's output — per-currency deltas, tripped rows,
     /// trigger source (`jsonb` on Postgres, `text` on `SQLite`).
     pub materiality: Json,
-    pub submitted_at: DateTime<Utc>,
+    pub submitted_at: OffsetDateTime,
     /// `None` exactly while the record is `submitted`.
-    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

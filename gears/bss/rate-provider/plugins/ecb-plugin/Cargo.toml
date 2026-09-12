@@ -35,8 +35,9 @@ async-trait = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
-# NaiveDate / DateTime<Utc> for as_of; no `clock` feature.
+# NaiveDate for the ECB cube's civil date; midnight UTC is `time::OffsetDateTime`.
 chrono = { workspace = true }
+time = { workspace = true }
 # ECB daily reference-rate XML parsing.
 quick-xml = { workspace = true }
 

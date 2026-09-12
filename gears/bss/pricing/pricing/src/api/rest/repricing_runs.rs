@@ -178,7 +178,7 @@ use axum::body::Bytes;
 use axum::extract::{Extension, Path};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::{AccessScope, DBRunner};
@@ -197,6 +197,8 @@ use crate::domain::approval::content_pin::repricing_run_content_hash;
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use crate::domain::bulk::{BulkKind, BulkState};
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
+use crate::domain::instant::rfc3339;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::materiality::{self, ChangeSet, MaterialityVerdict, PublishedPriceBaseline};
 use crate::domain::money::CurrencyCode;
@@ -214,6 +216,7 @@ use crate::infra::storage::repo::{
 };
 use crate::infra::storage::repo_failure;
 use crate::infra::threshold::effective_policy_at;
+use time::OffsetDateTime;
 
 const TAG: &str = "BSS Pricing Mass Repricing";
 
@@ -276,7 +279,8 @@ pub struct RepricingSelectorRequest {
     /// that retains nobody*. The second meaning is not lost: `cohort != none` if
     /// and only if `priceEligibility == existing_grandfathered`, so the rows that
     /// retain nobody are selected through `price_eligibility` instead.
-    pub cohort: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub cohort: Option<OffsetDateTime>,
     /// Axis 9 (D-196). A published metering unit.
     pub meter: Option<String>,
     /// Axis 10 (D-196). The empty string selects the **undimensioned** rows,
@@ -334,7 +338,8 @@ pub struct RepricingRunRequest {
     pub adjustment: RepricingAdjustmentRequest,
     /// **One** instant for every row of the run (D-88). Strictly future at
     /// submit; the approval commit holds it to a whole batching delay.
-    pub changeover: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub changeover: OffsetDateTime,
 }
 
 /// One selected row and how far it got (`inst-mr-journal`).
@@ -584,7 +589,7 @@ async fn open_repricing_run(
     // D-144's quantum before the distance, `plan_supersession`'s order: a malformed
     // instant is not an instant whose distance is worth measuring.
     crate::domain::instant::check_quantum("changeover", body.changeover)?;
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     check_changeover_instant(body.changeover, now, ChangeoverMoment::Submit)?;
 
     let selected = price_repo::load_published_for_selector(&conn, &scope, tenant, &selector)
@@ -669,7 +674,7 @@ async fn open_repricing_run(
                 operation_id: run.operation_id,
                 stamp: AuditStamp {
                     actor_principal_id: ctx.subject_id(),
-                    recorded_at: Utc::now(),
+                    recorded_at: OffsetDateTime::now_utc(),
                     correlation_id,
                 },
             });
@@ -797,7 +802,7 @@ async fn abort_repricing_run(
         tenant,
         run.operation_id,
         crate::infra::repricing::ABORT_NOTE,
-        Utc::now(),
+        OffsetDateTime::now_utc(),
     )
     .await
     .map_err(CanonicalError::from)?;
@@ -831,7 +836,7 @@ async fn audit_the_abort(
         NewAuditEntry {
             tenant_id: tenant,
             chain_id: audit_repo::bulk_operation_chain(aborted.operation_id),
-            recorded_at: Utc::now(),
+            recorded_at: OffsetDateTime::now_utc(),
             actor_principal_id: ctx.subject_id(),
             action: AuditAction::Abandon,
             subject_kind: AuditSubjectKind::BulkOperation,
@@ -1135,7 +1140,7 @@ async fn run_materiality(
     tenant_id: Uuid,
     selected: &[Uuid],
     adjustment: &Adjustment,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<(MaterialityVerdict, BTreeSet<String>), RepoError> {
     let touched_plans: BTreeSet<PlanId> =
         price_repo::load_plan_ids(runner, scope, selected.iter().copied())
@@ -1343,7 +1348,7 @@ fn empty_selector_detail(selector: &RunSelector) -> String {
 fn frozen_report(
     selector: &RunSelector,
     adjustment: &Adjustment,
-    changeover: DateTime<Utc>,
+    changeover: OffsetDateTime,
     selected: usize,
 ) -> serde_json::Value {
     let amounts: serde_json::Value = adjustment.amounts().map_or_else(
@@ -1372,7 +1377,10 @@ fn frozen_report(
             "adjustment_value": adjustment.percent_bp(),
             "amounts": amounts,
         },
-        "changeover": changeover.to_rfc3339(),
+        // main rendered this with `to_rfc3339()` (`+00:00`), and the document is
+        // what `repricing_run_content_hash` pins, so a unit opened before the type
+        // change must still digest to its `content_hash` after it.
+        "changeover": format_rfc3339(changeover),
         "selected": selected,
     })
 }
@@ -1398,8 +1406,8 @@ async fn run_view(
         operation_id: run.operation_id,
         state: run.state.as_str().to_owned(),
         report: run.report.clone(),
-        submitted_at: run.submitted_at.to_rfc3339(),
-        completed_at: run.completed_at.map(|at| at.to_rfc3339()),
+        submitted_at: format_rfc3339(run.submitted_at),
+        completed_at: run.completed_at.map(format_rfc3339),
         journal: journal
             .into_iter()
             .map(|row| RepricingJournalRowView {
@@ -1407,7 +1415,7 @@ async fn run_view(
                 state: row.state.as_str().to_owned(),
                 failure_reason: row.failure_reason,
                 applied_price_id: row.applied_price_id,
-                applied_at: row.applied_at.map(|at| at.to_rfc3339()),
+                applied_at: row.applied_at.map(format_rfc3339),
             })
             .collect(),
     })

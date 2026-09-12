@@ -1,6 +1,6 @@
 //! API-level (router) tests for the provisioning endpoint
 //! `POST /bss-ledger/v1/provisioning` (target tenant in the body) and
-//! `GET /bss-ledger/v1/accounts?tenant_id=…`.
+//! `GET /bss-ledger/v1/accounts` (seller via `$filter=tenant_id eq`, else caller).
 //!
 //! Drives the router via `tower::ServiceExt::oneshot` against a stub
 //! `LedgerClientV1` (no DB) and an in-test `PolicyEnforcer` fake (no
@@ -22,7 +22,7 @@
     clippy::panic
 )]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use authz_resolver_sdk::constraints::{Constraint, InPredicate, Predicate};
@@ -46,7 +46,10 @@ use uuid::Uuid;
 
 /// In-test data-access stub: the only method exercised is
 /// `provision`, which returns a canned outcome.
-struct StubClient;
+#[derive(Default)]
+struct StubClient {
+    last_list_tenant: Mutex<Option<Uuid>>,
+}
 
 #[async_trait::async_trait]
 impl LedgerClientV1 for StubClient {
@@ -94,9 +97,10 @@ impl LedgerClientV1 for StubClient {
     async fn list_accounts(
         &self,
         _ctx: &toolkit_security::SecurityContext,
-        _tenant_id: Uuid,
+        tenant_id: Uuid,
         _query: &ODataQuery,
     ) -> Result<Page<bss_ledger_sdk::AccountInfo>, CanonicalError> {
+        *self.last_list_tenant.lock().unwrap() = Some(tenant_id);
         Ok(Page {
             items: vec![bss_ledger_sdk::AccountInfo {
                 account_id: uuid::uuid!("99999999-9999-9999-9999-999999999999"),
@@ -347,7 +351,7 @@ fn deny_enforcer() -> PolicyEnforcer {
 /// missing extension before the auth/authz checks run.
 fn router_with_enforcer(enforcer: PolicyEnforcer) -> Router {
     let state = Arc::new(ApiState {
-        client: Arc::new(StubClient) as Arc<dyn LedgerClientV1>,
+        client: Arc::new(StubClient::default()) as Arc<dyn LedgerClientV1>,
     });
     let openapi = toolkit::api::OpenApiRegistryImpl::new();
     router(state, &openapi).layer(axum::Extension(enforcer))
@@ -435,9 +439,7 @@ async fn list_accounts_happy_path_returns_200() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri(format!(
-                    "/bss-ledger/v1/accounts?tenant_id={SUBJECT_TENANT}"
-                ))
+                .uri("/bss-ledger/v1/accounts")
                 .body(Body::empty())
                 .expect("build req"),
         )
@@ -460,6 +462,113 @@ async fn list_accounts_happy_path_returns_200() {
     assert!(
         value["page_info"].is_object(),
         "the Page envelope must carry page_info, got {value}"
+    );
+}
+
+#[tokio::test]
+async fn list_accounts_named_tenant_id_returns_400() {
+    let router = base_router().layer(axum::Extension(authed_context()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/bss-ledger/v1/accounts?tenant_id={SUBJECT_TENANT}"
+                ))
+                .body(Body::empty())
+                .expect("build req"),
+        )
+        .await
+        .expect("send");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+    let text = value.to_string();
+    assert!(text.contains("tenant_id"), "detail names the key: {value}");
+    assert!(text.contains("$filter"), "detail hints $filter: {value}");
+}
+
+#[tokio::test]
+async fn list_accounts_plain_status_returns_400() {
+    let router = base_router().layer(axum::Extension(authed_context()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/bss-ledger/v1/accounts?status=OPEN")
+                .body(Body::empty())
+                .expect("build req"),
+        )
+        .await
+        .expect("send");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+    assert!(
+        value.to_string().contains("status"),
+        "detail names the key: {value}"
+    );
+}
+
+#[tokio::test]
+async fn list_accounts_filter_tenant_id_eq_returns_200() {
+    let stub = Arc::new(StubClient::default());
+    let state = Arc::new(ApiState {
+        client: stub.clone() as Arc<dyn LedgerClientV1>,
+    });
+    let openapi = toolkit::api::OpenApiRegistryImpl::new();
+    let router = router(state, &openapi)
+        .layer(axum::Extension(allow_enforcer()))
+        .layer(axum::Extension(authed_context()));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/bss-ledger/v1/accounts?$filter=tenant_id%20eq%20{SUBJECT_TENANT}"
+                ))
+                .body(Body::empty())
+                .expect("build req"),
+        )
+        .await
+        .expect("send");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        *stub.last_list_tenant.lock().unwrap(),
+        Some(SUBJECT_TENANT),
+        "$filter=tenant_id eq must reach the client as that seller"
+    );
+}
+
+#[tokio::test]
+async fn list_accounts_openapi_declares_orderby_not_tenant_id() {
+    let state = Arc::new(ApiState {
+        client: Arc::new(StubClient::default()) as Arc<dyn LedgerClientV1>,
+    });
+    let openapi = toolkit::api::OpenApiRegistryImpl::new();
+    let _router = router(state, &openapi);
+    let spec = openapi
+        .build_openapi(&toolkit::api::OpenApiInfo::default())
+        .expect("openapi must build");
+    let json = serde_json::to_value(spec).expect("serialize spec");
+    let params = json["paths"]["/bss-ledger/v1/accounts"]["get"]["parameters"]
+        .as_array()
+        .expect("accounts GET must declare parameters");
+    let names: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
+    assert!(
+        names.contains(&"$orderby"),
+        "$orderby must be advertised: {names:?}"
+    );
+    assert!(
+        names.contains(&"$filter"),
+        "$filter must be advertised: {names:?}"
+    );
+    assert!(
+        !names.contains(&"tenant_id"),
+        "named tenant_id must leave the list: {names:?}"
     );
 }
 

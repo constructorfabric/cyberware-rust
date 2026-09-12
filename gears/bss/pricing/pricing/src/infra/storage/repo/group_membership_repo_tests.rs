@@ -7,19 +7,24 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{MembershipRow, resolve_active_membership};
+use crate::domain::instant::utc_ymd_hms;
+use time::OffsetDateTime;
 
-fn t(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 10, hour, 0, 0).unwrap()
+fn t(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 10, hour, 0, 0)
 }
 
 /// One membership row over `[from, to)`, distinguishable from a sibling by
 /// `group_value` so a test can tell which of several candidates resolution
 /// picked.
-fn membership(group_value: &str, from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> MembershipRow {
+fn membership(
+    group_value: &str,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
+) -> MembershipRow {
     MembershipRow {
         membership_id: Uuid::new_v4(),
         tenant_id: Uuid::from_u128(0x7e_11),
@@ -113,7 +118,7 @@ fn an_open_ended_interval_resolves_arbitrarily_far_into_the_future() {
             .group_value,
         "gold"
     );
-    let far_future = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+    let far_future = utc_ymd_hms(2099, 1, 1, 0, 0, 0);
     assert_eq!(
         resolve_active_membership(&rows, far_future)
             .expect("effective_to = None means open-ended, not unbounded-in-name-only")

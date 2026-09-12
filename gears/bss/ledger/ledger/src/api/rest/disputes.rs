@@ -31,6 +31,7 @@
 //! `return_payment` handler in [`crate::api::rest::payments`] (write) and
 //! [`crate::api::rest::refunds`] (the read surface).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
@@ -52,6 +53,7 @@ use crate::api::rest::dto::{
     DisputePhaseQueuedResponse, DisputeView, RecordDisputePhaseRequest, RecordDisputePhaseResponse,
 };
 use crate::api::rest::error::{authz_error_to_canonical, dispute_not_found};
+use crate::api::rest::odata_list::{list_seller_tenant, reject_non_odata_list_params};
 use crate::infra::storage::repo::DisputeRepo;
 use crate::odata::DisputeFilterField;
 
@@ -171,20 +173,16 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .summary("List recorded disputes (cursor-paginated)")
         .description(
             "Cursor-paginated list of the recorded chargeback disputes for the \
-             `tenant_id` query (the caller's own by default). Supports OData \
-             `$filter` over `payment_id`, `last_phase`, and `variant`. The `$filter` \
-             ANDs the caller's authorized subtree, so disputes outside it are never \
-             returned (SQL-level BOLA). Each item is the same `DisputeView` the \
-             by-id read returns. Mirrors `list_refunds`.",
+             seller named by `$filter=tenant_id eq <uuid>` (the caller's own by \
+             default). Supports OData `$filter` over `tenant_id`, `payment_id`, \
+             `last_phase`, and `variant`. The `$filter` ANDs the caller's \
+             authorized subtree, so disputes outside it are never returned \
+             (SQL-level BOLA). Each item is the same `DisputeView` the by-id \
+             read returns. Mirrors `list_refunds`.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "The disputes' owning seller tenant (defaults to the caller's own).",
-        )
         .query_param_typed(
             "limit",
             false,
@@ -194,6 +192,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_disputes)
         .with_odata_filter::<DisputeFilterField>()
+        .with_odata_orderby::<DisputeFilterField>()
         .json_response_with_schema::<Page<DisputeView>>(
             openapi,
             StatusCode::OK,
@@ -365,24 +364,18 @@ async fn get_dispute(
     Ok(Json(DisputeView::from(dispute)))
 }
 
-/// `GET /disputes` non-OData query: the disputes' owning tenant (the caller's own
-/// when omitted). The `OData` `$filter` / `$orderby` / `limit` / `cursor` are
-/// parsed separately by the `OData` extractor from the same query string;
-/// `tenant_id` stays a plain param alongside them (the list convention).
-#[derive(Debug, serde::Deserialize)]
-struct DisputeListQuery {
-    tenant_id: Option<Uuid>,
-}
-
+/// `GET /disputes`: seller from `$filter=tenant_id eq`, else the caller.
+#[allow(clippy::implicit_hasher)]
 async fn list_disputes(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<DisputeListQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<DisputeView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params(&extras)?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     // (dispute, read) PEP gate against the disputes' owning tenant — the dispute's
     // OWN resource (symmetric with `dispute.write`). The returned scope is the
     // SQL-level BOLA filter the repo binds, so the page never contains a foreign-tenant

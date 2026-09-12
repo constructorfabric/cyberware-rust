@@ -81,6 +81,13 @@ pub const REGION_UNKNOWN: &str = "REGION_UNKNOWN";
 /// (§5, 409; `inst-tx-mutation`).
 pub const TAXONOMY_VALUE_IN_USE: &str = "TAXONOMY_VALUE_IN_USE";
 
+/// `POST …/taxonomies/{class}/values` naming a value the tenant already declares
+/// with **different** content (or a retired one): 409. The value is the
+/// resource's natural key, so a second declaration of it is not a create — the
+/// remedy is `PATCH` on the value, and the detail says so. A body identical to
+/// what is held is **not** this refusal: it is the create's replay (200).
+pub const TAXONOMY_VALUE_EXISTS: &str = "TAXONOMY_VALUE_EXISTS";
+
 /// A price row, or a tenant default, naming a rounding reference the tenant's
 /// rounding-policy taxonomy does not declare as `active` (D-334).
 ///
@@ -88,6 +95,14 @@ pub const TAXONOMY_VALUE_IN_USE: &str = "TAXONOMY_VALUE_IN_USE";
 /// stated reason: the two name different facts about different axes, and an
 /// operator reading a report needs to know which vocabulary to go and fix.
 pub const ROUNDING_POLICY_UNKNOWN: &str = "ROUNDING_POLICY_UNKNOWN";
+
+/// A plan's billing-descriptor `glCode` naming a code the tenant's declared
+/// GL-code vocabulary does not hold as `active` (D-356).
+///
+/// Its own code rather than a reuse of [`ROUNDING_POLICY_UNKNOWN`] for that
+/// code's own stated reason: an operator reading a report has to know which
+/// vocabulary to go and fix, and the two are declared at two routes.
+pub const GL_CODE_UNKNOWN: &str = "GL_CODE_UNKNOWN";
 
 /// The four taxonomy classes `GET/PUT /config/taxonomies/{…}` addresses.
 ///
@@ -290,6 +305,170 @@ pub fn tag_of(class: TaxonomyClass, entries: &[TaxonomyEntry]) -> PolicyTag {
     )
 }
 
+/// The entity tag of **one** value's representation — what
+/// `GET/PATCH …/taxonomies/{class}/values/{value}` carry and assert.
+///
+/// The set tag ([`tag_of`]) moves whenever *any* value moves, which is right for
+/// a whole-set `PUT` and wrong for an edit of one value: two admins re-labelling
+/// two different regions would refuse each other on a set they never disagreed
+/// about. This tag digests one entry under the segment `{class}/{value}`, so it
+/// moves with that value alone — and cannot collide with a set tag, whose
+/// segment is the bare class.
+#[must_use]
+pub fn tag_of_value(class: TaxonomyClass, entry: &TaxonomyEntry) -> PolicyTag {
+    PolicyTag::of_taxonomy(
+        &format!("{}/{}", class.path_segment(), entry.value.as_str()),
+        std::iter::once(TaxonomyTagEntry {
+            value: entry.value.as_str(),
+            state: entry.state.as_str(),
+            display_name: entry.display_name.as_str(),
+            tax_category: entry.tax.as_ref().and_then(|t| t.tax_category.as_deref()),
+            tax_rate_present: entry.tax.as_ref().is_some_and(|t| t.tax_rate_present),
+        }),
+    )
+}
+
+/// The three things a `PATCH` can say about a region's default tax category:
+/// nothing, **clear** it, or set it. A single `Option` carries two of the three,
+/// which is why this is its own type rather than an `Option<Option<_>>`.
+/// Clearing is a guarded act (D-245).
+#[domain_model]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TaxCategoryPatch {
+    /// Leave the category as held.
+    #[default]
+    Keep,
+    /// Remove the default category (the wire's explicit `null`).
+    Clear,
+    /// Set the default category.
+    Set(String),
+}
+
+/// What a `PATCH …/values/{value}` asks to change. Every field is optional and
+/// an absent one leaves the held value as it is.
+#[domain_model]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaxonomyValuePatch {
+    /// A new label.
+    pub display_name: Option<String>,
+    /// `active` or `retired`; a retirement is guarded.
+    pub state: Option<TaxonomyState>,
+    /// **Region only.**
+    pub tax_category: TaxCategoryPatch,
+    /// **Region only.**
+    pub tax_rate_present: Option<bool>,
+}
+
+impl TaxonomyValuePatch {
+    /// Does this patch touch either region marker?
+    #[must_use]
+    pub const fn touches_tax_markers(&self) -> bool {
+        !matches!(self.tax_category, TaxCategoryPatch::Keep) || self.tax_rate_present.is_some()
+    }
+
+    /// The entry as it would stand with this patch applied over `held`.
+    ///
+    /// Pure: the guards read the result against the store, and the write
+    /// happens only once they pass. A patch that names nothing returns `held`
+    /// unchanged, which is what lets the caller treat it as the no-op it is.
+    #[must_use]
+    pub fn apply(&self, held: &TaxonomyEntry) -> TaxonomyEntry {
+        let mut next = held.clone();
+        if let Some(label) = &self.display_name {
+            next.display_name.clone_from(label);
+        }
+        if let Some(state) = self.state {
+            next.state = state;
+        }
+        if let Some(tax) = next.tax.as_mut() {
+            match &self.tax_category {
+                TaxCategoryPatch::Keep => {}
+                TaxCategoryPatch::Clear => tax.tax_category = None,
+                TaxCategoryPatch::Set(category) => tax.tax_category = Some(category.clone()),
+            }
+            if let Some(present) = self.tax_rate_present {
+                tax.tax_rate_present = present;
+            }
+        }
+        next
+    }
+}
+
+/// One proposed edit of one declared value — the subject a `PATCH …/values/{value}`
+/// unit is opened over (D-353).
+///
+/// Carried whole in the unit's `subject_ref` (as a membership move's set is),
+/// because a taxonomy value has no draft table for a pending edit to live in.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaxonomyValueProposal {
+    /// Which universe.
+    pub class: TaxonomyClass,
+    /// Which value.
+    pub value: ScopeValue,
+    /// What changes.
+    pub patch: TaxonomyValuePatch,
+}
+
+/// A proposal read against the value **as it stands**: the pair a reviewer is
+/// shown and the content the unit's hash pins.
+///
+/// Pinning `held` as well as the proposal is what makes the pin a TOCTOU guard
+/// (`inst-ap-pin`): if the value moves under a submitted unit — a relabel, a
+/// retirement by another door — the re-derived pair no longer digests to the
+/// record's hash, the detail view says so, and the approve is refused.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaxonomyValueChange {
+    /// The edit.
+    pub proposal: TaxonomyValueProposal,
+    /// The value the edit was authored against.
+    pub held: TaxonomyEntry,
+}
+
+impl TaxonomyValueChange {
+    /// The value as it would stand once the proposal commits.
+    #[must_use]
+    pub fn next(&self) -> TaxonomyEntry {
+        self.proposal.patch.apply(&self.held)
+    }
+}
+
+/// The one region every tenant starts with (D-354): `global`.
+///
+/// The same token the overlay plane stores for the classless scope
+/// ([`GLOBAL_SCOPE`](crate::domain::read_model::GLOBAL_SCOPE)), by reference
+/// rather than by a second literal: both spell "the whole market", and the
+/// domain-code census would otherwise read two rules rendering one string.
+pub const SEEDED_REGION: &str = crate::domain::read_model::GLOBAL_SCOPE;
+
+/// The region taxonomy of a tenant that has declared **no** region row yet
+/// (D-354): one active value, `global`, labelled `Global`, with no default tax
+/// category and no rate declared — C4's fail-closed reading, because the seed
+/// asserts no tax fact nobody declared.
+///
+/// `inst-tx-region` is fail-closed and a fresh tenant declares nothing, so
+/// without this a tenant that does not segment its market by territory could
+/// publish nothing until an admin invented a region to satisfy a rule about
+/// territories it does not have. The seed is **virtual while the tenant holds
+/// no row** and is written by the tenant's first region write; afterwards it is
+/// an ordinary value — retire it, re-label it, give it markers, every edit
+/// governed like any other (D-353).
+///
+/// # Panics
+///
+/// Never: the literal is a non-blank value.
+#[must_use]
+pub fn seeded_region() -> TaxonomyEntry {
+    TaxonomyEntry {
+        value: ScopeValue::new(SEEDED_REGION)
+            .unwrap_or_else(|| unreachable!("`{SEEDED_REGION}` is a non-blank literal")),
+        display_name: "Global".to_owned(),
+        state: TaxonomyState::Active,
+        tax: Some(RegionTaxMarkers::default()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // `inst-tx-mutation` — the retire guard.
 // ---------------------------------------------------------------------------
@@ -321,6 +500,28 @@ impl ValueReferences {
     pub const fn any(self) -> bool {
         self.published_price_rows > 0 || self.active_overlay_scopes > 0
     }
+}
+
+/// D-355: an edit of a value **nothing published names** is not a governed act.
+///
+/// The same reasoning that lets a `POST` declare commit at once (D-353) — "a
+/// value nothing has published against has moved nothing a second principal
+/// could protect" — reaches every edit while the value is unreferenced: a
+/// relabel, a retirement, a region's tax markers. [`references_to`]'s **broad**
+/// set is the gate: any published price row on the `region` axis or any
+/// published overlay scope of the class makes an edit governed; none makes it
+/// the operator's alone. The narrower `rows_resolving_category_through` set is
+/// D-245's clear guard and is not this question.
+///
+/// Retirement follows from this rather than adding to it: a referenced value's
+/// retirement is **refused** by [`check_retirable`], and an unreferenced one's
+/// is **ungoverned** here — so a "governed admissible retirement" is a null
+/// case.
+///
+/// [`references_to`]: crate::infra::storage::repo::taxonomy_repo::references_to
+#[must_use]
+pub const fn edit_is_governed(references: ValueReferences) -> bool {
+    references.any()
 }
 
 /// `inst-tx-mutation`: refuse a retirement while the value is referenced.
@@ -727,6 +928,112 @@ impl ValidationRule<PlanShape> for RoundingPolicyDeclared {
             if let Some(violation) = self.violation_for(&record.price_id.to_string(), reference) {
                 report.violations.push(violation);
             }
+        }
+    }
+}
+
+/// `inst-ds-glcode` — the plan's billing-descriptor `glCode` names a code the
+/// tenant declared (D-356).
+///
+/// [`RoundingPolicyDeclared`]'s argument on the descriptor plane. A GL code
+/// freezes into every `CatalogVersion` an ERP posts against, and before D-356
+/// publish checked only that one was *present* (`inst-ds-required`), so a typo'd
+/// or non-existent code froze into an immutable seven-year version and was met
+/// at posting time rather than by its author. This gear cannot say what
+/// `4000-REV` means — ledger's own PRD stores account *class* and takes the
+/// concrete code from the Catalog snapshot, so there is no list anywhere in BSS
+/// to defer to — but it can say that a code names nothing the tenant ever
+/// declared.
+///
+/// # One value per revision, not a row walk
+///
+/// `glCode` is a single field on the plan's descriptor set, so this rule reads
+/// `descriptor_set.gl_code` once and reports at most once. It judges a
+/// **present** value only: an absent or blank code is `inst-ds-required`'s
+/// finding, and a second report of the same absence would send the author to a
+/// vocabulary for a field they have not filled in.
+///
+/// # An empty set means **unconstrained** — the opt-in reading
+///
+/// [`RoundingPolicyDeclared`]'s asymmetry with [`RegionsDeclared`], for the same
+/// reason: a tenant with no declared GL codes has not opted in, and refusing
+/// there would have failed every existing plan on the day the table landed, for
+/// a vocabulary nobody had been given a chance to write. Declaring the first
+/// value is what turns the check on.
+///
+/// # The provider seam
+///
+/// `declared` is resolved by the caller from `taxonomy_repo::active_gl_codes`,
+/// and this rule never learns where the set came from. Today the provider is the
+/// tenant-declared set behind `PUT /bss-pricing/v1/config/gl-codes`; a future
+/// ERP gear (D-356 *Owed*) populates or reconciles that same table, and nothing
+/// on this side of the seam changes — exactly `RegionTaxReadiness`'s arrangement
+/// under D-01, tenant-declared today and reconciled against Tax Engine post-GA.
+///
+/// # One door
+///
+/// Only the publish path consults this rule. The descriptor **write**
+/// (`PUT …/descriptors`) does not, which is the asymmetry
+/// [`RoundingPolicyDeclared::violation_for`] records for the price write: a
+/// `glCode` is first judged at publish, and a write-door check is a behaviour
+/// change for a decision. The violation is stamped [`Stage::Publish`] for the
+/// reason that doc gives — a stage is a claim about which door judges a fault.
+#[domain_model]
+#[derive(Clone, Debug, Default)]
+pub struct GlCodeDeclared {
+    /// The tenant's `active` GL codes, resolved by the caller. Empty means the
+    /// tenant declared no vocabulary — see the type doc.
+    pub declared: BTreeSet<String>,
+}
+
+impl GlCodeDeclared {
+    /// The violation this code earns, if any.
+    ///
+    /// `subject` is the violation's subject — the plan, from [`Self::evaluate`].
+    /// Public with the subject as a parameter, as [`RoundingPolicyDeclared::violation_for`]
+    /// is, so that a write door added later judges the same fault with the same
+    /// words rather than a second spelling of it.
+    #[must_use]
+    pub fn violation_for(&self, subject: &str, code: &str) -> Option<Violation> {
+        if self.declared.is_empty() || self.declared.contains(code) {
+            return None;
+        }
+        Some(Violation {
+            code: GL_CODE_UNKNOWN.to_owned(),
+            subject: subject.to_owned(),
+            detail: format!(
+                "glCode `{code}` is not an active value of this tenant's declared GL-code \
+                 vocabulary; the code freezes into the catalog version an ERP posts against, so \
+                 a reference to something nobody declared is refused - declare it at PUT \
+                 /bss-pricing/v1/config/gl-codes first, correct the descriptor, or clear the \
+                 vocabulary to stop constraining codes at all"
+            ),
+            stage: Stage::Publish,
+        })
+    }
+}
+
+impl ValidationRule<PlanShape> for GlCodeDeclared {
+    fn name(&self) -> &'static str {
+        "inst-ds-glcode"
+    }
+
+    fn evaluate(&self, subject: &PlanShape, report: &mut ValidationReport) {
+        if self.declared.is_empty() {
+            return;
+        }
+        // A blank is an absence wearing a value's shape — `inst-ds-required`'s
+        // reading, and its finding.
+        let Some(code) = subject
+            .descriptor_set
+            .as_ref()
+            .and_then(|set| set.gl_code.as_deref())
+            .filter(|code| !code.trim().is_empty())
+        else {
+            return;
+        };
+        if let Some(violation) = self.violation_for(&subject.subject(), code) {
+            report.violations.push(violation);
         }
     }
 }

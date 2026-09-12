@@ -33,10 +33,11 @@
 //! carries the citations and the per-column consequence. Do not read a nullable
 //! column here as "a tenant may configure this today".
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_policy_object")]
@@ -79,7 +80,7 @@ pub struct Model {
     /// drop a v1 element, because a tenant policy may not publish past a pinned
     /// element of the contract Billing countersigns.
     pub additional_required_descriptors: Json,
-    pub updated_at_utc: DateTime<Utc>,
+    pub updated_at_utc: OffsetDateTime,
     pub updated_by: Uuid,
 }
 

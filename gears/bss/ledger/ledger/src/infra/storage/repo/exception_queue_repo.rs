@@ -3,7 +3,6 @@
 //! per-slice exception stubs + the reconciliation framework `open` rows here;
 //! the close gate reads OPEN rows for a period (Slice 7, design §4.6).
 
-use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use serde_json::Value as JsonValue;
@@ -21,6 +20,7 @@ use crate::infra::storage::repo::journal_repo::{
     OdataPageError, map_odata_err, query_with_default_order,
 };
 use crate::odata::ExceptionFilterField;
+use time::OffsetDateTime;
 
 /// SeaORM-backed exception-queue repository.
 #[derive(Clone)]
@@ -60,7 +60,7 @@ impl ExceptionQueueRepo {
             status: Set("OPEN".to_owned()),
             period_id: Set(period_id.map(ToOwned::to_owned)),
             detail: Set(detail),
-            opened_at: Set(Utc::now()),
+            opened_at: Set(OffsetDateTime::now_utc()),
             resolved_at: Set(None),
             resolved_by: Set(None),
         };
@@ -235,7 +235,10 @@ impl ExceptionQueueRepo {
                 exception_queue::Column::ResolvedBy,
                 Expr::value(resolved_by),
             )
-            .col_expr(exception_queue::Column::ResolvedAt, Expr::value(Utc::now()))
+            .col_expr(
+                exception_queue::Column::ResolvedAt,
+                Expr::value(OffsetDateTime::now_utc()),
+            )
             .filter(
                 Condition::all()
                     .add(exception_queue::Column::TenantId.eq(tenant))

@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use bss_ledger_sdk::{CurrencyPair, ProviderRate, RateProviderError, RateProviderV1};
 use bss_rate_provider::infra::discovery::DiscoveringRateProvider;
 use bss_rate_provider_sdk::RateProviderSourcePluginSpecV1;
-use chrono::DateTime;
+use time::OffsetDateTime;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::gts::PluginV1;
 use toolkit_security::SecurityContext;
@@ -49,7 +49,7 @@ impl RateProviderV1 for FakeSource {
                 base: "EUR".to_owned(),
                 quote: "USD".to_owned(),
                 rate_micro: 1_000_000,
-                as_of: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                as_of: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
                 // Real sources stamp their own id; the fake must too, since
                 // that is the provenance the ledger stores.
                 provider: self.id.clone(),

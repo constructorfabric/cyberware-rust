@@ -5,8 +5,8 @@
 //! now`, highest `version` on a tie); absent a row, the ratified platform
 //! defaults apply. Mirrors the `tenant_precedence_policy` append-only shape.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -23,7 +23,7 @@ pub struct Model {
     pub tenant_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub version: i64,
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// D2 threshold in USD-equivalent minor units; validated `[10000 .. 100000000]`
     /// (100 .. 1,000,000 USD at scale 2) — out-of-range config is rejected.
     pub d2_threshold_minor: i64,
@@ -31,7 +31,7 @@ pub struct Model {
     pub a6_backdating_biz_days: i32,
     /// TTL applied to a fresh `PENDING`/`NEEDS_REWORK` record before it expires.
     pub pending_ttl_seconds: i64,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

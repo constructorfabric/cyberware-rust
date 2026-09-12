@@ -54,12 +54,23 @@ impl FieldToColumn<AccountInfoFilterField> for AccountInfoODataMapper {
 
     fn map_field(field: AccountInfoFilterField) -> TenantAccountColumn {
         match field {
+            AccountInfoFilterField::TenantId => TenantAccountColumn::TenantId,
             AccountInfoFilterField::AccountId => TenantAccountColumn::AccountId,
             AccountInfoFilterField::AccountClass => TenantAccountColumn::AccountClass,
             AccountInfoFilterField::Currency => TenantAccountColumn::Currency,
             AccountInfoFilterField::RevenueStream => TenantAccountColumn::RevenueStream,
             AccountInfoFilterField::LifecycleState => TenantAccountColumn::LifecycleState,
         }
+    }
+
+    // `tenant_account.revenue_stream` is nullable, and a NULL cannot survive the cursor: the mapper
+    // extracts `Value::String(None)` and `encode_cursor_value` has no arm for it,
+    // so a NULL row landing on a page boundary would answer 400 to a request the
+    // OpenAPI document declares valid. Ordering a keyset walk on a nullable column
+    // would also need an explicit NULLS FIRST/LAST — SQLite and PostgreSQL disagree
+    // by default — so the field stays filterable and is refused as an order key.
+    fn is_orderable(field: AccountInfoFilterField) -> bool {
+        !matches!(field, AccountInfoFilterField::RevenueStream)
     }
 }
 
@@ -71,6 +82,7 @@ impl ODataFieldMapping<AccountInfoFilterField> for AccountInfoODataMapper {
         field: AccountInfoFilterField,
     ) -> sea_orm::Value {
         match field {
+            AccountInfoFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             AccountInfoFilterField::AccountId => sea_orm::Value::Uuid(Some(model.account_id)),
             AccountInfoFilterField::AccountClass => {
                 sea_orm::Value::String(Some(model.account_class.clone()))
@@ -102,12 +114,23 @@ impl FieldToColumn<JournalLineFilterField> for JournalLineODataMapper {
 
     fn map_field(field: JournalLineFilterField) -> JournalLineColumn {
         match field {
+            JournalLineFilterField::TenantId => JournalLineColumn::TenantId,
             JournalLineFilterField::LineId => JournalLineColumn::LineId,
             JournalLineFilterField::PayerTenantId => JournalLineColumn::PayerTenantId,
             JournalLineFilterField::AccountClass => JournalLineColumn::AccountClass,
             JournalLineFilterField::PeriodId => JournalLineColumn::PeriodId,
             JournalLineFilterField::InvoiceId => JournalLineColumn::InvoiceId,
         }
+    }
+
+    // `journal_line.invoice_id` is nullable, and a NULL cannot survive the cursor: the mapper
+    // extracts `Value::String(None)` and `encode_cursor_value` has no arm for it,
+    // so a NULL row landing on a page boundary would answer 400 to a request the
+    // OpenAPI document declares valid. Ordering a keyset walk on a nullable column
+    // would also need an explicit NULLS FIRST/LAST — SQLite and PostgreSQL disagree
+    // by default — so the field stays filterable and is refused as an order key.
+    fn is_orderable(field: JournalLineFilterField) -> bool {
+        !matches!(field, JournalLineFilterField::InvoiceId)
     }
 }
 
@@ -119,6 +142,7 @@ impl ODataFieldMapping<JournalLineFilterField> for JournalLineODataMapper {
         field: JournalLineFilterField,
     ) -> sea_orm::Value {
         match field {
+            JournalLineFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             JournalLineFilterField::LineId => sea_orm::Value::Uuid(Some(model.line_id)),
             JournalLineFilterField::PayerTenantId => {
                 sea_orm::Value::Uuid(Some(model.payer_tenant_id))
@@ -151,6 +175,7 @@ impl FieldToColumn<JournalEntryFilterField> for JournalEntryODataMapper {
 
     fn map_field(field: JournalEntryFilterField) -> JournalEntryColumn {
         match field {
+            JournalEntryFilterField::TenantId => JournalEntryColumn::TenantId,
             JournalEntryFilterField::EntryId => JournalEntryColumn::EntryId,
             JournalEntryFilterField::SourceDocType => JournalEntryColumn::SourceDocType,
             JournalEntryFilterField::SourceBusinessId => JournalEntryColumn::SourceBusinessId,
@@ -167,6 +192,7 @@ impl ODataFieldMapping<JournalEntryFilterField> for JournalEntryODataMapper {
         field: JournalEntryFilterField,
     ) -> sea_orm::Value {
         match field {
+            JournalEntryFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             JournalEntryFilterField::EntryId => sea_orm::Value::Uuid(Some(model.entry_id)),
             JournalEntryFilterField::SourceDocType => {
                 sea_orm::Value::String(Some(model.source_doc_type.clone()))
@@ -191,6 +217,7 @@ impl FieldToColumn<BalanceFilterField> for BalanceODataMapper {
 
     fn map_field(field: BalanceFilterField) -> BalanceColumn {
         match field {
+            BalanceFilterField::TenantId => BalanceColumn::TenantId,
             BalanceFilterField::AccountId => BalanceColumn::AccountId,
             BalanceFilterField::AccountClass => BalanceColumn::AccountClass,
             BalanceFilterField::Currency => BalanceColumn::Currency,
@@ -203,6 +230,7 @@ impl ODataFieldMapping<BalanceFilterField> for BalanceODataMapper {
 
     fn extract_cursor_value(model: &BalanceModel, field: BalanceFilterField) -> sea_orm::Value {
         match field {
+            BalanceFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             BalanceFilterField::AccountId => sea_orm::Value::Uuid(Some(model.account_id)),
             BalanceFilterField::AccountClass => {
                 sea_orm::Value::String(Some(model.account_class.clone()))
@@ -223,6 +251,7 @@ impl FieldToColumn<RefundFilterField> for RefundODataMapper {
 
     fn map_field(field: RefundFilterField) -> RefundColumn {
         match field {
+            RefundFilterField::TenantId => RefundColumn::TenantId,
             RefundFilterField::RefundId => RefundColumn::RefundId,
             RefundFilterField::PaymentId => RefundColumn::PaymentId,
             RefundFilterField::PspRefundId => RefundColumn::PspRefundId,
@@ -232,6 +261,16 @@ impl FieldToColumn<RefundFilterField> for RefundODataMapper {
             RefundFilterField::InvoiceId => RefundColumn::InvoiceId,
         }
     }
+
+    // `refund.invoice_id` is nullable, and a NULL cannot survive the cursor: the mapper
+    // extracts `Value::String(None)` and `encode_cursor_value` has no arm for it,
+    // so a NULL row landing on a page boundary would answer 400 to a request the
+    // OpenAPI document declares valid. Ordering a keyset walk on a nullable column
+    // would also need an explicit NULLS FIRST/LAST — SQLite and PostgreSQL disagree
+    // by default — so the field stays filterable and is refused as an order key.
+    fn is_orderable(field: RefundFilterField) -> bool {
+        !matches!(field, RefundFilterField::InvoiceId)
+    }
 }
 
 impl ODataFieldMapping<RefundFilterField> for RefundODataMapper {
@@ -239,6 +278,7 @@ impl ODataFieldMapping<RefundFilterField> for RefundODataMapper {
 
     fn extract_cursor_value(model: &RefundModel, field: RefundFilterField) -> sea_orm::Value {
         match field {
+            RefundFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             RefundFilterField::RefundId => sea_orm::Value::String(Some(model.refund_id.clone())),
             RefundFilterField::PaymentId => sea_orm::Value::String(Some(model.payment_id.clone())),
             RefundFilterField::PspRefundId => {
@@ -273,6 +313,7 @@ impl FieldToColumn<CreditNoteFilterField> for CreditNoteODataMapper {
 
     fn map_field(field: CreditNoteFilterField) -> CreditNoteColumn {
         match field {
+            CreditNoteFilterField::TenantId => CreditNoteColumn::TenantId,
             CreditNoteFilterField::CreditNoteId => CreditNoteColumn::CreditNoteId,
             CreditNoteFilterField::OriginInvoiceId => CreditNoteColumn::OriginInvoiceId,
             CreditNoteFilterField::RevenueStream => CreditNoteColumn::RevenueStream,
@@ -289,6 +330,7 @@ impl ODataFieldMapping<CreditNoteFilterField> for CreditNoteODataMapper {
         field: CreditNoteFilterField,
     ) -> sea_orm::Value {
         match field {
+            CreditNoteFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             CreditNoteFilterField::CreditNoteId => {
                 sea_orm::Value::String(Some(model.credit_note_id.clone()))
             }
@@ -317,6 +359,7 @@ impl FieldToColumn<DebitNoteFilterField> for DebitNoteODataMapper {
 
     fn map_field(field: DebitNoteFilterField) -> DebitNoteColumn {
         match field {
+            DebitNoteFilterField::TenantId => DebitNoteColumn::TenantId,
             DebitNoteFilterField::DebitNoteId => DebitNoteColumn::DebitNoteId,
             DebitNoteFilterField::OriginInvoiceId => DebitNoteColumn::OriginInvoiceId,
         }
@@ -328,6 +371,7 @@ impl ODataFieldMapping<DebitNoteFilterField> for DebitNoteODataMapper {
 
     fn extract_cursor_value(model: &DebitNoteModel, field: DebitNoteFilterField) -> sea_orm::Value {
         match field {
+            DebitNoteFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             DebitNoteFilterField::DebitNoteId => {
                 sea_orm::Value::String(Some(model.debit_note_id.clone()))
             }
@@ -350,6 +394,7 @@ impl FieldToColumn<DisputeFilterField> for DisputeODataMapper {
 
     fn map_field(field: DisputeFilterField) -> DisputeColumn {
         match field {
+            DisputeFilterField::TenantId => DisputeColumn::TenantId,
             DisputeFilterField::DisputeId => DisputeColumn::DisputeId,
             DisputeFilterField::PaymentId => DisputeColumn::PaymentId,
             DisputeFilterField::LastPhase => DisputeColumn::LastPhase,
@@ -363,6 +408,7 @@ impl ODataFieldMapping<DisputeFilterField> for DisputeODataMapper {
 
     fn extract_cursor_value(model: &DisputeModel, field: DisputeFilterField) -> sea_orm::Value {
         match field {
+            DisputeFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             DisputeFilterField::DisputeId => sea_orm::Value::String(Some(model.dispute_id.clone())),
             DisputeFilterField::PaymentId => sea_orm::Value::String(Some(model.payment_id.clone())),
             DisputeFilterField::LastPhase => sea_orm::Value::String(Some(model.last_phase.clone())),
@@ -384,6 +430,7 @@ impl FieldToColumn<RecognitionRunFilterField> for RecognitionRunODataMapper {
 
     fn map_field(field: RecognitionRunFilterField) -> RecognitionRunColumn {
         match field {
+            RecognitionRunFilterField::TenantId => RecognitionRunColumn::TenantId,
             RecognitionRunFilterField::RunId => RecognitionRunColumn::RunId,
             RecognitionRunFilterField::PeriodId => RecognitionRunColumn::PeriodId,
             RecognitionRunFilterField::Status => RecognitionRunColumn::Status,
@@ -399,6 +446,7 @@ impl ODataFieldMapping<RecognitionRunFilterField> for RecognitionRunODataMapper 
         field: RecognitionRunFilterField,
     ) -> sea_orm::Value {
         match field {
+            RecognitionRunFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             RecognitionRunFilterField::RunId => sea_orm::Value::Uuid(Some(model.run_id)),
             RecognitionRunFilterField::PeriodId => {
                 sea_orm::Value::String(Some(model.period_id.clone()))
@@ -422,12 +470,23 @@ impl FieldToColumn<ExceptionFilterField> for ExceptionODataMapper {
 
     fn map_field(field: ExceptionFilterField) -> ExceptionColumn {
         match field {
+            ExceptionFilterField::TenantId => ExceptionColumn::TenantId,
             ExceptionFilterField::ExceptionId => ExceptionColumn::ExceptionId,
             ExceptionFilterField::ExceptionType => ExceptionColumn::ExceptionType,
             ExceptionFilterField::Status => ExceptionColumn::Status,
             ExceptionFilterField::BusinessRef => ExceptionColumn::BusinessRef,
             ExceptionFilterField::PeriodId => ExceptionColumn::PeriodId,
         }
+    }
+
+    // `exception.period_id` is nullable, and a NULL cannot survive the cursor: the mapper
+    // extracts `Value::String(None)` and `encode_cursor_value` has no arm for it,
+    // so a NULL row landing on a page boundary would answer 400 to a request the
+    // OpenAPI document declares valid. Ordering a keyset walk on a nullable column
+    // would also need an explicit NULLS FIRST/LAST — SQLite and PostgreSQL disagree
+    // by default — so the field stays filterable and is refused as an order key.
+    fn is_orderable(field: ExceptionFilterField) -> bool {
+        !matches!(field, ExceptionFilterField::PeriodId)
     }
 }
 
@@ -436,6 +495,7 @@ impl ODataFieldMapping<ExceptionFilterField> for ExceptionODataMapper {
 
     fn extract_cursor_value(model: &ExceptionModel, field: ExceptionFilterField) -> sea_orm::Value {
         match field {
+            ExceptionFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
             ExceptionFilterField::ExceptionId => sea_orm::Value::Uuid(Some(model.exception_id)),
             ExceptionFilterField::ExceptionType => {
                 sea_orm::Value::String(Some(model.exception_type.clone()))

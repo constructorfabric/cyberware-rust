@@ -44,6 +44,7 @@
 //! region taxonomy alone — so its value view is narrower than
 //! `TaxonomyValueView`'s.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
@@ -51,9 +52,11 @@ use axum::http::HeaderMap;
 use axum::http::header::ETAG;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, Utc};
+use bss_pricing_sdk::odata::MembershipFilterField;
+
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::{OperationBuilderODataExt, ParamLocation, ParamSpec};
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
@@ -64,11 +67,13 @@ use crate::api::rest::approvals::{ApprovalView, MaterialityView};
 use crate::api::rest::auth_context::{audit_stamp, require_authenticated};
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::plans::idempotency_key_param;
 use crate::api::rest::preconditions;
 use crate::api::rest::state::AuthoringState;
 use crate::domain::concurrency::RowVersion;
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{self, ChangeSet, MaterialityVerdict};
 use crate::domain::membership_change::{MembershipMoveProposal, MembershipMoveSet};
@@ -82,6 +87,7 @@ use crate::infra::storage::repo::approval_repo;
 use crate::infra::storage::repo::taxonomy_repo::customer_group_tag_of;
 use crate::infra::storage::repo::{IdempotencyGate, NewMembership, group_membership_repo};
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to both operations (DE0205).
 const TAG: &str = "BSS Pricing Customer Groups";
@@ -109,6 +115,10 @@ pub const CUSTOMER_GROUP_MEMBER: &str = "/bss-pricing/v1/customer-groups/{group}
 /// payer (§5, `POST.../move`, `inst-ms-move`, D-09).
 pub const CUSTOMER_GROUP_MEMBER_MOVE: &str =
     "/bss-pricing/v1/customer-groups/{group}/members/{payerId}/move";
+
+/// Many payers into `{group}` in one approval unit (`inst-mm-bulk`).
+pub const CUSTOMER_GROUP_MEMBERS_MOVE: &str =
+    "/bss-pricing/v1/customer-groups/{group}/members/move";
 
 // ---------------------------------------------------------------------------
 // Views.
@@ -154,26 +164,6 @@ pub struct CustomerGroupTaxonomyView {
     /// operator who reads, edits and writes back has to be able to see the
     /// value they are about to re-activate.
     pub values: Vec<CustomerGroupValueView>,
-}
-
-/// `GET /customer-groups/{group}/members` — the query half (D-125, D4-4).
-///
-/// All three members are `Option<String>` and parsed in the handler, the shape
-/// `SellabilityQuery` records the reason for: a value axum's extractor parses is
-/// one it refuses, with a bare 400 carrying no problem document at all.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct MembershipPageQuery {
-    /// Rows per page; server default 100, hard cap 1,000 (D-125).
-    pub limit: Option<String>,
-    /// The opaque token the previous page's `next_cursor` carried.
-    pub cursor: Option<String>,
-    /// Narrow the page to one payer's intervals in this group.
-    ///
-    /// The filter that makes this list the practical by-id read the membership
-    /// family owes (`api/rest.rs`'s read-shape statement): there is no
-    /// `GET …/members/{id}`, and this answers *"what has this payer's history in
-    /// this group been"* without paging the group.
-    pub payer_id: Option<String>,
 }
 
 /// One page of a group's memberships (D-322, paginated by D4-4).
@@ -383,7 +373,7 @@ async fn put_customer_group_taxonomy(
     let correlation = require_correlation(extension_correlation)?;
     let scope = write_scope(&enforcer, &ctx).await?;
     let tenant = ctx.subject_tenant_id();
-    let now = chrono::Utc::now();
+    let now = OffsetDateTime::now_utc();
 
     let asserted = preconditions::if_match_policy(&headers).map_err(CanonicalError::from)?;
     let request: PutCustomerGroupTaxonomyRequest = preconditions::parse_body(&body)?;
@@ -603,9 +593,11 @@ pub struct MembershipView {
     /// The taxonomy value the payer is enrolled in over this interval.
     pub group_value: String,
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `null` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
     /// The concurrency token a later `PATCH` asserts as its `If-Match`.
     pub row_version: u64,
 }
@@ -685,9 +677,11 @@ pub struct EnrollMembershipRequest {
     /// this identity; tenant topology is never modified.
     pub payer_tenant_id: Uuid,
     /// Inclusive start of the half-open interval, UTC.
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; absent is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_to: Option<OffsetDateTime>,
 }
 
 /// The body of `PATCH /customer-groups/{group}/members/{id}`.
@@ -696,7 +690,8 @@ pub struct EnrollMembershipRequest {
 pub struct EndMembershipRequest {
     /// The new exclusive end, UTC — `inst-ms-time`'s "ending early = setting
     /// `to`".
-    pub effective_to: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_to: OffsetDateTime,
 }
 
 /// The body of `POST /customer-groups/{group}/members/{payerId}/move`.
@@ -706,7 +701,8 @@ pub struct MoveMembershipRequest {
     /// The instant the move pivots on — the ended membership's new
     /// `effectiveTo` and the new one's `effectiveFrom`, both at once (D-09:
     /// "no gap, no overlap").
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     /// Request an **immediate** re-resolution rather than the renewal-aligned
     /// default (`inst-mm-immediate`, `inst-mm-renewal`). Absent or `false` is
     /// the default: the move commits directly, audit-only, exactly as it did
@@ -714,6 +710,34 @@ pub struct MoveMembershipRequest {
     /// — it takes the Slice 5 two-person rule and commits nothing until a
     /// second principal approves.
     pub immediate: Option<bool>,
+}
+
+/// The body of `POST /customer-groups/{group}/members/move`.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request, response)]
+pub struct BulkMoveMembershipRequest {
+    /// Every payer moving into `{group}`. One entry per payer; duplicates
+    /// are refused (`MembershipMoveSet::new`).
+    pub payer_ids: Vec<Uuid>,
+    /// The instant every listed payer pivots on.
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
+}
+
+/// What `POST …/members/move` answers, on both arms.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct BulkMembershipMoveMaterialView {
+    /// `"submitted_for_approval"` or `"committed"`.
+    pub outcome: String,
+    /// One [`MembershipMoveView`] per payer, canonical payer order, once
+    /// committed. `None` while the unit is still `submitted`.
+    pub moved: Option<Vec<MembershipMoveView>>,
+    /// The `BulkGroupMove` verdict this act was opened under. `None` once
+    /// committed.
+    pub materiality: Option<MaterialityView>,
+    /// The one approval unit covering the whole set.
+    pub approval: Option<ApprovalView>,
 }
 
 /// What `POST.../move` answers, on **every** arm.
@@ -770,10 +794,10 @@ const CREATE_MEMBER_OPERATION: &str = "bss_pricing.create_customer_group_member"
 /// client_key)`).
 const MOVE_MEMBER_OPERATION: &str = "bss_pricing.move_customer_group_member";
 
-/// Build the Axum router for the three membership mutations and register
-/// them.
+/// Build the Axum router for the membership mutations and register them.
 ///
 /// On [`MembershipState`], not [`AuthoringState`] — see the section banner.
+#[allow(clippy::too_many_lines)] // five OperationBuilder chains, one per route; flat is clearer than helpers
 pub fn governance_router(state: Arc<MembershipState>, openapi: &dyn OpenApiRegistry) -> Router {
     let router = OperationBuilder::get("/bss-pricing/v1/customer-groups/{group}/members")
         .operation_id("bss_pricing.list_customer_group_members")
@@ -783,7 +807,7 @@ pub fn governance_router(state: Arc<MembershipState>, openapi: &dyn OpenApiRegis
              are included**, and that is the point rather than an oversight: this slice names an \
              auditor who reads membership history, membership is effective-dated, and a list of \
              only the currently-active intervals answers neither \"who is in this group\" nor \
-             \"who has been\". A reader wanting the first filters on `effective_to`. \
+             \"who has been\". Narrow to one payer with `$filter=payer_tenant_id eq '<uuid>'`. \
              **D-322, 2026-08-16**: the slice's endpoint table specified the three write verbs and \
              no read at all, so a membership could be created, ended and moved and never looked \
              at - an operator's only evidence that an enrolment landed was the 202 they had \
@@ -799,8 +823,9 @@ pub fn governance_router(state: Arc<MembershipState>, openapi: &dyn OpenApiRegis
         // against this layer's own opening sentence.
         .param(crate::api::rest::history::limit_param())
         .param(crate::api::rest::history::cursor_param())
-        .param(payer_id_param())
         .handler(list_memberships)
+        .with_odata_filter::<MembershipFilterField>()
+        .with_odata_orderby::<MembershipFilterField>()
         .json_response_with_schema::<MembershipListView>(
             openapi,
             StatusCode::OK,
@@ -905,6 +930,49 @@ pub fn governance_router(state: Arc<MembershipState>, openapi: &dyn OpenApiRegis
         .error_503(openapi)
         .register(router, openapi);
 
+    let router = OperationBuilder::post("/bss-pricing/v1/customer-groups/{group}/members/move")
+        .operation_id("bss_pricing.move_customer_group_members")
+        .summary("Atomically transfer many payers into {group}")
+        .description(
+            "The bulk group move (`inst-mm-bulk`): every `payer_ids` entry ends its active \
+             membership, if any, and enrolls in `{group}` at `effective_from`, as one approval \
+             unit. The route declares the act - always material, no `immediate` flag. The first \
+             call commits nothing and answers `202` with `outcome: \"submitted_for_approval\"`. \
+             After a second principal approves, the same POST answers `200` with \
+             `outcome: \"committed\"` and `moved` for every payer. One payer on this door is \
+             still bulk. `{group}` MUST be declared and active (`GROUP_UNKNOWN` otherwise). An \
+             `Idempotency-Key` is required and is not claimed (the material arm's contract). \
+             Gates on `customer_group` x `write`.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("group", "The target group.")
+        .param(idempotency_key_param())
+        .json_request::<BulkMoveMembershipRequest>(
+            openapi,
+            "The payers and the instant they pivot on.",
+        )
+        .handler(move_memberships)
+        .json_response_with_schema::<BulkMembershipMoveMaterialView>(
+            openapi,
+            StatusCode::OK,
+            "The set committed: `outcome` is `\"committed\"` and `moved` is one entry per payer.",
+        )
+        .json_response_with_schema::<BulkMembershipMoveMaterialView>(
+            openapi,
+            StatusCode::ACCEPTED,
+            "The unit is open: nothing moved, and `approval` names what a second principal must \
+             decide.",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_409(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     let router =
         OperationBuilder::post("/bss-pricing/v1/customer-groups/{group}/members/{payerId}/move")
             .operation_id("bss_pricing.move_customer_group_member")
@@ -989,30 +1057,6 @@ pub fn governance_router(state: Arc<MembershipState>, openapi: &dyn OpenApiRegis
         ))
 }
 
-/// The `payer_id` filter this family's list read offers.
-///
-/// The mitigation the read-shape statement asks of every deviation: there is no
-/// `GET.../members/{id}`, and until this filter existed the list had none either
-/// — the only deviation in the gear with no way to reach one member.
-fn payer_id_param() -> ParamSpec {
-    ParamSpec {
-        name: "payer_id".to_owned(),
-        location: ParamLocation::Query,
-        required: false,
-        description: Some(
-            "Narrow the page to one payer's intervals in this group, ended ones included. \
-             Answers `what has this payer's history in this group been` without paging the \
-             group."
-                .to_owned(),
-        ),
-        param_type: "string".to_owned(),
-        // Scalar: every parameter this gear declares is single-valued.
-        // `array` arrived upstream for `?tag=a&tag=b` repeats, which no route
-        // here has.
-        array: false,
-    }
-}
-
 /// The group path segment, non-blank — [`authored_entries`]'s validation,
 /// applied to one value instead of a whole set.
 fn required_group(group: &str) -> Result<String, CanonicalError> {
@@ -1070,59 +1114,37 @@ async fn membership_of_group(
 /// it. The group is **not** validated against the taxonomy here: a group that
 /// has been retired still has the memberships it accumulated, and refusing to
 /// show them would hide exactly what the retire guard is protecting.
+#[allow(clippy::implicit_hasher)]
 async fn list_memberships(
     Extension(state): Extension<Arc<MembershipState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
     Path(group): Path<String>,
-    Query(query): Query<MembershipPageQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let scope = read_scope(&enforcer, &ctx).await?;
     let group_value = required_group(&group)?;
-    // The interval-keyed request, not the `Uuid`-keyed one: D-322 clause 4 orders
-    // this read by `(effective_from, membership_id)`, and the cursor has to name
-    // both columns the order does.
-    let page = crate::api::rest::cursor::IntervalPageRequest::parse(
-        crate::api::rest::cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )?;
-    let payer = crate::api::rest::cursor::parse_uuid_param("payer_id", query.payer_id.as_deref())?;
 
     let conn = state.db.conn().map_err(|e| {
         CanonicalError::from(DomainError::Internal(format!("membership conn: {e}")))
     })?;
-    // One row more than the page, so "is there another page" needs no second query
-    // and no page whose `next_cursor` points at nothing — the probe every other
-    // paginated read in this gear uses.
-    let probe = page.limit.saturating_add(1);
-    let mut rows = group_membership_repo::memberships_in_group(
+    let page = group_membership_repo::list_odata(
         &conn,
         &scope,
         ctx.subject_tenant_id(),
         &group_value,
-        payer,
-        page.after,
-        probe,
+        &odata,
     )
     .await
-    .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
-
-    let has_more = u64::try_from(rows.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        rows.pop();
-    }
-    let next = has_more
-        .then(|| {
-            rows.last()
-                .map(|row| (row.effective_from, row.membership_id))
-        })
-        .flatten();
+    .map_err(map_odata_page_err)?;
 
     Ok(Json(MembershipListView {
         group_value,
-        memberships: rows.iter().map(MembershipView::from).collect(),
-        page_info: crate::api::rest::cursor::interval_page_info(next, page.limit),
+        memberships: page.items.iter().map(MembershipView::from).collect(),
+        page_info: page.page_info,
     })
     .into_response())
 }
@@ -1146,7 +1168,7 @@ async fn create_membership(
     let digest = preconditions::request_digest(&request)?;
     let group_value = required_group(&group)?;
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = audit_stamp(&ctx, now, correlation);
     let registry = Arc::clone(&state.registry);
     let mutation_ctx = ctx.clone();
@@ -1257,7 +1279,7 @@ async fn adjust_membership(
     let group_value = required_group(&group)?;
     membership_of_group(&state, &scope, tenant, &group_value, id).await?;
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = audit_stamp(&ctx, now, correlation);
     let registry = Arc::clone(&state.registry);
     let db = state.db.clone();
@@ -1353,7 +1375,7 @@ async fn move_membership(
     // This read opens no claim, so it does not disturb the immediate arm's contract
     // that a fresh key marks a fresh attempt: it answers only where an answer was
     // already recorded, which can only have happened down the guarded branch.
-    let now_for_replay = Utc::now();
+    let now_for_replay = OffsetDateTime::now_utc();
     let (_, replay) = state
         .db
         .db()
@@ -1384,7 +1406,7 @@ async fn move_membership(
         return replayed(MOVE_MEMBER_OPERATION, status, &body).map_err(CanonicalError::from);
     }
 
-    let lands_now = request.effective_from <= Utc::now();
+    let lands_now = request.effective_from <= OffsetDateTime::now_utc();
     if request.immediate == Some(true) || lands_now {
         return move_membership_immediate(
             &state,
@@ -1399,7 +1421,7 @@ async fn move_membership(
         .await;
     }
 
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let stamp = audit_stamp(&ctx, now, correlation);
     let registry = Arc::clone(&state.registry);
     let mutation_ctx = ctx.clone();
@@ -1521,8 +1543,8 @@ async fn refuse_a_move_by_the_side_door(
     scope: &AccessScope,
     tenant: Uuid,
     payer_tenant_id: Uuid,
-    effective_from: DateTime<Utc>,
-    now: DateTime<Utc>,
+    effective_from: OffsetDateTime,
+    now: OffsetDateTime,
 ) -> Result<(), DomainError> {
     if effective_from > now {
         return Ok(());
@@ -1545,13 +1567,28 @@ async fn refuse_a_move_by_the_side_door(
     ))
 }
 
-/// The material half of `POST.../move`: `inst-mm-immediate`'s two acts on one
-/// route (`overlays::submit_overlay`'s D-234 shape, applied to a subject with
-/// no draft table).
+/// What the material half of a move door answered, before the door renders it
+/// in its own view.
+enum MembershipMoveOutcome {
+    /// An approved unit over this exact set existed and committed.
+    Committed(Vec<membership_publish::MembershipMoveReceipt>),
+    /// No such unit yet: one was opened, and this is its verdict and record.
+    Submitted(Box<OpenedMove>),
+}
+
+/// The unit a first arrival opened, with the verdict it recorded.
+struct OpenedMove {
+    verdict: MaterialityVerdict,
+    opened: approval_repo::ApprovalRecord,
+}
+
+/// The material half both move doors share — `inst-mm-immediate`'s two acts on
+/// one route (`overlays::submit_overlay`'s D-234 shape, applied to a subject with
+/// no draft table), which `inst-mm-bulk` takes over a set.
 ///
-/// **First arrival** — no approved unit over this exact `(payer, group,
-/// instant)` yet: evaluate materiality (always [`Trigger::ImmediateMembershipReresolution`]),
-/// open the Slice 5 unit and answer `202`. **Nothing is written to the
+/// **First arrival** — no approved unit over this exact `(payers, group,
+/// instant)` yet: record the door's materiality `verdict`, open the Slice 5 unit
+/// and answer [`MembershipMoveOutcome::Submitted`]. **Nothing is written to the
 /// membership plane on this call** — `inst-mm-pending`'s own rule, restated
 /// from the route's side: no `pricing_group_membership` row exists until a
 /// second principal approves.
@@ -1559,40 +1596,36 @@ async fn refuse_a_move_by_the_side_door(
 /// **A later arrival, once approved** — [`approval_repo::find_approved_for_content`]
 /// finds a unit over this exact subject and content, [`ApprovalService::commit_membership_move_in`]
 /// re-verifies the two-person rule and applies the move atomically, and this
-/// call answers `200` carrying the committed membership and the D-06 publish
-/// unit's pending handle — the same shape the audit-only path answers,
-/// because from the payer's read model onward a material move and a
-/// renewal-aligned one converge on one publish unit.
+/// call answers [`MembershipMoveOutcome::Committed`] carrying the receipts —
+/// from the payer's read model onward a material move and a renewal-aligned one
+/// converge on one publish unit.
+///
+/// `door` names the door in a failure detail (`membership move`, `bulk membership
+/// move`); the door renders the outcome because the two answer different views.
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is a fact only the caller holds: the state, the security context \
-              and scope the gate compiled, the tenant, the target group and payer the path \
-              names, the instant the move pivots on, and the correlation the HTTP edge \
-              established. `move_membership`'s own reason, one call up."
+              and scope the gate compiled, the tenant, the target group the path names, the \
+              set the door assembled, the correlation the HTTP edge established, and the \
+              door's own verdict and name. `move_membership`'s own reason, one call up."
 )]
-async fn move_membership_immediate(
+async fn move_membership_set(
     state: &MembershipState,
     ctx: &SecurityContext,
     scope: &AccessScope,
     tenant: Uuid,
-    group_value: String,
-    payer_id: Uuid,
-    effective_from: DateTime<Utc>,
+    group_value: &str,
+    set: MembershipMoveSet,
     correlation: Uuid,
-) -> Result<Response, CanonicalError> {
-    let set_group_value = group_value.clone();
-    let set = MembershipMoveSet::new(vec![MembershipMoveProposal {
-        payer_tenant_id: payer_id,
-        group_value,
-        effective_from,
-    }])
-    .map_err(CanonicalError::from)?;
+    verdict: fn() -> MaterialityVerdict,
+    door: &str,
+) -> Result<MembershipMoveOutcome, CanonicalError> {
     let subject_ref = approval_repo::membership_move_subject_ref(&set)
         .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
     let pin = crate::domain::approval::content_pin::membership_content_hash(&set);
 
     let conn = state.db.conn().map_err(|e| {
-        CanonicalError::internal(format!("bss-pricing: membership move lookup: {e}")).create()
+        CanonicalError::internal(format!("bss-pricing: {door} lookup: {e}")).create()
     })?;
     // **The target group is judged on this arm too** (D-350). The refusal lives
     // inside `move_payer_in`, which this arm does not reach until an approval
@@ -1601,7 +1634,7 @@ async fn move_membership_immediate(
     // over a move that can never commit. Invisible while `immediate` is the only
     // way in; D-350 routes a backdated move here, and this is the door it arrives
     // at.
-    membership_publish::require_active_group(&conn, scope, tenant, &set_group_value)
+    membership_publish::require_active_group(&conn, scope, tenant, group_value)
         .await
         .map_err(CanonicalError::from)?;
 
@@ -1611,7 +1644,7 @@ async fn move_membership_immediate(
             .map_err(|e| CanonicalError::from(repo_failure(&e)))?;
 
     if let Some(approved) = approved {
-        let stamp = audit_stamp(ctx, Utc::now(), correlation);
+        let stamp = audit_stamp(ctx, OffsetDateTime::now_utc(), correlation);
         let registry = Arc::clone(&state.registry);
         let commit_ctx = ctx.clone();
         let commit_scope = scope.clone();
@@ -1637,20 +1670,15 @@ async fn move_membership_immediate(
             .await;
         let receipts = outcome.map_err(|err| {
             err.into_domain(|infra| {
-                DomainError::Internal(format!("bss-pricing: membership move commit: {infra}"))
+                DomainError::Internal(format!("bss-pricing: {door} commit: {infra}"))
             })
         })?;
-        let receipt = receipts.into_iter().next().ok_or_else(|| {
-            CanonicalError::from(DomainError::Internal(
-                "an approved single-payer membership move committed no receipt".to_owned(),
-            ))
-        })?;
-        return Ok((StatusCode::OK, Json(committed_move(&receipt))).into_response());
+        return Ok(MembershipMoveOutcome::Committed(receipts));
     }
 
-    let verdict = immediate_membership_materiality();
+    let verdict = verdict();
     let (_reason, stored_materiality) = crate::api::rest::overlays::rendered_materiality(&verdict)?;
-    let stamp = audit_stamp(ctx, Utc::now(), correlation);
+    let stamp = audit_stamp(ctx, OffsetDateTime::now_utc(), correlation);
     let submit_scope = scope.clone();
     let set_for_submit = set.clone();
     let (_, outcome) = state
@@ -1673,20 +1701,74 @@ async fn move_membership_immediate(
         .await;
     let opened = outcome.map_err(|err| {
         err.into_domain(|infra| {
-            DomainError::Internal(format!("bss-pricing: membership move submit: {infra}"))
+            DomainError::Internal(format!("bss-pricing: {door} submit: {infra}"))
         })
     })?;
+    Ok(MembershipMoveOutcome::Submitted(Box::new(OpenedMove {
+        verdict,
+        opened,
+    })))
+}
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(MembershipMoveMaterialView {
-            outcome: crate::api::rest::publish::OUTCOME_SUBMITTED.to_owned(),
-            moved: None,
-            materiality: Some(MaterialityView::from(&verdict)),
-            approval: Some(ApprovalView::from(&opened)),
-        }),
+/// The material half of `POST .../members/{payerId}/move`: one payer through
+/// [`move_membership_set`], answered in the single-payer view. `200` carries the
+/// committed membership and the D-06 publish unit's pending handle — the same
+/// shape the audit-only path answers; `202` carries the unit it opened.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is a fact only the caller holds: the state, the security context \
+              and scope the gate compiled, the tenant, the target group and payer the path \
+              names, the instant the move pivots on, and the correlation the HTTP edge \
+              established. `move_membership`'s own reason, one call up."
+)]
+async fn move_membership_immediate(
+    state: &MembershipState,
+    ctx: &SecurityContext,
+    scope: &AccessScope,
+    tenant: Uuid,
+    group_value: String,
+    payer_id: Uuid,
+    effective_from: OffsetDateTime,
+    correlation: Uuid,
+) -> Result<Response, CanonicalError> {
+    let set = MembershipMoveSet::new(vec![MembershipMoveProposal {
+        payer_tenant_id: payer_id,
+        group_value: group_value.clone(),
+        effective_from,
+    }])
+    .map_err(CanonicalError::from)?;
+    let outcome = move_membership_set(
+        state,
+        ctx,
+        scope,
+        tenant,
+        &group_value,
+        set,
+        correlation,
+        immediate_membership_materiality,
+        "membership move",
     )
-        .into_response())
+    .await?;
+    match outcome {
+        MembershipMoveOutcome::Committed(receipts) => {
+            let receipt = receipts.into_iter().next().ok_or_else(|| {
+                CanonicalError::from(DomainError::Internal(
+                    "an approved single-payer membership move committed no receipt".to_owned(),
+                ))
+            })?;
+            Ok((StatusCode::OK, Json(committed_move(&receipt))).into_response())
+        }
+        MembershipMoveOutcome::Submitted(submitted) => Ok((
+            StatusCode::ACCEPTED,
+            Json(MembershipMoveMaterialView {
+                outcome: crate::api::rest::publish::OUTCOME_SUBMITTED.to_owned(),
+                moved: None,
+                materiality: Some(MaterialityView::from(&submitted.verdict)),
+                approval: Some(ApprovalView::from(&submitted.opened)),
+            }),
+        )
+            .into_response()),
+    }
 }
 
 /// The materiality verdict `inst-mm-immediate`'s unit records — **evaluated,
@@ -1699,6 +1781,97 @@ async fn move_membership_immediate(
 fn immediate_membership_materiality() -> MaterialityVerdict {
     materiality::evaluate(
         &ChangeSet::of_act(Trigger::ImmediateMembershipReresolution, Vec::new()),
+        /* policy */ None,
+        /* baseline */ None,
+    )
+}
+
+/// `POST /customer-groups/{group}/members/move` — `inst-mm-bulk`.
+///
+/// Always the material arm. The route is the declaration; the count of
+/// `payer_ids` is not.
+async fn move_memberships(
+    Extension(state): Extension<Arc<MembershipState>>,
+    Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
+    extension_ctx: Option<Extension<SecurityContext>>,
+    extension_correlation: Option<Extension<CorrelationId>>,
+    Path(group): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Response, CanonicalError> {
+    let ctx = require_authenticated(extension_ctx)?;
+    let correlation = require_correlation(extension_correlation)?;
+    let scope = write_scope(&enforcer, &ctx).await?;
+    let tenant = ctx.subject_tenant_id();
+    let _key = preconditions::idempotency_key(&headers)?;
+    let request: BulkMoveMembershipRequest = preconditions::parse_body(&body)?;
+    let group_value = required_group(&group)?;
+    let set = MembershipMoveSet::new(
+        request
+            .payer_ids
+            .iter()
+            .map(|payer_tenant_id| MembershipMoveProposal {
+                payer_tenant_id: *payer_tenant_id,
+                group_value: group_value.clone(),
+                effective_from: request.effective_from,
+            })
+            .collect(),
+    )
+    .map_err(CanonicalError::from)?;
+    move_memberships_bulk(&state, &ctx, &scope, tenant, group_value, set, correlation).await
+}
+
+/// The material half of the bulk door: the set through [`move_membership_set`],
+/// answered in the set view — one unit, then one commit of the set.
+async fn move_memberships_bulk(
+    state: &MembershipState,
+    ctx: &SecurityContext,
+    scope: &AccessScope,
+    tenant: Uuid,
+    group_value: String,
+    set: MembershipMoveSet,
+    correlation: Uuid,
+) -> Result<Response, CanonicalError> {
+    let outcome = move_membership_set(
+        state,
+        ctx,
+        scope,
+        tenant,
+        &group_value,
+        set,
+        correlation,
+        bulk_membership_materiality,
+        "bulk membership move",
+    )
+    .await?;
+    match outcome {
+        MembershipMoveOutcome::Committed(receipts) => Ok((
+            StatusCode::OK,
+            Json(BulkMembershipMoveMaterialView {
+                outcome: MEMBERSHIP_OUTCOME_COMMITTED.to_owned(),
+                moved: Some(receipts.iter().map(MembershipMoveView::from).collect()),
+                materiality: None,
+                approval: None,
+            }),
+        )
+            .into_response()),
+        MembershipMoveOutcome::Submitted(submitted) => Ok((
+            StatusCode::ACCEPTED,
+            Json(BulkMembershipMoveMaterialView {
+                outcome: crate::api::rest::publish::OUTCOME_SUBMITTED.to_owned(),
+                moved: None,
+                materiality: Some(MaterialityView::from(&submitted.verdict)),
+                approval: Some(ApprovalView::from(&submitted.opened)),
+            }),
+        )
+            .into_response()),
+    }
+}
+
+/// The materiality verdict `inst-mm-bulk`'s unit records.
+fn bulk_membership_materiality() -> MaterialityVerdict {
+    materiality::evaluate(
+        &ChangeSet::of_act(Trigger::BulkGroupMove, Vec::new()),
         /* policy */ None,
         /* baseline */ None,
     )

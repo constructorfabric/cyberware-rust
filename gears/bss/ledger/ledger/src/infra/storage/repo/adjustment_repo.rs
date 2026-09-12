@@ -32,7 +32,7 @@
 //! tenant yields no rows).
 
 use bss_ledger_sdk::{AccountClass, Side, SourceDocType};
-use chrono::{DateTime, Utc};
+
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait};
@@ -57,6 +57,7 @@ use crate::infra::storage::repo::journal_repo::{
     OdataPageError, map_odata_err, query_with_default_order,
 };
 use crate::odata::{CreditNoteFilterField, DebitNoteFilterField, RefundFilterField};
+use time::OffsetDateTime;
 
 /// A `credit_note` row to persist (the record linking a posted credit note to its
 /// originating invoice item + the recognized/deferred split basis). `amount_minor`
@@ -73,7 +74,7 @@ pub struct NewCreditNote {
     pub deferred_part_minor: i64,
     pub split_basis_ref: Option<String>,
     pub reason_code: String,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 /// A `debit_note` row to persist (the record linking a posted debit note — an
@@ -88,7 +89,7 @@ pub struct NewDebitNote {
     pub amount_minor: i64,
     pub recognized_part_minor: i64,
     pub deferred_part_minor: i64,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 /// A `refund` row to persist (the record of a PSP refund's two-stage lifecycle,
@@ -123,7 +124,7 @@ pub struct NewRefund {
     /// The negated stage-1 entry id on a PSP reject/void (Group E); `None` in
     /// Group B.
     pub reverses_entry_id: Option<Uuid>,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 /// SeaORM-backed Slice-3 adjustment counter + record + read repository.

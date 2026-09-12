@@ -151,7 +151,7 @@ pub struct CatalogVersionRegistryConfig {
     pub mode: CatalogVersionSource,
 }
 
-/// Where the SKU pick-lists get their suggestions.
+/// Where SKU suggestions and tax-category definitions are read from.
 ///
 /// Separate from [`CatalogVersionRegistryConfig`] although both are the Product
 /// & SKU registry: one is a publish dependency that fails closed, the other a
@@ -176,7 +176,8 @@ pub enum ProductCatalogSource {
     /// it cannot be selected without saying so: a deployment carrying this value
     /// is showing operators catalog content no registry issued. See
     /// [`crate::infra::local_dev_catalog`] for what that costs and how it is
-    /// swept afterwards.
+    /// swept afterwards. The same opt-in also enables visibly prefixed demo
+    /// tax-category definitions; the existing config token is retained.
     LocalDevStaticSkus,
 }
 

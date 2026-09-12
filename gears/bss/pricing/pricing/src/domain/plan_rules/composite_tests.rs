@@ -12,6 +12,7 @@ use crate::domain::plan_shape::{CompositeMeter, PlanShape};
 use crate::domain::rules::{COMPOSITE_SELF_REFERENCE, COMPOSITE_TOO_FEW_CONSTITUENTS};
 use crate::domain::scope_key::PlanId;
 use crate::domain::validation::{ValidationReport, ValidationRule};
+use time::OffsetDateTime;
 
 fn composite(output: &str, units: &[&str]) -> CompositeMeter {
     CompositeMeter {
@@ -23,7 +24,11 @@ fn composite(output: &str, units: &[&str]) -> CompositeMeter {
 }
 
 fn shape(composites: Vec<CompositeMeter>) -> PlanShape {
-    let mut shape = PlanShape::new(PlanId::new(Uuid::from_u128(1)), 0, chrono::Utc::now());
+    let mut shape = PlanShape::new(
+        PlanId::new(Uuid::from_u128(1)),
+        0,
+        OffsetDateTime::now_utc(),
+    );
     shape.composites = composites;
     shape
 }

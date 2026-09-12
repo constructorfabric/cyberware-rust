@@ -63,8 +63,11 @@
 
 mod pg_support;
 
+use bss_pricing::domain::instant::format_rfc3339;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use pg_support::Pg;
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use time::OffsetDateTime;
 
 const TENANT: &str = "11111111-1111-1111-1111-111111111111";
 const PLAN: &str = "22222222-2222-2222-2222-222222222222";
@@ -950,7 +953,7 @@ async fn a_second_overlapping_window_on_one_key_is_refused_by_the_store() {
 
     use bss_pricing::infra::storage::RepoError;
     use bss_pricing::infra::storage::repo::window_repo::{self, NewWindow};
-    use chrono::{TimeZone, Utc};
+
     use tokio::sync::Notify;
     use toolkit_db::secure::AccessScope;
     use toolkit_db::secure::TxError;
@@ -960,10 +963,8 @@ async fn a_second_overlapping_window_on_one_key_is_refused_by_the_store() {
     /// slow one.
     const RACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-    fn instant(month: u32) -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2099, month, 1, 0, 0, 0)
-            .single()
-            .expect("a fixed instant")
+    fn instant(month: u32) -> OffsetDateTime {
+        utc_ymd_hms(2099, month, 1, 0, 0, 0)
     }
 
     fn stamp() -> bss_pricing::domain::audit::AuditStamp {
@@ -1166,7 +1167,7 @@ async fn an_extension_that_loses_a_race_is_refused_by_name_and_not_as_a_storage_
 
     use bss_pricing::infra::storage::RepoError;
     use bss_pricing::infra::storage::repo::window_repo::{self, NewWindow};
-    use chrono::{TimeZone, Utc};
+
     use tokio::sync::Notify;
     use toolkit_db::secure::AccessScope;
     use toolkit_db::secure::TxError;
@@ -1182,10 +1183,8 @@ async fn an_extension_that_loses_a_race_is_refused_by_name_and_not_as_a_storage_
     /// transaction.
     const NEIGHBOUR: u128 = 0x_f2;
 
-    fn instant(month: u32) -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2099, month, 1, 0, 0, 0)
-            .single()
-            .expect("a fixed instant")
+    fn instant(month: u32) -> OffsetDateTime {
+        utc_ymd_hms(2099, month, 1, 0, 0, 0)
     }
 
     fn stamp() -> bss_pricing::domain::audit::AuditStamp {
@@ -1321,7 +1320,11 @@ async fn an_extension_that_loses_a_race_is_refused_by_name_and_not_as_a_storage_
     );
     assert_eq!(
         requested,
-        &format!("[{}, {})", instant(1).to_rfc3339(), instant(5).to_rfc3339()),
+        &format!(
+            "[{}, {})",
+            format_rfc3339(instant(1)),
+            format_rfc3339(instant(5))
+        ),
         "and the interval the caller asked for, so the operator can see what it \
          would have taken"
     );

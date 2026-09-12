@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 
 use bss_ledger_sdk::{AccountClass, Side};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter};
@@ -34,6 +34,7 @@ use crate::infra::storage::entity::{
     account_balance, ar_invoice_balance, ar_payer_balance, reusable_credit_subbalance,
     tax_subbalance, unallocated_balance,
 };
+use time::OffsetDateTime;
 
 /// Projection error.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -104,7 +105,7 @@ struct GrainDelta {
     /// due date, stamped first-write-wins onto `ar_invoice_balance` so the
     /// oldest-first allocation precedence has a stable post date. Other grains
     /// carry the defaults (`posted_at` is unused, `due_date` is `None`).
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
     due_date: Option<NaiveDate>,
     /// Reusable-credit grain only: the credit-grant event type that sub-divides
     /// the wallet balance (a PK dim), and the entry's posted-at stamped
@@ -112,7 +113,7 @@ struct GrainDelta {
     /// recency marker. Other grains carry the defaults (empty event type,
     /// `first_granted_at` is `None`).
     credit_grant_event_type: String,
-    first_granted_at: Option<DateTime<Utc>>,
+    first_granted_at: Option<OffsetDateTime>,
 }
 
 /// The canonical lock-order sort key for a [`GrainDelta`]: `(table_rank, tenant,

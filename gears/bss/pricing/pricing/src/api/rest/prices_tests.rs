@@ -5,7 +5,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
@@ -13,6 +12,7 @@ use super::{
 };
 use crate::domain::concurrency::RowVersion;
 use crate::domain::contracts::{AnchorDay, BillingAnchorPolicy, ProrationBasis};
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, RateMinor};
 use crate::domain::price_record::PriceRecord;
@@ -50,7 +50,7 @@ fn record(bands: Vec<TierBand>) -> PriceRecord {
         supersedes_price_id: None,
         lifecycle_state: LifecycleState::Draft,
         created_by: Uuid::from_u128(0xac70),
-        created_at_utc: Utc.with_ymd_and_hms(2026, 8, 3, 9, 0, 0).unwrap(),
+        created_at_utc: utc_ymd_hms(2026, 8, 3, 9, 0, 0),
         row_version: RowVersion::new(2),
     }
 }

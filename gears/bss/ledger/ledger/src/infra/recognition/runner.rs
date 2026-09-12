@@ -70,6 +70,7 @@ use crate::infra::posting::service::{PostSidecar, PostingService};
 use crate::infra::recognition::sidecar::{RecognitionReversalSidecar, RecognitionStampSidecar};
 use crate::infra::storage::repo::recognition_repo::DuePendingSegment;
 use crate::infra::storage::repo::{RecognitionRepo, ReferenceRepo};
+use time::OffsetDateTime;
 
 /// Origin literal stamped on posts made through this service (mirrors the
 /// invoice-post / settlement orchestrators).
@@ -626,7 +627,7 @@ impl RecognitionRunner {
             source_business_id: entry.source_business_id.clone(),
             reverses_entry_id: entry.reverses_entry_id,
             reverses_period_id: entry.reverses_period_id.clone(),
-            posted_at_utc: chrono::Utc::now(),
+            posted_at_utc: OffsetDateTime::now_utc(),
             effective_at: entry.effective_at,
             origin: ORIGIN_SYSTEM.to_owned(),
             posted_by_actor_id: entry.posted_by_actor_id,

@@ -16,36 +16,43 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeZone, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::secure::SecureUpdateExt;
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
 
-use bss_pricing::infra::storage::entity::{audit_log, plan, price, price_overlay};
+use bss_pricing::infra::storage::entity::{
+    audit_log, plan, plan_descriptor_set, price, price_overlay,
+};
 use bss_pricing::infra::storage::migrations::Migrator;
 
 use bss_pricing::domain::audit::AuditStamp;
+use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::overlay::{ScopeClass, ScopeValue};
 use bss_pricing::domain::scope_key::Region;
 use bss_pricing::domain::taxonomy::{
-    RegionTaxMarkers, TAXONOMY_VALUE_IN_USE, TaxonomyClass, TaxonomyEntry, TaxonomyState, tag_of,
+    RegionTaxMarkers, SEEDED_REGION, TAXONOMY_VALUE_IN_USE, TaxonomyClass, TaxonomyEntry,
+    TaxonomyState, TaxonomyValueChange, TaxonomyValuePatch, TaxonomyValueProposal, seeded_region,
+    tag_of,
 };
+use bss_pricing::infra::approval::ApprovalService;
 use bss_pricing::infra::storage::repo::taxonomy_repo::{
-    Replaced, TaxonomyRepo, active_regions, customer_group_tag_of, references_to, region_readiness,
-    rounding_policy_tag_of,
+    Replaced, TaxonomyRepo, active_gl_codes, active_regions, customer_group_tag_of, gl_code_tag_of,
+    references_to, region_readiness, region_readiness_map, rounding_policy_tag_of,
+    write_value_patch,
 };
+use time::OffsetDateTime;
 
 const TENANT: Uuid = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
 const OTHER_TENANT: Uuid = Uuid::from_u128(0x9999_9999_9999_9999_9999_9999_9999_9999);
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 6, 12, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 6, 12, 0, 0)
 }
 
 fn stamp() -> AuditStamp {
@@ -54,6 +61,10 @@ fn stamp() -> AuditStamp {
         recorded_at: now(),
         correlation_id: Uuid::from_u128(0xc0_11),
     }
+}
+
+fn value(raw: &str) -> ScopeValue {
+    ScopeValue::new(raw).expect("non-blank")
 }
 
 fn entry(value: &str, state: TaxonomyState) -> TaxonomyEntry {
@@ -371,9 +382,19 @@ async fn a_put_on_one_class_leaves_the_other_three_alone() {
         .filter(|c| **c != TaxonomyClass::Brand)
     {
         let held = repo.list(&scope, TENANT, *class).await.expect("read back");
+        // The region universe also carries the seed the first write materialised
+        // and the whole-set replace then retired (D-354).
+        let expected = if *class == TaxonomyClass::Region {
+            vec![
+                (SEEDED_REGION, TaxonomyState::Retired),
+                ("shared-value", TaxonomyState::Active),
+            ]
+        } else {
+            vec![("shared-value", TaxonomyState::Active)]
+        };
         assert_eq!(
             values(&held),
-            [("shared-value", TaxonomyState::Active)],
+            expected,
             "{class} must be untouched by a brand PUT"
         );
     }
@@ -447,6 +468,92 @@ async fn a_foreign_tenants_taxonomy_is_invisible() {
 // ---------------------------------------------------------------------------
 // The `If-Match` premise, tested where it is enforced (T-7).
 // ---------------------------------------------------------------------------
+
+/// The **direct** value commit refuses a value the store has moved past, inside
+/// its own transaction — D-355's arm of the property the test below proves for
+/// `replace`.
+///
+/// The handler compares `tag_of_value` against `If-Match` on a plain connection
+/// and then hands the decision to a transaction that races it, and
+/// `update_entry` is an unconditional `UPDATE` over tables with no row version,
+/// so without an in-transaction premise test two operators editing one
+/// unreferenced value under the same tag both commit: one edit is lost and both
+/// callers see `200`. The governed arm cannot reach that state because it
+/// re-reads the value and re-derives the pin; this arm has no unit, so it
+/// compares against the `held` the patch was authored over.
+///
+/// Staged the way the `replace` case is — by moving the store between the
+/// caller's read and the call, which is what a concurrent commit does without
+/// needing two live transactions.
+#[tokio::test]
+async fn the_direct_value_commit_refuses_a_value_the_store_has_moved_past() {
+    let (repo, scope, provider) = harness().await;
+    repo.declare_value(
+        &scope,
+        TENANT,
+        TaxonomyClass::Brand,
+        entry("acme", TaxonomyState::Active),
+        stamp(),
+    )
+    .await
+    .expect("declare");
+
+    // What our caller read, and the edit they authored over it.
+    let held = repo
+        .find_value(&scope, TENANT, TaxonomyClass::Brand, &value("acme"))
+        .await
+        .expect("read")
+        .expect("declared");
+    let change = TaxonomyValueChange {
+        proposal: TaxonomyValueProposal {
+            class: TaxonomyClass::Brand,
+            value: value("acme"),
+            patch: TaxonomyValuePatch {
+                display_name: Some("ACME Ltd".to_owned()),
+                ..TaxonomyValuePatch::default()
+            },
+        },
+        held: held.clone(),
+    };
+
+    // Somebody else relabels it first. This is the concurrent commit.
+    let conn = provider.conn().expect("conn");
+    let moved = TaxonomyEntry {
+        display_name: "Acme Corporation".to_owned(),
+        ..held.clone()
+    };
+    write_value_patch(
+        &conn,
+        &scope,
+        TENANT,
+        TaxonomyClass::Brand,
+        &held,
+        &moved,
+        None,
+        stamp(),
+    )
+    .await
+    .expect("the concurrent commit lands");
+
+    let refused =
+        ApprovalService::commit_taxonomy_value_direct_in(&conn, &scope, TENANT, &change, stamp())
+            .await
+            .expect_err("a premise that moved must refuse");
+    assert!(
+        matches!(refused, DomainError::StaleVersion(_)),
+        "the store's own refusal, typed 409 STALE_VERSION: {refused:?}"
+    );
+
+    let standing = repo
+        .find_value(&scope, TENANT, TaxonomyClass::Brand, &value("acme"))
+        .await
+        .expect("read")
+        .expect("declared");
+    assert_eq!(
+        standing.display_name, "Acme Corporation",
+        "the refused edit wrote nothing over the concurrent one"
+    );
+}
 
 /// `replace` refuses a tag the store has moved past — **inside its own
 /// transaction**, not at the transport.
@@ -629,7 +736,14 @@ async fn a_published_overlay_scope_blocks_the_retirement_in_every_class() {
         );
         assert_eq!(
             values(&result.entries),
-            [("in-use", TaxonomyState::Active)],
+            if *class == TaxonomyClass::Region {
+                vec![
+                    (SEEDED_REGION, TaxonomyState::Retired),
+                    ("in-use", TaxonomyState::Active),
+                ]
+            } else {
+                vec![("in-use", TaxonomyState::Active)]
+            },
             "{class}: a refused PUT changes nothing at all"
         );
     }
@@ -669,7 +783,7 @@ async fn a_draft_overlay_scope_does_not_block_the_retirement() {
 /// identically-named value forever.
 #[tokio::test]
 async fn the_reference_count_is_scoped_to_its_own_class() {
-    let (_repo, scope, provider) = harness().await;
+    let (_repo, _scope, provider) = harness().await;
     publish_overlay_scoped(
         &provider,
         0x0e_1a,
@@ -681,7 +795,6 @@ async fn the_reference_count_is_scoped_to_its_own_class() {
 
     let same = references_to(
         &provider.conn().expect("conn"),
-        &scope,
         TENANT,
         TaxonomyClass::Brand,
         &ScopeValue::new("acme").expect("non-blank"),
@@ -690,7 +803,6 @@ async fn the_reference_count_is_scoped_to_its_own_class() {
     .expect("count");
     let other = references_to(
         &provider.conn().expect("conn"),
-        &scope,
         TENANT,
         TaxonomyClass::Partner,
         &ScopeValue::new("acme").expect("non-blank"),
@@ -765,12 +877,12 @@ async fn publish_price_row_in(provider: &DBProvider<DbError>, region: &str) {
 /// table is empty", and a probe deleting the branch left it green.
 #[tokio::test]
 async fn the_row_plane_is_counted_for_region_alone() {
-    let (_repo, scope, provider) = harness().await;
+    let (_repo, _scope, provider) = harness().await;
     publish_price_row_in(&provider, "eu").await;
     let conn = provider.conn().expect("conn");
     let value = ScopeValue::new("eu").expect("non-blank");
 
-    let region_refs = references_to(&conn, &scope, TENANT, TaxonomyClass::Region, &value)
+    let region_refs = references_to(&conn, TENANT, TaxonomyClass::Region, &value)
         .await
         .expect("count");
     assert_eq!(
@@ -782,7 +894,7 @@ async fn the_row_plane_is_counted_for_region_alone() {
         .iter()
         .filter(|c| **c != TaxonomyClass::Region)
     {
-        let refs = references_to(&conn, &scope, TENANT, *class, &value)
+        let refs = references_to(&conn, TENANT, *class, &value)
             .await
             .expect("count");
         assert_eq!(
@@ -836,7 +948,10 @@ async fn dropping_a_region_tax_category_a_published_row_leans_on_is_refused() {
     );
     assert_eq!(
         values(&result.entries),
-        [("eu", TaxonomyState::Active)],
+        [
+            ("eu", TaxonomyState::Active),
+            (SEEDED_REGION, TaxonomyState::Retired)
+        ],
         "one transaction, one verdict: the taxonomy is unchanged"
     );
 }
@@ -899,7 +1014,13 @@ async fn a_published_price_row_blocks_its_regions_retirement() {
             .collect::<Vec<_>>(),
         [TAXONOMY_VALUE_IN_USE]
     );
-    assert_eq!(values(&result.entries), [("eu", TaxonomyState::Active)]);
+    assert_eq!(
+        values(&result.entries),
+        [
+            ("eu", TaxonomyState::Active),
+            (SEEDED_REGION, TaxonomyState::Retired)
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,8 +1481,8 @@ async fn seed_customer_group_membership(
     membership_id: u128,
     payer_tenant_id: u128,
     group_value: &str,
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
 ) {
     use bss_pricing::infra::storage::entity::group_membership;
 
@@ -1407,7 +1528,7 @@ async fn a_live_membership_blocks_a_customer_groups_retirement() {
         0x0c_2a,
         0x0c_2b,
         "gold",
-        now() - chrono::Duration::days(30),
+        now() - time::Duration::days(30),
         None,
     )
     .await;
@@ -1453,7 +1574,7 @@ async fn a_membership_that_has_not_started_yet_blocks_a_customer_groups_retireme
         0x0c_2c,
         0x0c_2d,
         "gold",
-        now() + chrono::Duration::days(30),
+        now() + time::Duration::days(30),
         None,
     )
     .await;
@@ -1488,8 +1609,8 @@ async fn an_ended_membership_does_not_block_a_customer_groups_retirement() {
         0x0c_2e,
         0x0c_2f,
         "gold",
-        now() - chrono::Duration::days(60),
-        Some(now() - chrono::Duration::days(1)),
+        now() - time::Duration::days(60),
+        Some(now() - time::Duration::days(1)),
     )
     .await;
 
@@ -1832,5 +1953,480 @@ async fn a_value_only_the_frozen_resolution_names_still_blocks_retirement() {
             ("half_up", TaxonomyState::Active)
         ],
         "and a refused retirement writes nothing at all"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The GL-code vocabulary is its own taxonomy, on both planes (D-356).
+// ---------------------------------------------------------------------------
+
+/// `replace_gl_codes` under the tag the store currently renders —
+/// [`replace_rounding_policies_now`]'s shape on the third single-table taxonomy.
+async fn replace_gl_codes_now(
+    repo: &TaxonomyRepo,
+    scope: &AccessScope,
+    entries: Vec<TaxonomyEntry>,
+) -> Result<Replaced, bss_pricing::infra::storage::RepoError> {
+    let held = repo.list_gl_codes(scope, TENANT).await.expect("read back");
+    repo.replace_gl_codes(scope, TENANT, entries, &gl_code_tag_of(&held), stamp())
+        .await
+}
+
+fn declared_gl_codes(values: &[&str]) -> std::collections::BTreeSet<String> {
+    values.iter().map(|v| (*v).to_owned()).collect()
+}
+
+/// A first write declares the set, an omitted value is **retired rather than
+/// deleted**, and `active_gl_codes` — the publish rule's operand — reads the
+/// `active` values alone.
+///
+/// The three facts are pinned in one case because they are one contract: what a
+/// `PUT` writes is exactly what the publish rule will read, and a retirement
+/// that stayed visible to the rule would let a retired code validate a new
+/// descriptor set against itself.
+#[tokio::test]
+async fn a_gl_code_put_declares_retires_by_omission_and_the_active_read_follows() {
+    let (repo, scope, provider) = harness().await;
+    let conn = provider.conn().expect("conn");
+
+    assert!(
+        active_gl_codes(&conn, &scope, TENANT)
+            .await
+            .expect("read")
+            .is_empty(),
+        "a tenant that declared nothing reads an empty set - the opt-out state"
+    );
+
+    let declared = replace_gl_codes_now(
+        &repo,
+        &scope,
+        vec![
+            entry("4000-REV", TaxonomyState::Active),
+            entry("4010-TAX", TaxonomyState::Active),
+        ],
+    )
+    .await
+    .expect("declare");
+    assert!(!declared.stale && declared.report.is_publishable());
+    assert_eq!(
+        active_gl_codes(&conn, &scope, TENANT).await.expect("read"),
+        declared_gl_codes(&["4000-REV", "4010-TAX"])
+    );
+
+    let retired = replace_gl_codes_now(
+        &repo,
+        &scope,
+        vec![entry("4000-REV", TaxonomyState::Active)],
+    )
+    .await
+    .expect("retire by omission");
+    assert!(!retired.stale && retired.report.is_publishable());
+    assert_eq!(
+        values(&retired.entries),
+        [
+            ("4000-REV", TaxonomyState::Active),
+            ("4010-TAX", TaxonomyState::Retired)
+        ],
+        "the omitted code is retired, never deleted"
+    );
+    assert_eq!(
+        active_gl_codes(&conn, &scope, TENANT).await.expect("read"),
+        declared_gl_codes(&["4000-REV"]),
+        "and the publish rule's operand no longer contains it"
+    );
+}
+
+/// The cross-tenant probe the other three stores carry.
+///
+/// A GL code is what an ERP posts a tenant's revenue against, so a read path
+/// that trusted its `tenant_id` argument over the caller's compiled scope would
+/// validate one tenant's catalog against another's chart of accounts.
+#[tokio::test]
+async fn a_foreign_tenants_gl_code_taxonomy_is_invisible() {
+    let (repo, scope, provider) = harness().await;
+    replace_gl_codes_now(
+        &repo,
+        &scope,
+        vec![entry("4000-REV", TaxonomyState::Active)],
+    )
+    .await
+    .expect("seed");
+
+    let by_argument = repo
+        .list_gl_codes(&AccessScope::allow_all(), OTHER_TENANT)
+        .await
+        .expect("read");
+    assert!(
+        by_argument.is_empty(),
+        "another tenant's values are not visible to the argument"
+    );
+
+    let by_scope = repo
+        .list_gl_codes(&AccessScope::for_tenant(OTHER_TENANT), TENANT)
+        .await
+        .expect("read");
+    assert!(
+        by_scope.is_empty(),
+        "nor to a caller scoped elsewhere reaching for the owner's rows by name"
+    );
+
+    let conn = provider.conn().expect("conn");
+    assert!(
+        active_gl_codes(&conn, &AccessScope::for_tenant(OTHER_TENANT), TENANT)
+            .await
+            .expect("read")
+            .is_empty(),
+        "the publish rule's read is scoped the same way"
+    );
+    assert_eq!(
+        repo.list_gl_codes(&AccessScope::for_tenant(TENANT), TENANT)
+            .await
+            .expect("read")
+            .len(),
+        1,
+        "and the owner, scoped to itself, still sees its own value"
+    );
+}
+
+/// A GL-code `PUT` is audited **under the GL-code taxonomy**, not under either
+/// of its two siblings.
+///
+/// `inst-tx-mutation`'s reason as the rounding case gives it: three vocabularies
+/// are governed by three routes and retired against three reference planes, so
+/// an auditor filtering the per-tenant policy segment must be able to tell them
+/// apart.
+#[tokio::test]
+async fn a_gl_code_put_is_recorded_under_its_own_taxonomy() {
+    let (repo, scope, provider) = harness().await;
+
+    replace_gl_codes_now(
+        &repo,
+        &scope,
+        vec![
+            entry("4000-REV", TaxonomyState::Active),
+            entry("4010-TAX", TaxonomyState::Active),
+        ],
+    )
+    .await
+    .expect("put");
+
+    assert_eq!(
+        audit_records_for(&provider, "taxonomy/gl-codes").await,
+        1,
+        "one PUT is one act, recorded under the taxonomy it moved"
+    );
+    assert_eq!(
+        audit_records_for(&provider, "taxonomy/rounding-policies").await
+            + audit_records_for(&provider, "taxonomy/customer_group").await,
+        0,
+        "and nothing is recorded against a taxonomy this call never touched"
+    );
+}
+
+/// Seed one plan revision whose billing descriptor set names `gl_code`, and
+/// leave it in `state`.
+///
+/// Through the entities rather than the publish path, for
+/// [`publish_price_row_resolving`]'s reason: what is under test is the guard.
+/// The descriptor row is inserted **while the revision is a draft** — its
+/// append-only trigger refuses an insert under a non-draft parent — and the
+/// revision is then flipped, which is the same flip `publish_revision` performs.
+async fn seed_revision_naming_gl_code(
+    provider: &DBProvider<DbError>,
+    plan_id: Uuid,
+    gl_code: &str,
+    state: &str,
+) {
+    let conn = provider.conn().expect("conn");
+    let plan_row = plan::ActiveModel {
+        plan_id: Set(plan_id),
+        revision: Set(1),
+        tenant_id: Set(TENANT),
+        lifecycle_state: Set("draft".to_owned()),
+        created_by: Set(Uuid::from_u128(0x4444)),
+        created_at_utc: Set(now()),
+        ..Default::default()
+    };
+    plan::Entity::insert(plan_row.clone())
+        .secure()
+        .scope_with_model(&AccessScope::allow_all(), &plan_row)
+        .expect("scope")
+        .exec(&conn)
+        .await
+        .expect("seed the plan revision");
+
+    let descriptors = plan_descriptor_set::ActiveModel {
+        plan_id: Set(plan_id),
+        plan_revision: Set(1),
+        tenant_id: Set(TENANT),
+        invoice_line_template: Set(Some("{plan}".to_owned())),
+        gl_code: Set(Some(gl_code.to_owned())),
+        itemization_rule: Set(Some("per_charge".to_owned())),
+        additional_fields: Set(serde_json::json!({})),
+    };
+    plan_descriptor_set::Entity::insert(descriptors.clone())
+        .secure()
+        .scope_with_model(&AccessScope::allow_all(), &descriptors)
+        .expect("scope")
+        .exec(&conn)
+        .await
+        .expect("seed the descriptor set");
+
+    if state != "draft" {
+        let moved = plan::Entity::update_many()
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .col_expr(
+                plan::Column::LifecycleState,
+                sea_orm::sea_query::Expr::value(state),
+            )
+            .filter(
+                Condition::all()
+                    .add(plan::Column::PlanId.eq(plan_id))
+                    .add(plan::Column::Revision.eq(1_i64)),
+            )
+            .exec(&conn)
+            .await
+            .expect("flip the revision");
+        assert_eq!(moved.rows_affected, 1, "the seed must have moved one row");
+    }
+}
+
+/// A code a **published** revision's descriptor set names cannot be retired, and
+/// nothing is written; a code only a **draft** names can.
+///
+/// Both halves in one case, because either alone is satisfied by a wrong guard: a
+/// guard that refused every retirement passes the first, and a guard that counted
+/// nothing passes the second. Drafts are not counted for the rounding guard's
+/// reason - a draft's author can still change the code, while a published
+/// revision's is frozen into a `CatalogVersion` an ERP posts against.
+#[tokio::test]
+async fn a_gl_code_a_published_descriptor_set_names_cannot_be_retired_while_a_drafts_can() {
+    let (repo, scope, provider) = harness().await;
+    replace_gl_codes_now(
+        &repo,
+        &scope,
+        vec![
+            entry("4000-REV", TaxonomyState::Active),
+            entry("4010-TAX", TaxonomyState::Active),
+            entry("4020-WIP", TaxonomyState::Active),
+        ],
+    )
+    .await
+    .expect("declare the vocabulary");
+    seed_revision_naming_gl_code(&provider, Uuid::from_u128(0x91b1), "4000-REV", "published").await;
+    seed_revision_naming_gl_code(&provider, Uuid::from_u128(0x91b2), "4020-WIP", "draft").await;
+
+    let refused = replace_gl_codes_now(
+        &repo,
+        &scope,
+        vec![
+            entry("4010-TAX", TaxonomyState::Active),
+            entry("4020-WIP", TaxonomyState::Active),
+        ],
+    )
+    .await
+    .expect("refused, not errored");
+    assert!(
+        !refused.report.is_publishable(),
+        "a published revision's descriptor set names `4000-REV`, so it cannot be retired"
+    );
+    assert_eq!(refused.report.violations[0].code, TAXONOMY_VALUE_IN_USE);
+    assert!(
+        refused.report.violations[0]
+            .detail
+            .contains("1 published plan revision(s)"),
+        "the refusal counts the frozen revisions: {}",
+        refused.report.violations[0].detail
+    );
+    assert_eq!(
+        values(&refused.entries),
+        [
+            ("4000-REV", TaxonomyState::Active),
+            ("4010-TAX", TaxonomyState::Active),
+            ("4020-WIP", TaxonomyState::Active)
+        ],
+        "and a refused retirement writes nothing at all"
+    );
+
+    let allowed = replace_gl_codes_now(
+        &repo,
+        &scope,
+        vec![
+            entry("4000-REV", TaxonomyState::Active),
+            entry("4010-TAX", TaxonomyState::Active),
+        ],
+    )
+    .await
+    .expect("retire the code only a draft names");
+    assert!(
+        allowed.report.is_publishable(),
+        "a draft's author can still change the code, so a draft does not pin it"
+    );
+    assert_eq!(
+        values(&allowed.entries),
+        [
+            ("4000-REV", TaxonomyState::Active),
+            ("4010-TAX", TaxonomyState::Active),
+            ("4020-WIP", TaxonomyState::Retired)
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-354: the seeded region.
+// ---------------------------------------------------------------------------
+
+/// A tenant holding no region row reads `{global: active}` from every region
+/// reader, with the fail-closed markers — and nothing is written by reading.
+#[tokio::test]
+async fn a_tenant_with_no_region_row_reads_the_seeded_global_everywhere() {
+    let (repo, scope, provider) = harness().await;
+    let conn = provider.conn().expect("conn");
+
+    let listed = repo
+        .list(&scope, TENANT, TaxonomyClass::Region)
+        .await
+        .expect("list");
+    assert_eq!(listed, vec![seeded_region()]);
+    assert_eq!(
+        values(&listed),
+        vec![(SEEDED_REGION, TaxonomyState::Active)]
+    );
+    let universe = active_regions(&conn, &scope, TENANT)
+        .await
+        .expect("universe");
+    assert_eq!(
+        universe,
+        std::iter::once(Region::new(SEEDED_REGION).expect("ok")).collect()
+    );
+    assert_eq!(
+        region_readiness(
+            &conn,
+            &scope,
+            TENANT,
+            &Region::new(SEEDED_REGION).expect("ok")
+        )
+        .await
+        .expect("read"),
+        Some(RegionTaxMarkers::default()),
+        "declared, with no tax fact asserted"
+    );
+    assert_eq!(
+        region_readiness(&conn, &scope, TENANT, &Region::new("mars").expect("ok"))
+            .await
+            .expect("read"),
+        None,
+        "the seed does not make every region known"
+    );
+    let map = region_readiness_map(&conn, &scope, TENANT)
+        .await
+        .expect("map");
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.get(SEEDED_REGION), Some(&RegionTaxMarkers::default()));
+
+    // Reading wrote nothing: the brand list of the same tenant is untouched, and
+    // a second read of the region list is the same virtual entry.
+    assert!(
+        repo.list(&scope, TENANT, TaxonomyClass::Brand)
+            .await
+            .expect("brand")
+            .is_empty()
+    );
+    assert_eq!(
+        repo.list(&scope, TENANT, TaxonomyClass::Region)
+            .await
+            .expect("list again"),
+        vec![seeded_region()]
+    );
+}
+
+/// The tenant's first region write materialises the seed before it lands, so
+/// the value the reads answered is the row the write goes on to sit beside.
+#[tokio::test]
+async fn the_first_region_write_materialises_the_seed_beside_it() {
+    let (repo, scope, provider) = harness().await;
+    let conn = provider.conn().expect("conn");
+
+    repo.declare_value(
+        &scope,
+        TENANT,
+        TaxonomyClass::Region,
+        region_entry("eu", Some("standard"), true),
+        stamp(),
+    )
+    .await
+    .expect("declare");
+
+    let listed = repo
+        .list(&scope, TENANT, TaxonomyClass::Region)
+        .await
+        .expect("list");
+    assert_eq!(
+        values(&listed),
+        vec![
+            ("eu", TaxonomyState::Active),
+            (SEEDED_REGION, TaxonomyState::Active)
+        ],
+        "two rows now, the seed among them: {listed:?}"
+    );
+    let universe = active_regions(&conn, &scope, TENANT)
+        .await
+        .expect("universe");
+    assert_eq!(universe.len(), 2);
+    assert!(universe.contains(&Region::new(SEEDED_REGION).expect("ok")));
+}
+
+/// The seed is an ordinary value once written: retiring it leaves the universe
+/// **empty** — the tenant asked for no regions — and no second seed appears.
+#[tokio::test]
+async fn retiring_the_seed_empties_the_universe_and_nothing_reseeds_it() {
+    let (repo, scope, provider) = harness().await;
+    let conn = provider.conn().expect("conn");
+    let held = seeded_region();
+    let retired = TaxonomyEntry {
+        state: TaxonomyState::Retired,
+        ..held.clone()
+    };
+
+    write_value_patch(
+        &conn,
+        &scope,
+        TENANT,
+        TaxonomyClass::Region,
+        &held,
+        &retired,
+        None,
+        stamp(),
+    )
+    .await
+    .expect("materialise, then retire");
+
+    let listed = repo
+        .list(&scope, TENANT, TaxonomyClass::Region)
+        .await
+        .expect("list");
+    assert_eq!(
+        values(&listed),
+        vec![(SEEDED_REGION, TaxonomyState::Retired)],
+        "the row exists, retired - not a fresh virtual seed"
+    );
+    assert!(
+        active_regions(&conn, &scope, TENANT)
+            .await
+            .expect("universe")
+            .is_empty(),
+        "a tenant that retired every region has the empty universe it asked for"
+    );
+    assert_eq!(
+        region_readiness(
+            &conn,
+            &scope,
+            TENANT,
+            &Region::new(SEEDED_REGION).expect("ok")
+        )
+        .await
+        .expect("read"),
+        None
     );
 }

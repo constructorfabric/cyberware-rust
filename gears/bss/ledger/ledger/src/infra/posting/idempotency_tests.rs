@@ -3,11 +3,12 @@
 //! reuse with a differing payload surfaces as a conflict, not a silent replay.
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use serde_json::json;
 use uuid::Uuid;
 
 use super::*;
+use time::OffsetDateTime;
 
 fn entry() -> NewEntry {
     NewEntry {
@@ -20,7 +21,7 @@ fn entry() -> NewEntry {
         source_business_id: "biz-1".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 1).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: Uuid::from_u128(4),

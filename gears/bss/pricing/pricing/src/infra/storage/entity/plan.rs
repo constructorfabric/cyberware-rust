@@ -9,9 +9,10 @@
 //! `lifecycle_state` flip — so `row_version` (the `ETag`) is frozen with it:
 //! content that cannot change needs no new entity tag.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::JsonValue;
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -76,13 +77,13 @@ pub struct Model {
     /// `CHECK`-constrained to those five; the legal edges between them are
     /// `domain::lifecycle::LifecycleState`.
     pub lifecycle_state: String,
-    pub available_from: Option<DateTime<Utc>>,
-    pub available_to: Option<DateTime<Utc>>,
+    pub available_from: Option<OffsetDateTime>,
+    pub available_to: Option<OffsetDateTime>,
     /// Pseudonymous principal id of the authoring actor. The Slice-12 history
     /// surface reads it under `plan x read`, so actor identity never requires
     /// the Auditor-only `pricing_audit_log`.
     pub created_by: Uuid,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// The plan this one was cloned from (`inst-cl-copy`, D-19), or `None` for
     /// an authored plan. Lineage only: a clone is an ordinary draft and nothing
     /// reads this to decide behaviour.

@@ -52,6 +52,7 @@ use bss_pricing::domain::bulk::{BulkKind, BulkState, JournalState};
 use bss_pricing::domain::concurrency::RowVersion;
 use bss_pricing::domain::contracts::{BillingAnchorPolicy, ProrationBasis, ProrationContract};
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use bss_pricing::domain::plan_shape::{
     BillingCycle, DescriptorSet, Frequency, PhaseKind, PlanPhase,
@@ -73,7 +74,9 @@ use bss_pricing::infra::storage::repo::{
     repricing_journal_repo,
 };
 use bss_pricing_sdk::catalog_version_registry::{CatalogVersionRegistryV1, PendingVersionRef};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
+use bss_pricing::domain::instant::format_rfc3339;
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -150,16 +153,16 @@ fn ctx() -> SecurityContext {
         .expect("a subject and a tenant are all a context needs")
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 /// Far enough out that no wall clock reaches it, and clear of the batching
 /// delay floor `ChangeoverMoment::Commit` holds the apply to — the fixtures'
 /// standing rule (`tests/rest_repricing_runs.rs` carries the identical
 /// constant for the identical reason).
-fn changeover() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn changeover() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 struct Harness {
@@ -283,7 +286,7 @@ fn markup_report(value_bp: i64) -> serde_json::Value {
             "adjustment_value": value_bp,
             "amounts": {},
         },
-        "changeover": changeover().to_rfc3339(),
+        "changeover": format_rfc3339(changeover()),
         "selected": 0,
     })
 }
@@ -331,6 +334,7 @@ async fn seed_plan(h: &Harness, plan_id: Uuid, phase_id: Uuid) {
             vec![PlanPhase {
                 phase_id: PhaseId::new(phase_id),
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -495,7 +499,7 @@ async fn seed_grandfathered_row(
     plan: PlanId,
     phase: Uuid,
     region: &str,
-    generation: DateTime<Utc>,
+    generation: OffsetDateTime,
     amount_minor: i64,
 ) -> Uuid {
     let price_id = Uuid::now_v7();
@@ -641,7 +645,7 @@ fn report() -> serde_json::Value {
             "adjustment_value": 500,
             "amounts": {},
         },
-        "changeover": changeover().to_rfc3339(),
+        "changeover": format_rfc3339(changeover()),
         "selected": 0,
     })
 }

@@ -98,6 +98,7 @@ use bss_pricing::config::LimitsConfig;
 use bss_pricing::domain::approval::ApprovalState;
 use bss_pricing::domain::audit::AuditSubjectKind;
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::materiality::triggers::Trigger;
 use bss_pricing::domain::materiality::{self, ChangeSet, MaterialityReason, MaterialityVerdict};
 use bss_pricing::domain::money::MinorAmount;
@@ -116,7 +117,9 @@ use bss_pricing::infra::storage::entity::{audit_log, outbox, price_window};
 use bss_pricing::infra::storage::repo::{
     PendingVersionRow, approval_repo, audit_repo, window_repo,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
+use bss_pricing::domain::instant::format_rfc3339;
 use rest_support::{Harness, Publishable, problem_code, request};
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
@@ -126,13 +129,13 @@ const SUBMITTER: Uuid = Uuid::from_u128(0x_5c_13);
 const REVIEWER: Uuid = Uuid::from_u128(0x_5c_23);
 const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_5c_c2);
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 5, 0, 0, 0).unwrap()
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 5, 0, 0, 0)
 }
 
 /// Inside the predecessor's coverage and clear of both changeover floors.
-fn cutover_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn cutover_at() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 /// The instant the fixture's coverage window ends at, and the one the cutover
@@ -142,8 +145,8 @@ fn cutover_at() -> DateTime<Utc> {
 /// what it is looking for; `common`'s own doc makes the same point in reverse
 /// about not re-spelling the constant at a call site, and this **is** the call
 /// site that has to name the value as a value.
-fn pre_cutover_effective_to() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, 1, 0, 0, 0).unwrap()
+fn pre_cutover_effective_to() -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, 1, 0, 0, 0)
 }
 
 /// The instant the fixture's coverage window **begins** — `common::COVERAGE_FROM_UTC`
@@ -153,8 +156,8 @@ fn pre_cutover_effective_to() -> DateTime<Utc> {
 /// other half of the audit record's identity for this window, and the half that can
 /// never move: the append-only trigger's arm 4 refuses any `UPDATE` that changes
 /// `effective_from`, which is exactly why the record can be keyed on it.
-fn predecessor_effective_from() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 4, 0, 0, 0).unwrap()
+fn predecessor_effective_from() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 4, 0, 0, 0)
 }
 
 fn stamp_of(actor: Uuid) -> bss_pricing::domain::audit::AuditStamp {
@@ -511,8 +514,8 @@ async fn a_cutover_records_the_effective_to_it_overwrites() {
         before_state["shortenedWindow"],
         serde_json::json!({
             "scopeKey": key.to_string(),
-            "effectiveFrom": predecessor_effective_from(),
-            "effectiveTo": pre_cutover_effective_to(),
+            "effectiveFrom": format_rfc3339(predecessor_effective_from()),
+            "effectiveTo": format_rfc3339(pre_cutover_effective_to()),
             "state": "scheduled",
         }),
         "D-05's operand, as a value: the interval the shorten found, named by the two things a \
@@ -526,8 +529,8 @@ async fn a_cutover_records_the_effective_to_it_overwrites() {
         after_state["shortenedWindow"],
         serde_json::json!({
             "scopeKey": key.to_string(),
-            "effectiveFrom": predecessor_effective_from(),
-            "effectiveTo": cutover_at(),
+            "effectiveFrom": format_rfc3339(predecessor_effective_from()),
+            "effectiveTo": format_rfc3339(cutover_at()),
             "state": "scheduled",
         }),
         "and the pair differs in exactly the one field the act moved: {after_state}"
@@ -579,7 +582,7 @@ async fn the_append_only_trigger_does_not_refuse_the_unwinds_restore() {
     // assumed. If a fixture ever moved the cutover past the original bound, or the
     // suite's clock past the cutover, this is what would say so.
     assert!(
-        cutover_at() > Utc::now(),
+        cutover_at() > OffsetDateTime::now_utc(),
         "leg 1: inside D-05's scope the cutover has not yet taken effect, so OLD > now"
     );
     assert!(
@@ -646,7 +649,7 @@ async fn the_append_only_trigger_does_not_refuse_the_unwinds_restore() {
         &h.scope(),
         h.tenant,
         receipt.shortened_window_id,
-        Some(Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap()),
+        Some(utc_ymd_hms(2020, 1, 1, 0, 0, 0)),
         held.mutation_seq,
         stamp_of(SUBMITTER),
     )
@@ -758,7 +761,7 @@ async fn an_open_ended_predecessor_is_recorded_as_null_and_restorable_to_null() 
     );
     assert_eq!(
         before_state["shortenedWindow"]["effectiveFrom"],
-        serde_json::json!(predecessor_effective_from()),
+        serde_json::json!(format_rfc3339(predecessor_effective_from())),
         "and the same record still names which interval it is about: {before_state}"
     );
 
@@ -945,8 +948,8 @@ async fn the_audit_before_image_agrees_with_the_pre_cutover_frozen_delta() {
         audited,
         serde_json::json!({
             "scopeKey": frozen_group.scope_key.to_string(),
-            "effectiveFrom": frozen_interval.effective_from,
-            "effectiveTo": frozen_interval.effective_to,
+            "effectiveFrom": format_rfc3339(frozen_interval.effective_from),
+            "effectiveTo": frozen_interval.effective_to.map(format_rfc3339),
             "state": frozen_interval.state.as_str(),
         }),
         "the audit before-image and the pre-cutover frozen delta agree about the interval the \
@@ -957,7 +960,7 @@ async fn the_audit_before_image_agrees_with_the_pre_cutover_frozen_delta() {
     // pass by both stores agreeing on the cutover instant.
     assert_eq!(
         audited["effectiveTo"],
-        serde_json::json!(pre_cutover_effective_to()),
+        serde_json::json!(format_rfc3339(pre_cutover_effective_to())),
         "and the value they agree on is the pre-cutover end, not the one the act wrote: {audited}"
     );
 }
@@ -1053,7 +1056,7 @@ async fn a_retirement_over_a_live_cutover_is_refused() {
         panic!("the refusal is typed, not an Internal or a bare validation: {refusal:?}");
     };
     assert!(
-        detail.contains(&cutover_at().to_rfc3339()),
+        detail.contains(&format_rfc3339(cutover_at())),
         "the detail names the instant the cutover is at, which is the operand deciding whether \
          the unit is live at all: {detail}"
     );
@@ -1219,7 +1222,6 @@ fn when_the_lane_lands_retirement_cancels_the_cutovers_successor_and_keeps_only_
         dispose_windows, strand_free_disposition,
     };
     use bss_pricing::domain::window::{WindowInterval, WindowState};
-    use chrono::TimeDelta;
 
     let successor_price = Uuid::from_u128(0x_5c_a1);
     let copy_price = Uuid::from_u128(0x_5c_a2);
@@ -1260,8 +1262,8 @@ fn when_the_lane_lands_retirement_cancels_the_cutovers_successor_and_keeps_only_
             copy_window,
             WindowInterval::new(cutover_at(), None, WindowState::Scheduled),
         )],
-        grandfather_until: Some(Utc.with_ymd_and_hms(2100, 8, 20, 0, 0, 0).unwrap()),
-        margin: Some(TimeDelta::days(31)),
+        grandfather_until: Some(utc_ymd_hms(2100, 8, 20, 0, 0, 0)),
+        margin: Some(time::Duration::days(31)),
     };
     strand_free_disposition(&mut verdicts, &[generation], now());
 

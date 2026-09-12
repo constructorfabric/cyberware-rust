@@ -14,7 +14,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use uuid::Uuid;
 
 use super::{
@@ -22,6 +21,8 @@ use super::{
     longest_cycle_sold, window_coverage_rules,
 };
 use crate::domain::concurrency::RowVersion;
+use crate::domain::instant::format_rfc3339;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount};
 use crate::domain::plan_shape::{
@@ -34,17 +35,15 @@ use crate::domain::scope_key::{
 };
 use crate::domain::validation::ValidationReport;
 use crate::domain::window::{CoverageEnd, KeyWindows, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 /// A window-scale instant: 2026-09-01 plus `day` whole days.
-fn at(day: i64) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 9, 1, 0, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
-        + TimeDelta::days(day)
+fn at(day: i64) -> OffsetDateTime {
+    utc_ymd_hms(2026, 9, 1, 0, 0, 0) + time::Duration::days(day)
 }
 
 fn plan() -> PlanId {
@@ -116,6 +115,7 @@ fn one_row_plan(windows: Vec<KeyWindows>) -> PlanShape {
     shape.phases = PhaseGraph::new(vec![PlanPhase {
         phase_id: phase(),
         kind: PhaseKind::Evergreen,
+        display_name: None,
         ordinal: 0,
         converts_to_phase_id: None,
         phase_duration_days: None,
@@ -378,8 +378,8 @@ fn an_interior_gap_between_two_scheduled_windows_is_named() {
     assert_eq!(codes(&report), vec![WINDOW_GAP.to_owned()]);
     assert_eq!(report.violations[0].subject, scope_key.to_string());
     assert!(
-        report.violations[0].detail.contains(&at(3).to_rfc3339())
-            && report.violations[0].detail.contains(&at(6).to_rfc3339()),
+        report.violations[0].detail.contains(&format_rfc3339(at(3)))
+            && report.violations[0].detail.contains(&format_rfc3339(at(6))),
         "the detail names [gapStart, gapEnd): {}",
         report.violations[0].detail
     );
@@ -640,7 +640,7 @@ fn an_available_to_past_the_last_window_fails_publish() {
         vec![AVAILABILITY_OUTSIDE_COVERAGE.to_owned()]
     );
     assert_eq!(report.violations[0].subject, scope_key.to_string());
-    assert!(report.violations[0].detail.contains(&at(9).to_rfc3339()));
+    assert!(report.violations[0].detail.contains(&format_rfc3339(at(9))));
 }
 
 /// The same bound inside coverage publishes — the world that makes the refusal
@@ -678,7 +678,7 @@ fn an_available_from_before_all_coverage_fails_publish() {
         vec![AVAILABILITY_OUTSIDE_COVERAGE.to_owned()]
     );
     assert_eq!(report.violations[0].subject, scope_key.to_string());
-    assert!(report.violations[0].detail.contains(&at(2).to_rfc3339()));
+    assert!(report.violations[0].detail.contains(&format_rfc3339(at(2))));
 }
 
 /// An `availableFrom` inside a window the activation sweep has since moved to
@@ -813,7 +813,7 @@ fn the_margin_is_zero_where_the_market_sells_no_recurring_row() {
             &CurrencyCode::new("EUR").expect("three letters"),
             &Region::new("eu").expect("non-blank")
         ),
-        Some(TimeDelta::zero())
+        Some(time::Duration::ZERO)
     );
 }
 
@@ -836,7 +836,7 @@ fn the_margin_is_per_market_and_not_per_plan_alone() {
             &CurrencyCode::new("USD").expect("three letters"),
             &Region::new("us").expect("non-blank")
         ),
-        Some(TimeDelta::zero())
+        Some(time::Duration::ZERO)
     );
     assert_eq!(
         longest_cycle_sold(
@@ -844,7 +844,7 @@ fn the_margin_is_per_market_and_not_per_plan_alone() {
             &CurrencyCode::new("EUR").expect("three letters"),
             &Region::new("eu").expect("non-blank")
         ),
-        Some(TimeDelta::days(31)),
+        Some(time::Duration::days(31)),
         "monthly rounds up to the longest calendar month, because every consumer is a margin"
     );
 }
@@ -866,7 +866,7 @@ fn every_fixed_frequency_rounds_up_to_its_calendar_maximum() {
         shape.frequency = Some(frequency);
         assert_eq!(
             longest_cycle_sold(&shape, &market.0, &market.1),
-            Some(TimeDelta::days(days)),
+            Some(time::Duration::days(days)),
             "{frequency}"
         );
     }
@@ -891,7 +891,7 @@ fn a_custom_interval_is_read_from_the_variant_and_not_the_placeholder() {
     });
     assert_eq!(
         longest_cycle_sold(&days, &market.0, &market.1),
-        Some(TimeDelta::days(90))
+        Some(time::Duration::days(90))
     );
 
     let mut months = one_row_plan(Vec::new());
@@ -901,7 +901,7 @@ fn a_custom_interval_is_read_from_the_variant_and_not_the_placeholder() {
     });
     assert_eq!(
         longest_cycle_sold(&months, &market.0, &market.1),
-        Some(TimeDelta::days(62))
+        Some(time::Duration::days(62))
     );
 
     assert_ne!(

@@ -51,14 +51,15 @@
 
 use std::fmt;
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::instant;
+use crate::domain::instant::timestamp_millis;
 use crate::domain::money::CurrencyCode;
 use crate::domain::validation::ValidationReport;
+use time::OffsetDateTime;
 
 /// Rule code for a `cohort` / `priceEligibility` disagreement.
 ///
@@ -423,7 +424,7 @@ pub enum Cohort {
     /// A grandfathered generation, stamped with the UTC cutover instant that
     /// created it. Tariffs selects within the `existing_grandfathered` class by
     /// matching this instant.
-    Generation(DateTime<Utc>),
+    Generation(OffsetDateTime),
 }
 
 impl Cohort {
@@ -435,7 +436,7 @@ impl Cohort {
 
     /// The cutover instant, when there is one.
     #[must_use]
-    pub fn generation(self) -> Option<DateTime<Utc>> {
+    pub fn generation(self) -> Option<OffsetDateTime> {
         match self {
             Self::None => Option::None,
             Self::Generation(at) => Some(at),
@@ -451,7 +452,7 @@ impl fmt::Display for Cohort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::None => f.write_str("none"),
-            Self::Generation(at) => write!(f, "{}", at.timestamp_millis()),
+            Self::Generation(at) => write!(f, "{}", timestamp_millis(*at)),
         }
     }
 }
@@ -982,7 +983,7 @@ impl ScopeKey {
     /// key nobody can find. The cohort/eligibility biconditional is satisfied by
     /// construction and re-checked anyway, because a check that costs nothing and
     /// documents an invariant is cheaper than the invariant going unstated.
-    pub fn to_generation(&self, cutover: DateTime<Utc>) -> Result<Self, DomainError> {
+    pub fn to_generation(&self, cutover: OffsetDateTime) -> Result<Self, DomainError> {
         let Self {
             plan_id,
             currency,

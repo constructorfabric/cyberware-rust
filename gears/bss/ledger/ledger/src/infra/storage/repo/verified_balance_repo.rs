@@ -7,7 +7,6 @@
 //! (never deleted), so the baseline mirrors them upsert-only too — a grain that
 //! has appeared once stays in the baseline.
 
-use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{
@@ -17,6 +16,7 @@ use uuid::Uuid;
 
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::verified_balance;
+use time::OffsetDateTime;
 
 /// One grain instance's verified balance to snapshot — an ABSOLUTE total (not a
 /// delta): the cumulative value of the cache row at close time.
@@ -70,7 +70,7 @@ impl VerifiedBalanceRepo {
         watermark_seq: i64,
         rows: &[BaselineRow],
     ) -> Result<(), RepoError> {
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         for row in rows {
             let am = verified_balance::ActiveModel {
                 tenant_id: Set(tenant),

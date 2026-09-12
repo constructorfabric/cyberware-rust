@@ -77,10 +77,10 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{AccessScope, DBRunner, SecureEntityExt};
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
 use crate::api::rest::cursor::{DEFAULT_LIMIT, MAX_LIMIT};
@@ -89,8 +89,10 @@ use crate::domain::price_record::PriceRecord;
 use crate::domain::window::WindowState;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::price_window;
+use crate::infra::storage::odata_mapping::OdataPageError;
 use crate::infra::storage::repo::PriceRepo;
 use crate::infra::storage::repo::price_repo::HistoryPosition;
+use time::OffsetDateTime;
 
 /// One page's worth of request against the history read.
 ///
@@ -218,7 +220,7 @@ pub fn encode(position: HistoryPosition) -> String {
 /// # Errors
 /// [`DomainError::InvalidRequest`] when the token is not URL-safe base64, is not
 /// exactly the 28 bytes [`encode`] writes, or names an instant outside the range
-/// a [`DateTime<Utc>`] holds. All three are one refusal, because a caller can act
+/// a [`OffsetDateTime`] holds. All three are one refusal, because a caller can act
 /// no differently on any of them: the token did not come from this surface.
 pub fn decode(raw: &str) -> Result<HistoryPosition, DomainError> {
     let (authored_at, price_id) = crate::api::rest::cursor::decode_instant_and_id(raw)?;
@@ -235,9 +237,9 @@ pub fn decode(raw: &str) -> Result<HistoryPosition, DomainError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EffectiveInterval {
     /// Inclusive start, UTC.
-    pub from: DateTime<Utc>,
+    pub from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended.
-    pub to: Option<DateTime<Utc>>,
+    pub to: Option<OffsetDateTime>,
     /// Where the interval stands in Slice 7's window machine — carried because
     /// a `cancelled` interval never took effect and a reader told only its dates
     /// could not tell it from one that did.
@@ -356,6 +358,43 @@ impl HistoryExporter {
             })
             .collect();
         Ok(HistoryPage { entries, next })
+    }
+
+    /// One `OData` page of history. Envelope mapping (drop `prev_cursor`) is the
+    /// handler's.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor.
+    pub async fn read_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<(Vec<HistoryEntry>, Option<String>), OdataPageError> {
+        let page = self
+            .prices
+            .list_history_odata(scope, tenant_id, query)
+            .await?;
+        // `DBProvider::conn()` fails with the toolkit's `DbError`, not a
+        // `RepoError`: a connection that could not be opened has no row-level
+        // class to preserve, so it stays the string-shaped storage failure.
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| OdataPageError::Db(format!("conn: {e}")))?;
+        let mut intervals = effective_intervals(&conn, scope, tenant_id, &page.items)
+            .await
+            .map_err(OdataPageError::Repo)?;
+        let entries = page
+            .items
+            .into_iter()
+            .map(|record| {
+                let effective = intervals.remove(&record.price_id).unwrap_or_default();
+                HistoryEntry { record, effective }
+            })
+            .collect();
+        Ok((entries, page.page_info.next_cursor))
     }
 }
 

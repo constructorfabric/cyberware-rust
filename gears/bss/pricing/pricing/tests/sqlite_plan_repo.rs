@@ -19,6 +19,7 @@ use bss_pricing::domain::concurrency::RowVersion;
 use bss_pricing::domain::contracts::{
     EntitlementGrants, GrantSet, PlanChangeContract, UsageCounterOnPlanChange,
 };
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::plan::{PlanRevision, PlanShapePatch};
@@ -31,9 +32,11 @@ use bss_pricing::infra::storage::entity::{
     bundle, bundle_component, bundle_revshare, bundle_revshare_group, outbox, plan,
 };
 use bss_pricing::infra::storage::migrations::Migrator;
+use bss_pricing::infra::storage::repo::plan_repo::{PlanCounts, count_plans_by_authoring_state};
 use bss_pricing::infra::storage::repo::{NewPlanDraft, PlanRepo, PlanShapeRepo};
 use bss_pricing::infra::storage::{RepoError, repo_failure};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
@@ -52,10 +55,7 @@ const TEST_CORRELATION: uuid::Uuid = uuid::Uuid::from_u128(0x_c0_11_a7_10);
 
 /// The stamp an audited repository call is made under: who acted, when, and the
 /// request's correlation.
-fn stamp_of(
-    actor: uuid::Uuid,
-    when: chrono::DateTime<chrono::Utc>,
-) -> bss_pricing::domain::audit::AuditStamp {
+fn stamp_of(actor: uuid::Uuid, when: OffsetDateTime) -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -84,8 +84,8 @@ async fn harness() -> (PlanRepo, DBProvider<DbError>) {
     (PlanRepo::new(provider.clone()), provider)
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, hour, 0, 0)
 }
 
 /// A draft carrying **every** authorable column, the Slice-2 ones included.
@@ -1107,7 +1107,7 @@ async fn an_availability_bound_below_the_quantum_is_refused_on_both_write_paths(
     // one the catalog compares at (D-144), and the divergence surfaces as a
     // window bound that never matches rather than as an error.
     let mut draft = new_draft(plan_id, tenant);
-    draft.available_from = Some(at(11) + chrono::TimeDelta::microseconds(500));
+    draft.available_from = Some(at(11) + time::Duration::microseconds(500));
     let err = repo
         .create_draft(&scope, draft)
         .await
@@ -1142,7 +1142,7 @@ async fn an_availability_bound_below_the_quantum_is_refused_on_both_write_paths(
             0,
             RowVersion::new(0),
             PlanShapePatch {
-                available_to: Some(at(23) + chrono::TimeDelta::nanoseconds(1)),
+                available_to: Some(at(23) + time::Duration::nanoseconds(1)),
                 ..PlanShapePatch::default()
             },
             stamp(),
@@ -1658,6 +1658,7 @@ fn three_phases() -> Vec<PlanPhase> {
         PlanPhase {
             phase_id: trial,
             kind: PhaseKind::Trial,
+            display_name: None,
             ordinal: 0,
             converts_to_phase_id: Some(intro),
             phase_duration_days: Some(14),
@@ -1667,7 +1668,14 @@ fn three_phases() -> Vec<PlanPhase> {
         },
         PlanPhase {
             phase_id: intro,
-            kind: PhaseKind::Intro,
+            kind: PhaseKind::Interim,
+            // **Non-`None` on purpose (D-357).** Every phase fixture that crosses
+            // a revision copy or a clone used to set this `None`, so
+            // `copy_phases`' `display_name: Set(row.display_name)` and
+            // `clone.rs::remapped_phase` were indistinguishable from `Set(None)`
+            // and the field's whole storage contract - that it versions with the
+            // revision like every other phase field - was asserted nowhere.
+            display_name: Some("Onboarding".to_owned()),
             ordinal: 1,
             converts_to_phase_id: Some(evergreen),
             phase_duration_days: Some(30),
@@ -1676,6 +1684,7 @@ fn three_phases() -> Vec<PlanPhase> {
         PlanPhase {
             phase_id: evergreen,
             kind: PhaseKind::Evergreen,
+            display_name: None,
             ordinal: 2,
             // Terminality is the absent successor, never the kind.
             converts_to_phase_id: None,
@@ -3083,6 +3092,7 @@ async fn the_child_shape_rows_are_untouched_by_the_flip_and_freeze_with_the_revi
             vec![PlanPhase {
                 phase_id: terminal,
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -3293,7 +3303,7 @@ async fn a_refused_repeat_publish_leaves_the_plan_its_current_revision() {
 fn stamp() -> bss_pricing::domain::audit::AuditStamp {
     bss_pricing::domain::audit::AuditStamp {
         actor_principal_id: uuid::Uuid::from_u128(0xac_10),
-        recorded_at: chrono::Utc::now(),
+        recorded_at: OffsetDateTime::now_utc(),
         correlation_id: TEST_CORRELATION,
     }
 }
@@ -3791,5 +3801,71 @@ async fn abandoning_a_draft_emits_nothing_further() {
             .collect::<Vec<_>>(),
         vec!["PlanCreated".to_owned()],
         "the creation is announced; the abandon is not"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D-360: the tenant's plan counts under the list's authoring collapse.
+// ---------------------------------------------------------------------------
+
+/// Two plans holding only a draft, one published, one retired, and one
+/// published plan with an **open successor draft**: the last one counts as
+/// `draft`, because that is the row the list shows for it. `total` is the
+/// number of plans, not of rows - the successor plan holds two.
+#[tokio::test]
+async fn the_authoring_state_counts_fold_a_successor_draft_onto_its_plan() {
+    let (repo, provider) = harness().await;
+    let tenant = Uuid::from_u128(0x7e_11);
+    let scope = AccessScope::for_tenant(tenant);
+    let ids: Vec<PlanId> = (1..=5_u128)
+        .map(|n| PlanId::new(Uuid::from_u128(0xd3_60 + n)))
+        .collect();
+    for id in &ids {
+        repo.create_draft(&scope, new_draft(*id, tenant))
+            .await
+            .expect("create the draft");
+    }
+    // ids[0], ids[1]: drafts. ids[2]: published. ids[3]: retired.
+    flip_state(&provider, &scope, ids[2], 0, LifecycleState::Published).await;
+    flip_state(&provider, &scope, ids[3], 0, LifecycleState::Published).await;
+    flip_state(&provider, &scope, ids[3], 0, LifecycleState::Retired).await;
+    // ids[4]: published, then a successor draft opened over it.
+    flip_state(&provider, &scope, ids[4], 0, LifecycleState::Published).await;
+    let successor = repo
+        .open_revision(
+            &scope,
+            tenant,
+            ids[4],
+            stamp_of(Uuid::from_u128(0xac_20), at(12)),
+        )
+        .await
+        .expect("the successor opens");
+    assert_eq!(successor.revision, 1, "the premise: two rows for one plan");
+
+    let conn = provider.conn().expect("conn");
+    let counts = count_plans_by_authoring_state(&conn, &scope, tenant)
+        .await
+        .expect("count");
+
+    assert_eq!(
+        counts,
+        PlanCounts {
+            total: 5,
+            draft: 3,
+            published: 1,
+            retired: 1,
+        },
+        "the successor-draft plan is draft, as the list shows it"
+    );
+    assert_eq!(
+        count_plans_by_authoring_state(
+            &conn,
+            &AccessScope::for_tenant(Uuid::from_u128(0x99)),
+            Uuid::from_u128(0x99)
+        )
+        .await
+        .expect("count another tenant"),
+        PlanCounts::default(),
+        "another tenant's catalogue counts nothing here"
     );
 }

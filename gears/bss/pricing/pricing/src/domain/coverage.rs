@@ -63,15 +63,16 @@
 //! `chargeKind` axis exists precisely so they do not collide). Covering the
 //! recurring key covers nothing else.
 
-use chrono::{DateTime, TimeDelta, Utc};
 use toolkit_macros::domain_model;
 
+use crate::domain::instant::format_rfc3339;
 use crate::domain::money::CurrencyCode;
 use crate::domain::plan_shape::{Frequency, PlanShape};
 use crate::domain::price_record::PriceRecord;
 use crate::domain::scope_key::{ChargeKind, PriceOverlay, Region, ScopeKey};
 use crate::domain::validation::{ValidationReport, ValidationRule};
 use crate::domain::window::{CoverageEnd, KeyWindows, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 /// A billable row's canonical scope key holds no active or scheduled window
 /// (§5, **422 architectural**; `inst-wc-required`).
@@ -254,7 +255,7 @@ impl KeyCoverage {
     /// **past** must not filter on the state token, and asking it here is the defect
     /// review H5 found in the availability rule.
     #[must_use]
-    pub fn covers(&self, at: DateTime<Utc>) -> bool {
+    pub fn covers(&self, at: OffsetDateTime) -> bool {
         self.windows
             .intervals
             .iter()
@@ -286,7 +287,7 @@ impl KeyCoverage {
     /// no-remedy refusal one rule over — which is `COVERING_STATES`' own argument
     /// for excluding `expired`.
     #[must_use]
-    pub fn covers_at(&self, at: DateTime<Utc>) -> bool {
+    pub fn covers_at(&self, at: OffsetDateTime) -> bool {
         self.windows.covers_at(at)
     }
 
@@ -328,8 +329,8 @@ impl KeyCoverage {
     /// this filter; the two-window adjacency case, which is §9's own criterion,
     /// does not and says so.
     #[must_use]
-    pub fn interior_gaps(&self) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
-        let mut ends: Vec<DateTime<Utc>> = self
+    pub fn interior_gaps(&self) -> Vec<(OffsetDateTime, OffsetDateTime)> {
+        let mut ends: Vec<OffsetDateTime> = self
             .windows
             .intervals
             .iter()
@@ -349,7 +350,7 @@ impl KeyCoverage {
     ///
     /// The successor half of `interior_gaps`: its `None` is precisely the
     /// trailing void that walk cannot see.
-    fn next_start_after(&self, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    fn next_start_after(&self, at: OffsetDateTime) -> Option<OffsetDateTime> {
         self.windows
             .intervals
             .iter()
@@ -521,7 +522,7 @@ pub fn longest_cycle_sold(
     shape: &PlanShape,
     currency: &CurrencyCode,
     region: &Region,
-) -> Option<TimeDelta> {
+) -> Option<time::Duration> {
     longest_cycle_sold_on(
         shape.rows.iter().map(|record| &record.scope_key),
         shape.frequency,
@@ -551,14 +552,14 @@ pub fn longest_cycle_sold_on<'a>(
     frequency: Option<Frequency>,
     currency: &CurrencyCode,
     region: &Region,
-) -> Option<TimeDelta> {
+) -> Option<time::Duration> {
     let sells_recurring = keys.into_iter().any(|key| {
         key.charge_kind() == ChargeKind::Recurring
             && key.currency() == currency
             && key.region() == region
     });
     if !sells_recurring {
-        return Some(TimeDelta::zero());
+        return Some(time::Duration::ZERO);
     }
     frequency.map(cycle_length)
 }
@@ -582,23 +583,23 @@ pub fn longest_cycle_sold_on<'a>(
 /// [`Frequency::CUSTOM_INTERVAL_PLACEHOLDER`] and is a *variant representative*,
 /// not an interval — handing a member of that list to this function would compute
 /// a one-day margin for whatever the plan actually authored, and no call site does.
-fn cycle_length(frequency: Frequency) -> TimeDelta {
+fn cycle_length(frequency: Frequency) -> time::Duration {
     /// The longest a calendar month can run.
     const LONGEST_MONTH: i64 = 31;
     /// The longest a calendar year can run.
     const LONGEST_YEAR: i64 = 366;
 
     match frequency {
-        Frequency::Monthly => TimeDelta::days(LONGEST_MONTH),
-        Frequency::Quarterly => TimeDelta::days(3 * LONGEST_MONTH),
-        Frequency::Semiannual => TimeDelta::days(6 * LONGEST_MONTH),
-        Frequency::Annual => TimeDelta::days(LONGEST_YEAR),
+        Frequency::Monthly => time::Duration::days(LONGEST_MONTH),
+        Frequency::Quarterly => time::Duration::days(3 * LONGEST_MONTH),
+        Frequency::Semiannual => time::Duration::days(6 * LONGEST_MONTH),
+        Frequency::Annual => time::Duration::days(LONGEST_YEAR),
         Frequency::CustomEveryN { n, unit } => {
             let n = i64::from(n);
             match unit {
-                crate::domain::plan_shape::CustomIntervalUnit::Days => TimeDelta::days(n),
+                crate::domain::plan_shape::CustomIntervalUnit::Days => time::Duration::days(n),
                 crate::domain::plan_shape::CustomIntervalUnit::Months => {
-                    TimeDelta::days(n.saturating_mul(LONGEST_MONTH))
+                    time::Duration::days(n.saturating_mul(LONGEST_MONTH))
                 }
             }
         }
@@ -745,8 +746,8 @@ impl ValidationRule<PlanShape> for NoInteriorGap {
                          period can fall in must be covered, and no fallback pricing exists for \
                          the ones inside this interval",
                         entry.scope_key(),
-                        start.to_rfc3339(),
-                        end.to_rfc3339()
+                        format_rfc3339(start),
+                        format_rfc3339(end)
                     ),
                 );
             }
@@ -830,7 +831,7 @@ impl ValidationRule<PlanShape> for AvailabilityInsideCoverage {
                         "the plan is purchasable from {} and no window of scope key {} covers \
                          that instant: availability dates gate purchase, they do not schedule a \
                          window",
-                        from.to_rfc3339(),
+                        format_rfc3339(from),
                         entry.scope_key()
                     ),
                 );
@@ -846,9 +847,9 @@ impl ValidationRule<PlanShape> for AvailabilityInsideCoverage {
                         "the plan is purchasable until {} and the coverage of scope key {} ends \
                          at {}: a purchase made in between binds a line no window makes \
                          effective",
-                        to.to_rfc3339(),
+                        format_rfc3339(to),
                         entry.scope_key(),
-                        end.to_rfc3339()
+                        format_rfc3339(end)
                     ),
                 );
             }

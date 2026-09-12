@@ -40,8 +40,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
+use time::Duration;
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
 use toolkit_db::{DBProvider, DbError};
 use toolkit_security::SecurityContext;
@@ -56,6 +56,7 @@ use crate::infra::storage::entity::{
     account_balance, journal_entry, journal_line, refund, tax_subbalance, unallocated_balance,
 };
 use crate::infra::storage::repo::PendingQueueRepo;
+use time::OffsetDateTime;
 
 /// The allocation deferred-apply queue flow this job ages — the
 /// `PAYMENT_ALLOCATE` literal (kept in lockstep with `SourceDocType::PaymentAllocate`
@@ -270,8 +271,8 @@ impl AgedAlarmJob {
     /// candidate feeds (the pass cannot start); per-tenant unallocated read faults
     /// are isolated (logged) within the pass.
     pub async fn run(&self) -> anyhow::Result<()> {
-        let now = Utc::now();
-        let threshold = ChronoDuration::seconds(AGED_THRESHOLD_SECS);
+        let now = OffsetDateTime::now_utc();
+        let threshold = Duration::seconds(AGED_THRESHOLD_SECS);
 
         // Z10-1: each alarm FAMILY runs independently. An infra fault enumerating one
         // family's candidate feed is logged and the pass continues to the others (a
@@ -342,8 +343,8 @@ impl AgedAlarmJob {
     async fn aged_queue_rows(
         &self,
         flow: &str,
-        now: DateTime<Utc>,
-        threshold: ChronoDuration,
+        now: OffsetDateTime,
+        threshold: Duration,
     ) -> anyhow::Result<Vec<AgedQueueItem>> {
         let repo = PendingQueueRepo::new(self.db.clone());
         // `list_all_due` returns due `QUEUED` rows oldest-`queued_at` first; an
@@ -360,7 +361,7 @@ impl AgedAlarmJob {
             .map(|r| AgedQueueItem {
                 tenant_id: r.tenant_id,
                 business_id: r.business_id,
-                age_secs: (now - r.queued_at).num_seconds(),
+                age_secs: (now - r.queued_at).whole_seconds(),
             })
             .collect())
     }
@@ -374,8 +375,8 @@ impl AgedAlarmJob {
     /// Returns `Err` only if the up-front tenant enumeration fails.
     async fn aged_unallocated_grains(
         &self,
-        now: DateTime<Utc>,
-        threshold: ChronoDuration,
+        now: OffsetDateTime,
+        threshold: Duration,
     ) -> anyhow::Result<Vec<AgedUnallocatedGrain>> {
         // Enumerate tenants holding a parked unallocated grain (UNSCOPED system
         // scope). Scoped to a block so the connection is released before the
@@ -420,8 +421,8 @@ impl AgedAlarmJob {
     async fn aged_unallocated_for_tenant(
         &self,
         tenant_id: Uuid,
-        now: DateTime<Utc>,
-        cutoff: DateTime<Utc>,
+        now: OffsetDateTime,
+        cutoff: OffsetDateTime,
     ) -> anyhow::Result<Vec<AgedUnallocatedGrain>> {
         let conn = self.db.conn()?;
         let scope = AccessScope::for_tenant(tenant_id);
@@ -467,7 +468,7 @@ impl AgedAlarmJob {
     /// Returns `Err` only if the up-front tenant enumeration fails.
     async fn aged_refund_clearing_grains(
         &self,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> anyhow::Result<Vec<AgedRefundClearingGrain>> {
         // Enumerate tenants holding an open REFUND_CLEARING balance (system scope).
         let tenant_ids: BTreeSet<Uuid> = {
@@ -488,8 +489,8 @@ impl AgedAlarmJob {
             rows.iter().map(|c| c.tenant_id).collect()
         };
 
-        let warn_cutoff = now - ChronoDuration::seconds(REFUND_CLEARING_WARN_SECS);
-        let page_cutoff = now - ChronoDuration::seconds(REFUND_CLEARING_PAGE_SECS);
+        let warn_cutoff = now - Duration::seconds(REFUND_CLEARING_WARN_SECS);
+        let page_cutoff = now - Duration::seconds(REFUND_CLEARING_PAGE_SECS);
         let mut aged = Vec::new();
         for tenant_id in tenant_ids {
             match self
@@ -515,9 +516,9 @@ impl AgedAlarmJob {
     async fn aged_refund_clearing_for_tenant(
         &self,
         tenant_id: Uuid,
-        now: DateTime<Utc>,
-        warn_cutoff: DateTime<Utc>,
-        page_cutoff: DateTime<Utc>,
+        now: OffsetDateTime,
+        warn_cutoff: OffsetDateTime,
+        page_cutoff: OffsetDateTime,
     ) -> anyhow::Result<Vec<AgedRefundClearingGrain>> {
         let conn = self.db.conn()?;
         let scope = AccessScope::for_tenant(tenant_id);
@@ -575,7 +576,7 @@ impl AgedAlarmJob {
     /// Returns `Err` only if the up-front tenant enumeration fails.
     async fn stage1_orphan_refunds(
         &self,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> anyhow::Result<Vec<Stage1OrphanRefund>> {
         // Enumerate tenants with at least one stage-1 refund row (system scope).
         let tenant_ids: BTreeSet<Uuid> = {
@@ -590,7 +591,7 @@ impl AgedAlarmJob {
             rows.iter().map(|r| r.tenant_id).collect()
         };
 
-        let cutoff = now - ChronoDuration::seconds(REFUND_CLEARING_WARN_SECS);
+        let cutoff = now - Duration::seconds(REFUND_CLEARING_WARN_SECS);
         let mut orphans = Vec::new();
         for tenant_id in tenant_ids {
             match self.stage1_orphans_for_tenant(tenant_id, now, cutoff).await {
@@ -611,8 +612,8 @@ impl AgedAlarmJob {
     async fn stage1_orphans_for_tenant(
         &self,
         tenant_id: Uuid,
-        now: DateTime<Utc>,
-        cutoff: DateTime<Utc>,
+        now: OffsetDateTime,
+        cutoff: OffsetDateTime,
     ) -> anyhow::Result<Vec<Stage1OrphanRefund>> {
         let conn = self.db.conn()?;
         let scope = AccessScope::for_tenant(tenant_id);
@@ -776,9 +777,9 @@ impl AgedAlarmJob {
     /// Returns `Err` on an infrastructure failure reading `tax_subbalance`.
     async fn negative_tax_subbalances(
         &self,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> anyhow::Result<Vec<NegativeTaxGrain>> {
-        let current_period = format!("{:04}{:02}", now.year(), now.month());
+        let current_period = crate::domain::instant::yyyymm(now);
         let conn = self.db.conn()?;
         let rows = tax_subbalance::Entity::find()
             .secure()
@@ -980,17 +981,17 @@ fn aged_grains(
     entries: &[journal_entry::Model],
     lines: &[journal_line::Model],
     cache: &[unallocated_balance::Model],
-    now: DateTime<Utc>,
-    cutoff: DateTime<Utc>,
+    now: OffsetDateTime,
+    cutoff: OffsetDateTime,
 ) -> Vec<AgedUnallocatedGrain> {
     // entry_id -> posted_at_utc (the age source; `journal_line` carries none).
-    let posted_at: HashMap<Uuid, DateTime<Utc>> = entries
+    let posted_at: HashMap<Uuid, OffsetDateTime> = entries
         .iter()
         .map(|e| (e.entry_id, e.posted_at_utc))
         .collect();
 
     // (payer_tenant_id, account_id, currency) -> oldest contributing post time.
-    let mut oldest: HashMap<(Uuid, Uuid, String), DateTime<Utc>> = HashMap::new();
+    let mut oldest: HashMap<(Uuid, Uuid, String), OffsetDateTime> = HashMap::new();
     for line in lines {
         // A line whose entry isn't in the map can't be aged (defensive — entries
         // and lines are read in the same scope, so this should not happen).
@@ -1021,7 +1022,7 @@ fn aged_grains(
                 account_id: c.account_id,
                 currency: c.currency.clone(),
                 balance_minor: c.balance_minor,
-                age_secs: (now - oldest_ts).num_seconds(),
+                age_secs: (now - oldest_ts).whole_seconds(),
             })
         })
         .collect()
@@ -1043,18 +1044,18 @@ fn aged_refund_clearing_grains(
     entries: &[journal_entry::Model],
     lines: &[journal_line::Model],
     cache: &[account_balance::Model],
-    now: DateTime<Utc>,
-    warn_cutoff: DateTime<Utc>,
-    page_cutoff: DateTime<Utc>,
+    now: OffsetDateTime,
+    warn_cutoff: OffsetDateTime,
+    page_cutoff: OffsetDateTime,
     metrics: &dyn crate::domain::ports::metrics::LedgerMetricsPort,
 ) -> Vec<AgedRefundClearingGrain> {
-    let posted_at: HashMap<Uuid, DateTime<Utc>> = entries
+    let posted_at: HashMap<Uuid, OffsetDateTime> = entries
         .iter()
         .map(|e| (e.entry_id, e.posted_at_utc))
         .collect();
 
     // (account_id, currency) -> oldest contributing REFUND_CLEARING post time.
-    let mut oldest: HashMap<(Uuid, String), DateTime<Utc>> = HashMap::new();
+    let mut oldest: HashMap<(Uuid, String), OffsetDateTime> = HashMap::new();
     for line in lines {
         let Some(ts) = posted_at.get(&line.entry_id).copied() else {
             continue;
@@ -1078,7 +1079,7 @@ fn aged_refund_clearing_grains(
             let oldest_ts = *oldest.get(&key)?;
             // Feed the §9 gauges for every OPEN grain (not just aged ones): the
             // balance + its current age, by tenant.
-            let age_secs = (now - oldest_ts).num_seconds();
+            let age_secs = (now - oldest_ts).whole_seconds();
             metrics.refund_clearing_balance_minor(c.tenant_id, c.balance_minor);
             #[allow(clippy::cast_precision_loss)]
             metrics.refund_clearing_aged_seconds(c.tenant_id, age_secs as f64);
@@ -1104,8 +1105,8 @@ fn aged_refund_clearing_grains(
 fn stage1_orphans(
     tenant_id: Uuid,
     rows: &[refund::Model],
-    now: DateTime<Utc>,
-    cutoff: DateTime<Utc>,
+    now: OffsetDateTime,
+    cutoff: OffsetDateTime,
 ) -> Vec<Stage1OrphanRefund> {
     // psp_refund_id -> (has a terminal/advanced phase?, the stage-1 row if present).
     let mut by_psp: HashMap<&str, (bool, Option<&refund::Model>)> = HashMap::new();
@@ -1134,7 +1135,7 @@ fn stage1_orphans(
                 psp_refund_id: stage1.psp_refund_id.clone(),
                 currency: stage1.currency.clone(),
                 amount_minor: stage1.amount_minor,
-                age_secs: (now - stage1.created_at_utc).num_seconds(),
+                age_secs: (now - stage1.created_at_utc).whole_seconds(),
             })
         })
         .collect()

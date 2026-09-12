@@ -14,6 +14,7 @@ use tracing::warn;
 use crate::domain::model::FiscalPeriodRow;
 use crate::domain::status::PERIOD_STATUS_OPEN;
 use crate::infra::storage::repo::ReferenceRepo;
+use time::OffsetDateTime;
 
 /// Granularity literal honored by the MVP period-open job (monthly only).
 const GRANULARITY_MONTH: &str = "MONTH";
@@ -60,7 +61,7 @@ impl PeriodOpenJob {
                 continue;
             }
 
-            let cur = crate::domain::period::period_id_for(chrono::Utc::now());
+            let cur = crate::domain::period::period_id_for(OffsetDateTime::now_utc());
             let next = crate::domain::period::next_period_id(&cur);
             // Flatten the current + (optional) next period ids.
             let period_ids: Vec<String> = [Some(cur), next].into_iter().flatten().collect();

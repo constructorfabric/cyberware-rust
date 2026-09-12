@@ -49,19 +49,27 @@
 //! executor already honoured, and the table's `trg_pricing_migration_exclusion_replay`
 //! arm refuses the write that would install a different one.
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{Expr, OnConflict, SimpleExpr};
 use sea_orm::{ColumnTrait, Condition, DbErr, EntityTrait, Order};
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{
     AccessScope, DBRunner, ScopeError, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
+
+use bss_pricing_sdk::odata::MigrationFilterField;
 
 use crate::domain::migration::MigrationState;
 use crate::domain::scope_key::PlanId;
 use crate::infra::storage::entity::migration;
+use crate::infra::storage::odata_mapping::{
+    LIST_LIMIT_CFG, MigrationODataMapper, OdataPageError, domain_page, map_odata_err,
+    query_with_default_order,
+};
 use crate::infra::storage::repo::check_authored_instant;
 use crate::infra::storage::{RepoError, contention_or_db};
 
@@ -77,9 +85,9 @@ pub struct MigrationRecord {
     /// The published target.
     pub target_plan_id: PlanId,
     /// When the migration takes effect.
-    pub effective_at: DateTime<Utc>,
+    pub effective_at: OffsetDateTime,
     /// The instant D-49's notice period is measured from.
-    pub announced_at: DateTime<Utc>,
+    pub announced_at: OffsetDateTime,
     /// `all` or a subscription filter.
     pub scope: JsonValue,
     /// Where the run stands in §4's machine.
@@ -106,9 +114,9 @@ pub struct NewMigration {
     /// The published target.
     pub target_plan_id: PlanId,
     /// When the migration takes effect.
-    pub effective_at: DateTime<Utc>,
+    pub effective_at: OffsetDateTime,
     /// D-49's announcement instant — the scheduling commit.
-    pub announced_at: DateTime<Utc>,
+    pub announced_at: OffsetDateTime,
     /// `all` or a subscription filter.
     pub scope: JsonValue,
     /// The schedule-time delta report.
@@ -116,7 +124,7 @@ pub struct NewMigration {
     /// The principal scheduling it.
     pub created_by: Uuid,
     /// The commit instant.
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 /// What [`insert_or_load`] answered with.
@@ -141,7 +149,7 @@ pub struct Scheduled {
 ///
 /// `announced_at` is the scheduling **commit** instant, minted here from the act's
 /// stamp rather than authored, and it is outside the rule for the reason
-/// [`super::window_repo::transition`] records after measuring it: `Utc::now()`
+/// [`super::window_repo::transition`] records after measuring it: `OffsetDateTime::now_utc()`
 /// carries sub-millisecond precision, so gating a machine-generated timestamp
 /// refuses every write that would ever be attempted. `created_at` is outside it on
 /// the same footing — `domain::instant` names storage bookkeeping explicitly.
@@ -495,6 +503,43 @@ pub async fn list_page(
         .collect()
 }
 
+/// One `OData` page of the tenant's migration schedules. Default order is
+/// `migration_id asc`.
+///
+/// # Errors
+/// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+/// malformed `$filter` / `$orderby` / cursor.
+pub async fn list_odata(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    query: &ODataQuery,
+) -> Result<Page<MigrationRecord>, OdataPageError> {
+    let base_select = migration::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(migration::Column::TenantId.eq(tenant_id)));
+    let query = query_with_default_order(query, &[MigrationFilterField::MigrationId]);
+    let page = paginate_odata::<
+        MigrationFilterField,
+        MigrationODataMapper,
+        migration::Entity,
+        migration::Model,
+        _,
+        _,
+    >(
+        base_select,
+        runner,
+        &query,
+        ("migration_id", SortDir::Asc),
+        LIST_LIMIT_CFG,
+        |m| m,
+    )
+    .await
+    .map_err(map_odata_err)?;
+    domain_page(page, into_record)
+}
+
 /// The **live** migrations aimed at a plan (`RETIRE_TARGET_OF_MIGRATION`).
 ///
 /// Live means `scheduled` or `in_progress`: a completed or cancelled run moves
@@ -560,7 +605,7 @@ pub async fn start(
     tenant_id: Uuid,
     migration_id: Uuid,
     exclusion_snapshot: JsonValue,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<Option<Started>, RepoError> {
     let Some(current) = load(runner, scope, tenant_id, migration_id).await? else {
         return Ok(None);
@@ -611,7 +656,7 @@ pub async fn complete(
     tenant_id: Uuid,
     migration_id: Uuid,
     completion_record: JsonValue,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<MigrationRecord, RepoError> {
     flip(
         runner,
@@ -658,7 +703,7 @@ pub async fn cancel(
     migration_id: Uuid,
     from: MigrationState,
     partial_record: Option<JsonValue>,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<MigrationRecord, RepoError> {
     flip(
         runner,

@@ -14,11 +14,12 @@
 //! migration's module doc for why `started_at` alone is written as two
 //! implications instead.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_migration")]
@@ -66,11 +67,11 @@ pub struct Model {
     /// a target that stops being published afterwards surfaces as a D-36
     /// execution-time exclusion rather than as a retroactive refusal.
     pub target_plan_id: Uuid,
-    pub effective_at: DateTime<Utc>,
+    pub effective_at: OffsetDateTime,
     /// The announcement instant D-49 measures the notice period from — the
     /// scheduling commit. Stored rather than derived from `created_at` so the
     /// rule stays auditable if the two ever diverge.
-    pub announced_at: DateTime<Utc>,
+    pub announced_at: OffsetDateTime,
     /// `all` or a subscription filter (§6).
     pub scope: JsonValue,
     /// One of `scheduled | in_progress | completed | cancelled`.
@@ -85,10 +86,10 @@ pub struct Model {
     /// (migrated / not-attempted) sets on an in-flight cancel (D-34).
     pub completion_record: Option<JsonValue>,
     pub created_by: Uuid,
-    pub created_at: DateTime<Utc>,
-    pub started_at: Option<DateTime<Utc>>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub cancelled_at: Option<DateTime<Utc>>,
+    pub created_at: OffsetDateTime,
+    pub started_at: Option<OffsetDateTime>,
+    pub completed_at: Option<OffsetDateTime>,
+    pub cancelled_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

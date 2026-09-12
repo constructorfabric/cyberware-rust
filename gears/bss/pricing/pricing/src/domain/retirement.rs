@@ -63,13 +63,13 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, TimeDelta, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::scope_key::ScopeKey;
 use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 /// Wire code for a retirement refused by a blocking reference
 /// (`11-lifecycle.md` §5, `inst-re-references`, 409).
@@ -266,8 +266,8 @@ enum BoundSpan {
     /// A `None` `until` is D-147's indefinite generation: nothing short of an
     /// unbroken run into an open interval answers it.
     Walk {
-        anchor: DateTime<Utc>,
-        until: Option<DateTime<Utc>>,
+        anchor: OffsetDateTime,
+        until: Option<OffsetDateTime>,
     },
     /// The floor cannot be computed at all, so no interval set can be shown to
     /// reach it. Two causes, one arm: W6's term has **no value** on this key, or
@@ -299,11 +299,11 @@ pub struct GenerationCoverage {
     pub windows: Vec<(Uuid, WindowInterval)>,
     /// D-04's horizon, off the key's published row. `None` is D-147's indefinite
     /// generation, whose coverage no finite end satisfies.
-    pub grandfather_until: Option<DateTime<Utc>>,
+    pub grandfather_until: Option<OffsetDateTime>,
     /// W6's margin on the key's market. `None` when the term has **no value** —
     /// the market sells recurring and the plan authored no frequency — which is
     /// not `Some(zero)` and is refused rather than read as no margin.
-    pub margin: Option<TimeDelta>,
+    pub margin: Option<time::Duration>,
 }
 
 impl GenerationCoverage {
@@ -320,14 +320,14 @@ impl GenerationCoverage {
     /// representable instant.** `grandfather_until` is an operator-authored stored
     /// instant that `infra::storage::repo::check_authored_instant` bounds only for
     /// millisecond precision and never for range, and chrono's
-    /// `impl Add<TimeDelta> for DateTime<Tz>` is `checked_add_signed(..).expect(..)`
+    /// `impl Add<time::Duration> for DateTime<Tz>` is `checked_add_signed(..).expect(..)`
     /// — so this was an `expect` on request-derived data that aborts a **release**
     /// build too, reachable from `PLAN_RETIRE` through `preview` and through the
     /// commit arm. `sellability::active_window_with_horizon` does the identical add
     /// fallibly with the hazard documented; this now matches it, and folds the
     /// unrepresentable horizon into the arm the caller already reads as
     /// keep-the-window.
-    fn span(&self, now: DateTime<Utc>) -> BoundSpan {
+    fn span(&self, now: OffsetDateTime) -> BoundSpan {
         // D-316 clause (3): the cohort, raised by `now`. A generation cannot
         // strand anybody before it exists, and a void strictly in the past is
         // repairable by no act at all.
@@ -345,7 +345,7 @@ impl GenerationCoverage {
             },
             Some(horizon) => self.margin.map_or(BoundSpan::Incomputable, |m| {
                 horizon
-                    .checked_add_signed(m)
+                    .checked_add(m)
                     .map_or(BoundSpan::Incomputable, |until| BoundSpan::Walk {
                         anchor,
                         until: Some(until),
@@ -425,7 +425,7 @@ impl GenerationCoverage {
 pub fn strand_free_disposition(
     verdicts: &mut [WindowVerdict],
     generations: &[GenerationCoverage],
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) {
     for generation in generations {
         let on_key: BTreeSet<Uuid> = generation.windows.iter().map(|(id, _)| *id).collect();

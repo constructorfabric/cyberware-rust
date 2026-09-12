@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::precedence::Allocated;
@@ -43,11 +44,12 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -107,7 +109,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// the four payment-flow chart accounts, and a stream-less REUSABLE_CREDIT credit
 /// account (the wallet). Mirrors `postgres_credit::setup_seller`.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -116,7 +118,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
         reusable_credit: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -267,7 +269,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     // Post a REAL balanced invoice (DR AR / CR PSP_FEE_EXPENSE) so ALL three AR
     // grains (account_balance, ar_payer_balance, ar_invoice_balance) are credited
@@ -290,7 +292,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -413,8 +415,8 @@ async fn concurrent_applies_drain_one_wallet_without_overspend() {
     // Fund a 500 "promo" wallet, and seed two open AR invoices of 300 each (600
     // receivable headroom > 500 wallet, so the wallet is the binding cap).
     fund_wallet(&provider, &s, "PAY-WAL", "CR-FUND", "promo", 500).await;
-    seed_ar_invoice(&provider, &s, "inv-1", 300, Utc::now()).await;
-    seed_ar_invoice(&provider, &s, "inv-2", 300, Utc::now()).await;
+    seed_ar_invoice(&provider, &s, "inv-1", 300, OffsetDateTime::now_utc()).await;
+    seed_ar_invoice(&provider, &s, "inv-2", 300, OffsetDateTime::now_utc()).await;
     assert_eq!(
         wallet_subgrain(&raw, &s, "promo").await,
         500,
@@ -546,7 +548,7 @@ async fn grant_and_apply_on_same_subgrain_serialize_without_deadlock() {
         )
         .await
         .expect("seed the wallet at 400");
-    seed_ar_invoice(&provider, &s, "inv-1", 300, Utc::now()).await;
+    seed_ar_invoice(&provider, &s, "inv-1", 300, OffsetDateTime::now_utc()).await;
     assert_eq!(
         wallet_subgrain(&raw, &s, "promo").await,
         400,

@@ -7,10 +7,11 @@
 //! `pricing.readmodel.pin_eligibility_overdue` fires on its age. Nothing
 //! recomputes the predicate at read time.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_pin_frontier")]
@@ -26,7 +27,7 @@ pub struct Model {
     /// The newest pin-eligible version. Moves forward only.
     pub catalog_version: i64,
     /// UTC instant the frontier last advanced.
-    pub advanced_at: DateTime<Utc>,
+    pub advanced_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

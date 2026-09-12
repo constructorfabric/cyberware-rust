@@ -58,7 +58,6 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use toolkit_db::secure::{AccessScope, DbTx, TxError};
 use toolkit_db::{DBProvider, DbError};
@@ -67,6 +66,7 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::infra::storage::repo::{ClaimOutcome, IdempotencyGate};
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// What a guarded mutation returns when it runs inside the caller's transaction.
 ///
@@ -133,7 +133,7 @@ pub struct GuardedRequest {
     /// The authoring instant, used as the claim's timestamp and as the reference
     /// its expiry window is measured against — so a request is never judged
     /// against a clock other than its own.
-    pub now: DateTime<Utc>,
+    pub now: OffsetDateTime,
 }
 
 /// Run `mutation` at most once for `request.client_key`, inside one transaction

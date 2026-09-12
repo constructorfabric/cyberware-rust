@@ -26,6 +26,8 @@
 
 use std::sync::Arc;
 
+use bss_ledger::domain::instant::format_rfc3339;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::precedence::DEFAULT_PRECEDENCE_POLICY;
@@ -40,11 +42,12 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -102,7 +105,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// month, and the four payment-flow chart accounts (CASH_CLEARING / UNALLOCATED
 /// / PSP_FEE_EXPENSE / AR).
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -110,7 +113,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         unallocated: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -200,15 +203,15 @@ async fn seed_policy(
     s: &Seller,
     version: i64,
     strategy: &str,
-    effective_from: DateTime<Utc>,
+    effective_from: OffsetDateTime,
 ) {
     raw.execute_raw(pg(format!(
         "INSERT INTO bss.ledger_tenant_precedence_policy
             (tenant_id, version, effective_from, strategy, created_at_utc)
          VALUES ('{}', {version}, '{}', '{strategy}', '{}')",
         s.tenant,
-        effective_from.to_rfc3339(),
-        Utc::now().to_rfc3339()
+        format_rfc3339(effective_from),
+        format_rfc3339(OffsetDateTime::now_utc())
     )))
     .await
     .expect("seed precedence policy row");
@@ -257,7 +260,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -273,7 +276,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -373,7 +376,7 @@ async fn settle_and_seed_two_invoices(
         s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(2),
+        OffsetDateTime::now_utc() - time::Duration::hours(2),
     )
     .await;
     seed_ar_invoice(
@@ -381,7 +384,7 @@ async fn settle_and_seed_two_invoices(
         s,
         "INV-B",
         800,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 }
@@ -416,7 +419,7 @@ async fn effective_policy_steers_split_and_stamps_real_ref() {
         &s,
         3,
         "highest-amount-first.v1",
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     settle_and_seed_two_invoices(&provider, &s, &ctx, &scope, "PAY-HAF-1").await;
@@ -510,7 +513,7 @@ async fn latest_effective_version_in_effect_is_chosen() {
         &s,
         1,
         "highest-amount-first.v1",
-        Utc::now() - chrono::Duration::hours(2),
+        OffsetDateTime::now_utc() - time::Duration::hours(2),
     )
     .await;
     // v2: oldest-first, effective 1h ago (the one in effect now).
@@ -519,7 +522,7 @@ async fn latest_effective_version_in_effect_is_chosen() {
         &s,
         2,
         "oldest-first.v1",
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
     // v3: highest-amount-first, effective TOMORROW (not yet in effect).
@@ -528,7 +531,7 @@ async fn latest_effective_version_in_effect_is_chosen() {
         &s,
         3,
         "highest-amount-first.v1",
-        Utc::now() + chrono::Duration::days(1),
+        OffsetDateTime::now_utc() + time::Duration::days(1),
     )
     .await;
     settle_and_seed_two_invoices(&provider, &s, &ctx, &scope, "PAY-VER-1").await;

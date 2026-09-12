@@ -222,25 +222,35 @@
 //! read it — `recorded_at` is the clock `inst-ws-immutable` is judged against
 //! there.
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{Expr, SelectStatement};
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order, QueryFilter, QuerySelect, QueryTrait};
+use time::OffsetDateTime;
+use toolkit_db::odata::sea_orm_filter::paginate_odata;
 use toolkit_db::secure::{
     AccessScope, DBRunner, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use uuid::Uuid;
 
 use crate::domain::audit::AuditStamp;
 use crate::domain::projection::PROJECTED_ROW_STATES;
+use std::collections::HashMap;
+
 use crate::domain::scope_key::{PlanId, ScopeKey};
 use crate::domain::window::{
     FrozenEnd, WindowInterval, WindowState, frozen_end, interval_is_non_empty,
 };
 use crate::infra::storage::entity::{price, price_window};
+use crate::infra::storage::odata_mapping::{
+    LIST_LIMIT_CFG, OdataPageError, WindowODataMapper, domain_page, map_odata_err,
+    query_with_default_order,
+};
 use crate::infra::storage::repo::{check_authored_instant, price_repo};
 use crate::infra::storage::{RepoError, contention_or_db};
+use bss_pricing_sdk::odata::WindowFilterField;
 
+use crate::domain::instant::{format_rfc3339, truncate_millis};
 /// The window states an interval competes for its key with —
 /// [`crate::domain::window::OCCUPYING_STATES`], where the argument for the set
 /// lives.
@@ -271,9 +281,9 @@ pub struct NewWindow {
     /// under. Immutable once written (§6).
     pub price_id: Uuid,
     /// Inclusive start of the half-open interval, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended (`inst-ws-expire`).
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// The operator-supplied change reason (§6, from the legacy UC scenarios).
     pub reason_code: String,
 }
@@ -299,9 +309,9 @@ pub struct WindowRecord {
     /// every read, never stored here.
     pub scope_key: ScopeKey,
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// Where the window stands in §4's machine.
     pub state: WindowState,
     /// The operator-supplied change reason.
@@ -309,13 +319,13 @@ pub struct WindowRecord {
     /// Who scheduled it — pseudonymous principal id.
     pub created_by: Uuid,
     /// When it was scheduled, UTC.
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
     /// When it took effect; set exactly on an `active` or `expired` window.
-    pub activated_at: Option<DateTime<Utc>>,
+    pub activated_at: Option<OffsetDateTime>,
     /// When it expired; set exactly on an `expired` window.
-    pub expired_at: Option<DateTime<Utc>>,
+    pub expired_at: Option<OffsetDateTime>,
     /// When it was cancelled; set exactly on a `cancelled` window.
-    pub cancelled_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<OffsetDateTime>,
     /// How many **operator acts** this window has been the subject of — `0` at its
     /// schedule, `+1` per adjustment and per cancellation, unmoved by the activation
     /// and expiry sweeps (D-190).
@@ -504,30 +514,23 @@ pub async fn list_for_plan(
     tenant_id: Uuid,
     plan_id: PlanId,
 ) -> Result<Vec<WindowRecord>, RepoError> {
-    let keys = price_repo::load_scope_keys_for_plan(runner, scope, tenant_id, plan_id).await?;
+    let keys: HashMap<Uuid, ScopeKey> =
+        price_repo::load_scope_keys_for_plan(runner, scope, tenant_id, plan_id)
+            .await?
+            .into_iter()
+            .collect();
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = load_windows(
-        runner,
-        scope,
-        tenant_id,
-        keys.iter().map(|(price_id, _)| *price_id),
-        &[],
-    )
-    .await?;
+    let rows = load_windows(runner, scope, tenant_id, keys.keys().copied(), &[]).await?;
     rows.into_iter()
         .map(|row| {
-            let key = keys
-                .iter()
-                .find(|(price_id, _)| *price_id == row.price_id)
-                .map(|(_, key)| key.clone())
-                .ok_or_else(|| {
-                    RepoError::CorruptRow(format!(
-                        "window {} names price row {}, which is not on plan {plan_id}",
-                        row.window_id, row.price_id
-                    ))
-                })?;
+            let key = keys.get(&row.price_id).cloned().ok_or_else(|| {
+                RepoError::CorruptRow(format!(
+                    "window {} names price row {}, which is not on plan {plan_id}",
+                    row.window_id, row.price_id
+                ))
+            })?;
             to_domain(row, key)
         })
         .collect()
@@ -590,23 +593,83 @@ pub async fn list_page(
     let mut price_ids: Vec<Uuid> = rows.iter().map(|row| row.price_id).collect();
     price_ids.sort_unstable();
     price_ids.dedup();
-    let keys = price_repo::load_scope_keys_for_ids(runner, scope, tenant_id, &price_ids).await?;
+    // Indexed once rather than scanned per row: the mapping closure below runs for
+    // every row of a page capped at `LIST_LIMIT_CFG`, and a linear `find` over the
+    // key set made that `page x price_ids` comparisons.
+    let keys: HashMap<Uuid, ScopeKey> =
+        price_repo::load_scope_keys_for_ids(runner, scope, tenant_id, &price_ids)
+            .await?
+            .into_iter()
+            .collect();
 
     rows.into_iter()
         .map(|row| {
-            let key = keys
-                .iter()
-                .find(|(price_id, _)| *price_id == row.price_id)
-                .map(|(_, key)| key.clone())
-                .ok_or_else(|| {
-                    RepoError::CorruptRow(format!(
-                        "window {} names price row {}, which does not exist",
-                        row.window_id, row.price_id
-                    ))
-                })?;
+            let key = keys.get(&row.price_id).cloned().ok_or_else(|| {
+                RepoError::CorruptRow(format!(
+                    "window {} names price row {}, which does not exist",
+                    row.window_id, row.price_id
+                ))
+            })?;
             to_domain(row, key)
         })
         .collect()
+}
+
+/// One `OData` page of the tenant's windows. `$filter` is additive over the
+/// tenant + `SecureORM` scope. Default order is `window_id asc`.
+///
+/// # Errors
+/// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+/// malformed `$filter` / `$orderby` / cursor.
+pub async fn list_odata(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    query: &ODataQuery,
+) -> Result<Page<WindowRecord>, OdataPageError> {
+    let base_select = price_window::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(price_window::Column::TenantId.eq(tenant_id)));
+    let query = query_with_default_order(query, &[WindowFilterField::WindowId]);
+    let page = paginate_odata::<
+        WindowFilterField,
+        WindowODataMapper,
+        price_window::Entity,
+        price_window::Model,
+        _,
+        _,
+    >(
+        base_select,
+        runner,
+        &query,
+        ("window_id", SortDir::Asc),
+        LIST_LIMIT_CFG,
+        |m| m,
+    )
+    .await
+    .map_err(map_odata_err)?;
+
+    let mut price_ids: Vec<Uuid> = page.items.iter().map(|row| row.price_id).collect();
+    price_ids.sort_unstable();
+    price_ids.dedup();
+    // Indexed once, for the reason `load_for_plan`'s twin above carries.
+    let keys: HashMap<Uuid, ScopeKey> =
+        price_repo::load_scope_keys_for_ids(runner, scope, tenant_id, &price_ids)
+            .await
+            .map_err(OdataPageError::Repo)?
+            .into_iter()
+            .collect();
+
+    domain_page(page, |row| {
+        let key = keys.get(&row.price_id).cloned().ok_or_else(|| {
+            RepoError::CorruptRow(format!(
+                "window {} names price row {}, which does not exist",
+                row.window_id, row.price_id
+            ))
+        })?;
+        to_domain(row, key)
+    })
 }
 
 /// Which of §4's two **time-driven** boundaries a sweep is asking about.
@@ -674,9 +737,9 @@ pub struct DueWindow {
     /// within.
     pub plan_id: PlanId,
     /// Inclusive start, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// Exclusive end, UTC; `None` is open-ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// Which boundary arrived.
     pub boundary: DueBoundary,
     /// **The instant that boundary is** — `effective_from` for an activation,
@@ -688,7 +751,7 @@ pub struct DueWindow {
     /// stamp. [`list_due`] refuses such a row rather than dropping it, because a
     /// row the expiry predicate returned without an end means the predicate and
     /// this mapping have stopped agreeing.
-    pub at: DateTime<Utc>,
+    pub at: OffsetDateTime,
 }
 
 /// Every window whose `boundary` has arrived by `at`, oldest boundary first.
@@ -804,19 +867,19 @@ pub async fn list_due(
     runner: &impl DBRunner,
     scope: &AccessScope,
     boundary: DueBoundary,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
     limit: u64,
 ) -> Result<Vec<DueWindow>, RepoError> {
     let (column, filter) = match boundary {
         DueBoundary::Activation => (
             price_window::Column::EffectiveFrom,
-            Condition::all().add(price_window::Column::EffectiveFrom.lte(at)),
+            Condition::all().add(price_window::Column::EffectiveFrom.lte(sql_instant(at))),
         ),
         DueBoundary::Expiry => (
             price_window::Column::EffectiveTo,
             Condition::all()
                 .add(price_window::Column::EffectiveTo.is_not_null())
-                .add(price_window::Column::EffectiveTo.lte(at)),
+                .add(price_window::Column::EffectiveTo.lte(sql_instant(at))),
         ),
     };
     let rows = price_window::Entity::find()
@@ -951,7 +1014,7 @@ fn projected_price_rows() -> SelectStatement {
 /// difference observable. **`at` is not subject to D-144's quantum.** That quantum
 /// is an *authoring* rule — §5 scopes it to `effectiveFrom`/`effectiveTo`, the
 /// cutover instant, the D-88 changeover instant and `grandfatherUntil` — and this
-/// is a machine-generated flip timestamp. `Utc::now()` carries sub-millisecond
+/// is a machine-generated flip timestamp. `OffsetDateTime::now_utc()` carries sub-millisecond
 /// precision, so applying it here failed **every** flip an activation sweep would
 /// ever attempt with `TIMESTAMP_PRECISION_EXCEEDED`; [`schedule`] does not apply
 /// it to `stamp.recorded_at` either, for the same reason.
@@ -974,7 +1037,7 @@ pub async fn transition(
     tenant_id: Uuid,
     window_id: Uuid,
     to: WindowState,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
     _stamp: AuditStamp,
 ) -> Result<WindowRecord, RepoError> {
     let current = require(runner, scope, tenant_id, window_id).await?;
@@ -1011,7 +1074,7 @@ pub async fn transition(
         .secure()
         .scope_with(scope)
         .col_expr(price_window::Column::State, Expr::value(to.as_str()))
-        .col_expr(column, Expr::value(at))
+        .col_expr(column, Expr::value(sql_instant(at)))
         .col_expr(
             price_window::Column::MutationSeq,
             Expr::value(advanced_seq(window_id, current.mutation_seq, advances)?),
@@ -1082,11 +1145,12 @@ pub async fn transition(
         });
     }
 
+    let stamped = sql_instant(at);
     Ok(WindowRecord {
         state: to,
-        activated_at: pick(to, WindowState::Active, at, current.activated_at),
-        expired_at: pick(to, WindowState::Expired, at, current.expired_at),
-        cancelled_at: pick(to, WindowState::Cancelled, at, current.cancelled_at),
+        activated_at: pick(to, WindowState::Active, stamped, current.activated_at),
+        expired_at: pick(to, WindowState::Expired, stamped, current.expired_at),
+        cancelled_at: pick(to, WindowState::Cancelled, stamped, current.cancelled_at),
         mutation_seq: if advances {
             current.mutation_seq.saturating_add(1)
         } else {
@@ -1233,7 +1297,7 @@ pub async fn adjust_effective_to(
     scope: &AccessScope,
     tenant_id: Uuid,
     window_id: Uuid,
-    effective_to: Option<DateTime<Utc>>,
+    effective_to: Option<OffsetDateTime>,
     expected_seq: u64,
     stamp: AuditStamp,
 ) -> Result<WindowRecord, RepoError> {
@@ -1375,8 +1439,8 @@ pub async fn adjust_effective_to(
 fn overlap_or(
     err: &toolkit_db::secure::ScopeError,
     key: &ScopeKey,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
     subject: &str,
     action: &str,
 ) -> RepoError {
@@ -1516,8 +1580,8 @@ async fn refuse_overlap(
     scope: &AccessScope,
     tenant_id: Uuid,
     key: &ScopeKey,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
     except: Option<Uuid>,
 ) -> Result<(), RepoError> {
     let mates: Vec<Uuid> =
@@ -1581,7 +1645,7 @@ async fn refuse_overlap(
 fn refuse_unsanctioned_edge(
     current: &WindowRecord,
     to: WindowState,
-    at: DateTime<Utc>,
+    at: OffsetDateTime,
 ) -> Result<(), RepoError> {
     if !current.state.may_move_to(to) {
         return Err(forbidden(
@@ -1594,8 +1658,8 @@ fn refuse_unsanctioned_edge(
     let unmet = match to {
         WindowState::Active if !interval.has_started(at) => Some(format!(
             "the transition to active at {}, before its effective_from {}",
-            at.to_rfc3339(),
-            current.effective_from.to_rfc3339()
+            format_rfc3339(at),
+            format_rfc3339(current.effective_from)
         )),
         WindowState::Expired if !interval.is_due_to_expire(at) => {
             Some(match current.effective_to {
@@ -1603,8 +1667,8 @@ fn refuse_unsanctioned_edge(
                     .to_owned(),
                 Some(end) => format!(
                     "the transition to expired at {}, before its effective_to {}",
-                    at.to_rfc3339(),
-                    end.to_rfc3339()
+                    format_rfc3339(at),
+                    format_rfc3339(end)
                 ),
             })
         }
@@ -1690,14 +1754,27 @@ const fn idempotent_arrival(to: WindowState) -> bool {
 /// job's own Postgres concurrency suite is the place for. Until then this clause is
 /// defence-in-depth whose absence a suite cannot see, and saying so is the point:
 /// the guard-by-removal answer for it is `0`, not `1`.
-fn edge_condition(to: WindowState, at: DateTime<Utc>) -> Condition {
+fn edge_condition(to: WindowState, at: OffsetDateTime) -> Condition {
     match to {
-        WindowState::Active => Condition::all().add(price_window::Column::EffectiveFrom.lte(at)),
+        WindowState::Active => {
+            Condition::all().add(price_window::Column::EffectiveFrom.lte(sql_instant(at)))
+        }
         WindowState::Expired => Condition::all()
             .add(price_window::Column::EffectiveTo.is_not_null())
-            .add(price_window::Column::EffectiveTo.lte(at)),
+            .add(price_window::Column::EffectiveTo.lte(sql_instant(at))),
         WindowState::Scheduled | WindowState::Cancelled => Condition::all(),
     }
+}
+
+/// Bind `at` at the authored millisecond quantum for SQL instant comparisons.
+///
+/// Window bounds are D-144-quantized. `SeaORM`'s `time` TEXT form writes those as
+/// `…00.000Z`. A later machine instant with extra fractional digits
+/// (`…00.000001Z`) then compares *smaller* as `SQLite` TEXT, because `Z` > `0`.
+/// Flooring the bind to milliseconds makes `bound <= at` the same comparison
+/// the domain already makes when the bound sits on the quantum.
+fn sql_instant(at: OffsetDateTime) -> OffsetDateTime {
+    truncate_millis(at)
 }
 
 /// Refuse an interval whose end is not strictly after its start.
@@ -1707,7 +1784,10 @@ fn edge_condition(to: WindowState, at: DateTime<Utc>) -> Condition {
 /// [`check_authored_instant`] arrangement, one rule over: the domain holds the
 /// predicate, this layer holds the [`RepoError`] and the domain's own checked form
 /// holds the wire answer.
-fn refuse_empty_interval(from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> Result<(), RepoError> {
+fn refuse_empty_interval(
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
+) -> Result<(), RepoError> {
     if interval_is_non_empty(from, to) {
         return Ok(());
     }
@@ -1734,8 +1814,8 @@ fn refuse_empty_interval(from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> Resu
 /// caller reading a 409 is looking at their own request.
 fn refuse_frozen_end(
     current: &WindowRecord,
-    to: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
+    to: Option<OffsetDateTime>,
+    now: OffsetDateTime,
 ) -> Result<(), RepoError> {
     let interval = WindowInterval::new(current.effective_from, current.effective_to, current.state);
     let Some(ground) = frozen_end(&interval, to, now) else {
@@ -1747,13 +1827,13 @@ fn refuse_frozen_end(
         }
         FrozenEnd::StoredEndPassed(stored) => format!(
             "its effective_to {} had already passed at {}; only a future end may be moved",
-            stored.to_rfc3339(),
-            now.to_rfc3339()
+            format_rfc3339(stored),
+            format_rfc3339(now)
         ),
         FrozenEnd::TargetNotFuture(target) => format!(
             "an end may only be moved to a future instant, and {} is not after {}",
-            target.to_rfc3339(),
-            now.to_rfc3339()
+            format_rfc3339(target),
+            format_rfc3339(now)
         ),
     };
     Err(RepoError::WindowHistorical {
@@ -1774,10 +1854,10 @@ fn refuse_frozen_end(
 /// §9 names the false positive a `<=` here would produce, and it would refuse
 /// exactly the shape a supersession and a cutover both produce.
 fn intersects(
-    a_from: DateTime<Utc>,
-    a_to: Option<DateTime<Utc>>,
-    b_from: DateTime<Utc>,
-    b_to: Option<DateTime<Utc>>,
+    a_from: OffsetDateTime,
+    a_to: Option<OffsetDateTime>,
+    b_from: OffsetDateTime,
+    b_to: Option<OffsetDateTime>,
 ) -> bool {
     let a_before_b_ends = b_to.is_none_or(|end| a_from < end);
     let b_before_a_ends = a_to.is_none_or(|end| b_from < end);
@@ -1852,9 +1932,9 @@ fn forbidden(window_id: Uuid, state: WindowState, attempted: &str) -> RepoError 
 fn pick(
     to: WindowState,
     column: WindowState,
-    at: DateTime<Utc>,
-    stored: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
+    at: OffsetDateTime,
+    stored: Option<OffsetDateTime>,
+) -> Option<OffsetDateTime> {
     if to == column { Some(at) } else { stored }
 }
 
@@ -1868,10 +1948,10 @@ fn pick(
 /// An absent end is spelled rather than dropped, for the same reason: "\[t, )"
 /// leaves an open-ended window indistinguishable from one whose end the rendering
 /// lost.
-fn render_interval(from: DateTime<Utc>, to: Option<DateTime<Utc>>) -> String {
+fn render_interval(from: OffsetDateTime, to: Option<OffsetDateTime>) -> String {
     match to {
-        Some(to) => format!("[{}, {})", from.to_rfc3339(), to.to_rfc3339()),
-        None => format!("[{}, open-ended)", from.to_rfc3339()),
+        Some(to) => format!("[{}, {})", format_rfc3339(from), format_rfc3339(to)),
+        None => format!("[{}, open-ended)", format_rfc3339(from)),
     }
 }
 

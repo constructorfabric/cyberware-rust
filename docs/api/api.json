@@ -629,11 +629,54 @@
         ],
         "type": "object"
       },
+      "ApprovalCountsView": {
+        "description": "State totals, not the contents of one page. Withdrawals count as `voided`.",
+        "properties": {
+          "approved": {
+            "description": "Approved.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rejected": {
+            "description": "Rejected.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "submitted": {
+            "description": "Awaiting review.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Total number of visible approvals.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "voided": {
+            "description": "Withdrawn or automatically voided.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "submitted",
+          "approved",
+          "rejected",
+          "voided"
+        ],
+        "type": "object"
+      },
       "ApprovalDetailView": {
         "description": "One record **and what its pin covers** — D-61.",
         "properties": {
           "approval": {
-            "$ref": "#/components/schemas/ApprovalView",
+            "$ref": "#/components/schemas/ApprovalReadView",
             "description": "The record."
           },
           "content_matches_pin": {
@@ -664,6 +707,17 @@
           },
           "pinned_repricing_run": {
             "description": "The pinned **mass-repricing run**, on a `bulkOperation` unit\n(`inst-bs-approval`). `null` on every other kind.\n\nThe run's frozen `report` — selector, adjustment, changeover instant and\nselected-row count — which is the document\n[`repricing_run_content_hash`](crate::domain::approval::content_pin::repricing_run_content_hash)\npins and therefore the one a reviewer is signing for. D-61 in its own\nterms, and it is not decorative here: a run spans plans, so\n`pinned_content` is structurally `null` on this kind, and without this\nmember the reviewer of a tenant-wide reprice was shown a digest and\nnothing else. The run's own `GET` is not the escape either — it is\naddressed by the caller's `run_id`, and the unit's `subject_ref` carries\nthe *minted* `operation_id`, which that route does not take.\n\nRendered as the stored value rather than re-typed: it is this crate's own\ncontrolled rendering (`api::rest::repricing_runs::frozen_report`), and a\nsecond projection of it here would be a second answer to what the run was\naccepted as."
+          },
+          "pinned_taxonomy_value": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PinnedTaxonomyValueView",
+                "description": "The pinned **taxonomy-value edit**, on a `taxonomy_value` unit (D-353).\n`null` on every other kind — and on a taxonomy-value unit whose value is\nno longer declared, in which case `content_matches_pin` is `false`.\n\n`before` is the value as the reviewer must see it stand, `after` as the\nedit would leave it; the pin covers both, so a relabel landing under the\nunit shows here as a mismatch rather than as a silently different `after`."
+              }
+            ]
           },
           "pinned_threshold_policy": {
             "oneOf": [
@@ -779,6 +833,64 @@
         ],
         "type": "object"
       },
+      "ApprovalParticipantView": {
+        "description": "Current identity presentation. Never persisted in Pricing or included in pins.",
+        "properties": {
+          "display_name": {
+            "description": "Current display name, full name, or username from `IdP`; null unless resolved.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name_status": {
+            "$ref": "#/components/schemas/ParticipantNameStatus",
+            "description": "Why a name is present or absent. Never treat null as an anonymous actor."
+          },
+          "principal_id": {
+            "description": "The same durable id as the corresponding `*_principal` field.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "principal_id",
+          "name_status"
+        ],
+        "type": "object"
+      },
+      "ApprovalReadView": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ApprovalView",
+            "description": "Stored metadata remains unchanged and flat on the wire."
+          },
+          {
+            "properties": {
+              "approver": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ApprovalParticipantView",
+                    "description": "Null when no reviewer is recorded, including a voided unit."
+                  }
+                ]
+              },
+              "submitter": {
+                "$ref": "#/components/schemas/ApprovalParticipantView",
+                "description": "Always present, including an explicit name-resolution failure."
+              }
+            },
+            "required": [
+              "submitter"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "The same enriched record in list items and `GET /approvals/{id}.approval`."
+      },
       "ApprovalThreadResponse": {
         "description": "An approval's comment thread.",
         "properties": {
@@ -795,7 +907,7 @@
         "type": "object"
       },
       "ApprovalView": {
-        "description": "One approval record, as §6's columns stand.",
+        "description": "One approval record, as §6's columns stand. Mutation responses retain this\nshape; GETs add current, independently authorized participant names.",
         "properties": {
           "approval_id": {
             "description": "The record's durable name.",
@@ -1025,6 +1137,7 @@
           },
           "recorded_at": {
             "description": "When it was recorded, UTC.",
+            "format": "date-time",
             "type": "string"
           },
           "seq": {
@@ -1451,6 +1564,74 @@
         ],
         "type": "object"
       },
+      "BulkMembershipMoveMaterialView": {
+        "description": "What `POST …/members/move` answers, on both arms.",
+        "properties": {
+          "approval": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApprovalView",
+                "description": "The one approval unit covering the whole set."
+              }
+            ]
+          },
+          "materiality": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MaterialityView",
+                "description": "The `BulkGroupMove` verdict this act was opened under. `None` once\ncommitted."
+              }
+            ]
+          },
+          "moved": {
+            "description": "One [`MembershipMoveView`] per payer, canonical payer order, once\ncommitted. `None` while the unit is still `submitted`.",
+            "items": {
+              "$ref": "#/components/schemas/MembershipMoveView"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "`\"submitted_for_approval\"` or `\"committed\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "BulkMoveMembershipRequest": {
+        "description": "The body of `POST /customer-groups/{group}/members/move`.",
+        "properties": {
+          "effective_from": {
+            "description": "The instant every listed payer pivots on.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "payer_ids": {
+            "description": "Every payer moving into `{group}`. One entry per payer; duplicates\nare refused (`MembershipMoveSet::new`).",
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "payer_ids",
+          "effective_from"
+        ],
+        "type": "object"
+      },
       "BundleCompositionView": {
         "description": "What the read answers with — the bundle's declaration and its composition.\n\nThe component and rev-share members are the **authoring** shapes\n([`ComponentRequest`], [`RevShareGroupRequest`]) rather than views of their\nown, so what an author reads back is spelled exactly as what they wrote. A\nsecond rendering of one composition is a second answer to what it is.",
         "properties": {
@@ -1633,6 +1814,144 @@
         "required": [
           "source",
           "items"
+        ],
+        "type": "object"
+      },
+      "CatalogTaxCategoriesView": {
+        "description": "The dictionary and its configured source. Failure is never an empty success.",
+        "properties": {
+          "items": {
+            "description": "Definitions in provider order; a configured empty dictionary is `[]`.",
+            "items": {
+              "$ref": "#/components/schemas/CatalogTaxCategoryView"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "`local_dev_static` or `registry`. Demo codes are not production taxonomy.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "items"
+        ],
+        "type": "object"
+      },
+      "CatalogTaxCategoryView": {
+        "description": "A definition from Product Catalog; no assignment or rate lives here.",
+        "properties": {
+          "code": {
+            "description": "Stable provider-owned code.",
+            "type": "string"
+          },
+          "display_name": {
+            "description": "Human-readable label, read from the provider.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "CatalogVersionRefSubjectView": {
+        "description": "One subject of a pending handle.",
+        "properties": {
+          "catalog_version": {
+            "description": "The assigned version, once finalized.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "commit_observed_at": {
+            "description": "When this gear first saw the registry answer (D-166).",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "committed_at": {
+            "description": "When finalize wrote the version.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requested_at": {
+            "description": "When the publish asked for the handle.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "status": {
+            "description": "`pending | commit_observed | committed`.",
+            "type": "string"
+          },
+          "subject_effective_to": {
+            "description": "Membership pin; absent on every other kind.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject_kind": {
+            "description": "`plan | price_overlay | overlay_index | group_membership`.",
+            "type": "string"
+          },
+          "subject_lifecycle_state": {
+            "description": "The lifecycle the publish judged, when the kind has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject_ref": {
+            "description": "Which one.",
+            "type": "string"
+          },
+          "subject_revision": {
+            "description": "The revision the publish judged, when the kind has one.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "subject_kind",
+          "subject_ref",
+          "status",
+          "requested_at"
+        ],
+        "type": "object"
+      },
+      "CatalogVersionRefView": {
+        "description": "One handle and the subjects the publish unit projected against it.",
+        "properties": {
+          "pending_version_ref": {
+            "description": "The registry handle the caller asked about.",
+            "type": "string"
+          },
+          "subjects": {
+            "description": "One row per subject of that handle, `subject_kind` then `subject_ref`.",
+            "items": {
+              "$ref": "#/components/schemas/CatalogVersionRefSubjectView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "pending_version_ref",
+          "subjects"
         ],
         "type": "object"
       },
@@ -4281,6 +4600,46 @@
         ],
         "type": "object"
       },
+      "DeclareTaxonomyValueRequest": {
+        "additionalProperties": false,
+        "description": "The one value a `POST …/values` declares — the authored fields and nothing\nelse.\n\nIts own type rather than [`TaxonomyValueView`], which is what this route read\nuntil D-355 added two **read-only** fields to that view. A declare body could\nthen carry `edit_governed` / `references`, `authored_entry` would ignore\nthem, and `docs/api/api.json` would advertise two settable properties the\nserver discards — the failure `authored_entry` refuses six lines into itself\nfor the tax markers, on the argument that *\"a field that vanishes silently\nreads to the operator exactly like one that failed to save\"*. A field absent\nfrom the request type cannot vanish silently: it is refused by the parse.",
+        "properties": {
+          "display_name": {
+            "description": "The operator's label for it.",
+            "type": "string"
+          },
+          "state": {
+            "description": "`active` or `retired`, defaulting to `active`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_category": {
+            "description": "The region's default tax category (D-01). **Region taxonomy only.**",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_rate_present": {
+            "description": "Tenant-declared *\"a tax rate is configured for this region\"* (D-01).\n**Region taxonomy only.**",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The declared code — the string a price row's `region` or an overlay's\n`scopeValue` must match. Never blank.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "display_name"
+        ],
+        "type": "object"
+      },
       "DeltaData": {
         "description": "Delta text chunk.",
         "properties": {
@@ -5898,6 +6257,52 @@
         "required": [
           "gear",
           "version"
+        ],
+        "type": "object"
+      },
+      "GlCodeValueView": {
+        "description": "One declared GL code.",
+        "properties": {
+          "display_name": {
+            "description": "The operator's label for it.",
+            "type": "string"
+          },
+          "state": {
+            "description": "`active` or `retired`. Absent reads as `active`, because a body listing a\nvalue is a body declaring it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "description": "The code a plan's descriptor `glCode` must match. Never blank.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "display_name"
+        ],
+        "type": "object"
+      },
+      "GlCodesView": {
+        "description": "The vocabulary, whole.",
+        "properties": {
+          "resource": {
+            "description": "What this document is a representation **of**.\n\nA constant, and it exists for a client rather than for a reader: a\nresponse carries no URL, so a client that must pair this body with the\n`ETag` header — the only source of the `PUT`'s precondition — has nothing\nelse to attribute it by. `rounding_policies::RoundingPoliciesView` is\nstructurally identical (`values` alone), and a client reading several\nconfig documents concurrently could pair one's tag with the other's body,\nwhich is a wrong precondition rather than a failed one.",
+            "type": "string"
+          },
+          "values": {
+            "description": "Every declared value, `active` and `retired` alike, ordered by value.\n\nRetirements are **included** so the round trip is honest: an operator who\nreads, edits and writes back can see the value they are about to\nre-activate.",
+            "items": {
+              "$ref": "#/components/schemas/GlCodeValueView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "resource",
+          "values"
         ],
         "type": "object"
       },
@@ -9105,7 +9510,7 @@
             "type": "integer"
           },
           "row_version": {
-            "description": "The row version — the **second** half of the `If-Match` tag\n`\"<revision>-<version>\"` a `PATCH` must assert.\n\n**Without it the edit door was reachable from nowhere.** The tag was\nemitted at exactly two places, the create's `201` and the `PATCH`'s own\n`200`; the create's *replay* deliberately omits it, this list emitted no\n`ETag`, and there is no `GET …/price-overlays/{id}` — the `Location` the\ncreate sets answers `405`. So a caller that lost the one-shot tag, and\nwhose overlay was then moved by anyone else, could construct no `If-Match`\nthat was not `409 STALE_VERSION`, and no request existed that would tell it\nthe current version.\n\nThe three sibling lists carry their token on the page for this reason and\nsay so — `windows.rs`'s `mutation_seq` (*\"a caller that lists and then\nadjusts needs the precondition from the page\"*), `prices.rs`'s and\n`plans.rs`'s `row_version`. This list carried exactly half of its own tag.\n\nDistinct from [`crate::domain::overlay::OverlayRevision`]'s deliberate\nomission of it, and that distinction is the point: a **pin** must not carry\na concurrency token, because it answers \"is this the content the reviewer\nsaw\" and the token moves for reasons the content did not. A **view** is not\na pin — it is what a client reads before it writes.",
+            "description": "The row version — the **second** half of the `If-Match` tag\n`\"<revision>-<version>\"` a `PATCH` must assert.\n\n**Without it the edit door was reachable from nowhere.** The tag was\nemitted at exactly two places, the create's `201` and the `PATCH`'s own\n`200`; the create's *replay* deliberately omits it and this list emits no\n`ETag`. `GET …/price-overlays/{id}` is the reload: it answers the\nauthoring revision and the tag a subsequent `PATCH` must present. A\ncaller that lost the one-shot tag re-reads that path rather than paging\nthe tenant's overlay set.\n\nThe three sibling lists carry their token on the page for this reason and\nsay so — `windows.rs`'s `mutation_seq` (*\"a caller that lists and then\nadjusts needs the precondition from the page\"*), `prices.rs`'s and\n`plans.rs`'s `row_version`. This list carried exactly half of its own tag.\n\nDistinct from [`crate::domain::overlay::OverlayRevision`]'s deliberate\nomission of it, and that distinction is the point: a **pin** must not carry\na concurrency token, because it answers \"is this the content the reviewer\nsaw\" and the token moves for reasons the content did not. A **view** is not\na pin — it is what a client reads before it writes.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -9299,11 +9704,11 @@
         ],
         "type": "object"
       },
-      "Page_ApprovalView": {
+      "Page_ApprovalReadView": {
         "properties": {
           "items": {
             "items": {
-              "$ref": "#/components/schemas/ApprovalView"
+              "$ref": "#/components/schemas/ApprovalReadView"
             },
             "type": "array"
           },
@@ -10252,6 +10657,16 @@
         ],
         "type": "object"
       },
+      "ParticipantNameStatus": {
+        "description": "Availability of a current participant name, not the approval's state.",
+        "enum": [
+          "resolved",
+          "restricted",
+          "not_found",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "PartyShareRequest": {
         "description": "One party's typed share.",
         "properties": {
@@ -10388,6 +10803,41 @@
         },
         "type": "object"
       },
+      "PatchTaxonomyValueRequest": {
+        "additionalProperties": false,
+        "description": "The body of a `PATCH …/values/{value}`: only the fields to change.\n\nEvery member is optional and an absent one leaves the held value as it is.\n`tax_category` alone distinguishes *absent* from `null`: `null` **clears** the\nregion's default category, which is a guarded act (D-245) exactly as it is on\nthe whole-set `PUT`.",
+        "properties": {
+          "display_name": {
+            "description": "A new label.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`active` or `retired`. A retirement is guarded (`TAXONOMY_VALUE_IN_USE`);\n`retired -> active` re-activates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_category": {
+            "description": "**Region only.** A string sets the default category; `null` clears it;\nabsent leaves it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_rate_present": {
+            "description": "**Region only.**",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "PathSuffixMode": {
         "enum": [
           "disabled",
@@ -10447,6 +10897,77 @@
         },
         "required": [
           "allocations"
+        ],
+        "type": "object"
+      },
+      "PendingApprovalView": {
+        "description": "One submitted approval belonging directly to a plan's aggregate.\n\nOnly what a `plan × read` caller may learn: **that** a unit is pending,\n**which** one, and since when. The submitter, the verdict, the reason and the\npinned content sit behind `approval × read` on\n`GET /bss-pricing/v1/approvals/{approvalId}`, and this view exists so a\nclient can open that resource under its own gate rather than page the\napprovals list and join on `subject_ref` — which it cannot narrow\nserver-side today.",
+        "properties": {
+          "approval_id": {
+            "description": "The unit to open under `approval × read`.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "subject_kind": {
+            "description": "`plan_revision`, `window` or `price_unit`.",
+            "type": "string"
+          },
+          "submitted_at": {
+            "description": "When the unit was opened, UTC.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_id",
+          "subject_kind",
+          "submitted_at"
+        ],
+        "type": "object"
+      },
+      "PendingContentAccess": {
+        "description": "Whether this caller may read this particular pending unit's proposal.",
+        "enum": [
+          "granted",
+          "restricted"
+        ],
+        "type": "string"
+      },
+      "PendingTaxonomyApprovalView": {
+        "description": "A submitted taxonomy unit. The first three fields match a plan pending link.",
+        "properties": {
+          "approval_id": {
+            "description": "The unit to open under `approval × read`.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "content_access": {
+            "$ref": "#/components/schemas/PendingContentAccess",
+            "description": "Explicit per-unit preview availability, not inferred from an empty array."
+          },
+          "content_matches_pin": {
+            "description": "Present only for granted content. False means the current value plus\nproposal no longer matches the submitted pin, not a historical snapshot.",
+            "type": "boolean"
+          },
+          "proposed_changes": {
+            "$ref": "#/components/schemas/TaxonomyProposedChangesView",
+            "description": "Present only for granted content; exactly the stored authored patch."
+          },
+          "subject_kind": {
+            "description": "Always `taxonomy_value`.",
+            "type": "string"
+          },
+          "submitted_at": {
+            "description": "When the unit was opened, UTC.",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approval_id",
+          "subject_kind",
+          "submitted_at",
+          "content_access"
         ],
         "type": "object"
       },
@@ -10849,6 +11370,34 @@
         ],
         "type": "object"
       },
+      "PinnedTaxonomyValueView": {
+        "description": "**An exhaustive destructure, and that is the guard** — [`From<&PlanShape>`]'s\ndiscipline, applied to the second subject on the day it arrived rather than\nafter a field went missing from a reviewer's document.\n\n[`ThresholdEntry`] is destructured; [`ThresholdVersion`] cannot be, its fields\nbeing private behind the constructor that refuses an empty or duplicated entry\nset — which is the exposure `content_pin`'s module doc counts and carries the\nsame obligation here: a fourth field on the version is a field this view will\nsilently omit unless somebody adds it.\n\n[`From<&PlanShape>`]: PinnedContentView\nOne taxonomy value before and after a proposed edit (D-353).",
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/TaxonomyValueView",
+            "description": "The value as the edit would leave it."
+          },
+          "before": {
+            "$ref": "#/components/schemas/TaxonomyValueView",
+            "description": "The value as it stands."
+          },
+          "class": {
+            "description": "The universe: `region`, `brand`, `partner` or `org_tier`.",
+            "type": "string"
+          },
+          "value": {
+            "description": "The value being edited.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "class",
+          "value",
+          "before",
+          "after"
+        ],
+        "type": "object"
+      },
       "PinnedThresholdPolicyView": {
         "description": "Exactly the threshold-policy version the pin hashes — the reviewer's document\nfor a D-10 unit.\n\nA **second** pinned-content member rather than a widening of\n[`PinnedContentView`], for the reason `PinnedSubject` is a sum type: the two\nsubjects share no field, and a single view carrying the union of both would\nhave every member `null` for one of the two kinds. A reviewer would then be\nreading a document whose shape does not say what they are approving, and the\nexhaustive-destructure guard below would have nothing to be exhaustive over.",
         "properties": {
@@ -10963,6 +11512,42 @@
         ],
         "type": "object"
       },
+      "PlanCountsView": {
+        "description": "The tenant's plans counted by **authoring** state — what the list's rows\nshow, over the whole catalogue rather than one page (D-360). `total` is the\nnumber of plans; the three states sum to it.",
+        "properties": {
+          "draft": {
+            "description": "Plans holding an open draft, whatever their current revision's state — the\nlist's own collapse.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "published": {
+            "description": "Plans whose current revision is `published` and that hold no draft.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "retired": {
+            "description": "Plans whose current revision is `retired` and that hold no draft.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "The number of plans in the authoring set.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "draft",
+          "published",
+          "retired"
+        ],
+        "type": "object"
+      },
       "PlanCoverageView": {
         "description": "The plan's whole time axis, one entry per canonical scope key.",
         "properties": {
@@ -10996,6 +11581,13 @@
               "null"
             ]
           },
+          "display_name": {
+            "description": "The operator's label for the phase (D-357): optional and free-form. Absent\nin a body means \"no label\"; a blank string is read as absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "display_trial_days": {
             "description": "The trial length a storefront displays, on a `trial` phase.",
             "format": "int32",
@@ -11006,7 +11598,7 @@
             ]
           },
           "kind": {
-            "description": "`trial` | `intro` | `evergreen`.",
+            "description": "`trial` | `interim` | `evergreen`. `intro` is not accepted as a legacy\nspelling (D-358).",
             "type": "string"
           },
           "ordinal": {
@@ -11238,14 +11830,35 @@
               "null"
             ]
           },
-          "created_at_utc": {
-            "description": "When the revision was created, UTC.",
+          "created_at": {
+            "description": "When the plan's first revision was created, UTC; stable across revisions.",
             "format": "date-time",
             "type": "string"
+          },
+          "currencies": {
+            "description": "Distinct currencies of those rows, sorted (D-360).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "lifecycle_state": {
             "description": "`draft` | `abandoned` | `published` | `superseded` | `retired`.",
             "type": "string"
+          },
+          "model_kinds": {
+            "description": "Distinct `model_kind`s of those rows, sorted; a row with none contributes\nno kind (D-360).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pending_approvals": {
+            "description": "Same pending metadata as [`PlanView::pending_approvals`]. Empty when no\ndirectly owned unit is submitted; oldest first, then approval id.\nComputed and advisory; filter its non-emptiness with `has_pending_approvals`.",
+            "items": {
+              "$ref": "#/components/schemas/PendingApprovalView"
+            },
+            "type": "array"
           },
           "plan_id": {
             "description": "The plan this revision belongs to.",
@@ -11266,11 +11879,22 @@
               "null"
             ]
           },
+          "price_row_count": {
+            "description": "The plan's `draft` + `published` rows — the count `GET …/prices` returns\nwith no `$filter` (**D-360**). Filled by `list_plans` from one grouped\nread over the page's plans, so a catalogue screen no longer reads every\nplan's rows to show it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "revision": {
             "description": "The revision number the page is answering about — the open draft's when\nthe plan has one, else the current revision's.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "revision_created_at": {
+            "description": "When this shown revision was created, UTC.",
+            "format": "date-time",
+            "type": "string"
           },
           "row_version": {
             "description": "The precondition a caller needs to `PATCH` this row without reading it\nagain. Carried on the page for the same reason [`PlanView`] carries it: a\nclient that cannot see response headers can still submit an `If-Match`.",
@@ -11291,8 +11915,13 @@
           "plan_id",
           "revision",
           "lifecycle_state",
-          "created_at_utc",
-          "row_version"
+          "created_at",
+          "revision_created_at",
+          "row_version",
+          "pending_approvals",
+          "price_row_count",
+          "model_kinds",
+          "currencies"
         ],
         "type": "object"
       },
@@ -11340,8 +11969,8 @@
             },
             "type": "array"
           },
-          "created_at_utc": {
-            "description": "When the revision was created, UTC.",
+          "created_at": {
+            "description": "When the plan's first revision was created, UTC; stable across revisions.",
             "format": "date-time",
             "type": "string"
           },
@@ -11386,6 +12015,13 @@
           "lifecycle_state": {
             "description": "`draft` | `abandoned` | `published` | `superseded` | `retired`. Named on\nthe wire so a caller never has to infer which revision it was given.",
             "type": "string"
+          },
+          "pending_approvals": {
+            "description": "Submitted approvals belonging directly to this plan: revision, window\nand price units. Empty when none are pending; sorted by submission time\nand approval id. Matches the list contract.\n\n**Derived, not stored.** No plan state says \"in review\": the revision's\nlifecycle does not change just because a unit opens. This field is read\nfrom the approval store on every GET, following `voided`,\n`rejected`, `withdrawn` and `approved` without a second writer of one\nfact. It is **not part of the `ETag`**, which digests the revision and its\n`row_version`: a unit opening or closing is not a change to plan content,\nand a tag that moved with it would stale every author's `If-Match` for\nsomething they did not edit.\n\nGET always returns a fresh body with `Cache-Control: private, no-store`;\nit does not evaluate `If-None-Match`. The tag is a write precondition,\nnot a validator for these derived fields. Advisory, like every snapshot:\nthe unit can be decided between this read\nand the caller's next act, and the write path stays the authority\n(`PENDING_CHANGE_UNIT_EXISTS` on a second submit,\n`APPROVAL_NOT_PENDING` on a stale decision).",
+            "items": {
+              "$ref": "#/components/schemas/PendingApprovalView"
+            },
+            "type": "array"
           },
           "period_floor_caps": {
             "description": "The revision's period floor/cap set, in `(currency, region)` order\n(**D-319**).\n\nA write surface whose read surface does not show the value is half a\nfeature, and here the read is what makes a wholesale replace usable at\nall: the facet replaces the set, so an author adding a bound in a second\nmarket has to be able to read the first one back to resubmit it.\n\nAn empty list is a plan with no minimum, which is the ordinary plan.",
@@ -11448,6 +12084,11 @@
             "minimum": 0,
             "type": "integer"
           },
+          "revision_created_at": {
+            "description": "When this shown revision was created, UTC.",
+            "format": "date-time",
+            "type": "string"
+          },
           "row_version": {
             "description": "The revision's optimistic-concurrency version - the same number the\n`ETag` header quotes, carried in the body too so a client that cannot see\nresponse headers can still submit a precondition.",
             "format": "int64",
@@ -11469,14 +12110,16 @@
           "lifecycle_state",
           "plan_tier_override",
           "created_by",
-          "created_at_utc",
+          "created_at",
+          "revision_created_at",
           "row_version",
           "phases",
           "addon_rules",
           "composites",
           "period_floor_caps",
           "entitlement_grants",
-          "change_contract"
+          "change_contract",
+          "pending_approvals"
         ],
         "type": "object"
       },
@@ -12936,13 +13579,13 @@
         ],
         "type": "object"
       },
-      "PutRoundingPoliciesRequest": {
+      "PutGlCodesRequest": {
         "description": "The body of a `PUT`: the complete value set, not a patch.",
         "properties": {
           "values": {
             "description": "The whole vocabulary. A value declared today and absent here is\n**retired**, and the retirement is refused while anything names it.",
             "items": {
-              "$ref": "#/components/schemas/RoundingPolicyValueView"
+              "$ref": "#/components/schemas/GlCodeValueView"
             },
             "type": "array"
           }
@@ -12952,13 +13595,13 @@
         ],
         "type": "object"
       },
-      "PutTaxonomyRequest": {
-        "description": "The body of a `PUT`: the complete value set.",
+      "PutRoundingPoliciesRequest": {
+        "description": "The body of a `PUT`: the complete value set, not a patch.",
         "properties": {
           "values": {
-            "description": "The whole taxonomy, not a patch. A value declared today and absent here is\n**retired**.",
+            "description": "The whole vocabulary. A value declared today and absent here is\n**retired**, and the retirement is refused while anything names it.",
             "items": {
-              "$ref": "#/components/schemas/TaxonomyValueView"
+              "$ref": "#/components/schemas/RoundingPolicyValueView"
             },
             "type": "array"
           }
@@ -17259,12 +17902,98 @@
         ],
         "type": "object"
       },
+      "TaxonomyProposedChangesView": {
+        "description": "Authored patch only. Omitted fields mean keep; an explicit category null clears.",
+        "properties": {
+          "display_name": {
+            "description": "Proposed label, without replacing the current value's label.",
+            "type": "string"
+          },
+          "state": {
+            "description": "Proposed `active` or `retired` state.",
+            "type": "string"
+          },
+          "tax_category": {
+            "description": "Region only: absent keeps, null clears, a string sets the category.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tax_rate_present": {
+            "description": "Proposed region rate-readiness marker, including an explicit false.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "TaxonomyValueMutationView": {
+        "description": "What a `PATCH …/values/{value}` answered when it opened a unit rather than\ncommitting (`202`): the outcome token, the verdict the unit records and the\nunit itself. On a commit the route answers the plain value (`200`) instead —\nthe same convergence the membership doors have, where a committed act is\nthe resource and a pending one is the unit.",
+        "properties": {
+          "approval": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ApprovalView",
+                "description": "The unit a second principal decides."
+              }
+            ]
+          },
+          "materiality": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MaterialityView",
+                "description": "The verdict recorded on the unit — always material for this act."
+              }
+            ]
+          },
+          "outcome": {
+            "description": "`submitted_for_approval`.",
+            "type": "string"
+          },
+          "value": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TaxonomyValueView",
+                "description": "`null` while the edit waits for a second principal."
+              }
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "type": "object"
+      },
       "TaxonomyValueView": {
-        "description": "One declared value, as an operator reads and writes it.",
+        "description": "One declared value, as an operator reads it.",
         "properties": {
           "display_name": {
             "description": "The operator's label for it.",
             "type": "string"
+          },
+          "edit_governed": {
+            "description": "D-355: does an edit of this value need a second principal? `true` while a\npublished price row or overlay scope names it.\n\nFilled on both `GET`s and absent everywhere else — a write response omits\nit, because the screen re-reads after a write.\n\n**Advisory, and outside the entity tag.** The tag covers the five\nauthored fields above and nothing else, deliberately: a publish\nelsewhere in the tenant can flip this field, and a tag that moved with it\nwould refuse every in-flight editor of a value they are not changing —\nthe false conflict the per-value routes exist to remove. Two consequences\na client must handle: a conditional read may be answered `304` while this\nfield has since changed, so re-read unconditionally before relying on it;\nand the `PATCH` response (`200` or `202`) is the truth when the two\ndisagree.",
+            "type": "boolean"
+          },
+          "pending_approvals": {
+            "description": "Submitted proposals for this exact class/value, oldest first then by id.\nBoth GETs always include an array (empty when none); writes and pins omit\nit. Metadata is config-read data; each preview additionally requires\napproval-read access to that unit. Outside the authored entity tag:\nrefresh unconditionally to observe submission, withdrawal or permission changes.",
+            "items": {
+              "$ref": "#/components/schemas/PendingTaxonomyApprovalView"
+            },
+            "type": "array"
+          },
+          "references": {
+            "$ref": "#/components/schemas/ValueReferencesView",
+            "description": "The counts behind [`Self::edit_governed`], on both list and by-value\n`GET`s, including explicit zero counts. Absent from write responses and\napproval pins. Outside the entity tag for [`Self::edit_governed`]'s reason."
           },
           "state": {
             "description": "`active` or `retired`. Optional on the way in and defaulting to `active`,\nbecause a body listing a value is a body declaring it; sending\n`\"retired\"` is the explicit spelling of the same act as leaving it out,\nand both are guarded identically.",
@@ -18594,6 +19323,28 @@
           "display_name",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "ValueReferencesView": {
+        "description": "D-355: how many published things resolve through a value — the read-side twin\nof the retire guard's counts, so a UI can show that an edit is governed before\nthe operator makes one.\n\nPresent on both list and by-value GETs, alongside `edit_governed` derived\nfrom these same counts. Write responses and approval pins carry neither.",
+        "properties": {
+          "active_overlay_scopes": {
+            "description": "Published overlay scopes selecting on this `(class, value)`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "published_price_rows": {
+            "description": "Published price rows carrying this value on their `region` axis. Always\nzero outside the `region` class, which is not a price-row axis at all.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "published_price_rows",
+          "active_overlay_scopes"
         ],
         "type": "object"
       },
@@ -25748,18 +26499,9 @@
     },
     "/bss-ledger/v1/accounts": {
       "get": {
-        "description": "Cursor-paginated list of the target tenant's chart-of-accounts entries — each account's persistent id + coordinate — so a caller can resolve the ids it posts to / reads balances for. The target is the `tenant_id` query param (the caller's own tenant by default). Supports OData `$filter` over `account_class`, `currency`, `revenue_stream`, and `lifecycle_state`. Tenant-scoped: the `$filter` ANDs the caller's authorized subtree, so a tenant outside it yields an empty page (no leak, not a 403).",
+        "description": "Cursor-paginated list of the target tenant's chart-of-accounts entries — each account's persistent id + coordinate — so a caller can resolve the ids it posts to / reads balances for. The target is `$filter=tenant_id eq <uuid>` (the caller's own tenant when omitted). Supports OData `$filter` over `tenant_id`, `account_class`, `currency`, `revenue_stream`, and `lifecycle_state`. Tenant-scoped: the `$filter` ANDs the caller's authorized subtree, so a tenant outside it yields an empty page (no leak, not a 403).",
         "operationId": "bss_ledger.list_accounts",
         "parameters": [
-          {
-            "description": "Target tenant whose accounts to list (defaults to the caller's own tenant)",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -25779,9 +26521,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- account_id: eq|ne|in\n- account_class: eq|ne|contains|startswith|endswith|in\n- currency: eq|ne|contains|startswith|endswith|in\n- revenue_stream: eq|ne|contains|startswith|endswith|in\n- lifecycle_state: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- account_id: eq|ne|in\n- account_class: eq|ne|contains|startswith|endswith|in\n- currency: eq|ne|contains|startswith|endswith|in\n- revenue_stream: eq|ne|contains|startswith|endswith|in\n- lifecycle_state: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- account_id asc\n- account_id desc\n- account_class asc\n- account_class desc\n- currency asc\n- currency desc\n- lifecycle_state asc\n- lifecycle_state desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -25887,8 +26638,27 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "account_id asc",
+            "account_id desc",
+            "account_class asc",
+            "account_class desc",
+            "currency asc",
+            "currency desc",
+            "lifecycle_state asc",
+            "lifecycle_state desc"
+          ]
         }
       }
     },
@@ -26677,18 +27447,9 @@
     },
     "/bss-ledger/v1/balances": {
       "get": {
-        "description": "Cursor-paginated list of the account-balance cache rows for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `account_class` and `currency`. The `$filter` ANDs the caller's authorized subtree, so rows outside it are excluded (SQL-level BOLA). Each row carries BOTH the transaction-currency `balance_minor` and the Slice-5 functional valuation (`functional_balance_minor` / `functional_currency`); the latter is `null` on a single-currency grain, where the functional value equals `balance_minor` by identity (`?valuation=functional` fallback, P1 decision 8).",
+        "description": "Cursor-paginated list of the account-balance cache rows for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `account_class` and `currency`. The `$filter` ANDs the caller's authorized subtree, so rows outside it are excluded (SQL-level BOLA). Each row carries BOTH the transaction-currency `balance_minor` and the Slice-5 functional valuation (`functional_balance_minor` / `functional_currency`); the latter is `null` on a single-currency grain, where the functional value equals `balance_minor` by identity (`?valuation=functional` fallback, P1 decision 8).",
         "operationId": "bss_ledger.list_balances",
         "parameters": [
-          {
-            "description": "Target tenant (defaults to the caller's own)",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Valuation lens: `transaction` (default) or `functional`. Both columns are always returned; this selects which the client should read (functional falls back to the transaction balance on a single-currency grain).",
             "in": "query",
@@ -26717,9 +27478,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- account_id: eq|ne|in\n- account_class: eq|ne|contains|startswith|endswith|in\n- currency: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- account_id: eq|ne|in\n- account_class: eq|ne|contains|startswith|endswith|in\n- currency: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- account_id asc\n- account_id desc\n- account_class asc\n- account_class desc\n- currency asc\n- currency desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -26809,8 +27579,25 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "account_id asc",
+            "account_id desc",
+            "account_class asc",
+            "account_class desc",
+            "currency asc",
+            "currency desc"
+          ]
         }
       }
     },
@@ -27067,18 +27854,9 @@
     },
     "/bss-ledger/v1/credit-notes": {
       "get": {
-        "description": "Cursor-paginated list of the recorded credit notes for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `origin_invoice_id`, `revenue_stream`, and `reason_code`. The `$filter` ANDs the caller's authorized subtree, so credit notes outside it are never returned (SQL-level BOLA). Each item is the same `CreditNoteView` the by-id read returns. Mirrors `list_refunds`.",
+        "description": "Cursor-paginated list of the recorded credit notes for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `origin_invoice_id`, `revenue_stream`, and `reason_code`. The `$filter` ANDs the caller's authorized subtree, so credit notes outside it are never returned (SQL-level BOLA). Each item is the same `CreditNoteView` the by-id read returns. Mirrors `list_refunds`.",
         "operationId": "bss_ledger.list_credit_notes",
         "parameters": [
-          {
-            "description": "The credit notes' owning seller tenant (defaults to the caller's own).",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -27098,9 +27876,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- credit_note_id: eq|ne|contains|startswith|endswith|in\n- origin_invoice_id: eq|ne|contains|startswith|endswith|in\n- revenue_stream: eq|ne|contains|startswith|endswith|in\n- reason_code: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- credit_note_id: eq|ne|contains|startswith|endswith|in\n- origin_invoice_id: eq|ne|contains|startswith|endswith|in\n- revenue_stream: eq|ne|contains|startswith|endswith|in\n- reason_code: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- credit_note_id asc\n- credit_note_id desc\n- origin_invoice_id asc\n- origin_invoice_id desc\n- revenue_stream asc\n- revenue_stream desc\n- reason_code asc\n- reason_code desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -27201,8 +27988,27 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "credit_note_id asc",
+            "credit_note_id desc",
+            "origin_invoice_id asc",
+            "origin_invoice_id desc",
+            "revenue_stream asc",
+            "revenue_stream desc",
+            "reason_code asc",
+            "reason_code desc"
+          ]
         }
       },
       "post": {
@@ -27391,18 +28197,9 @@
     },
     "/bss-ledger/v1/debit-notes": {
       "get": {
-        "description": "Cursor-paginated list of the recorded debit notes for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `origin_invoice_id`. The `$filter` ANDs the caller's authorized subtree, so debit notes outside it are never returned (SQL-level BOLA). Each item is the same `DebitNoteView` the by-id read returns. Mirrors `list_credit_notes`.",
+        "description": "Cursor-paginated list of the recorded debit notes for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id` and `origin_invoice_id`. The `$filter` ANDs the caller's authorized subtree, so debit notes outside it are never returned (SQL-level BOLA). Each item is the same `DebitNoteView` the by-id read returns. Mirrors `list_credit_notes`.",
         "operationId": "bss_ledger.list_debit_notes",
         "parameters": [
-          {
-            "description": "The debit notes' owning seller tenant (defaults to the caller's own).",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -27422,9 +28219,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- debit_note_id: eq|ne|contains|startswith|endswith|in\n- origin_invoice_id: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- debit_note_id: eq|ne|contains|startswith|endswith|in\n- origin_invoice_id: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- debit_note_id asc\n- debit_note_id desc\n- origin_invoice_id asc\n- origin_invoice_id desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -27509,8 +28315,23 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "debit_note_id asc",
+            "debit_note_id desc",
+            "origin_invoice_id asc",
+            "origin_invoice_id desc"
+          ]
         }
       },
       "post": {
@@ -27699,18 +28520,9 @@
     },
     "/bss-ledger/v1/disputes": {
       "get": {
-        "description": "Cursor-paginated list of the recorded chargeback disputes for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `payment_id`, `last_phase`, and `variant`. The `$filter` ANDs the caller's authorized subtree, so disputes outside it are never returned (SQL-level BOLA). Each item is the same `DisputeView` the by-id read returns. Mirrors `list_refunds`.",
+        "description": "Cursor-paginated list of the recorded chargeback disputes for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `payment_id`, `last_phase`, and `variant`. The `$filter` ANDs the caller's authorized subtree, so disputes outside it are never returned (SQL-level BOLA). Each item is the same `DisputeView` the by-id read returns. Mirrors `list_refunds`.",
         "operationId": "bss_ledger.list_disputes",
         "parameters": [
-          {
-            "description": "The disputes' owning seller tenant (defaults to the caller's own).",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -27730,9 +28542,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- dispute_id: eq|ne|contains|startswith|endswith|in\n- payment_id: eq|ne|contains|startswith|endswith|in\n- last_phase: eq|ne|contains|startswith|endswith|in\n- variant: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- dispute_id: eq|ne|contains|startswith|endswith|in\n- payment_id: eq|ne|contains|startswith|endswith|in\n- last_phase: eq|ne|contains|startswith|endswith|in\n- variant: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- dispute_id asc\n- dispute_id desc\n- payment_id asc\n- payment_id desc\n- last_phase asc\n- last_phase desc\n- variant asc\n- variant desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -27826,6 +28647,11 @@
               "endswith",
               "in"
             ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
             "variant": [
               "eq",
               "ne",
@@ -27835,6 +28661,20 @@
               "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "dispute_id asc",
+            "dispute_id desc",
+            "payment_id asc",
+            "payment_id desc",
+            "last_phase asc",
+            "last_phase desc",
+            "variant asc",
+            "variant desc"
+          ]
         }
       }
     },
@@ -28190,7 +29030,7 @@
     },
     "/bss-ledger/v1/exceptions": {
       "get": {
-        "description": "Cursor-paginated list of the caller tenant's exception-queue rows (the Revenue Assurance dashboard / queue). Supports OData `$filter` over `type` (e.g. RECON_MISMATCH), `status` (OPEN / ACK / RESOLVED / APPROVED_EXCEPTION), `business_ref`, and `period_id`. The `$filter` ANDs the caller's authorized subtree, so exceptions outside it are never returned (SQL-level BOLA). Each item is the same `ExceptionView`.",
+        "description": "Cursor-paginated list of exception-queue rows (the Revenue Assurance dashboard / queue) for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `type` (e.g. RECON_MISMATCH), `status` (OPEN / ACK / RESOLVED / APPROVED_EXCEPTION), `business_ref`, and `period_id`. The `$filter` ANDs the caller's authorized subtree, so exceptions outside it are never returned (SQL-level BOLA). Each item is the same `ExceptionView`.",
         "operationId": "bss_ledger.list_exceptions",
         "parameters": [
           {
@@ -28212,9 +29052,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- exception_id: eq|ne|in\n- type: eq|ne|contains|startswith|endswith|in\n- status: eq|ne|contains|startswith|endswith|in\n- business_ref: eq|ne|contains|startswith|endswith|in\n- period_id: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- exception_id: eq|ne|in\n- type: eq|ne|contains|startswith|endswith|in\n- status: eq|ne|contains|startswith|endswith|in\n- business_ref: eq|ne|contains|startswith|endswith|in\n- period_id: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- exception_id asc\n- exception_id desc\n- type asc\n- type desc\n- status asc\n- status desc\n- business_ref asc\n- business_ref desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -28313,6 +29162,11 @@
               "endswith",
               "in"
             ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
             "type": [
               "eq",
               "ne",
@@ -28322,6 +29176,20 @@
               "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "exception_id asc",
+            "exception_id desc",
+            "type asc",
+            "type desc",
+            "status asc",
+            "status desc",
+            "business_ref asc",
+            "business_ref desc"
+          ]
         }
       }
     },
@@ -28920,18 +29788,9 @@
     },
     "/bss-ledger/v1/journal-entries": {
       "get": {
-        "description": "Cursor-paginated list of journal entry HEADERS for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `source_doc_type`, `source_business_id`, and `period_id` — the header-only dims that enable cross-cuts like \"all `MANUAL_ADJUSTMENT` entries\" or \"all `REFUND` / `CREDIT_NOTE` entries\" (these live on the entry HEADER, not on `journal_line`). Each item is a lightweight `EntryHeaderView` (NO lines, NO hash-chain fields); read the full entry with its lines via `GET /journal-entries/{entryId}`. The `$filter` ANDs the caller's authorized subtree, so headers outside it are never returned (SQL-level BOLA).",
+        "description": "Cursor-paginated list of journal entry HEADERS for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `source_doc_type`, `source_business_id`, and `period_id` — the header-only dims that enable cross-cuts like \"all `MANUAL_ADJUSTMENT` entries\" or \"all `REFUND` / `CREDIT_NOTE` entries\" (these live on the entry HEADER, not on `journal_line`). Each item is a lightweight `EntryHeaderView` (NO lines, NO hash-chain fields); read the full entry with its lines via `GET /journal-entries/{entryId}`. The `$filter` ANDs the caller's authorized subtree, so headers outside it are never returned (SQL-level BOLA).",
         "operationId": "bss_ledger.list_journal_entries",
         "parameters": [
-          {
-            "description": "Target tenant (defaults to the caller's own)",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -28951,9 +29810,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- entry_id: eq|ne|in\n- source_doc_type: eq|ne|contains|startswith|endswith|in\n- source_business_id: eq|ne|contains|startswith|endswith|in\n- period_id: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- entry_id: eq|ne|in\n- source_doc_type: eq|ne|contains|startswith|endswith|in\n- source_business_id: eq|ne|contains|startswith|endswith|in\n- period_id: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- entry_id asc\n- entry_id desc\n- source_doc_type asc\n- source_doc_type desc\n- source_business_id asc\n- source_business_id desc\n- period_id asc\n- period_id desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -29051,8 +29919,27 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "entry_id asc",
+            "entry_id desc",
+            "source_doc_type asc",
+            "source_doc_type desc",
+            "source_business_id asc",
+            "source_business_id desc",
+            "period_id asc",
+            "period_id desc"
+          ]
         }
       },
       "post": {
@@ -29508,18 +30395,9 @@
     },
     "/bss-ledger/v1/journal-lines": {
       "get": {
-        "description": "Cursor-paginated list of journal lines for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `payer_tenant_id`, `account_class`, `period_id`, and `invoice_id`. The `$filter` ANDs the caller's authorized subtree, so rows outside it are never returned (SQL-level BOLA).",
+        "description": "Cursor-paginated list of journal lines for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `payer_tenant_id`, `account_class`, `period_id`, and `invoice_id`. The `$filter` ANDs the caller's authorized subtree, so rows outside it are never returned (SQL-level BOLA).",
         "operationId": "bss_ledger.list_lines",
         "parameters": [
-          {
-            "description": "Target tenant (defaults to the caller's own)",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -29539,9 +30417,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- line_id: eq|ne|in\n- payer_tenant_id: eq|ne|in\n- account_class: eq|ne|contains|startswith|endswith|in\n- period_id: eq|ne|contains|startswith|endswith|in\n- invoice_id: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- line_id: eq|ne|in\n- payer_tenant_id: eq|ne|in\n- account_class: eq|ne|contains|startswith|endswith|in\n- period_id: eq|ne|contains|startswith|endswith|in\n- invoice_id: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- line_id asc\n- line_id desc\n- payer_tenant_id asc\n- payer_tenant_id desc\n- account_class asc\n- account_class desc\n- period_id asc\n- period_id desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -29644,8 +30531,27 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "line_id asc",
+            "line_id desc",
+            "payer_tenant_id asc",
+            "payer_tenant_id desc",
+            "account_class asc",
+            "account_class desc",
+            "period_id asc",
+            "period_id desc"
+          ]
         }
       }
     },
@@ -31590,18 +32496,9 @@
     },
     "/bss-ledger/v1/recognition-runs": {
       "get": {
-        "description": "Cursor-paginated list of the recorded recognition runs for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `run_id`, `period_id`, and `status`. The `$filter` ANDs the caller's authorized subtree, so runs outside it are never returned (SQL-level BOLA). Each item is the same `RecognitionRunView` the by-id read returns. Mirrors `list_disputes`.",
+        "description": "Cursor-paginated list of the recorded recognition runs for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `run_id`, `period_id`, and `status`. The `$filter` ANDs the caller's authorized subtree, so runs outside it are never returned (SQL-level BOLA). Each item is the same `RecognitionRunView` the by-id read returns. Mirrors `list_disputes`.",
         "operationId": "bss_ledger.list_recognition_runs",
         "parameters": [
-          {
-            "description": "The runs' owning seller tenant (defaults to the caller's own).",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -31621,9 +32518,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- run_id: eq|ne|in\n- period_id: eq|ne|contains|startswith|endswith|in\n- status: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- run_id: eq|ne|in\n- period_id: eq|ne|contains|startswith|endswith|in\n- status: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- run_id asc\n- run_id desc\n- period_id asc\n- period_id desc\n- status asc\n- status desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -31713,8 +32619,25 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "run_id asc",
+            "run_id desc",
+            "period_id asc",
+            "period_id desc",
+            "status asc",
+            "status desc"
+          ]
         }
       },
       "post": {
@@ -32273,18 +33196,9 @@
     },
     "/bss-ledger/v1/refunds": {
       "get": {
-        "description": "Cursor-paginated list of the recorded refunds for the `tenant_id` query (the caller's own by default). Supports OData `$filter` over `payment_id`, `psp_refund_id`, `phase`, `pattern`, `clearing_state`, and `invoice_id`. The `$filter` ANDs the caller's authorized subtree, so refunds outside it are never returned (SQL-level BOLA). Each item is the same `RefundView` the by-id read returns.",
+        "description": "Cursor-paginated list of the recorded refunds for the seller named by `$filter=tenant_id eq <uuid>` (the caller's own by default). Supports OData `$filter` over `tenant_id`, `payment_id`, `psp_refund_id`, `phase`, `pattern`, `clearing_state`, and `invoice_id`. The `$filter` ANDs the caller's authorized subtree, so refunds outside it are never returned (SQL-level BOLA). Each item is the same `RefundView` the by-id read returns.",
         "operationId": "bss_ledger.list_refunds",
         "parameters": [
-          {
-            "description": "The refunds' owning seller tenant (defaults to the caller's own).",
-            "in": "query",
-            "name": "tenant_id",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
           {
             "description": "Maximum items per page (default 25, max 200)",
             "in": "query",
@@ -32304,9 +33218,18 @@
             }
           },
           {
-            "description": "OData v4 filter expression\n- refund_id: eq|ne|contains|startswith|endswith|in\n- payment_id: eq|ne|contains|startswith|endswith|in\n- psp_refund_id: eq|ne|contains|startswith|endswith|in\n- phase: eq|ne|contains|startswith|endswith|in\n- pattern: eq|ne|contains|startswith|endswith|in\n- clearing_state: eq|ne|contains|startswith|endswith|in\n- invoice_id: eq|ne|contains|startswith|endswith|in",
+            "description": "OData v4 filter expression\n- tenant_id: eq|ne|in\n- refund_id: eq|ne|contains|startswith|endswith|in\n- payment_id: eq|ne|contains|startswith|endswith|in\n- psp_refund_id: eq|ne|contains|startswith|endswith|in\n- phase: eq|ne|contains|startswith|endswith|in\n- pattern: eq|ne|contains|startswith|endswith|in\n- clearing_state: eq|ne|contains|startswith|endswith|in\n- invoice_id: eq|ne|contains|startswith|endswith|in",
             "in": "query",
             "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- tenant_id asc\n- tenant_id desc\n- refund_id asc\n- refund_id desc\n- payment_id asc\n- payment_id desc\n- psp_refund_id asc\n- psp_refund_id desc\n- phase asc\n- phase desc\n- pattern asc\n- pattern desc\n- clearing_state asc\n- clearing_state desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -32431,8 +33354,31 @@
               "startswith",
               "endswith",
               "in"
+            ],
+            "tenant_id": [
+              "eq",
+              "ne",
+              "in"
             ]
           }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "tenant_id asc",
+            "tenant_id desc",
+            "refund_id asc",
+            "refund_id desc",
+            "payment_id asc",
+            "payment_id desc",
+            "psp_refund_id asc",
+            "psp_refund_id desc",
+            "phase asc",
+            "phase desc",
+            "pattern asc",
+            "pattern desc",
+            "clearing_state asc",
+            "clearing_state desc"
+          ]
         }
       },
       "post": {
@@ -32718,7 +33664,7 @@
     },
     "/bss-pricing/v1/approvals": {
       "get": {
-        "description": "One page of the tenant's approval records, in `approval_id` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). `state` narrows the page to one of `submitted`, `approved`, `rejected` or `voided`; omitting it returns every state, which is what a reviewer's queue over pending **and** decided units asks for. The pinned content is **not** on this page - a page of a hundred units would be a hundred plan assemblies - so a reviewer opens `GET /bss-pricing/v1/approvals/{approvalId}` before deciding, which is the surface D-61's reviewability invariant binds.",
+        "description": "One page of the tenant's approval records, in `approval_id` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Narrow with `$filter=state eq 'submitted'` (or `approved` / `rejected` / `voided`); omitting `$filter` returns every state, which is what a reviewer's queue over pending **and** decided units asks for. The pinned content is **not** on this page - a page of a hundred units would be a hundred plan assemblies - so a reviewer opens `GET /bss-pricing/v1/approvals/{approvalId}` before deciding, which is the surface D-61's reviewability invariant binds.",
         "operationId": "bss_pricing.list_approvals",
         "parameters": [
           {
@@ -32740,9 +33686,18 @@
             }
           },
           {
-            "description": "submitted | approved | rejected | voided; absent is every state",
+            "description": "OData v4 filter expression\n- state: eq|ne|contains|startswith|endswith|in\n- approval_id: eq|ne|in",
             "in": "query",
-            "name": "state",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- state asc\n- state desc\n- approval_id asc\n- approval_id desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -32754,11 +33709,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Page_ApprovalView"
+                  "$ref": "#/components/schemas/Page_ApprovalReadView"
                 }
               }
             },
-            "description": "One page of the tenant's approval units."
+            "description": "One page of the tenant's approval units, with live AM/IdP participant names. Profile access is separately authorized by AM; unresolved names have explicit name_status. Cache-Control: private, no-store."
           },
           "400": {
             "content": {
@@ -32819,12 +33774,114 @@
         "summary": "List the tenant's approval units (cursor-paginated)",
         "tags": [
           "BSS Pricing Approvals"
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "approval_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "state": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "state asc",
+            "state desc",
+            "approval_id asc",
+            "approval_id desc"
+          ]
+        }
+      }
+    },
+    "/bss-pricing/v1/approvals/counts": {
+      "get": {
+        "description": "Totals over the whole approval-read scope, including resource ID restrictions. No filtering or pagination parameters. Withdrawn units count as voided. No participant profile lookup. Cache-Control: private, no-store.",
+        "operationId": "bss_pricing.count_approvals",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalCountsView"
+                }
+              }
+            },
+            "description": "State totals"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Count visible approval units by state",
+        "tags": [
+          "BSS Pricing Approvals"
         ]
       }
     },
     "/bss-pricing/v1/approvals/{approvalId}": {
       "get": {
-        "description": "Returns the record **and the pinned content** - D-61's reviewability invariant, which exists because deny-by-default otherwise turns the two-person rule into a hash-blind signature: an approver who cannot read the subject resource can still read what they are approving here. `pinned_content` carries exactly the fields the content hash covers, and `content_matches_pin` says whether the subject as it stands still digests to the pin. A record outside the caller's scope reads exactly like an absent one (404, no existence leak) - what a pending unit tells an observer is that a price change is in flight.",
+        "description": "Returns the record **and the pinned content** - D-61's reviewability invariant, which exists because deny-by-default otherwise turns the two-person rule into a hash-blind signature: an approver who cannot read the subject resource can still read what they are approving here. `pinned_content` carries exactly the fields the content hash covers, and `content_matches_pin` says whether the subject as it stands still digests to the pin. A record outside the caller's scope reads exactly like an absent one (404, no existence leak) - what a pending unit tells an observer is that a price change is in flight. `approval.submitter` and `approval.approver` project current AM/IdP names under the caller's profile-read rights, with explicit name_status on failure. Names are not pinned or stored in Pricing. Cache-Control: private, no-store.",
         "operationId": "bss_pricing.get_approval",
         "parameters": [
           {
@@ -32922,7 +33979,7 @@
     },
     "/bss-pricing/v1/approvals/{approvalId}/approve": {
       "post": {
-        "description": "Moves a `submitted` unit to `approved` (`inst-as-approve`). The submitter may not be the approver - identity, never role, so one human holding both `plan x publish` and `approval x approve` is still refused `SELF_APPROVAL_FORBIDDEN` (403), and the attempt is written to the audit trail as a `deny` record before the refusal is returned (`inst-tp-selfaudit`). The pinned content hash is re-verified against the subject as it now stands; a mismatch is `APPROVAL_CONTENT_MISMATCH` (409) - a reviewer can only ever approve exactly what they saw. A record that has already been decided or voided is `APPROVAL_NOT_PENDING` (409). The decision needs no precondition header: the store's compare-and-swap carries `state = 'submitted'`, so the second arrival is refused whether it is a retry or a race. Approving does not publish; `POST /bss-pricing/v1/plans/{planId}/publish` does, and it re-verifies the pin again at the commit.",
+        "description": "Moves a `submitted` unit to `approved` (`inst-as-approve`). The submitter may not be the approver - identity, never role, so one human holding both `plan x publish` and `approval x approve` is still refused `SELF_APPROVAL_FORBIDDEN` (403), and the attempt is written to the audit trail as a `deny` record before the refusal is returned (`inst-tp-selfaudit`). The pinned content hash is re-verified against the subject as it now stands; a mismatch is `APPROVAL_CONTENT_MISMATCH` (409) - a reviewer can only ever approve exactly what they saw. A record that has already been decided or voided is `APPROVAL_NOT_PENDING` (409). The decision needs no precondition header: the store's compare-and-swap carries `state = 'submitted'`, so the second arrival is refused whether it is a retry or a race. For a `taxonomy_value` unit, approval also applies the pinned patch and its audit in this transaction: a stale pin or failed domain guard rolls back the decision. No second PATCH or additional `config x write` role is required. Plan approvals still do not publish; `POST /bss-pricing/v1/plans/{planId}/publish` does and re-verifies the pin at commit.",
         "operationId": "bss_pricing.approve_approval",
         "parameters": [
           {
@@ -33268,7 +34325,7 @@
     },
     "/bss-pricing/v1/audit": {
       "get": {
-        "description": "Returns the tenant's audit trail in commit order, oldest first: every append-only `pricing_audit_log` record with the pseudonymous principal who acted, the instant, the before and after states, the approval record the mutation ran under and the correlation id of the request that caused it. Denied attempts are records like any other - a self-approval refused is a `deny` record naming the approval it was attempted on, which is where an operator recovers the detail the 403 does not carry. Ordered by `(recorded_at, chain_id, seq)`, the cursor's own key: `seq` counts within a chain segment (D-135), never across the tenant. Paginated on an opaque cursor per D-125, with a server default page size and a hard cap. **Auditor-only**: gates on `audit` x `read` (D-12), which carries no read of live pricing and no write authority. Two things this surface does not do: it declares no filters, and it is not the export - `audit` x `export` is a second permission for a chunked shape, which `POST /bss-pricing/v1/history/export` is the gear's one holder of.",
+        "description": "Returns the tenant's audit trail in commit order, oldest first: every append-only `pricing_audit_log` record with the pseudonymous principal who acted, the instant, the before and after states, the approval record the mutation ran under and the correlation id of the request that caused it. Denied attempts are records like any other - a self-approval refused is a `deny` record naming the approval it was attempted on, which is where an operator recovers the detail the 403 does not carry. Ordered by `(recorded_at, chain_id, seq)`, the cursor's own key: `seq` counts within a chain segment (D-135), never across the tenant. Paginated on an opaque cursor per D-125, with a server default page size and a hard cap. **Auditor-only**: gates on `audit` x `read` (D-12), which carries no read of live pricing and no write authority. `$filter` and `$orderby` are the AM list contract. This surface is not the export - `audit` x `export` is a second permission for a chunked shape, which `POST /bss-pricing/v1/history/export` is the gear's one holder of.",
         "operationId": "bss_pricing.read_audit_trail",
         "parameters": [
           {
@@ -33281,9 +34338,27 @@
             }
           },
           {
-            "description": "The opaque token the previous page returned as `next_cursor`. Opaque by contract: a token a caller can read is a token a caller will construct, and then the walk's ordering guarantee is whatever that caller assumed.",
+            "description": "The opaque token this same operation returned as `next_cursor`. GET history and GET audit mint an OData CursorV1; POST history/export mints the history-engine token. The two encodings are not interchangeable.",
             "in": "query",
             "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- chain_id: eq|ne|in\n- seq: eq|ne|gt|ge|lt|le|in\n- entry_kind: eq|ne|contains|startswith|endswith|in\n- recorded_at: eq|ne|gt|ge|lt|le|in\n- actor_principal_id: eq|ne|in\n- action: eq|ne|contains|startswith|endswith|in\n- subject_kind: eq|ne|contains|startswith|endswith|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- chain_id asc\n- chain_id desc\n- seq asc\n- seq desc\n- recorded_at asc\n- recorded_at desc\n- subject_kind asc\n- subject_kind desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -33360,7 +34435,75 @@
         "summary": "Read the immutable audit trail",
         "tags": [
           "BSS Pricing Audit"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "action": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "actor_principal_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "chain_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "entry_kind": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "recorded_at": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "seq": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "subject_kind": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "chain_id asc",
+            "chain_id desc",
+            "seq asc",
+            "seq desc",
+            "recorded_at asc",
+            "recorded_at desc",
+            "subject_kind asc",
+            "subject_kind desc"
+          ]
+        }
       }
     },
     "/bss-pricing/v1/bulk-imports": {
@@ -33679,7 +34822,7 @@
     },
     "/bss-pricing/v1/bundles": {
       "get": {
-        "description": "One page of the tenant's bundles in `bundleId` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). `plan_id` narrows the page to the bundle riding one plan, which a plan carries at most one of. There is no `lifecycle_state` filter: a bundle row is an identity and its composition is revision-scoped, so a bundle's state is its plan revision's state and belongs to the plan surface. The composition is **not** on this page - a bundle's components and revenue shares are three further queries each - so a caller opens `GET /bss-pricing/v1/bundles/{bundleId}` for one bundle's composition. Gates on `bundle` x `read`, which is the pair the by-id read already asks for.",
+        "description": "One page of the tenant's bundles in `bundle_id` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Narrow with `$filter=plan_id eq <uuid>` to the bundle riding one plan, which a plan carries at most one of. There is no `lifecycle_state` filter: a bundle row is an identity and its composition is revision-scoped, so a bundle's state is its plan revision's state and belongs to the plan surface. The composition is **not** on this page - a bundle's components and revenue shares are three further queries each - so a caller opens `GET /bss-pricing/v1/bundles/{bundleId}` for one bundle's composition. Gates on `bundle` x `read`, which is the pair the by-id read already asks for.",
         "operationId": "bss_pricing.list_bundles",
         "parameters": [
           {
@@ -33701,9 +34844,18 @@
             }
           },
           {
-            "description": "Narrow the page to one plan's bundle",
+            "description": "OData v4 filter expression\n- plan_id: eq|ne|in\n- bundle_id: eq|ne|in",
             "in": "query",
-            "name": "plan_id",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- plan_id asc\n- plan_id desc\n- bundle_id asc\n- bundle_id desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -33780,7 +34932,29 @@
         "summary": "List the tenant's bundles (cursor-paginated)",
         "tags": [
           "BSS Pricing Bundles"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "bundle_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "plan_id": [
+              "eq",
+              "ne",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "plan_id asc",
+            "plan_id desc",
+            "bundle_id asc",
+            "bundle_id desc"
+          ]
+        }
       },
       "post": {
         "description": "Declares a `bundle`-type plan's price basis (`sum_of_parts` or `own_price`) and its invoice itemization. The composition itself is authored through `PATCH /bss-pricing/v1/bundles/{bundleId}`, which is where it becomes revision-scoped. A plan carries at most one bundle. An absent `price_basis` is refused `BASIS_MISSING` (`inst-bb-declared`). A `plan_id` naming no plan the caller can read is `404` - a plan in another tenant answers exactly as an absent one does, so the refusal confirms nothing about a catalog the caller cannot see. **`Idempotency-Key` is required and is honoured**: a retry under the same key replays the first call's `201` and its bundle id rather than creating or refusing anything, and the same key carrying a different request is `409` `IDEMPOTENCY_PAYLOAD_MISMATCH`. Gates on `bundle` x `write`.",
@@ -34319,6 +35493,104 @@
         ]
       }
     },
+    "/bss-pricing/v1/catalog-version/refs/{pendingRef}": {
+      "get": {
+        "description": "Returns every subject row this tenant recorded against the registry handle a publish receipt carried (`pending_version_ref`). One handle is one assignment and may project one, two or three subjects (D-234). `status` is `pending` (registry has not answered), `commit_observed` (version known, finalize not landed) or `committed` (the row carries `catalog_version`). This is not the pin-eligibility frontier: a caller asking whether *this* publish committed must not poll `GET /catalog-version/frontier`. An unknown handle, or one outside the caller's scope, is 404. Gates on `plan` x `read`.",
+        "operationId": "bss_pricing.get_catalog_version_ref",
+        "parameters": [
+          {
+            "description": "The registry handle the publish receipt named.",
+            "in": "path",
+            "name": "pendingRef",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogVersionRefView"
+                }
+              }
+            },
+            "description": "The handle and every subject row recorded against it."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read one pending CatalogVersion handle",
+        "tags": [
+          "BSS Pricing Catalog Version"
+        ]
+      }
+    },
     "/bss-pricing/v1/catalog/skus": {
       "get": {
         "description": "A pass-through of the Product & SKU registry's browse list, for the pick-lists that author a price row's meter or bind a plan's `skuId`. This gear validates nothing against it: a meter and a `skuId` are taken as given, and filtering here would imply a constraint publish does not enforce. **Read `source` before `items`**: `unconfigured` with no items means no registry was asked, which is not the same fact as a tenant that sells nothing. A registry that is configured and fails answers 503 instead. Gates on `config` x `read`.",
@@ -34381,6 +35653,83 @@
           }
         ],
         "summary": "The SKUs this tenant may price",
+        "tags": [
+          "BSS Pricing"
+        ]
+      }
+    },
+    "/bss-pricing/v1/catalog/tax-categories": {
+      "get": {
+        "description": "Read-only codes and display names for a price row's `tax_category_ref`. Definitions belong to Product Catalog; rates and tax rules do not. `source` distinguishes the explicitly enabled `local_dev_static` demo from `registry`. No CRUD, SKU/region assignment or automatic dev fallback. An unconfigured provider answers 501; an unavailable one answers 503. Gates on `config` x `read`.",
+        "operationId": "bss_pricing.list_catalog_tax_categories",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogTaxCategoriesView"
+                }
+              }
+            },
+            "description": "Definitions and their source."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "501": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "No product catalog configured"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Tax-category definitions from Product Catalog",
         "tags": [
           "BSS Pricing"
         ]
@@ -34571,6 +35920,194 @@
         "summary": "Propose the tenant's approval-threshold policy",
         "tags": [
           "BSS Pricing Governance"
+        ]
+      }
+    },
+    "/bss-pricing/v1/config/gl-codes": {
+      "get": {
+        "description": "The vocabulary a plan's billing-descriptor `glCode` is validated against at publish (D-356). **An empty set constrains nothing** - that is where every tenant starts, and declaring the first value is how a tenant opts in. Retired values are included, because an operator editing the set has to see what they may re-activate. Gates on `config` x `read`.",
+        "operationId": "bss_pricing.get_gl_codes",
+        "parameters": [
+          {
+            "description": "Optional conditional-read precondition (RFC 9110). Send the `ETag` this route last answered; if it still names the current representation the answer is `304` with the tag and no body. The wildcard `*` and a comma-separated list are both accepted, and comparison is weak, per RFC 9110 section 13.1.2 - deliberately laxer than this gear's `If-Match`, where a wildcard would be an unconditional write.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlCodesView"
+                }
+              }
+            },
+            "description": "The declared vocabulary."
+          },
+          "304": {
+            "description": "The caller's `If-None-Match` matches the current representation, so the body is not re-sent."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read the tenant's declared GL codes",
+        "tags": [
+          "BSS Pricing Configuration"
+        ]
+      },
+      "put": {
+        "description": "Replaces the **whole** set. A value declared today and absent from the body is retired, not deleted: a published plan revision's descriptor set may still name it, and a deletion would make that reference dangle rather than merely stop being authorable. A retirement is refused with `TAXONOMY_VALUE_IN_USE` (409) while a published revision's descriptor set still names the value, and **nothing at all is written** - re-point them first. Declaring the first value turns the publish check on: from then on a plan whose descriptor `glCode` is outside the active set fails publish with `GL_CODE_UNKNOWN`. Clearing the set turns it off again. It is audited, and opens no approval unit. **`If-Match` is required.** Gates on `config` x `write`.",
+        "operationId": "bss_pricing.put_gl_codes",
+        "parameters": [
+          {
+            "description": "Mandatory precondition (RFC 9110). Send the opaque tag the `GET` returned, verbatim. A tenant that has declared nothing is answered `200` with an empty set and carries a tag, so a first `PUT` asserts it like any other. A tag that no longer describes the stored set is `409` `STALE_VERSION` and nothing is written - a `PUT` replaces the whole set, so applying yours over a moved one would retire whatever the other author added.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutGlCodesRequest"
+              }
+            }
+          },
+          "description": "The complete value set.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GlCodesView"
+                }
+              }
+            },
+            "description": "The vocabulary as it now stands."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Replace the tenant's declared GL codes",
+        "tags": [
+          "BSS Pricing Configuration"
         ]
       }
     },
@@ -35140,7 +36677,7 @@
     },
     "/bss-pricing/v1/config/taxonomies/{class}": {
       "get": {
-        "description": "Every value the tenant has declared in this universe, `active` and `retired` alike, ordered by value. Retirements are included deliberately: retirement is guarded rather than cascading and `retired -> active` is a legal audited move, so an operator editing this list has to be able to see the value they are about to re-activate. A tenant that has declared nothing is answered `200` with an empty list - that is a state, not an absent resource, and it is a fail-closed one: `inst-tx-region` validates every price row's region against the **active** values here, so a tenant with none publishes no rows at all. **The response carries the `ETag` the `PUT` demands**, and this is the only place to obtain one. On the `region` universe each value also carries D-01's two markers, `taxCategory` and `taxRatePresent`, which are the MVP source for the tax-display readiness check; the other three universes carry no such columns. Gates on `config` x `read`.",
+        "description": "Every value the tenant has declared in this universe, `active` and `retired` alike, ordered by value. Retirements are included deliberately: retirement is guarded rather than cascading and `retired -> active` is a legal audited move, so an operator editing this list has to be able to see the value they are about to re-activate. A tenant that has declared nothing is answered `200` with an empty list on the brand, partner and org_tier universes - a state, not an absent resource. The **region** universe is never empty: until the tenant declares a region row it reads as the seeded `global` (D-354), so a fresh tenant publishes `global` rows at once; `inst-tx-region` validates every price row's region against the **active** values here. The response carries the set's authored-content `ETag`; the per-value routes carry their own write token. On the `region` universe each value also carries D-01's two markers, `taxCategory` and `taxRatePresent`, which are the MVP source for the tax-display readiness check; the other three universes carry no such columns. Each value also carries `edit_governed` and `references` (published price-row and overlay-scope counts), including explicit zeroes, matching the by-value GET without extra queries. `pending_approvals` lists every submitted proposal for each value, or []. Each unit exposes pending metadata and `content_access`; `proposed_changes` and `content_matches_pin` appear only when the full `approval` x `read` scope grants that unit. Restricted content does not hide the pending unit. Tags cover authored content only, preserving write preconditions independently of references and pending units. This GET always returns a fresh body with `Cache-Control: private, no-store`; it does not evaluate `If-None-Match` or return `304`. Gates on `config` x `read`.",
         "operationId": "bss_pricing.get_taxonomy",
         "parameters": [
           {
@@ -35148,15 +36685,6 @@
             "in": "path",
             "name": "class",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Optional conditional-read precondition (RFC 9110). Send the `ETag` this route last answered; if it still names the current representation the answer is `304` with the tag and no body. The wildcard `*` and a comma-separated list are both accepted, and comparison is weak, per RFC 9110 section 13.1.2 - deliberately laxer than this gear's `If-Match`, where a wildcard would be an unconditional write.",
-            "in": "header",
-            "name": "If-None-Match",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -35172,9 +36700,6 @@
               }
             },
             "description": "The declared values of this universe."
-          },
-          "304": {
-            "description": "The caller's `If-None-Match` matches the current representation, so the body is not re-sent."
           },
           "400": {
             "content": {
@@ -35236,24 +36761,17 @@
         "tags": [
           "BSS Pricing Configuration"
         ]
-      },
-      "put": {
-        "description": "The body is the **whole** taxonomy, not a patch. A value listed here is declared (and re-activated if it was retired); a value the tenant holds today and this body omits is **retired** - never deleted, because a value a published price row or a published overlay scope still names has to keep existing. Sending a value with `state: \"retired\"` is the explicit spelling of the same act, and the two are guarded identically. **Retirement is guarded** (`inst-tx-mutation`): a value still named by a published price row on its region axis, or by a published `PriceOverlay` scoped to this class and value, cannot retire - the response is `409` `TAXONOMY_VALUE_IN_USE` naming both counts, and **nothing at all is written**, so the taxonomy an operator re-authors against is the one they had. One transaction, one verdict: there is no partial application. Draft rows and draft overlays do not block, and neither does history - a superseded row keeps naming its region and counting it would refuse the retirement of every region a tenant ever repriced. The whole call is one audited config mutation, however many values it moved. `taxCategory` and `taxRatePresent` are accepted on the `region` universe only and refused elsewhere. **`If-Match` is required**: send the opaque `ETag` the `GET` returned. Gates on `config` x `write`.",
-        "operationId": "bss_pricing.put_taxonomy",
+      }
+    },
+    "/bss-pricing/v1/config/taxonomies/{class}/values": {
+      "post": {
+        "description": "Adds **one** value to the class without re-sending the set (D-353). `201` with the value as stored, its own `ETag`, and a `Location` naming it. The value is the resource's natural key, so there is no `Idempotency-Key`: a repeat carrying the **same** body is the create's replay and answers `200`; a body naming a value the tenant already declares with other content - or a retired one - is `409` `TAXONOMY_VALUE_EXISTS`, and the remedy is `PATCH` on that value. `state` defaults to `active`; `taxCategory` and `taxRatePresent` are accepted on the `region` universe only and refused elsewhere. One audited config mutation naming the value. Gates on `config` x `write`.",
+        "operationId": "bss_pricing.declare_taxonomy_value",
         "parameters": [
           {
             "description": "Which value universe: `region`, `brand`, `partner` or `org_tier`. Each segment is the same token the class carries in an overlay's `scopeClass` field, so a generated client has one name per class (D-241); the camelCase `orgTier` section 5 used to spell is refused rather than accepted as an alias. `global` and `customerGroup` are deliberately not addressable: the first has no value universe, and the second's table belongs to the customer-group membership half and does not exist.",
             "in": "path",
             "name": "class",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Mandatory precondition (RFC 9110), and section 5's `ETag` cell for this row. The value is the **opaque** tag the `GET` returns in its `ETag` header - copy it back verbatim. It is not a row version: a taxonomy is a value set with no version column, so the tag is a digest over the representation the `GET` serves - the class, and every value's code, state and label. It therefore moves when a value is added, retired, re-activated or re-labelled. A tenant with no values at all is answered `200` with an empty list and carries a tag, so a first `PUT` asserts it like any other. It matters here more than on most rows because this `PUT` replaces the **whole** set: without it, two admins who each add one value would leave a taxonomy carrying one addition and silently retiring the other's. A tag that no longer describes the taxonomy is `409` `STALE_VERSION`; an absent or malformed one is `400`. Weak validators, the wildcard `*` and tag lists are all refused.",
-            "in": "header",
-            "name": "If-Match",
             "required": true,
             "schema": {
               "type": "string"
@@ -35264,11 +36782,11 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PutTaxonomyRequest"
+                "$ref": "#/components/schemas/DeclareTaxonomyValueRequest"
               }
             }
           },
-          "description": "The complete value set for this universe.",
+          "description": "The one value to declare.",
           "required": true
         },
         "responses": {
@@ -35276,11 +36794,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/TaxonomyView"
+                  "$ref": "#/components/schemas/TaxonomyValueView"
                 }
               }
             },
-            "description": "The taxonomy as it now stands."
+            "description": "The value was already declared with exactly this content: the create's replay."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaxonomyValueView"
+                }
+              }
+            },
+            "description": "The value as declared, with its own `ETag` and `Location`."
           },
           "400": {
             "content": {
@@ -35348,7 +36876,259 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Replace one of the tenant's four scope-value taxonomies",
+        "summary": "Declare one value in a scope-value taxonomy",
+        "tags": [
+          "BSS Pricing Configuration"
+        ]
+      }
+    },
+    "/bss-pricing/v1/config/taxonomies/{class}/values/{value}": {
+      "get": {
+        "description": "One value, `active` or `retired`, with **its own `ETag`** - the tag the per-value `PATCH` demands, and the only place to obtain it (the set's tag from `GET .../taxonomies/{class}` covers the whole list and does not satisfy the per-value precondition). A value the tenant has never declared is `404`. Carries `edit_governed` and `references` (D-355): whether a published price row or overlay scope names this value - and so whether editing it needs a second principal - with the count on each plane behind that answer. Also carries `pending_approvals` with the same metadata, per-unit `content_access` and approval-read-gated preview as the collection GET; current fields are not replaced by proposed ones. **These derived fields are outside the `ETag`**, which covers the declared value alone because it is also the `PATCH` precondition; moving it when an unrelated publish flips the flag would refuse every in-flight editor of a value they are not changing. This GET always returns a fresh body with `Cache-Control: private, no-store`; it does not evaluate `If-None-Match` or return `304`. The tag remains the `PATCH` precondition. Gates on `config` x `read`.",
+        "operationId": "bss_pricing.get_taxonomy_value",
+        "parameters": [
+          {
+            "description": "Which value universe: `region`, `brand`, `partner` or `org_tier`. Each segment is the same token the class carries in an overlay's `scopeClass` field, so a generated client has one name per class (D-241); the camelCase `orgTier` section 5 used to spell is refused rather than accepted as an alias. `global` and `customerGroup` are deliberately not addressable: the first has no value universe, and the second's table belongs to the customer-group membership half and does not exist.",
+            "in": "path",
+            "name": "class",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The declared code - the string a price row's `region` or an overlay's `scopeValue` carries, exactly as the taxonomy lists it. Retired values are still addressable: retirement is a state, not a deletion, and `PATCH` with `state: active` is the way back.",
+            "in": "path",
+            "name": "value",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaxonomyValueView"
+                }
+              }
+            },
+            "description": "The declared value."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read one declared value of a scope-value taxonomy",
+        "tags": [
+          "BSS Pricing Configuration"
+        ]
+      },
+      "patch": {
+        "description": "Changes only the fields the body names (D-353): `displayName`, `state`, and on the `region` universe `taxCategory` (a string sets it, an explicit `null` **clears** it) and `taxRatePresent`; the two markers are refused on the other three universes. **An edit is a governed act only while a published price row or overlay scope names the value** (D-355): then the first call judges the edit and, if admissible, opens an approval unit over the proposal and the value as it stands and answers `202` `submitted_for_approval` - nothing is written; the second principal's approve atomically applies the patch with the decision and audit. Re-read GET for the new value and tag; do not re-send PATCH. **While nothing published names the value, the first call commits at once and answers `200`, no unit** - as a declaration does. **Retirement is guarded** (`inst-tx-mutation`), at submit and again at commit: a value still named by a published price row or a published overlay scope is `409` `TAXONOMY_VALUE_IN_USE`; clearing a region's default category that published rows still resolve through is refused the same way (D-245). `retired -> active` re-activates. A body that changes nothing answers `200`, writes nothing and opens no unit. **`If-Match` is required** and asserts the value's **own** tag from `GET .../values/{value}`. The commit is one audited config mutation naming the value, its state before and after, and the unit it ran under. Gates on `config` x `write`.",
+        "operationId": "bss_pricing.patch_taxonomy_value",
+        "parameters": [
+          {
+            "description": "Which value universe: `region`, `brand`, `partner` or `org_tier`. Each segment is the same token the class carries in an overlay's `scopeClass` field, so a generated client has one name per class (D-241); the camelCase `orgTier` section 5 used to spell is refused rather than accepted as an alias. `global` and `customerGroup` are deliberately not addressable: the first has no value universe, and the second's table belongs to the customer-group membership half and does not exist.",
+            "in": "path",
+            "name": "class",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The declared code - the string a price row's `region` or an overlay's `scopeValue` carries, exactly as the taxonomy lists it. Retired values are still addressable: retirement is a state, not a deletion, and `PATCH` with `state: active` is the way back.",
+            "in": "path",
+            "name": "value",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Mandatory precondition (RFC 9110). The value is the **opaque** tag `GET .../values/{value}` returns in its `ETag` header - copy it back verbatim. It digests this one value's code, state, label and (region) tax markers, so it moves when this value changes and **not** when a sibling does: two admins editing two different values do not refuse each other, which is the reason this route exists beside the whole-set `PUT`. The set's tag from `GET .../taxonomies/{class}` does not satisfy it. A tag that no longer describes the value is `409` `STALE_VERSION`; an absent or malformed one is `400`.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PatchTaxonomyValueRequest"
+              }
+            }
+          },
+          "description": "The fields to change.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaxonomyValueView"
+                }
+              }
+            },
+            "description": "An ungoverned edit committed, a legacy approved unit was applied, or nothing changed: the value as it now stands, with its `ETag`."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaxonomyValueMutationView"
+                }
+              }
+            },
+            "description": "The edit is material and waits for a second principal: `outcome` is `submitted_for_approval` and `approval` names the unit. Nothing was written."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Edit one declared value of a scope-value taxonomy",
         "tags": [
           "BSS Pricing Configuration"
         ]
@@ -35544,7 +37324,7 @@
     },
     "/bss-pricing/v1/customer-groups/{group}/members": {
       "get": {
-        "description": "Every membership recorded in the group, oldest interval first. **Ended memberships are included**, and that is the point rather than an oversight: this slice names an auditor who reads membership history, membership is effective-dated, and a list of only the currently-active intervals answers neither \"who is in this group\" nor \"who has been\". A reader wanting the first filters on `effective_to`. **D-322, 2026-08-16**: the slice's endpoint table specified the three write verbs and no read at all, so a membership could be created, ended and moved and never looked at - an operator's only evidence that an enrolment landed was the 202 they had already seen. Gates on `customer_group` x `read`.",
+        "description": "Every membership recorded in the group, oldest interval first. **Ended memberships are included**, and that is the point rather than an oversight: this slice names an auditor who reads membership history, membership is effective-dated, and a list of only the currently-active intervals answers neither \"who is in this group\" nor \"who has been\". Narrow to one payer with `$filter=payer_tenant_id eq '<uuid>'`. **D-322, 2026-08-16**: the slice's endpoint table specified the three write verbs and no read at all, so a membership could be created, ended and moved and never looked at - an operator's only evidence that an enrolment landed was the 202 they had already seen. Gates on `customer_group` x `read`.",
         "operationId": "bss_pricing.list_customer_group_members",
         "parameters": [
           {
@@ -35566,7 +37346,7 @@
             }
           },
           {
-            "description": "The opaque token the previous page returned as `next_cursor`. Opaque by contract: a token a caller can read is a token a caller will construct, and then the walk's ordering guarantee is whatever that caller assumed.",
+            "description": "The opaque token this same operation returned as `next_cursor`. GET history and GET audit mint an OData CursorV1; POST history/export mints the history-engine token. The two encodings are not interchangeable.",
             "in": "query",
             "name": "cursor",
             "required": false,
@@ -35575,9 +37355,18 @@
             }
           },
           {
-            "description": "Narrow the page to one payer's intervals in this group, ended ones included. Answers `what has this payer's history in this group been` without paging the group.",
+            "description": "OData v4 filter expression\n- payer_tenant_id: eq|ne|in\n- membership_id: eq|ne|in\n- effective_from: eq|ne|gt|ge|lt|le|in",
             "in": "query",
-            "name": "payer_id",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- payer_tenant_id asc\n- payer_tenant_id desc\n- membership_id asc\n- membership_id desc\n- effective_from asc\n- effective_from desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -35654,7 +37443,40 @@
         "summary": "Read a customer group's memberships",
         "tags": [
           "BSS Pricing Customer Groups"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "effective_from": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "membership_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "payer_tenant_id": [
+              "eq",
+              "ne",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "payer_tenant_id asc",
+            "payer_tenant_id desc",
+            "membership_id asc",
+            "membership_id desc",
+            "effective_from asc",
+            "effective_from desc"
+          ]
+        }
       },
       "post": {
         "description": "Creates an effective-dated membership (`inst-cg-record`) and commits it directly: the default membership change is renewal-aligned and audit-only (`inst-mm-renewal`) - no approval unit opens. The committed mutation is its **own publish unit** through the Foundation engine (D-06, `dod-customer-group`'s MUST): the response carries the registry's **pending** handle, and a caller resolving this payer's group through the read model sees the new membership only once `CatalogVersionPublished` warms it. `{group}` MUST be declared and **active** in the tenant's customer-group taxonomy (`GET/PUT .../customer-groups/taxonomy`) - absent or **retired** both answer `GROUP_UNKNOWN` (400 carrying the code - the design set types it 422 and the canonical family has no such category, so the code is the discriminator; `api::rest::bundles`' \"422 does not exist on this platform\"), the retired case deliberately not merged into a generic \"not found\": `inst-cg-taxonomy`'s retire guard protects references a value already carries, and a route that enrolled a new one into a retired group would leave that guard's point unenforced for the one act that most needs it. Interval validation is D-09's: an interval overlapping the payer's existing membership in the **same** group is `MEMBERSHIP_OVERLAP` (409); one overlapping a membership in **another** group is `MEMBERSHIP_CONFLICT` (409 - a payer holds at most one active membership across all groups) - use the move operation instead. **An `Idempotency-Key` header is required and is honoured**: the same key with the same body returns the first answer verbatim and mints no second membership. Gates on `customer_group` x `write`.",
@@ -35768,6 +37590,134 @@
           }
         ],
         "summary": "Enroll a payer into a customer group",
+        "tags": [
+          "BSS Pricing Customer Groups"
+        ]
+      }
+    },
+    "/bss-pricing/v1/customer-groups/{group}/members/move": {
+      "post": {
+        "description": "The bulk group move (`inst-mm-bulk`): every `payer_ids` entry ends its active membership, if any, and enrolls in `{group}` at `effective_from`, as one approval unit. The route declares the act - always material, no `immediate` flag. The first call commits nothing and answers `202` with `outcome: \"submitted_for_approval\"`. After a second principal approves, the same POST answers `200` with `outcome: \"committed\"` and `moved` for every payer. One payer on this door is still bulk. `{group}` MUST be declared and active (`GROUP_UNKNOWN` otherwise). An `Idempotency-Key` is required and is not claimed (the material arm's contract). Gates on `customer_group` x `write`.",
+        "operationId": "bss_pricing.move_customer_group_members",
+        "parameters": [
+          {
+            "description": "The target group.",
+            "in": "path",
+            "name": "group",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Mandatory client idempotency key (S2/S3 API surface, foundation step 1). Bounded at 255 printable-ASCII characters. The key is claimed in the same transaction as the mutation it guards, so a retry carrying the same key and body is answered the recorded response verbatim, and one carrying the same key with a different body is `409` `IDEMPOTENCY_PAYLOAD_MISMATCH`. An absent header is `400`: an unguarded create on a governed authoring plane is the retry hazard the gate exists for.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkMoveMembershipRequest"
+              }
+            }
+          },
+          "description": "The payers and the instant they pivot on.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkMembershipMoveMaterialView"
+                }
+              }
+            },
+            "description": "The set committed: `outcome` is `\"committed\"` and `moved` is one entry per payer."
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkMembershipMoveMaterialView"
+                }
+              }
+            },
+            "description": "The unit is open: nothing moved, and `approval` names what a second principal must decide."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Atomically transfer many payers into {group}",
         "tags": [
           "BSS Pricing Customer Groups"
         ]
@@ -36062,9 +38012,27 @@
             }
           },
           {
-            "description": "The opaque token the previous page returned as `next_cursor`. Opaque by contract: a token a caller can read is a token a caller will construct, and then the walk's ordering guarantee is whatever that caller assumed.",
+            "description": "The opaque token this same operation returned as `next_cursor`. GET history and GET audit mint an OData CursorV1; POST history/export mints the history-engine token. The two encodings are not interchangeable.",
             "in": "query",
             "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- price_id: eq|ne|in\n- plan_id: eq|ne|in\n- lifecycle_state: eq|ne|contains|startswith|endswith|in\n- authored_at: eq|ne|gt|ge|lt|le|in\n- actor: eq|ne|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- price_id asc\n- price_id desc\n- plan_id asc\n- plan_id desc\n- lifecycle_state asc\n- lifecycle_state desc\n- authored_at asc\n- authored_at desc\n- actor asc\n- actor desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -36141,12 +38109,62 @@
         "summary": "Read immutable price history",
         "tags": [
           "BSS Pricing History"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "actor": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "authored_at": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "lifecycle_state": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "plan_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "price_id": [
+              "eq",
+              "ne",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "price_id asc",
+            "price_id desc",
+            "plan_id asc",
+            "plan_id desc",
+            "lifecycle_state asc",
+            "lifecycle_state desc",
+            "authored_at asc",
+            "authored_at desc",
+            "actor asc",
+            "actor desc"
+          ]
+        }
       }
     },
     "/bss-pricing/v1/history/export": {
       "post": {
-        "description": "Streams the tenant's price history in the same commit order the interactive read serves, in bounded chunks: one call returns one chunk and the token for the next, and a client walks the token to the end of the history. Identical records, identical order, identical cursor - the only difference is the chunk size a caller asks for, which is what the SLO is stated per (p95 <= 5s per 100 records, scaling linearly to the D-125 hard cap of 1,000). That is why this is a separate surface rather than a larger `limit` on the read: a full 1,000-row page is budgeted at 50s and is an export shape, never an interactive read, so the read keeps the server default of 100 and this is where a caller asks for more. It adds no store - the Foundation's immutability IS the history (`inst-he-nostore`), so an export is a read and produces no job, no file and no artifact to collect later. Gates on `audit` x `export` (D-12): bulk extraction of a seven-year actor trail is grantable separately from reading it, which is the whole reason the action exists beside `audit` x `read`.",
+        "description": "Streams the tenant's price history in the same commit order the interactive read serves, in bounded chunks: one call returns one chunk and the token for the next, and a client walks the token to the end of the history. Identical records and identical order; the cursor is this surface's history-engine token, not the OData CursorV1 GET /history mints, and the two are not interchangeable. The remaining difference is the chunk size a caller asks for, which is what the SLO is stated per (p95 <= 5s per 100 records, scaling linearly to the D-125 hard cap of 1,000). That is why this is a separate surface rather than a larger `limit` on the read: a full 1,000-row page is budgeted at 50s and is an export shape, never an interactive read, so the read keeps the server default of 100 and this is where a caller asks for more. It adds no store - the Foundation's immutability IS the history (`inst-he-nostore`), so an export is a read and produces no job, no file and no artifact to collect later. Gates on `audit` x `export` (D-12): bulk extraction of a seven-year actor trail is grantable separately from reading it, which is the whole reason the action exists beside `audit` x `read`.",
         "operationId": "bss_pricing.export_price_history",
         "parameters": [
           {
@@ -36159,7 +38177,7 @@
             }
           },
           {
-            "description": "The opaque token the previous page returned as `next_cursor`. Opaque by contract: a token a caller can read is a token a caller will construct, and then the walk's ordering guarantee is whatever that caller assumed.",
+            "description": "The opaque token this same operation returned as `next_cursor`. GET history and GET audit mint an OData CursorV1; POST history/export mints the history-engine token. The two encodings are not interchangeable.",
             "in": "query",
             "name": "cursor",
             "required": false,
@@ -36341,7 +38359,7 @@
     },
     "/bss-pricing/v1/migrations": {
       "get": {
-        "description": "One page of the tenant's migration schedules in `migrationId` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). `state` narrows the page to one of `scheduled`, `in_progress`, `completed` or `cancelled`; omitting it returns every state, which is what an operator's queue over pending **and** finished runs asks for - a completed run is the record of what moved. Each entry carries the schedule-time delta report verbatim, exactly as `GET /bss-pricing/v1/migrations/{migrationId}` does: it is frozen at schedule time, so rendering it on a page costs no further read. Gates on `plan` x `read`, the pair the by-id read already asks for - a schedule is a read of the authoring plane, not a mutation of it.",
+        "description": "One page of the tenant's migration schedules in `migrationId` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Narrow with `$filter=state eq 'scheduled'` (or `in_progress` / `completed` / `cancelled`); omitting `$filter` returns every state, which is what an operator's queue over pending **and** finished runs asks for - a completed run is the record of what moved. Each entry carries the schedule-time delta report verbatim, exactly as `GET /bss-pricing/v1/migrations/{migrationId}` does: it is frozen at schedule time, so rendering it on a page costs no further read. Gates on `plan` x `read`, the pair the by-id read already asks for - a schedule is a read of the authoring plane, not a mutation of it.",
         "operationId": "bss_pricing.list_migrations",
         "parameters": [
           {
@@ -36363,9 +38381,18 @@
             }
           },
           {
-            "description": "scheduled | in_progress | completed | cancelled; absent is every state",
+            "description": "OData v4 filter expression\n- state: eq|ne|contains|startswith|endswith|in\n- migration_id: eq|ne|in",
             "in": "query",
-            "name": "state",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- state asc\n- state desc\n- migration_id asc\n- migration_id desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -36442,7 +38469,32 @@
         "summary": "List the tenant's plan migrations (cursor-paginated)",
         "tags": [
           "BSS Pricing Plans"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "migration_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "state": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "state asc",
+            "state desc",
+            "migration_id asc",
+            "migration_id desc"
+          ]
+        }
       },
       "post": {
         "description": "Schedules a migration (`inst-ms-api`). The catalog emits `PlanMigrationScheduled`; **Subscriptions** creates the effective-dated `PlanLink`s and executes - this gear never mutates a subscription and never re-opens a posted period. `migrationId` is **client-supplied** and is the idempotency key (M2): a timed-out retry returns the original schedule and answers `200`, never a second schedule and never `202`. A fresh schedule answers `202` - the catalog has scheduled and nothing has migrated yet. **A replay must carry the request the key was spent on.** A resubmission under a spent `migrationId` naming a different source or target plan, or a different subscriber scope, is a different migration rather than a retry and is refused `409 IDEMPOTENCY_PAYLOAD_MISMATCH`; nothing is scheduled and the stored schedule is left as it stands. `effectiveAt` is the one stated field **outside** that comparison: a resubmission that changes only the instant is still a replay and is answered `200` with the **stored** schedule, so read that body before treating a corrected date as applied. The remedy for a mistyped schedule is `DELETE .../migrations/{migrationId}` and a **new** id, not a re-post under the old one, and that holds for a `cancelled` or `completed` id too: the key is spent for good. The target MUST be **published** (`MIGRATION_TARGET_INVALID`), must not be the source plan itself, and `effectiveAt` must clear the tenant's configured notice period - default floor **60 days**, D-49 - or the request is refused `MIGRATION_NOTICE_TOO_SHORT` with the earliest admissible instant named. There is no override on this request: a shorter migration needs an audited change to the notice policy first. Blocking deltas (entitlement overflow, invalid or missing-required add-ons, a target missing the subscriber's frozen `(currency, region)` row of matching frequency) refuse the schedule with `MIGRATION_BLOCKED` and are enumerated; **an unresolved blocking delta never persists a schedule**. Contract-locked subscriptions are different: they are reported and **excluded**, never blocking, because the lock is never broken. **Read `subjectsUnresolved` and `exclusionsUnresolved` before trusting an empty delta report.** The catalog holds no subscriptions and the Contracts lock registry has no client in this deployment, so an empty report means nobody could be enumerated rather than nobody having a problem. Gates on `plan` x `migrate`.",
@@ -36767,7 +38819,7 @@
     },
     "/bss-pricing/v1/plans": {
       "get": {
-        "description": "One page of the tenant's plans in `planId` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Each plan is rendered as the revision an **author** is holding: its open draft when it has one, else its current revision - `draft` is not a current revision (`is_current_revision()` is `published | retired`), so a listing that asked for current revisions would hide every plan being authored right now. `lifecycle_state` narrows the page to a comma-separated set of states. The five child sets are **not** on this page - a hundred plans would be six hundred queries - so a caller opens `GET /bss-pricing/v1/plans/{planId}` for a plan's shape.",
+        "description": "One row per plan: choose its open draft, else current published/retired revision, then apply filters, ordering and keyset pagination. Historical revisions cannot match filters on the displayed name/state. Default order is plan_id asc; supported sort fields are plan_id, plan_name, lifecycle_state, billing_cycle, created_at and price_row_count. plan_id asc is appended as a unique tie-breaker when absent; nullable names/cycles sort last in both directions. limit defaults to 100, max 1,000. Repeat the same $filter with cursor; omit $orderby on subsequent pages. plan_name supports exact equality and case-insensitive contains/startswith/endswith. Query-only model_kind and currency predicates independently match draft/published price rows (possibly different rows); response arrays stay model_kinds/currencies. Example: $filter=model_kind eq 'flat' and currency in ('EUR','USD'). has_pending_approvals eq true tests the same direct submitted units as pending_approvals. created_at is the original plan creation time; revision_created_at is the shown revision's creation time. No created_at_utc alias. Full shape remains on GET /plans/{planId}. Cache-Control: private, no-store.",
         "operationId": "bss_pricing.list_plans",
         "parameters": [
           {
@@ -36789,9 +38841,18 @@
             }
           },
           {
-            "description": "Comma-separated lifecycle states; absent is each plan's authoring revision",
+            "description": "OData v4 filter expression\n- plan_id: eq|ne|in\n- lifecycle_state: eq|ne|contains|startswith|endswith|in\n- sku_id: eq|ne|in\n- plan_tier: eq|ne|contains|startswith|endswith|in\n- billing_cycle: eq|ne|contains|startswith|endswith|in\n- plan_name: eq|ne|contains|startswith|endswith|in\n- created_at: eq|ne|gt|ge|lt|le|in\n- model_kind: eq|ne|contains|startswith|endswith|in\n- currency: eq|ne|contains|startswith|endswith|in\n- has_pending_approvals: eq|ne",
             "in": "query",
-            "name": "lifecycle_state",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- plan_id asc\n- plan_id desc\n- plan_name asc\n- plan_name desc\n- lifecycle_state asc\n- lifecycle_state desc\n- billing_cycle asc\n- billing_cycle desc\n- created_at asc\n- created_at desc\n- price_row_count asc\n- price_row_count desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -36868,7 +38929,98 @@
         "summary": "List the tenant's plans (cursor-paginated)",
         "tags": [
           "BSS Pricing Plans"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "billing_cycle": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "created_at": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "currency": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "has_pending_approvals": [
+              "eq",
+              "ne"
+            ],
+            "lifecycle_state": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "model_kind": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "plan_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "plan_name": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "plan_tier": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "sku_id": [
+              "eq",
+              "ne",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "plan_id asc",
+            "plan_id desc",
+            "plan_name asc",
+            "plan_name desc",
+            "lifecycle_state asc",
+            "lifecycle_state desc",
+            "billing_cycle asc",
+            "billing_cycle desc",
+            "created_at asc",
+            "created_at desc",
+            "price_row_count asc",
+            "price_row_count desc"
+          ]
+        }
       },
       "post": {
         "description": "Creates a plan by writing its revision `0` in `draft`, and answers `201` with a `Location` header naming the new plan and an `ETag` carrying the revision's row version. The plan id is **minted by the server**, so a caller never has to choose one and a retry can never create a second plan under a name the client picked. An `Idempotency-Key` header is **required** (S2 API surface, foundation step 1): the gate is the first step of the mutation and runs in the same transaction as it, so a retry carrying the same key and the same body is answered the recorded response - the original plan id included: and a retry carrying the same key and a different body is refused `IDEMPOTENCY_PAYLOAD_MISMATCH`. Nothing here judges the plan's shape: the Slice-2 rules run at publish.\n\nThe answer carries **one phase**: the implicit terminal `evergreen` phase, auto-created with the plan (`inst-ph-default`, D-19) because a price row's `scopeKey.phase` is a required `Uuid` with no server-side default, and the phase axis defaults to the plan's terminal phase. Read its `phase_id` out of this response rather than minting one: a phase id the store did not choose can collide, and a row keyed on a phase the revision does not attach is refused at publish (`PHASE_ROW_ORPHANED`) with no way to re-point the row.",
@@ -36978,9 +39130,76 @@
         ]
       }
     },
+    "/bss-pricing/v1/plans/counts": {
+      "get": {
+        "description": "How many plans the tenant holds as `draft`, `published` and `retired`, counted the way the list renders them: a plan with an open draft counts as `draft`, else as its current revision's state (D-360). Over the whole catalogue - a tab strip built from one page of `GET /plans` is wrong past that page. `total` is the number of plans and the three counts sum to it. Gates on `plan` x `read`, like the list.",
+        "operationId": "bss_pricing.count_plans",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanCountsView"
+                }
+              }
+            },
+            "description": "The counts."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Count the tenant's plans by authoring state",
+        "tags": [
+          "BSS Pricing Plans"
+        ]
+      }
+    },
     "/bss-pricing/v1/plans/{planId}": {
       "get": {
-        "description": "Returns the plan's **open draft** revision when it has one, and its **current** revision (`published` or `retired`) otherwise, with all five of its child sets - its phase chain, its add-on rules, its descriptor set, its derived (composite) meters and its period floor/cap. This is the authoring read (`plan` x `read`); the published content a consumer resolves comes from the read model, which is a different contract. `lifecycle_state` and `revision` name which revision was answered, so a caller never infers it. The `ETag` header carries the revision's row version and is what the mutating verbs take as `If-Match`. A plan outside the caller's scope reads exactly like an absent one (404, no existence leak).",
+        "description": "Returns the plan's **open draft** revision when it has one, and its **current** revision (`published` or `retired`) otherwise, with all five of its child sets - its phase chain, its add-on rules, its descriptor set, its derived (composite) meters and its period floor/cap. This is the authoring read (`plan` x `read`); the published content a consumer resolves comes from the read model, which is a different contract. `lifecycle_state` and `revision` name which revision was answered, so a caller never infers it. The `ETag` header carries the revision's row version and is what the mutating verbs take as `If-Match`. It is not a cache validator for derived pending metadata: this GET returns a fresh body with `Cache-Control: private, no-store` and does not evaluate `If-None-Match`. A plan outside the caller's scope reads exactly like an absent one (404, no existence leak).",
         "operationId": "bss_pricing.get_plan",
         "parameters": [
           {
@@ -36988,15 +39207,6 @@
             "in": "path",
             "name": "planId",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Optional conditional-read precondition (RFC 9110). Send the `ETag` this route last answered; if it still names the current representation the answer is `304` with the tag and no body. The wildcard `*` and a comma-separated list are both accepted, and comparison is weak, per RFC 9110 section 13.1.2 - deliberately laxer than this gear's `If-Match`, where a wildcard would be an unconditional write.",
-            "in": "header",
-            "name": "If-None-Match",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -37012,9 +39222,6 @@
               }
             },
             "description": "The plan's open draft revision, or its current revision."
-          },
-          "304": {
-            "description": "The caller's `If-None-Match` matches the current representation, so the body is not re-sent."
           },
           "400": {
             "content": {
@@ -37773,7 +39980,7 @@
     },
     "/bss-pricing/v1/plans/{planId}/prices": {
       "get": {
-        "description": "One page of the plan's `draft` and `published` rows, in `price_id` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). `next_cursor` is returned on every page until the result is exhausted, so a client stops without issuing an extra request that returns an empty page. `prev_cursor` is always `null`: D-125 specifies a forward walk only. `superseded` rows are excluded - they are history and no longer current on their key - and so is any state the price-row machine does not have.",
+        "description": "One page of the plan's `draft` and `published` rows, in `price_id` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Omitting `$filter` keeps that authoring default. `$filter=lifecycle_state eq 'superseded'` is how superseded rows appear here; they also remain on `/history`. `next_cursor` is returned on every page until the result is exhausted. `prev_cursor` is always `null`: D-125 specifies a forward walk only.",
         "operationId": "bss_pricing.list_plan_prices",
         "parameters": [
           {
@@ -37798,6 +40005,24 @@
             "description": "Opaque base64url pagination cursor",
             "in": "query",
             "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 filter expression\n- price_id: eq|ne|in\n- lifecycle_state: eq|ne|contains|startswith|endswith|in\n- created_at_utc: eq|ne|gt|ge|lt|le|in",
+            "in": "query",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- price_id asc\n- price_id desc\n- lifecycle_state asc\n- lifecycle_state desc\n- created_at_utc asc\n- created_at_utc desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -37874,7 +40099,43 @@
         "summary": "List a plan's authoring price rows (cursor-paginated)",
         "tags": [
           "BSS Pricing Price Rows"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "created_at_utc": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "lifecycle_state": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "price_id": [
+              "eq",
+              "ne",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "price_id asc",
+            "price_id desc",
+            "lifecycle_state asc",
+            "lifecycle_state desc",
+            "created_at_utc asc",
+            "created_at_utc desc"
+          ]
+        }
       },
       "post": {
         "description": "Creates a `draft` price row and its tier bands in one transaction, and answers `201` with a `Location` header naming the row and an `ETag` carrying its own row version. The `price_id` is minted by the server. An `Idempotency-Key` header is required: the gate runs in the same transaction as the insert, so a retry carrying the same key and body is answered the recorded response - the original price id included - and a retry with a different body is refused `IDEMPOTENCY_PAYLOAD_MISMATCH`. A key already held by a `draft` or `published` row is refused `DUPLICATE_SCOPE_KEY` (on the draft plane too, since D-148). The row's `charge_kind` is the key's, not the body's, so the response echoes what was stored rather than what was sent. Slice-3 shape rules run at publish, not here - with one exception: content that contradicts the frozen scope key (a `model_kind` the key's `charge_kind` forbids, `billingGranularity` on a non-usage key) is refused `400` here, carrying the same enumerated violation report the publish pre-check answers rather than a single message (D-312). A row missing its kind, its amount or its bands still saves - that is the multi-call authoring this door protects.",
@@ -38117,6 +40378,123 @@
           }
         ],
         "summary": "Delete a never-published draft row",
+        "tags": [
+          "BSS Pricing Price Rows"
+        ]
+      },
+      "get": {
+        "description": "Returns the named row when it belongs to `{planId}`, with its whole content. This is the authoring read (`plan` x `read`); the create's `Location` is this path. The `ETag` header carries the row's own version (D-141) and is what `PATCH` and `DELETE` take as `If-Match`. A row belonging to a different plan than the `{planId}` segment answers `404`, exactly as an absent row does.",
+        "operationId": "bss_pricing.get_price",
+        "parameters": [
+          {
+            "description": "The plan the row belongs to.",
+            "in": "path",
+            "name": "planId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The row to read.",
+            "in": "path",
+            "name": "priceId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional conditional-read precondition (RFC 9110). Send the `ETag` this route last answered; if it still names the current representation the answer is `304` with the tag and no body. The wildcard `*` and a comma-separated list are both accepted, and comparison is weak, per RFC 9110 section 13.1.2 - deliberately laxer than this gear's `If-Match`, where a wildcard would be an unconditional write.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PriceRowView"
+                }
+              }
+            },
+            "description": "The named row."
+          },
+          "304": {
+            "description": "The caller's `If-None-Match` matches the current representation, so the body is not re-sent."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read one price row by id",
         "tags": [
           "BSS Pricing Price Rows"
         ]
@@ -38749,7 +41127,7 @@
     },
     "/bss-pricing/v1/price-overlays": {
       "get": {
-        "description": "The admin and Tariffs read. Returns **every** revision, draft included, optionally narrowed to one `scope_class`, and paginated on an opaque cursor per D-125. Ordered by overlay id then revision - the cursor's own key and **not** precedence order: a keyset walk has to be ordered by the key its cursor names. Every row carries its `precedence`, so a caller assembling a stack reads it from the row rather than from the sequence. It does **not** filter on `disclosure`: L6 governs consumer-facing exposure and section 3 step 7 is explicit that operator and service reads are unaffected, so a `restricted` overlay is still its author's to read. Gates on `price_overlay` x `read`.",
+        "description": "The admin and Tariffs read. Returns **every** revision, draft included, optionally narrowed with `$filter=scope_class eq 'global'`, and paginated on an opaque cursor per D-125. Default order is `price_overlay_id` then `revision` - the seekset tiebreaker. Every row carries its `precedence`, so a caller assembling a stack reads it from the row rather than from the sequence. It does **not** filter on `disclosure`: L6 governs consumer-facing exposure and section 3 step 7 is explicit that operator and service reads are unaffected, so a `restricted` overlay is still its author's to read. Gates on `price_overlay` x `read`.",
         "operationId": "bss_pricing.list_price_overlays",
         "parameters": [
           {
@@ -38762,7 +41140,7 @@
             }
           },
           {
-            "description": "The opaque token the previous page returned as `next_cursor`. Opaque by contract: a token a caller can read is a token a caller will construct, and then the walk's ordering guarantee is whatever that caller assumed.",
+            "description": "The opaque token this same operation returned as `next_cursor`. GET history and GET audit mint an OData CursorV1; POST history/export mints the history-engine token. The two encodings are not interchangeable.",
             "in": "query",
             "name": "cursor",
             "required": false,
@@ -38771,9 +41149,18 @@
             }
           },
           {
-            "description": "Narrow to one of L2's scope classes, by its `snake_case` token as the overlay's own `scope_class` field carries it. Absent returns every class. An unknown token is refused `400` rather than silently ignored: a filter that quietly matched everything would answer a narrowed question with the whole set. The classes are not enumerated here - D-120 added two after this surface was written, and a list beside a vocabulary leaves only one of the two true.",
+            "description": "OData v4 filter expression\n- price_overlay_id: eq|ne|in\n- scope_class: eq|ne|contains|startswith|endswith|in\n- lifecycle_state: eq|ne|contains|startswith|endswith|in\n- precedence: eq|ne|gt|ge|lt|le|in\n- revision: eq|ne|gt|ge|lt|le|in",
             "in": "query",
-            "name": "scope_class",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- price_overlay_id asc\n- price_overlay_id desc\n- scope_class asc\n- scope_class desc\n- lifecycle_state asc\n- lifecycle_state desc\n- precedence asc\n- precedence desc\n- revision asc\n- revision desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -38850,7 +41237,64 @@
         "summary": "List PriceOverlays",
         "tags": [
           "BSS Pricing Overlays"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "lifecycle_state": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ],
+            "precedence": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "price_overlay_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "revision": [
+              "eq",
+              "ne",
+              "gt",
+              "ge",
+              "lt",
+              "le",
+              "in"
+            ],
+            "scope_class": [
+              "eq",
+              "ne",
+              "contains",
+              "startswith",
+              "endswith",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "price_overlay_id asc",
+            "price_overlay_id desc",
+            "scope_class asc",
+            "scope_class desc",
+            "lifecycle_state asc",
+            "lifecycle_state desc",
+            "precedence asc",
+            "precedence desc",
+            "revision asc",
+            "revision desc"
+          ]
+        }
       },
       "post": {
         "description": "Creates an overlay at revision 0 in `draft`, with its whole adjustment line set (D-42: an overlay is a container of one or more lines, never a single adjustment). A save **never publishes** - the submit route is what opens the always-material approval unit. An absent `tax_basis` is refused `TAX_BASIS_UNDECLARED`: L5 says the basis must be declared and silence fails. `disclosure` defaults to `restricted`, which is L6's fail-closed default. **`Idempotency-Key` is required and is honoured**: a retry under the same key replays the first call's `201` and its overlay id rather than authoring a second draft, and the same key carrying a different request is `409` `IDEMPOTENCY_PAYLOAD_MISMATCH`. Gates on `price_overlay` x `write`.",
@@ -38961,6 +41405,114 @@
       }
     },
     "/bss-pricing/v1/price-overlays/{overlayId}": {
+      "get": {
+        "description": "Returns the overlay's **open draft** revision when it has one, and its **published** revision otherwise, with its whole line set. This is the authoring read (`price_overlay` x `read`); `lifecycle_state` and `revision` name which revision was answered, so a caller never infers it. The `ETag` header carries `\"<revision>-<row_version>\"` and is what `PATCH` takes as `If-Match`. An overlay outside the caller's scope reads exactly like an absent one (404, no existence leak). The create's `Location` is this path.",
+        "operationId": "bss_pricing.get_price_overlay",
+        "parameters": [
+          {
+            "description": "The overlay to read.",
+            "in": "path",
+            "name": "overlayId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional conditional-read precondition (RFC 9110). Send the `ETag` this route last answered; if it still names the current representation the answer is `304` with the tag and no body. The wildcard `*` and a comma-separated list are both accepted, and comparison is weak, per RFC 9110 section 13.1.2 - deliberately laxer than this gear's `If-Match`, where a wildcard would be an unconditional write.",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OverlayView"
+                }
+              }
+            },
+            "description": "The overlay's open draft revision, or its published revision."
+          },
+          "304": {
+            "description": "The caller's `If-None-Match` matches the current representation, so the body is not re-sent."
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a PriceOverlay's authoring revision",
+        "tags": [
+          "BSS Pricing Overlays"
+        ]
+      },
       "patch": {
         "description": "Replaces the adjustment lines **wholesale** - every D-42 rule quantifies over the set, so a partial update leaves nothing the validator can evaluate. `If-Match` carries the **overlay revision's** entity tag, not a plan's: an overlay has no plan and D-92 gives it a revision chain of its own. Only an open draft revision's lines are mutable. Supplying a line's `line_id` is how its identity stays stable across revisions. Gates on `price_overlay` x `write`.",
         "operationId": "bss_pricing.replace_price_overlay_lines",
@@ -39219,7 +41771,7 @@
     },
     "/bss-pricing/v1/price-windows": {
       "get": {
-        "description": "One page of the tenant's price windows in `windowId` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). `price_id` narrows the page to one price row's windows. There is no `plan_id` filter: a window is bound to a **row** and carries no plan reference, so that the row and its canonical scope key cannot disagree - a plan's whole time axis is `GET /bss-pricing/v1/plans/{planId}/coverage`, which answers it per key. Every state is on the page, cancelled and expired included, because \"why did this key lose its successor\" is a question about a plane rather than about a live row. Each entry carries `mutationSeq`, which is the `If-Match` the next `PATCH` or `DELETE` on that window must assert. Gates on `plan` x `read`.",
+        "description": "One page of the tenant's price windows in `window_id` order, with an opaque `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 (D-125). Narrow with `$filter=price_id eq <uuid>`. There is no `plan_id` filter: a window is bound to a **row** and carries no plan reference, so that the row and its canonical scope key cannot disagree - a plan's whole time axis is `GET /bss-pricing/v1/plans/{planId}/coverage`, which answers it per key. Every state is on the page, cancelled and expired included, because \"why did this key lose its successor\" is a question about a plane rather than about a live row. Each entry carries `mutationSeq`, which is the `If-Match` the next `PATCH` or `DELETE` on that window must assert. Gates on `plan` x `read`.",
         "operationId": "bss_pricing.list_price_windows",
         "parameters": [
           {
@@ -39241,9 +41793,18 @@
             }
           },
           {
-            "description": "Narrow the page to one price row's windows",
+            "description": "OData v4 filter expression\n- price_id: eq|ne|in\n- window_id: eq|ne|in",
             "in": "query",
-            "name": "price_id",
+            "name": "$filter",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 orderby expression\n- price_id asc\n- price_id desc\n- window_id asc\n- window_id desc",
+            "in": "query",
+            "name": "$orderby",
             "required": false,
             "schema": {
               "type": "string"
@@ -39320,7 +41881,29 @@
         "summary": "List the tenant's price windows (cursor-paginated)",
         "tags": [
           "BSS Pricing Price Windows"
-        ]
+        ],
+        "x-odata-filter": {
+          "allowedFields": {
+            "price_id": [
+              "eq",
+              "ne",
+              "in"
+            ],
+            "window_id": [
+              "eq",
+              "ne",
+              "in"
+            ]
+          }
+        },
+        "x-odata-orderby": {
+          "allowedFields": [
+            "price_id asc",
+            "price_id desc",
+            "window_id asc",
+            "window_id desc"
+          ]
+        }
       }
     },
     "/bss-pricing/v1/price-windows/{windowId}": {

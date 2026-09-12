@@ -27,6 +27,10 @@ coord = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
+# Instants are `time::OffsetDateTime` end-to-end (entity, domain, REST), matching
+# AM and pricing. `serde-well-known` is the RFC 3339 wire form. `chrono` stays
+# for calendar `NaiveDate` (due dates, posting `effective_at`).
+time = { workspace = true, features = ["serde-well-known"] }
 # `FutureExt::catch_unwind`: flip a recognition-run row FAILED on a panic (not only
 # on `Err`), so a panicked pass leaves no stuck `RUNNING` row a retry would replay.
 futures = { workspace = true }
@@ -98,7 +102,7 @@ toolkit-canonical-errors = { workspace = true }
 
 # REST surface (the gear's first): axum router/extractors + utoipa schemas.
 axum = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
 # Holds the per-process REST `ApiState` populated in `init()`.
 arc-swap = { workspace = true }
 

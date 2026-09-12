@@ -62,14 +62,18 @@
 //! from nothing would hand Subscriptions a set it would honour as authoritative.
 //! Left unmounted rather than mounted-and-lying; reported in the hand-back.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use bss_pricing_sdk::odata::MigrationFilterField;
+
 use toolkit::api::canonical_prelude::CanonicalError;
+use toolkit::api::odata::OData;
+use toolkit::api::operation_builder::OperationBuilderODataExt;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_odata::Page;
 use toolkit_security::SecurityContext;
@@ -77,15 +81,16 @@ use uuid::Uuid;
 
 use crate::api::rest::auth_context::require_authenticated;
 use crate::api::rest::correlation::{CorrelationId, require_correlation};
-use crate::api::rest::cursor::{self, PageRequest};
 use crate::api::rest::error::authz_error_to_canonical;
+use crate::api::rest::odata_list::{map_odata_page_err, reject_non_odata_list_params};
 use crate::api::rest::preconditions;
 use crate::api::rest::state::GovernanceState;
 use crate::domain::error::DomainError;
-use crate::domain::migration::MigrationState;
+use crate::domain::instant::rfc3339;
 use crate::domain::scope_key::PlanId;
 use crate::infra::migration::ScheduleRequest;
 use crate::infra::storage::repo::MigrationRecord;
+use time::OffsetDateTime;
 
 /// The collection route's registered path template.
 ///
@@ -117,7 +122,8 @@ pub struct ScheduleMigrationBody {
     pub target_plan_id: Uuid,
     /// When the migration takes effect. Validated against the tenant's notice
     /// period (D-49) with a 60-day floor.
-    pub effective_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_at: OffsetDateTime,
     /// `all` or a subscription filter. Free-form, because the catalog does not
     /// interpret it — it rides the `PlanMigrationScheduled` contract to the party
     /// that does.
@@ -154,9 +160,11 @@ pub struct MigrationView {
     /// The published target.
     pub target_plan_id: Uuid,
     /// When it takes effect.
-    pub effective_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_at: OffsetDateTime,
     /// The instant D-49's notice period was measured from.
-    pub announced_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub announced_at: OffsetDateTime,
     /// `scheduled` | `in_progress` | `completed` | `cancelled`.
     pub state: String,
     /// The schedule-time delta report, verbatim as stored.
@@ -239,7 +247,8 @@ async fn schedule_migration(
 
     // Parsed after the gate - `api::rest::supersessions`' house rule.
     let request: ScheduleMigrationBody = preconditions::parse_body(&body)?;
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
 
     // Bounded before the call: the column is frozen by the table's append-only
     // trigger and the value is copied onto the `PlanMigrationScheduled` contract.
@@ -272,19 +281,6 @@ async fn schedule_migration(
     Ok((status, Json(MigrationView::of(&scheduled.record))).into_response())
 }
 
-/// The two pagination query parameters plus the state filter (D-125).
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct MigrationPageQuery {
-    /// Schedules per page; server default 100, hard cap 1,000.
-    pub limit: Option<String>,
-    /// The opaque token a previous page returned.
-    pub cursor: Option<String>,
-    /// One of `scheduled` | `in_progress` | `completed` | `cancelled`. Absent is
-    /// every state, which is what an operator's queue over pending **and**
-    /// finished runs asks for.
-    pub state: Option<String>,
-}
-
 /// `GET /migrations`.
 ///
 /// Gated `plan × read`, which is exactly what [`read_migration`] asks for and for
@@ -298,13 +294,16 @@ pub struct MigrationPageQuery {
 /// tenant, and only a write passes `Some(target_tenant)` so the membership
 /// assertion has a target to test.
 ///
+#[allow(clippy::implicit_hasher)]
 async fn list_migrations(
     Extension(state): Extension<Arc<GovernanceState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<MigrationPageQuery>,
+    Query(extras): Query<HashMap<String, String>>,
+    OData(odata): OData,
 ) -> Result<Json<Page<MigrationView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
+    reject_non_odata_list_params(&extras)?;
     let tenant = ctx.subject_tenant_id();
 
     let scope = crate::authz::access_scope(
@@ -327,58 +326,15 @@ async fn list_migrations(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    let page = PageRequest::parse(
-        cursor::parse_limit(query.limit.as_deref())?,
-        query.cursor.as_deref(),
-    )?;
-    let states = state_filter(query.state.as_deref())?;
-    // One row more than the page, so "is there another page" needs no second
-    // query and no page whose `next_cursor` points at nothing.
-    let probe = page.limit.saturating_add(1);
-    let mut records = state
+    let page = state
         .migrations
-        .list(&scope, tenant, &states, page.after, probe)
-        .await?;
-
-    let has_more = u64::try_from(records.len()).unwrap_or(u64::MAX) > page.limit;
-    if has_more {
-        records.pop();
-    }
-    let next = has_more
-        .then(|| records.last().map(|record| record.migration_id))
-        .flatten();
+        .list_odata(&scope, tenant, &odata)
+        .await
+        .map_err(map_odata_page_err)?;
     Ok(Json(Page {
-        items: records.iter().map(MigrationView::of).collect(),
-        page_info: cursor::page_info(next, page.limit),
+        items: page.items.iter().map(MigrationView::of).collect(),
+        page_info: page.page_info,
     }))
-}
-
-/// The state filter, read through [`MigrationState::ALL`] rather than parsed
-/// here.
-///
-/// `approvals::state_filter`'s discipline exactly: one authority for what states
-/// exist, so a state added to §4's machine becomes filterable the day it is added
-/// and one removed stops being accepted the day it is removed.
-fn state_filter(token: Option<&str>) -> Result<Vec<MigrationState>, DomainError> {
-    let Some(token) = token else {
-        return Ok(Vec::new());
-    };
-    MigrationState::ALL
-        .iter()
-        .copied()
-        .find(|state| state.as_str() == token)
-        .map(|state| vec![state])
-        .ok_or_else(|| {
-            let known: Vec<&str> = MigrationState::ALL
-                .iter()
-                .copied()
-                .map(MigrationState::as_str)
-                .collect();
-            DomainError::InvalidRequest(format!(
-                "state `{token}` is not one of {}",
-                known.join(", ")
-            ))
-        })
 }
 
 async fn read_migration(
@@ -465,7 +421,8 @@ async fn cancel_migration(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    let stamp = crate::api::rest::auth_context::audit_stamp(&ctx, Utc::now(), correlation);
+    let stamp =
+        crate::api::rest::auth_context::audit_stamp(&ctx, OffsetDateTime::now_utc(), correlation);
     let cancelled = state
         .migrations
         .cancel(&scope, tenant, migration_id, stamp)
@@ -485,10 +442,10 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
         .description(
             "One page of the tenant's migration schedules in `migrationId` order, with an opaque \
              `cursor` and a `limit` whose server default is 100 and whose hard cap is 1,000 \
-             (D-125). `state` narrows the page to one of `scheduled`, `in_progress`, `completed` \
-             or `cancelled`; omitting it returns every state, which is what an operator's queue \
-             over pending **and** finished runs asks for - a completed run is the record of what \
-             moved. Each entry carries the schedule-time delta report verbatim, exactly as \
+             (D-125). Narrow with `$filter=state eq 'scheduled'` (or `in_progress` / `completed` \
+             / `cancelled`); omitting `$filter` returns every state, which is what an operator's \
+             queue over pending **and** finished runs asks for - a completed run is the record \
+             of what moved. Each entry carries the schedule-time delta report verbatim, exactly as \
              `GET /bss-pricing/v1/migrations/{migrationId}` does: it is frozen at schedule time, \
              so rendering it on a page costs no further read. Gates on `plan` x `read`, the pair \
              the by-id read already asks for - a schedule is a read of the authoring plane, not \
@@ -504,12 +461,9 @@ pub fn router(state: Arc<GovernanceState>, openapi: &dyn OpenApiRegistry) -> Rou
             "integer",
         )
         .query_param("cursor", false, "Opaque base64url pagination cursor")
-        .query_param(
-            "state",
-            false,
-            "scheduled | in_progress | completed | cancelled; absent is every state",
-        )
         .handler(list_migrations)
+        .with_odata_filter::<MigrationFilterField>()
+        .with_odata_orderby::<MigrationFilterField>()
         .json_response_with_schema::<Page<MigrationView>>(
             openapi,
             StatusCode::OK,

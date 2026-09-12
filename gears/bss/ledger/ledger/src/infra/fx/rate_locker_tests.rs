@@ -14,7 +14,6 @@
 )]
 
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side};
-use chrono::Utc;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use uuid::Uuid;
@@ -23,6 +22,7 @@ use super::*;
 use crate::config::FxConfig;
 use crate::domain::model::NewLine;
 use crate::infra::storage::repo::FxRepo;
+use time::OffsetDateTime;
 
 /// A minimal AR `NewLine` in `currency`, functional columns unset — the input
 /// shape `lock_and_stamp` reads (`account_class`, `side`, `amount_minor`) and
@@ -89,7 +89,14 @@ async fn single_currency_returns_none_and_leaves_functional_null() {
     ];
 
     let result = locker
-        .lock_and_stamp(&scope, tenant, &mut lines, "USD", "USD", Utc::now())
+        .lock_and_stamp(
+            &scope,
+            tenant,
+            &mut lines,
+            "USD",
+            "USD",
+            OffsetDateTime::now_utc(),
+        )
         .await
         .expect("single-currency lock must succeed");
 

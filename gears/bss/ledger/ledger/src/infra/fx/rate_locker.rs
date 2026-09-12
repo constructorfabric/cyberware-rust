@@ -19,7 +19,7 @@
 //! unit-tested here.
 
 use bss_ledger_sdk::AccountClass;
-use chrono::{DateTime, Utc};
+
 use toolkit_db::secure::AccessScope;
 use uuid::Uuid;
 
@@ -28,6 +28,7 @@ use crate::domain::fx::translate::{FxLine, FxTranslateError, translate_entry};
 use crate::domain::model::NewLine;
 use crate::infra::fx::rate_source::RateSource;
 use crate::infra::storage::repo::{FxRepo, NewRateSnapshot};
+use time::OffsetDateTime;
 
 /// Resolves + locks the FX rate for an entry and stamps the functional columns.
 #[derive(Clone)]
@@ -68,7 +69,7 @@ impl RateLocker {
         lines: &mut [NewLine],
         transaction_ccy: &str,
         functional_ccy: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<Uuid>, DomainError> {
         // Single-currency: nothing to translate, functional columns stay NULL.
         if transaction_ccy == functional_ccy {

@@ -118,7 +118,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, Path};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
@@ -140,6 +140,7 @@ use crate::domain::publish::{PlanPublishUnit, PublishAuthorization, PublishRecei
 use crate::domain::scope_key::PlanId;
 use crate::infra::storage::repo::approval_repo::ApprovalRecord;
 use crate::infra::storage::repo_failure;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the publish operation (DE0205).
 const TAG: &str = "BSS Pricing Plans";
@@ -307,7 +308,7 @@ async fn publish_plan(
     let plan_id = PlanId::new(plan_id);
     let scope = publish_scope(&enforcer, &ctx, plan_id.get(), tenant).await?;
     let asserted = preconditions::if_match_revision(&headers)?;
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
 
     // The subject, resolved before anything else acts on it. A plan with no open
     // draft is discriminated the way S2 §5 asks — spent, nothing to publish, or
@@ -496,7 +497,7 @@ async fn assemble_subject(
     scope: &AccessScope,
     tenant: Uuid,
     plan_id: PlanId,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<PlanShape, CanonicalError> {
     let conn = state.db.conn().map_err(|e| {
         CanonicalError::from(DomainError::Internal(format!(
@@ -569,7 +570,7 @@ async fn materiality_of(
     tenant: Uuid,
     plan_id: PlanId,
     shape: &PlanShape,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<MaterialityVerdict, CanonicalError> {
     let change = ChangeSet::of_records(
         crate::infra::publish::unit_row_set(shape)

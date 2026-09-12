@@ -213,12 +213,12 @@ fn update(id: &str, set: &str) -> String {
 /// `pricing_price_window`'s migration doc is this crate's standing licence to compare
 /// these `text` instants directly, and until 2026-08-18 the licence rested on a
 /// false premise: it said the stored rendering is *"fixed-width, zero-padded and
-/// monotonic"*. It is not fixed-width. `sqlx-sqlite` encodes a `DateTime<Utc>` as
+/// monotonic"*. It is not fixed-width. `sqlx-sqlite` encodes a `OffsetDateTime` as
 /// `to_rfc3339_opts(SecondsFormat::AutoSi, false)`, and `AutoSi` picks 0, 3, 6 or
 /// 9 fractional digits per value — so one column holds 25-, 29-, 32- and
 /// 35-character renderings side by side, and this gear's own writers mix them:
 /// `check_authored_instant` bounds an *authored* instant at a millisecond and
-/// explicitly excludes storage bookkeeping, so `Utc::now()` reaches `created_at`
+/// explicitly excludes storage bookkeeping, so `OffsetDateTime::now_utc()` reaches `created_at`
 /// at nanosecond precision.
 ///
 /// The conclusion survives on a different argument, and this is that argument

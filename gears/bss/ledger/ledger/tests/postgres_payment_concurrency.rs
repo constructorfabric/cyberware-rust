@@ -33,6 +33,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use bss_ledger::domain::error::DomainError;
+use bss_ledger::domain::instant::to_naive_date;
 use bss_ledger::domain::model::{AccountRow, CurrencyScaleRow, NewEntry, NewLine};
 use bss_ledger::domain::money::DEFAULT_PLAUSIBLE_MAX_MAJOR;
 use bss_ledger::domain::payment::settlement::SettlementInput;
@@ -48,11 +49,12 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::{PaymentRepo, ReferenceRepo};
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -112,7 +114,7 @@ fn account(tenant: Uuid, id: Uuid, class: AccountClass, normal: Side) -> Account
 /// UNALLOCATED credit, PSP_FEE_EXPENSE debit, AR debit). Mirrors
 /// `postgres_payments::setup_seller`.
 async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<DbError>) -> Seller {
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
     let s = Seller {
         tenant: Uuid::now_v7(),
         payer: Uuid::now_v7(),
@@ -120,7 +122,7 @@ async fn setup_seller(raw: &sea_orm::DatabaseConnection, provider: &DBProvider<D
         unallocated: Uuid::now_v7(),
         psp_fee: Uuid::now_v7(),
         ar: Uuid::now_v7(),
-        period_id: format!("{:04}{:02}", now.year(), now.month()),
+        period_id: bss_ledger::domain::instant::yyyymm(now),
     };
 
     let reference = ReferenceRepo::new(provider.clone());
@@ -258,7 +260,7 @@ async fn seed_ar_invoice(
     s: &Seller,
     invoice_id: &str,
     amount: i64,
-    posted_at: DateTime<Utc>,
+    posted_at: OffsetDateTime,
 ) {
     let posting = PostingService::new(provider.clone(), Arc::new(LedgerEventPublisher::noop()));
     let ctx = SecurityContext::anonymous();
@@ -275,7 +277,7 @@ async fn seed_ar_invoice(
         reverses_entry_id: None,
         reverses_period_id: None,
         posted_at_utc: posted_at,
-        effective_at: posted_at.date_naive(),
+        effective_at: to_naive_date(posted_at),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: s.tenant,
         correlation_id: Uuid::now_v7(),
@@ -475,7 +477,7 @@ async fn concurrent_allocate_respects_per_payment_cap() {
             &s,
             invoice,
             100,
-            Utc::now() - chrono::Duration::hours(4 - i64::try_from(i).unwrap()),
+            OffsetDateTime::now_utc() - time::Duration::hours(4 - i64::try_from(i).unwrap()),
         )
         .await;
     }
@@ -584,7 +586,7 @@ async fn allocate_and_invoice_post_serialize_without_deadlock() {
         &s,
         "INV-A",
         300,
-        Utc::now() - chrono::Duration::hours(1),
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
     )
     .await;
 
@@ -636,7 +638,7 @@ async fn allocate_and_invoice_post_serialize_without_deadlock() {
         );
         let ctx = SecurityContext::anonymous();
         let scope = AccessScope::for_tenant(s_post.tenant);
-        let posted_at = Utc::now() - chrono::Duration::minutes(30);
+        let posted_at = OffsetDateTime::now_utc() - time::Duration::minutes(30);
         // The concurrent invoice-post serializes against the allocate at the
         // shared payer/AR grain; the same client retry lands it.
         retry_on_serialization(|| {
@@ -651,7 +653,7 @@ async fn allocate_and_invoice_post_serialize_without_deadlock() {
                 reverses_entry_id: None,
                 reverses_period_id: None,
                 posted_at_utc: posted_at,
-                effective_at: posted_at.date_naive(),
+                effective_at: to_naive_date(posted_at),
                 origin: "SYSTEM".to_owned(),
                 posted_by_actor_id: s_post.tenant,
                 correlation_id: Uuid::now_v7(),

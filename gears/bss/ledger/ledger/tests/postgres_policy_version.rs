@@ -38,10 +38,11 @@ use bss_ledger::infra::posting::service::PostingService;
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::ReferenceRepo;
 use bss_ledger_sdk::{AccountClass, EntryView, LineView, MappingStatus, Side, SourceDocType};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use time::OffsetDateTime;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_security::SecurityContext;
@@ -169,7 +170,7 @@ fn entry(
         source_business_id: business_id.to_owned(),
         reverses_entry_id,
         reverses_period_id: reverses_entry_id.map(|_| f.period_id.clone()),
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: naive(2026, 6, 1),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: f.tenant,
@@ -237,7 +238,7 @@ fn line(
 /// carry pinned evidence-ref columns, so the reversal it builds has no pinned
 /// refs — exactly the production behaviour the guard tolerates.
 fn original_view(f: &Fixture, entry_id: Uuid) -> EntryView {
-    let now: DateTime<Utc> = Utc::now();
+    let now: OffsetDateTime = OffsetDateTime::now_utc();
     EntryView {
         entry_id,
         tenant_id: f.tenant,

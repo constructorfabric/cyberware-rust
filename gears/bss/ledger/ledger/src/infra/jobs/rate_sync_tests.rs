@@ -17,7 +17,6 @@
 
 use async_trait::async_trait;
 use bss_ledger_sdk::{CurrencyPair, UnconfiguredRateProviderV1};
-use chrono::Utc;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -25,6 +24,7 @@ use toolkit_db::{ConnectOpts, connect_db};
 
 use super::*;
 use crate::infra::storage::migrations::Migrator;
+use time::OffsetDateTime;
 
 /// A configurable fake `RateProviderV1`: a stable id + a fixed fetch outcome.
 /// `id` is owned (not `&'static`) so `provider_id` returns a borrowed `&self.id`
@@ -90,7 +90,7 @@ fn rate(base: &str, quote: &str, rate_micro: i64) -> ProviderRate {
         base: base.to_owned(),
         quote: quote.to_owned(),
         rate_micro,
-        as_of: Utc::now(),
+        as_of: OffsetDateTime::now_utc(),
         provider: "unstamped".to_owned(),
     }
 }

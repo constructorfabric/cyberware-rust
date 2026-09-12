@@ -23,8 +23,8 @@ pub use bss_pricing_sdk::catalog_version_registry::{
     registry_unreachable, unconfigured_registry,
 };
 pub use bss_pricing_sdk::product_catalog::{
-    CatalogSku, ProductCatalogClientV1, ProductCatalogError, UnconfiguredProductCatalogClientV1,
-    unconfigured_catalog,
+    CatalogSku, CatalogTaxCategory, ProductCatalogClientV1, ProductCatalogError,
+    UnconfiguredProductCatalogClientV1, unconfigured_catalog,
 };
 
 use crate::domain::error::DomainError;

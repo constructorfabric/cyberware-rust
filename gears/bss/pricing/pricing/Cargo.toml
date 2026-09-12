@@ -20,6 +20,16 @@ test-support = ["dep:opentelemetry_sdk"]
 
 [dependencies]
 bss-pricing-sdk = { workspace = true }
+# Live, authorized participant profiles; no identity storage in Pricing.
+account-management-sdk = { workspace = true }
+# The gear behind that SDK, declared so `#[toolkit::gear(deps = ...)]` can name it
+# and `RegistryBuilder` gets the `account-management -> bss-pricing` edge. Without
+# it a process built without AM starts clean and every approval read renders its
+# participants as `Unavailable`, with nothing said at boot. Referenced only through
+# the macro expansion, which is why it is in the workspace `cargo-shear` ignore
+# list — as it already is for `bss-ledger`, which declares the same client.
+account-management = { workspace = true }
+futures-util = { workspace = true }
 
 # The joint golden conformance corpus registry, read by `infra::fixture_gate`.
 # `default-features = false` on purpose: the loader, the case model and `chrono`
@@ -42,9 +52,10 @@ async-trait = { workspace = true }
 # provider the platform installs at bootstrap, exactly as the sibling ledger's
 # posting gate uses); no non-FIPS hasher enters the graph.
 aws-lc-rs = { workspace = true }
-# `DateTime<Utc>` for the `cohort` scope-key axis (the UTC cutover instant that
-# created a grandfathering generation) and the pin-frontier instant.
-chrono = { workspace = true }
+# Instants are `time::OffsetDateTime` end-to-end (entity, domain, REST), matching
+# AM. `serde-well-known` is the RFC 3339 wire form; the default `time` serde
+# format is a tuple and must not leak onto the catalog contract.
+time = { workspace = true, features = ["serde-well-known"] }
 serde = { workspace = true }
 # Authz-label stub type-schemas registered at init (`authz::authz_label_type_schemas`).
 serde_json = { workspace = true }
@@ -93,7 +104,7 @@ toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 base64 = { workspace = true }
 # `#[toolkit_macros::api_dto(...)]` expands to `#[derive(utoipa::ToSchema)]`, so
 # the crate has to be a direct dependency of every gear carrying REST DTOs.
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["time"] }
 # Holds the per-process runtime populated in `init()`.
 arc-swap = { workspace = true }
 
@@ -118,6 +129,7 @@ toolkit-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Re-imports the crate under test with `test-support` enabled so the metrics
 # harness is available to the in-file tests. Cargo unifies the lib-under-test
 # edge with this dev-dep edge into one `test-support = on` compilation.

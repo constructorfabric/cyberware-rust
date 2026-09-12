@@ -1,16 +1,17 @@
 //! Tests for the reversal + `MAPPING_CORRECTION` flow.
 
 use bss_ledger_sdk::{AccountClass, LineView, MappingStatus};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::NaiveDate;
 
 use super::*;
+use time::OffsetDateTime;
 
 fn naive(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
 }
 
-fn now() -> DateTime<Utc> {
-    Utc::now()
+fn now() -> OffsetDateTime {
+    OffsetDateTime::now_utc()
 }
 
 fn line(account: Uuid, class: AccountClass, side: Side, amount: i64) -> LineView {

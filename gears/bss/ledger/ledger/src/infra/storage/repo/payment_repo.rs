@@ -18,7 +18,7 @@
 //! (SQL-level BOLA — a foreign tenant yields no rows).
 
 use bss_ledger_sdk::SourceDocType;
-use chrono::{DateTime, Utc};
+
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait, Order};
@@ -38,6 +38,7 @@ use crate::infra::storage::entity::{
     payment_allocation_refund, payment_settlement, reusable_credit_subbalance,
     tenant_precedence_policy, unallocated_balance,
 };
+use time::OffsetDateTime;
 
 /// A `payment_allocation` row to insert (one per allocation split).
 pub struct NewAllocationRow {
@@ -49,7 +50,7 @@ pub struct NewAllocationRow {
     pub amount_minor: i64,
     pub currency: String,
     pub precedence_policy_ref: String,
-    pub allocated_at_utc: DateTime<Utc>,
+    pub allocated_at_utc: OffsetDateTime,
 }
 
 /// One open AR invoice in the allocation candidate set (oldest-first ordered by
@@ -57,7 +58,7 @@ pub struct NewAllocationRow {
 pub struct OpenArInvoice {
     pub invoice_id: String,
     pub balance_minor: i64,
-    pub original_posted_at: Option<DateTime<Utc>>,
+    pub original_posted_at: Option<OffsetDateTime>,
     pub currency: String,
     /// The grain's carried functional balance (Slice 5). `Some` only when the
     /// invoice was posted cross-currency (S1 stamped a functional translation);
@@ -1424,7 +1425,7 @@ impl PaymentRepo {
         &self,
         scope: &AccessScope,
         tenant: Uuid,
-        at: DateTime<Utc>,
+        at: OffsetDateTime,
     ) -> Result<Option<(PrecedenceStrategy, i64)>, RepoError> {
         let conn = self
             .db

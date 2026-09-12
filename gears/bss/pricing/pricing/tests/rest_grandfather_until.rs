@@ -27,31 +27,44 @@ use axum::http::StatusCode;
 use bss_pricing::api::rest::cutovers::{PLAN_CUTOVERS, PRICE_GRANDFATHER_UNTIL};
 use bss_pricing::domain::approval::{DecisionBy, WithdrawAuthority};
 use bss_pricing::infra::approval::{DecideRequest, RegionGrant};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::{format_rfc3339, utc_ymd_hms};
 use rest_support::{
     Harness, audit_rows, body_json, code_in, problem_code, seed_publishable_plan, violation_for,
     with_headers,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 const SUBMITTER: Uuid = Uuid::from_u128(0x_9f_11);
 const REVIEWER: Uuid = Uuid::from_u128(0x_9f_22);
 
-fn cutover_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn cutover_at() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 /// A horizon well inside the fixture's coverage.
-fn horizon(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, day, 0, 0, 0).unwrap()
+fn horizon(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, day, 0, 0, 0)
 }
 
 fn path(price_id: Uuid) -> String {
     PRICE_GRANDFATHER_UNTIL.replace("{priceId}", &price_id.to_string())
 }
 
-fn body(at: DateTime<Utc>) -> serde_json::Value {
-    serde_json::json!({ "grandfather_until": at })
+/// The gear's own rendering, not a second one written here.
+///
+/// This used to call `time`'s well-known `Rfc3339` directly, which is a
+/// re-implementation of the thing under test: the day the gear's renderer
+/// changed, every expectation built through this helper asserted the form the
+/// gear had stopped emitting, and the failure read as a wire-format regression
+/// rather than as a stale fixture.
+fn wire(at: OffsetDateTime) -> String {
+    bss_pricing::domain::instant::format_rfc3339(at)
+}
+
+fn body(at: OffsetDateTime) -> serde_json::Value {
+    serde_json::json!({ "grandfather_until": wire(at) })
 }
 
 async fn approve(h: &Harness, approval_id: Uuid) {
@@ -67,7 +80,7 @@ async fn approve(h: &Harness, approval_id: Uuid) {
                 approver_regions: RegionGrant::Untransported,
                 stamp: bss_pricing::domain::audit::AuditStamp {
                     actor_principal_id: REVIEWER,
-                    recorded_at: Utc::now(),
+                    recorded_at: OffsetDateTime::now_utc(),
                     correlation_id: Uuid::from_u128(0x_9f_c0),
                 },
                 withdraw_authority: WithdrawAuthority::OwnUnitsOnly,
@@ -102,7 +115,9 @@ async fn cut_over(h: &Harness) -> Generation {
 
     let cutover = serde_json::json!({
         "predecessor_price_id": seeded.price_id.to_string(),
-        "cutover_at": cutover_at(),
+        "cutover_at": cutover_at()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339"),
         "successor": {
             "model_kind": "flat",
             "amount_minor": 12_000,
@@ -167,7 +182,7 @@ async fn tag_of(h: &Harness, price_id: Uuid) -> String {
     format!("\"{}\"", record.row_version.get())
 }
 
-async fn stored_horizon(h: &Harness, price_id: Uuid) -> Option<DateTime<Utc>> {
+async fn stored_horizon(h: &Harness, price_id: Uuid) -> Option<OffsetDateTime> {
     h.governance
         .prices
         .find(&h.scope(), h.tenant, price_id)
@@ -206,7 +221,10 @@ async fn the_controlled_arm_answers_202_names_the_transition_and_writes_no_colum
     // absent: a cutover's copy is born indefinite (D-147), and this is the
     // `active_indefinite -> active_bounded` edge.
     assert!(view["prior_grandfather_until"].is_null(), "{view}");
-    assert_eq!(view["grandfather_until"], serde_json::json!(horizon(1)));
+    assert_eq!(
+        view["grandfather_until"],
+        serde_json::json!(wire(horizon(1)))
+    );
     assert!(view["pending_version_ref"].is_null(), "{view}");
 
     // Nothing was written. Asserted on the **column** rather than on the response,
@@ -308,7 +326,10 @@ async fn the_call_after_an_independent_approve_sets_the_bound_and_records_the_be
         before["grandfatherUntil"].is_null(),
         "the generation was indefinite before this act: {before}"
     );
-    assert_eq!(after["grandfatherUntil"], serde_json::json!(horizon(1)));
+    assert_eq!(
+        after["grandfatherUntil"],
+        serde_json::json!(format_rfc3339(horizon(1)))
+    );
     // The pair is self-describing: one field moved and the tag did not, which is
     // what tells a reader this is the in-place mutation D-141 freezes the tag
     // through rather than a republish.

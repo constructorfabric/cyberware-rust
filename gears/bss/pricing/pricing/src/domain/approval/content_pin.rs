@@ -256,7 +256,7 @@
 //! [`ThresholdVersionParts`]: crate::domain::materiality::ThresholdVersionParts
 
 use aws_lc_rs::digest::{SHA256, digest as sha256};
-use chrono::{DateTime, Utc};
+
 use uuid::Uuid;
 
 use crate::domain::concurrency::RowVersion;
@@ -264,6 +264,7 @@ use crate::domain::contracts::{
     AnchorDay, BillingAnchorPolicy, EntitlementGrants, GrantSet, PlanChangeContract,
     ProrationBasis, ProrationContract,
 };
+use crate::domain::instant::timestamp_micros;
 use crate::domain::materiality::{
     ThresholdBasis, ThresholdEntry, ThresholdVersion, ThresholdVersionParts,
 };
@@ -284,7 +285,9 @@ use crate::domain::price_row::{
     TierBand, TierQualificationWindow, model_kind_wire,
 };
 use crate::domain::scope_key::{Meter, PhaseId, PlanId, ScopeKey, ScopeKeyParts};
+use crate::domain::taxonomy::{RegionTaxMarkers, TaxonomyEntry, TaxonomyValueChange};
 use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
+use time::OffsetDateTime;
 
 /// Versioned domain-separation tag for the approval content pin.
 ///
@@ -566,7 +569,16 @@ use crate::domain::window::{KeyWindows, WindowInterval, WindowState};
 /// existing golden vectors, which is the proof rather than the claim. Recorded
 /// because "a change to the encoder" and "a change to the encoding" are the two
 /// things this constant exists to keep apart.
-pub const CONTENT_PIN_DOMAIN_SEP: &[u8] = b"VHP-BSS-PRICING-APPROVAL-PIN-v15\x1f";
+///
+/// # `v16`: a phase frames its label, and its middle kind is `interim` (D-357, D-358)
+///
+/// [`put_plan_phase`] frames [`PlanPhase::display_name`] (a reviewer is shown the
+/// label they approve), and `PhaseKind::as_str` renders `interim` where it
+/// rendered `intro`. Either alone changes stored digests; the bump records which
+/// framing a digest was taken under. Every unit pending at rollout answers
+/// `APPROVAL_CONTENT_MISMATCH` and is re-submitted — D-358's runbook drains them
+/// first.
+pub const CONTENT_PIN_DOMAIN_SEP: &[u8] = b"VHP-BSS-PRICING-APPROVAL-PIN-v16\x1f";
 
 /// Versioned domain-separation tag for the **threshold-policy** content pin.
 ///
@@ -603,6 +615,11 @@ pub const BUNDLE_PIN_DOMAIN_SEP: &[u8] = b"VHP-BSS-PRICING-BUNDLE-PIN-v1\x1f";
 /// taken for one kind of unit authorize a decision about another. `v1`
 /// because nothing has been pinned under it yet.
 pub const MEMBERSHIP_PIN_DOMAIN_SEP: &[u8] = b"VHP-BSS-PRICING-MEMBERSHIP-PIN-v1\x1f";
+
+/// The taxonomy-value edit's own separator (D-353), disjoint from every other
+/// pin's for the reason each of them is: two encodings freezing different
+/// content must not share a preimage.
+pub const TAXONOMY_VALUE_PIN_DOMAIN_SEP: &[u8] = b"VHP-BSS-PRICING-TAXONOMY-VALUE-PIN-v1\x1f";
 
 /// The token the preimage frames an absolute threshold basis as.
 ///
@@ -821,6 +838,49 @@ pub fn membership_content_hash(set: &MembershipMoveSet) -> [u8; 32] {
         put_instant(&mut buf, *effective_from);
     }
     digest32(&buf)
+}
+
+/// The pin over a proposed edit of one taxonomy value (D-353): the class, the
+/// value, the value **as held** when the edit was authored, and the value as it
+/// would stand — every field the per-value `GET` renders, for both.
+///
+/// The held half is what makes this a TOCTOU guard rather than a description of
+/// the request: a relabel or a retirement landing under a submitted unit changes
+/// the re-derived digest, and the approve is refused (`inst-ap-pin`).
+#[must_use]
+pub fn taxonomy_value_content_hash(change: &TaxonomyValueChange) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(256);
+    buf.extend_from_slice(TAXONOMY_VALUE_PIN_DOMAIN_SEP);
+    put_str(&mut buf, change.proposal.class.path_segment());
+    put_str(&mut buf, change.proposal.value.as_str());
+    put_taxonomy_entry(&mut buf, &change.held);
+    put_taxonomy_entry(&mut buf, &change.next());
+    digest32(&buf)
+}
+
+fn put_taxonomy_entry(buf: &mut Vec<u8>, entry: &TaxonomyEntry) {
+    // Destructured with no rest pattern, so a field added to `TaxonomyEntry` is a
+    // compile error here rather than content that silently stops being pinned.
+    let TaxonomyEntry {
+        value,
+        display_name,
+        state,
+        tax,
+    } = entry;
+    put_str(buf, value.as_str());
+    put_str(buf, display_name);
+    put_str(buf, state.as_str());
+    match tax {
+        None => put_bool(buf, false),
+        Some(RegionTaxMarkers {
+            tax_category,
+            tax_rate_present,
+        }) => {
+            put_bool(buf, true);
+            put_opt_str(buf, tax_category.as_deref());
+            put_bool(buf, *tax_rate_present);
+        }
+    }
 }
 
 fn put_overlay_revision(buf: &mut Vec<u8>, revision: &OverlayRevision) {
@@ -1272,6 +1332,7 @@ fn put_plan_phase(buf: &mut Vec<u8>, phase: &PlanPhase) {
     let PlanPhase {
         phase_id,
         kind,
+        display_name,
         ordinal,
         converts_to_phase_id,
         phase_duration_days,
@@ -1279,6 +1340,8 @@ fn put_plan_phase(buf: &mut Vec<u8>, phase: &PlanPhase) {
     } = phase;
     put_uuid(buf, phase_id.get());
     put_str(buf, kind.as_str());
+    // D-357: a reviewer is shown the label they approve, so it is framed.
+    put_opt_str(buf, display_name.as_deref());
     put_i64(buf, i64::from(*ordinal));
     put_opt_uuid(buf, converts_to_phase_id.map(PhaseId::get));
     put_opt_u64(buf, phase_duration_days.map(u64::from));
@@ -1726,11 +1789,11 @@ fn put_bool(buf: &mut Vec<u8>, value: bool) {
 /// An instant, in **microseconds** — the same resolution `audit_row_hash` uses
 /// and the resolution `timestamptz` stores, so a value that round-tripped
 /// through the column hashes as it did before it was written.
-fn put_instant(buf: &mut Vec<u8>, value: DateTime<Utc>) {
-    put_i64(buf, value.timestamp_micros());
+fn put_instant(buf: &mut Vec<u8>, value: OffsetDateTime) {
+    put_i64(buf, timestamp_micros(value));
 }
 
-fn put_opt_instant(buf: &mut Vec<u8>, value: Option<DateTime<Utc>>) {
+fn put_opt_instant(buf: &mut Vec<u8>, value: Option<OffsetDateTime>) {
     match value {
         Some(value) => put_instant(buf, value),
         None => put_none(buf),

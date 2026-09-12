@@ -90,6 +90,7 @@ use std::time::Duration;
 use bss_pricing::domain::approval::{ApprovalState, DecisionBy, WithdrawAuthority};
 use bss_pricing::domain::audit::AuditStamp;
 use bss_pricing::domain::error::DomainError;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::materiality::{ThresholdBasis, ThresholdEntry};
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::plan_shape::{
@@ -107,7 +108,8 @@ use bss_pricing::infra::storage::repo::{
     PlanRepo, PlanShapeRepo, PriceRepo, ThresholdEntryRow, threshold_repo,
 };
 use bss_pricing::infra::threshold::{AssertedPolicy, ThresholdService};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use pg_support::Pg;
 use serde_json::json;
 use tokio::sync::Notify;
@@ -137,8 +139,8 @@ fn terminal_phase() -> PhaseId {
     PhaseId::new(Uuid::from_u128(0xfa_5e))
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 fn stamp() -> AuditStamp {
@@ -151,7 +153,7 @@ fn stamp() -> AuditStamp {
 
 /// The stamp a decision is taken under: who acted, when, and the request's
 /// correlation.
-fn stamp_of(actor: uuid::Uuid, when: DateTime<Utc>) -> AuditStamp {
+fn stamp_of(actor: uuid::Uuid, when: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -250,6 +252,7 @@ async fn seed(pg: &Pg) {
             vec![PlanPhase {
                 phase_id: terminal_phase(),
                 kind: PhaseKind::Evergreen,
+                display_name: None,
                 ordinal: 0,
                 converts_to_phase_id: None,
                 phase_duration_days: None,
@@ -345,9 +348,267 @@ async fn an_uncontended_approve_succeeds() {
     assert_eq!(decided.state, ApprovalState::Approved);
 }
 
+/// The taxonomy approve/apply boundary also works under `PostgreSQL`'s real
+/// append-only approval and hash-chain triggers, not only the `SQLite` mirror.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_taxonomy_approve_applies_once_with_its_audit_on_postgres() {
+    use bss_pricing::domain::overlay::ScopeValue;
+    use bss_pricing::domain::taxonomy::{
+        TaxonomyClass, TaxonomyEntry, TaxonomyState, TaxonomyValueChange, TaxonomyValuePatch,
+        TaxonomyValueProposal,
+    };
+    use bss_pricing::infra::storage::repo::approval_repo;
+    use bss_pricing::infra::storage::repo::taxonomy_repo::{self, TaxonomyRepo};
+    use sea_orm::{ConnectionTrait, Statement};
+    use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
+
+    let pg = Pg::applied().await;
+    let provider = DBProvider::<DbError>::new(pg.db().await);
+    let held = TaxonomyEntry {
+        value: ScopeValue::new("acme").expect("value"),
+        display_name: "Acme".to_owned(),
+        state: TaxonomyState::Active,
+        tax: None,
+    };
+    TaxonomyRepo::new(provider.clone())
+        .declare_value(
+            &scope(),
+            TENANT,
+            TaxonomyClass::Brand,
+            held.clone(),
+            stamp(),
+        )
+        .await
+        .expect("declare");
+    let change = TaxonomyValueChange {
+        proposal: TaxonomyValueProposal {
+            class: TaxonomyClass::Brand,
+            value: held.value.clone(),
+            patch: TaxonomyValuePatch {
+                display_name: Some("ACME Ltd".to_owned()),
+                ..TaxonomyValuePatch::default()
+            },
+        },
+        held,
+    };
+    let id = Uuid::from_u128(0xa4);
+    let conn = provider.conn().expect("conn");
+    ApprovalService::submit_taxonomy_value_on(
+        &conn,
+        &scope(),
+        TENANT,
+        &change,
+        id,
+        json!({}),
+        stamp(),
+    )
+    .await
+    .expect("submit");
+    let pending = approval_repo::pending_for_taxonomy_values(
+        &conn,
+        &scope(),
+        TENANT,
+        TaxonomyClass::Brand,
+        &["acme".to_owned()],
+    )
+    .await
+    .expect("pending metadata on PostgreSQL");
+    assert_eq!(pending["acme"].len(), 1);
+    assert_eq!(pending["acme"][0].record.approval_id, id);
+    assert_eq!(pending["acme"][0].proposal, change.proposal);
+    let readable_scope = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![TENANT]),
+        ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![id]),
+    ]));
+    assert_eq!(
+        approval_repo::visible_ids(&conn, &readable_scope, TENANT, &[id])
+            .await
+            .expect("scoped preview access"),
+        BTreeSet::from([id])
+    );
+    let service = ApprovalService::new(provider.clone());
+    let mut decision = approve(id);
+    decision.approver_regions = RegionGrant::Explicit(BTreeSet::new());
+    service
+        .decide(&scope(), TENANT, decision.clone())
+        .await
+        .expect("approve and apply");
+    assert_eq!(state_of(&pg, id).await, ApprovalState::Approved);
+    assert!(
+        approval_repo::pending_for_taxonomy_values(
+            &conn,
+            &scope(),
+            TENANT,
+            TaxonomyClass::Brand,
+            &["acme".to_owned()],
+        )
+        .await
+        .expect("decided is no longer pending")
+        .is_empty()
+    );
+    assert_eq!(
+        taxonomy_repo::find_value_on(
+            &conn,
+            &scope(),
+            TENANT,
+            TaxonomyClass::Brand,
+            &change.proposal.value
+        )
+        .await
+        .expect("read")
+        .expect("value")
+        .display_name,
+        "ACME Ltd"
+    );
+    assert!(matches!(
+        service.decide(&scope(), TENANT, decision).await,
+        Err(DomainError::ApprovalNotPending(_))
+    ));
+    let row = pg.raw().await.query_one_raw(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT COUNT(*) AS n FROM bss.pricing_audit_log WHERE tenant_id = '{TENANT}' \
+                 AND subject_ref = 'taxonomy/brand/acme' AND action = 'update' AND approval_ref = '{id}'"),
+    )).await.expect("audit query").expect("count");
+    assert_eq!(row.try_get::<i64>("", "n").expect("count"), 1);
+}
+
 // ---------------------------------------------------------------------------
 // The race
 // ---------------------------------------------------------------------------
+
+/// Both reviewers read the same before-value. Hold the taxonomy row until both
+/// transactions demonstrably wait on database locks, then release it: at most
+/// one proposal and its decision/audits may commit. The loser stays submitted
+/// and a retry sees a stale pin, not a second successful rename.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn two_taxonomy_approvals_in_flight_apply_exactly_one_proposal() {
+    use bss_pricing::domain::overlay::ScopeValue;
+    use bss_pricing::domain::taxonomy::{
+        TaxonomyClass, TaxonomyEntry, TaxonomyState, TaxonomyValueChange, TaxonomyValuePatch,
+        TaxonomyValueProposal,
+    };
+    use bss_pricing::infra::storage::repo::taxonomy_repo::{self, TaxonomyRepo};
+    use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+
+    let pg = Pg::applied().await;
+    let provider = DBProvider::<DbError>::new(pg.db().await);
+    let held = TaxonomyEntry {
+        value: ScopeValue::new("acme").expect("value"),
+        display_name: "Acme".to_owned(),
+        state: TaxonomyState::Active,
+        tax: None,
+    };
+    TaxonomyRepo::new(provider.clone())
+        .declare_value(
+            &scope(),
+            TENANT,
+            TaxonomyClass::Brand,
+            held.clone(),
+            stamp(),
+        )
+        .await
+        .expect("declare");
+    let ids = [Uuid::from_u128(0xa5), Uuid::from_u128(0xa6)];
+    let conn = provider.conn().expect("conn");
+    for (id, label) in ids.into_iter().zip(["ACME Ltd", "ACME Corp"]) {
+        ApprovalService::submit_taxonomy_value_on(
+            &conn,
+            &scope(),
+            TENANT,
+            &TaxonomyValueChange {
+                held: held.clone(),
+                proposal: TaxonomyValueProposal {
+                    class: TaxonomyClass::Brand,
+                    value: held.value.clone(),
+                    patch: TaxonomyValuePatch {
+                        display_name: Some(label.to_owned()),
+                        ..TaxonomyValuePatch::default()
+                    },
+                },
+            },
+            id,
+            json!({}),
+            stamp(),
+        )
+        .await
+        .expect("submit independent proposal");
+    }
+    let observer = pg.raw().await;
+    let lock = observer.begin().await.expect("blocking transaction");
+    lock.query_one_raw(Statement::from_string(sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT value FROM bss.pricing_brand_taxonomy WHERE tenant_id = '{TENANT}' AND value = 'acme' FOR UPDATE"),
+    )).await.expect("hold taxonomy row").expect("held value");
+    let mut racers = Vec::new();
+    for id in ids {
+        let service = ApprovalService::new(DBProvider::<DbError>::new(pg.db().await));
+        racers.push(tokio::spawn(async move {
+            let mut request = approve(id);
+            request.approver_regions = RegionGrant::Explicit(BTreeSet::new());
+            (id, service.decide(&scope(), TENANT, request).await)
+        }));
+    }
+    tokio::time::timeout(RACE_TIMEOUT, async {
+        while pg_support::blocked_backends(&observer).await < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both decisions must be in flight before release");
+    lock.commit().await.expect("release taxonomy row");
+
+    let mut winner = None;
+    let mut loser = None;
+    for racer in racers {
+        let (id, result) = tokio::time::timeout(RACE_TIMEOUT, racer)
+            .await
+            .expect("decision completes")
+            .expect("no task panic");
+        match result {
+            Ok(record) => {
+                assert_eq!(record.state, ApprovalState::Approved);
+                assert!(winner.replace(id).is_none(), "only one winner");
+            }
+            Err(DomainError::ConcurrentMutation(_) | DomainError::ApprovalContentMismatch(_)) => {
+                assert!(loser.replace(id).is_none(), "only one loser");
+            }
+            other => panic!("expected success or typed concurrency refusal: {other:?}"),
+        }
+    }
+    let winner = winner.expect("one winner");
+    let loser = loser.expect("one loser");
+    assert_eq!(state_of(&pg, loser).await, ApprovalState::Submitted);
+    let value =
+        taxonomy_repo::find_value_on(&conn, &scope(), TENANT, TaxonomyClass::Brand, &held.value)
+            .await
+            .expect("read")
+            .expect("value");
+    assert_eq!(
+        value.display_name,
+        if winner == ids[0] {
+            "ACME Ltd"
+        } else {
+            "ACME Corp"
+        }
+    );
+    let mut retry = approve(loser);
+    retry.approver_regions = RegionGrant::Explicit(BTreeSet::new());
+    assert!(matches!(
+        ApprovalService::new(provider)
+            .decide(&scope(), TENANT, retry)
+            .await,
+        Err(DomainError::ApprovalContentMismatch(_))
+    ));
+    let audit = observer.query_one_raw(Statement::from_string(sea_orm::DatabaseBackend::Postgres,
+        format!("SELECT COUNT(*) AS n FROM bss.pricing_audit_log WHERE tenant_id = '{TENANT}' AND approval_ref IN ('{}', '{}') AND action IN ('approve', 'update')", ids[0], ids[1]),
+    )).await.expect("audit query").expect("count");
+    assert_eq!(
+        audit.try_get::<i64>("", "n").expect("count"),
+        2,
+        "one decision and one apply, no loser residue"
+    );
+}
 
 /// The mutation commits first: the approve is `APPROVAL_NOT_PENDING`, **not** a
 /// storage fault.
@@ -919,7 +1180,7 @@ const POLICY_LOSER: Uuid = Uuid::from_u128(0x_b4);
 /// One value for both, because a version's `effective_from` is content and two racers
 /// disagreeing about it would be a second difference between them — this case is about
 /// the one difference it names, their currency sets.
-fn policy_effective_from() -> DateTime<Utc> {
+fn policy_effective_from() -> OffsetDateTime {
     at(16)
 }
 

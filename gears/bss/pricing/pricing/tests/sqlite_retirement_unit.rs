@@ -27,9 +27,11 @@ use bss_pricing::domain::error::DomainError;
 use bss_pricing::domain::retirement::{KeptReason, WindowDisposition, WindowVerdict};
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::retirement::{RetirementOutcome, RetirementService};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use rest_support::Harness;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
+use time::OffsetDateTime;
 use toolkit_db::secure::SecureEntityExt;
 use uuid::Uuid;
 
@@ -37,8 +39,8 @@ const SUBMITTER: Uuid = Uuid::from_u128(0x_5c_12);
 const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_5c_c1);
 
 /// Inside `common`'s coverage window `[2099-08-04, 2099-09-01)`.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 5, 0, 0, 0).unwrap()
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 5, 0, 0, 0)
 }
 
 fn stamp_of(actor: Uuid) -> bss_pricing::domain::audit::AuditStamp {
@@ -80,7 +82,6 @@ async fn open_retirement_unit(
     let conn = h.db.conn().expect("conn");
     bss_pricing::infra::storage::repo::approval_repo::find_pending_for_subject(
         &conn,
-        &h.scope(),
         h.tenant,
         &bss_pricing::infra::approval::retirement_unit_ref(plan_id, 0),
     )
@@ -140,7 +141,7 @@ async fn schedule_migration_targeting(h: &Harness, target: PlanId) -> Uuid {
             source_plan_id: PlanId::new(Uuid::now_v7()),
             source_revision: 0,
             target_plan_id: target,
-            effective_at: now() + chrono::Duration::days(90),
+            effective_at: now() + time::Duration::days(90),
             announced_at: now(),
             scope: serde_json::json!({ "kind": "all" }),
             delta_report: serde_json::json!({
@@ -541,13 +542,13 @@ async fn a_kept_window_is_left_alone_and_announces_nothing() {
 /// `common`'s coverage start, so the fixture's generation is one whose window a
 /// cutover would have composed **at** the cohort (`algo-cutover` step 3, D-204
 /// clause (4)) rather than one already stranded before this file's `now()`.
-fn generation_cohort() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 4, 0, 0, 0).unwrap()
+fn generation_cohort() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 4, 0, 0, 0)
 }
 
 /// The horizon the fixture's generation is grandfathered until.
-fn generation_horizon() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 10, 1, 0, 0, 0).unwrap()
+fn generation_horizon() -> OffsetDateTime {
+    utc_ymd_hms(2099, 10, 1, 0, 0, 0)
 }
 
 /// `generation_horizon()` + W6's margin.
@@ -556,8 +557,8 @@ fn generation_horizon() -> DateTime<Utc> {
 /// maximum — 31 days — because a margin rounded down leaves the tail of a bound
 /// period uncovered, which is the hole D-04 exists to close. Spelled as the
 /// arithmetic so the case says what the floor *is*.
-fn generation_floor() -> DateTime<Utc> {
-    generation_horizon() + chrono::TimeDelta::days(31)
+fn generation_floor() -> OffsetDateTime {
+    generation_horizon() + time::Duration::days(31)
 }
 
 /// A published plan carrying an ordinary row **and** a grandfathered generation
@@ -568,8 +569,8 @@ fn generation_floor() -> DateTime<Utc> {
 /// generation has one and is what the bound is about.
 async fn plan_with_a_generation(
     h: &Harness,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
 ) -> (PlanId, Uuid, Uuid) {
     use bss_pricing::domain::scope_key::{Cohort, PriceEligibility};
 
@@ -601,8 +602,8 @@ async fn plan_with_a_generation(
 async fn schedule_window(
     h: &Harness,
     price_id: Uuid,
-    effective_from: DateTime<Utc>,
-    effective_to: Option<DateTime<Utc>>,
+    effective_from: OffsetDateTime,
+    effective_to: Option<OffsetDateTime>,
 ) -> Uuid {
     use bss_pricing::infra::storage::repo::window_repo::{NewWindow, schedule};
     let conn = h.db.conn().expect("conn");
@@ -722,7 +723,7 @@ async fn an_ordinary_keys_window_still_cancels_on_an_empty_lane() {
 async fn an_already_stranded_generation_does_not_become_unretirable() {
     let h = Harness::new().await;
     let (plan_id, _ordinary, generation_price) =
-        plan_with_a_generation(&h, generation_floor() + chrono::TimeDelta::days(10), None).await;
+        plan_with_a_generation(&h, generation_floor() + time::Duration::days(10), None).await;
 
     let generation_window = disposition_with_an_empty_lane(&h, plan_id)
         .await

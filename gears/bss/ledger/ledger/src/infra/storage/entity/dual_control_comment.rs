@@ -5,8 +5,8 @@
 //! revoked at the DB role (same encapsulation as posted financial facts);
 //! tenant-scoped via `SecureORM`, resource col is the parent `approval_id`.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -27,7 +27,7 @@ pub struct Model {
     pub revision: i32,
     pub author_actor: Uuid,
     pub body: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -45,6 +45,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::DatabaseConnection;
 
 mod common;
@@ -202,7 +203,7 @@ async fn a_revision_beyond_the_old_columns_range_round_trips() {
     use bss_pricing::domain::synthesis::SynthesisTrigger;
     use bss_pricing::infra::storage::migrations::Migrator;
     use bss_pricing::infra::storage::repo::{NewProvenance, synthesis_repo};
-    use chrono::{TimeZone, Utc};
+
     use sea_orm_migration::MigratorTrait as _;
     use toolkit_db::secure::AccessScope;
     use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -219,10 +220,7 @@ async fn a_revision_beyond_the_old_columns_range_round_trips() {
 
     let tenant_id = Uuid::parse_str(TENANT).expect("a tenant uuid");
     let beyond = u64::try_from(i32::MAX).expect("i32::MAX is non-negative") + 1;
-    let instant = Utc
-        .with_ymd_and_hms(2026, 11, 5, 0, 0, 0)
-        .single()
-        .expect("a fixed instant");
+    let instant = utc_ymd_hms(2026, 11, 5, 0, 0, 0);
 
     let frozen = synthesis_repo::freeze_or_load(
         &conn,

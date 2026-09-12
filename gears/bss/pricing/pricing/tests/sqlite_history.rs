@@ -41,6 +41,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use bss_pricing::domain::audit::AuditStamp;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::price_record::PriceContent;
@@ -57,7 +58,8 @@ use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::price_repo::HistoryPosition;
 use bss_pricing::infra::storage::repo::window_repo::{self, NewWindow};
 use bss_pricing::infra::storage::repo::{NewPriceDraft, PriceRepo};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use sea_orm_migration::MigratorTrait;
@@ -93,8 +95,8 @@ const AUTHORING_ACTOR: Uuid = Uuid::from_u128(0xac_02);
 const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_c0_11_a7_10);
 
 /// `2026-08-02T<hour>:00:00Z` — the authoring scale.
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 2, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 2, hour, 0, 0)
 }
 
 /// `2099-09-<day>T00:00:00Z` — the effective-dating scale.
@@ -102,8 +104,8 @@ fn at(hour: u32) -> DateTime<Utc> {
 /// A different year from the authoring one, and far enough ahead that "future"
 /// is a fact rather than a fixture that ages: `sqlite_window_repo.rs` records
 /// what happens when a window suite's instants drift into the past.
-fn effective(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, day, 0, 0, 0).unwrap()
+fn effective(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, day, 0, 0, 0)
 }
 
 fn scope() -> AccessScope {
@@ -210,7 +212,7 @@ async fn seed_row(
     price_id: Uuid,
     currency: &str,
     lifecycle_state: &str,
-    authored_at: DateTime<Utc>,
+    authored_at: OffsetDateTime,
 ) {
     let conn = provider.conn().expect("scoped connection");
     let row = price::ActiveModel {

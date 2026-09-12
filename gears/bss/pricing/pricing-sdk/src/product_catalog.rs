@@ -10,7 +10,10 @@
 //! catalog sells**, so the pick-lists can only ever offer what the tenant has
 //! already used, and a first row for a new SKU is typed from memory.
 //!
-//! So this is a suggestion source, deliberately: `list_skus` and nothing else.
+//! SKU browsing is a suggestion source. `list_tax_categories` also exposes the
+//! registry-owned category dictionary: pricing owns the assignment on a price
+//! row, not a category default on a SKU or region. The dictionary defines codes
+//! and labels, not rates or tax calculation rules.
 //! No create, no lifecycle, no resolution — those belong to the registry's own
 //! authoring surface (`cpt-cf-bss-products-interface-authoring-publish`), and a
 //! gear that could write the catalog it prices would be the second author of it.
@@ -25,7 +28,7 @@
 //!
 //! # Failing is not the same as answering "none"
 //!
-//! Nothing depends on this list, so the fail-closed posture the version registry
+//! SKU validity does not depend on the browse list, so the fail-closed posture the version registry
 //! takes would be wrong here: a publish must not proceed on an invented version,
 //! but a pick-list with no suggestions is merely a pick-list with no
 //! suggestions. What must **not** happen is the two being confused. An empty
@@ -82,6 +85,19 @@ pub struct CatalogSku {
     pub status: String,
     /// The registry-owned tier, which a plan's own tier is checked against.
     pub plan_tier: Option<String>,
+}
+
+/// A tax-category definition owned by Product Catalog, not a tax rate.
+///
+/// Pricing assigns `code` to a price row's `tax_category_ref`. Neither a SKU nor
+/// a region supplies a second editable assignment or fallback. Labels are read
+/// from the provider rather than stored alongside each assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogTaxCategory {
+    /// Stable provider-owned code. Development providers visibly prefix demo codes.
+    pub code: String,
+    /// Human-readable label for the category picker.
+    pub display_name: String,
 }
 
 /// Why the catalog could not be read — the typed view over [`CanonicalError`].
@@ -163,6 +179,20 @@ pub trait ProductCatalogClientV1: Send + Sync {
     /// that renders them as one is telling an operator the tenant sells nothing.
     /// Project with [`ProductCatalogError::from`] to tell the three apart.
     async fn list_skus(&self, ctx: &SecurityContext) -> Result<Vec<CatalogSku>, CanonicalError>;
+
+    /// Tax-category definitions available to this tenant, in provider order.
+    ///
+    /// No CRUD or rate data. Implementations must not fall back to fabricated
+    /// definitions when the real provider is unavailable. A validator can read
+    /// this list once per operation, not once per price row.
+    ///
+    /// # Errors
+    /// [`CanonicalError`] when unconfigured, unreachable or unusable. These
+    /// cases must not be interpreted as an empty valid dictionary.
+    async fn list_tax_categories(
+        &self,
+        ctx: &SecurityContext,
+    ) -> Result<Vec<CatalogTaxCategory>, CanonicalError>;
 }
 
 /// The default until the registry gear exists: it says so, every time.
@@ -175,6 +205,13 @@ pub struct UnconfiguredProductCatalogClientV1;
 #[async_trait]
 impl ProductCatalogClientV1 for UnconfiguredProductCatalogClientV1 {
     async fn list_skus(&self, _ctx: &SecurityContext) -> Result<Vec<CatalogSku>, CanonicalError> {
+        Err(unconfigured_catalog())
+    }
+
+    async fn list_tax_categories(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<Vec<CatalogTaxCategory>, CanonicalError> {
         Err(unconfigured_catalog())
     }
 }

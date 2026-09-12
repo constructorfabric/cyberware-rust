@@ -19,6 +19,7 @@ use bss_pricing::domain::bundle::{
     Absorber, InvoiceItemization, Party, PartyShare, PriceBasis, RevShareGroup,
 };
 use bss_pricing::domain::concurrency::RowVersion;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::storage::RepoError;
@@ -27,7 +28,8 @@ use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{
     BundleComponentDraft, BundleRepo, CompositionDraft, NewBundle, NewPlanDraft, PlanRepo,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
 use toolkit_db::migration_runner::run_migrations_for_testing;
@@ -37,10 +39,8 @@ use uuid::Uuid;
 
 const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_c0_11_a7_10);
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 6, hour, 0, 0)
-        .single()
-        .expect("instant")
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 6, hour, 0, 0)
 }
 
 fn stamp() -> AuditStamp {

@@ -32,6 +32,7 @@ use rest_support::{
     plan_state, price_rows, problem_code, publishable_row, publishable_scope_key, refused_by,
     seed_draft_plan, seed_publishable_plan, seed_publishable_plan_with, with_headers,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// The submitting principal, and the independent one that reviews.
@@ -828,7 +829,7 @@ async fn the_publish_voids_the_unit_it_did_not_consume() {
             serde_json::json!({ "material": true, "reason": "noConfiguredThreshold" }),
             bss_pricing::domain::audit::AuditStamp {
                 actor_principal_id: SUBMITTER,
-                recorded_at: chrono::Utc::now(),
+                recorded_at: OffsetDateTime::now_utc(),
                 correlation_id: uuid::Uuid::from_u128(0x_c0_11_a7_10),
             },
         )

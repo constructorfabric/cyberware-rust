@@ -2,6 +2,7 @@
 //! mappings the domain deliberately knows nothing about.
 
 pub mod approval;
+pub mod approval_participants;
 pub mod audit_read;
 pub mod bulk;
 pub mod bundle;

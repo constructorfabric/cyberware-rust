@@ -135,7 +135,6 @@ use axum::http::HeaderMap;
 use axum::http::header::ETAG;
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, SubsecRound, Utc};
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::operation_builder::{ParamLocation, ParamSpec};
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
@@ -152,10 +151,13 @@ use crate::api::rest::error::authz_error_to_canonical;
 use crate::api::rest::preconditions;
 use crate::api::rest::state::GovernanceState;
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
+use crate::domain::instant::truncate_millis;
 use crate::domain::materiality::triggers::Trigger;
 use crate::domain::materiality::{self, ChangeSet, ThresholdBasis, ThresholdEntry};
 use crate::domain::money::CurrencyCode;
 use crate::infra::threshold::AssertedPolicy;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to both operations (DE0205).
 const TAG: &str = "BSS Pricing Governance";
@@ -247,7 +249,8 @@ pub struct PutThresholdPolicyRequest {
     /// When the thresholds start applying, once approved. UTC, millisecond
     /// precision (D-144). Required on a threshold proposal; **must be absent on a
     /// retirement**, which is not schedulable — see `retire`.
-    pub effective_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_from: Option<OffsetDateTime>,
     /// The per-currency entries. **The whole policy**, not a patch: a version is a
     /// complete entry set, so a currency left out of this list is a currency with
     /// no threshold — which is material by `inst-mat-percurrency`'s fail-safe
@@ -440,7 +443,7 @@ async fn put_threshold_policy(
     let correlation = require_correlation(extension_correlation)?;
     let scope = write_scope(&enforcer, &ctx).await?;
     let tenant = ctx.subject_tenant_id();
-    let now = Utc::now();
+    let now = OffsetDateTime::now_utc();
 
     // **After the gate, deliberately.** A caller who may not touch this resource is
     // told that, rather than being told their header is malformed — the ordering
@@ -483,7 +486,7 @@ async fn put_threshold_policy(
         }
         // Quantized to the millisecond (D-144) and **truncated**, so the instant is
         // never later than the moment asked for.
-        let at = now.trunc_subsecs(3);
+        let at = truncate_millis(now);
         state
             .thresholds
             .retire(

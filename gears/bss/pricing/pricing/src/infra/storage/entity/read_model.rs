@@ -4,11 +4,12 @@
 //! `warm_completed` is per row, not per version: a row is invisible to
 //! resolution until both `CatalogVersionPublished` and this marker are present.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use serde_json::Value as JsonValue;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_read_model")]
@@ -39,10 +40,10 @@ pub struct Model {
     /// forward dependency, not waste, and the pair reads as symmetric until
     /// somebody says which of the two decides anything. The flag is what a
     /// resolution asks; this is when the warm that set it finished.
-    pub warm_completed_at: Option<DateTime<Utc>>,
+    pub warm_completed_at: Option<OffsetDateTime>,
     /// The frozen projected payload for this subject at this version.
     pub payload: JsonValue,
-    pub projected_at: DateTime<Utc>,
+    pub projected_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

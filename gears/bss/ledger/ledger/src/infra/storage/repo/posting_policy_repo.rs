@@ -6,7 +6,6 @@
 //! via `SecureORM` (SQL-level BOLA); out-of-txn on a fresh scoped connection (the
 //! policy is admin-plane, never the hot money path).
 
-use chrono::{DateTime, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use toolkit_db::secure::{AccessScope, SecureEntityExt, SecureInsertExt};
@@ -16,6 +15,7 @@ use uuid::Uuid;
 use crate::domain::invoice::policy::{AgingThresholds, MissingMappingMode, PostingPolicy};
 use crate::domain::model::RepoError;
 use crate::infra::storage::entity::posting_policy;
+use time::OffsetDateTime;
 
 /// `SeaORM`-backed posting-policy repository.
 #[derive(Clone)]
@@ -44,7 +44,7 @@ impl PostingPolicyRepo {
         &self,
         scope: &AccessScope,
         tenant: Uuid,
-        at: DateTime<Utc>,
+        at: OffsetDateTime,
     ) -> Result<PostingPolicy, RepoError> {
         let conn = self
             .db
@@ -99,7 +99,7 @@ impl PostingPolicyRepo {
         scope: &AccessScope,
         tenant: Uuid,
         policy: &PostingPolicy,
-        effective_from: DateTime<Utc>,
+        effective_from: OffsetDateTime,
     ) -> Result<i64, RepoError> {
         let conn = self
             .db
@@ -120,7 +120,7 @@ impl PostingPolicyRepo {
             effective_from: Set(effective_from),
             missing_mapping_mode: Set(policy.missing_mapping_mode.as_str().to_owned()),
             ar_aging_thresholds: Set(policy.aging_thresholds.to_csv()),
-            created_at_utc: Set(Utc::now()),
+            created_at_utc: Set(OffsetDateTime::now_utc()),
         };
         posting_policy::Entity::insert(am.clone())
             .secure()

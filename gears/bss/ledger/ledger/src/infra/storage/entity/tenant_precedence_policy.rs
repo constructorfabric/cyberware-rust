@@ -1,8 +1,8 @@
 //! `SeaORM` entity for `bss.ledger_tenant_precedence_policy` (per-tenant,
 //! append-only effective-dated allocation precedence policy versions).
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -19,9 +19,9 @@ pub struct Model {
     pub tenant_id: Uuid,
     #[sea_orm(primary_key, auto_increment = false)]
     pub version: i64,
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     pub strategy: String,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

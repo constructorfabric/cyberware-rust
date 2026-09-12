@@ -17,9 +17,11 @@
 use async_trait::async_trait;
 use bss_pricing::domain::approval::{ApprovalDecision, ApprovalState};
 use bss_pricing::domain::audit::{AuditStamp, AuditSubjectKind};
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::materiality::triggers::Trigger;
 use bss_pricing::domain::materiality::{self, ChangeSet};
 use bss_pricing::domain::membership_change::{MembershipMoveProposal, MembershipMoveSet};
+use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::approval::{ApprovalService, PinnedSubject};
 use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::migrations::Migrator;
@@ -29,7 +31,8 @@ use bss_pricing::infra::storage::repo::approval_repo::{
 use bss_pricing::infra::storage::repo::group_membership_repo;
 use bss_pricing_sdk::catalog_version::CatalogVersion;
 use bss_pricing_sdk::catalog_version_registry::{CatalogVersionRegistryV1, PendingVersionRef};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
@@ -49,7 +52,7 @@ const APPROVER: Uuid = Uuid::from_u128(0xab_01);
 const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_c0_11_a7_10);
 
 /// The stamp an act is written under: who, when, and the request's correlation.
-fn stamp_of(actor: Uuid, when: DateTime<Utc>) -> AuditStamp {
+fn stamp_of(actor: Uuid, when: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -67,8 +70,8 @@ async fn harness() -> DBProvider<DbError> {
     DBProvider::<DbError>::new(db)
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 fn pending(approval_id: Uuid, tenant_id: Uuid) -> NewApproval {
@@ -87,6 +90,21 @@ fn pending(approval_id: Uuid, tenant_id: Uuid) -> NewApproval {
         // names. The register has its own suite (`tests/sqlite_window_service.rs`)
         // and its own race (`tests/postgres_approval_race.rs`).
         held_keys: std::collections::BTreeSet::new(),
+    }
+}
+
+/// A pending unit over a **named** subject — `pending`'s variant for the cases
+/// that need more than one plan, or a kind other than `plan_revision`.
+fn pending_over(
+    approval_id: Uuid,
+    tenant_id: Uuid,
+    subject_ref: &str,
+    subject_kind: AuditSubjectKind,
+) -> NewApproval {
+    NewApproval {
+        subject_ref: subject_ref.to_owned(),
+        subject_kind,
+        ..pending(approval_id, tenant_id)
     }
 }
 
@@ -112,7 +130,7 @@ fn decided_from(
     state: ApprovalState,
     approver_principal: Option<Uuid>,
     reason: Option<&str>,
-    decided_at: DateTime<Utc>,
+    decided_at: OffsetDateTime,
 ) -> ApprovalRecord {
     ApprovalRecord {
         approval_id: new.approval_id,
@@ -1533,4 +1551,336 @@ async fn a_self_approved_membership_record_still_commits_nothing() {
         .await
         .expect("read the payer's intervals");
     assert!(after.is_empty(), "a refused commit must write nothing");
+}
+
+/// Direct aggregate kinds are included; decided, foreign, indirect and
+/// off-page units are excluded. Multiple units survive with stable ordering.
+#[tokio::test]
+async fn pending_plan_units_are_scoped_ordered_and_include_all_direct_kinds() {
+    let provider = harness().await;
+    let conn = provider.conn().expect("scoped connection");
+    let scope = AccessScope::for_tenant(TENANT);
+    let one = Uuid::from_u128(0x9_a1);
+    let two = Uuid::from_u128(0x9_a2);
+    let decided_plan = Uuid::from_u128(0x9_a3);
+    let windowed_plan = Uuid::from_u128(0x9_a4);
+    let foreign_plan = Uuid::from_u128(0x9_a5);
+
+    for (unit, plan) in [(0xb1_u128, one), (0xb2, two)] {
+        approval_repo::open(
+            &conn,
+            &scope,
+            pending_over(
+                Uuid::from_u128(unit),
+                TENANT,
+                &format!("{plan}/1"),
+                AuditSubjectKind::PlanRevision,
+            ),
+            opened_under(),
+        )
+        .await
+        .expect("open a pending plan unit");
+    }
+
+    // Decided: out of the set, and the only one of the four whose exclusion the
+    // `state` predicate is responsible for.
+    let approved = Uuid::from_u128(0xb3);
+    approval_repo::open(
+        &conn,
+        &scope,
+        pending_over(
+            approved,
+            TENANT,
+            &format!("{decided_plan}/1"),
+            AuditSubjectKind::PlanRevision,
+        ),
+        opened_under(),
+    )
+    .await
+    .expect("open");
+    approval_repo::decide(
+        &conn,
+        &scope,
+        TENANT,
+        approved,
+        ApprovalDecision::Approve,
+        Some(APPROVER),
+        None,
+        stamp_of(APPROVER, at(11)),
+    )
+    .await
+    .expect("approve it");
+
+    // A window belongs directly to its plan, despite not reviewing a revision.
+    approval_repo::open(
+        &conn,
+        &scope,
+        pending_over(
+            Uuid::from_u128(0xb4),
+            TENANT,
+            &format!("{windowed_plan}/1"),
+            AuditSubjectKind::Window,
+        ),
+        opened_under(),
+    )
+    .await
+    .expect("open");
+
+    // Another tenant's pending plan unit.
+    approval_repo::open(
+        &conn,
+        &AccessScope::for_tenant(OTHER_TENANT),
+        pending_over(
+            Uuid::from_u128(0xb5),
+            OTHER_TENANT,
+            &format!("{foreign_plan}/1"),
+            AuditSubjectKind::PlanRevision,
+        ),
+        opened_under(),
+    )
+    .await
+    .expect("open");
+
+    // Insert in reverse id order, with equal timestamps, to exercise the tie-break.
+    for (id, kind, subject) in [
+        (
+            0xb7,
+            AuditSubjectKind::PriceUnit,
+            format!("{one}/price-change"),
+        ),
+        (
+            0xb6,
+            AuditSubjectKind::Window,
+            format!("{one}/window-change"),
+        ),
+        (0xb8, AuditSubjectKind::Policy, "tenant-policy".to_owned()),
+    ] {
+        approval_repo::open(
+            &conn,
+            &scope,
+            pending_over(Uuid::from_u128(id), TENANT, &subject, kind),
+            opened_under(),
+        )
+        .await
+        .expect("open additional unit");
+    }
+    let requested: Vec<PlanId> = [one, two, decided_plan, windowed_plan, foreign_plan]
+        .into_iter()
+        .map(PlanId::new)
+        .collect();
+    let pending = approval_repo::pending_for_plans(&conn, &scope, TENANT, &requested)
+        .await
+        .expect("read the pending set");
+    let held: std::collections::BTreeSet<Uuid> = pending.keys().map(|plan| plan.get()).collect();
+    assert_eq!(
+        held,
+        [one, two, windowed_plan]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<Uuid>>(),
+        "only requested plans with direct submitted units"
+    );
+    assert_eq!(
+        pending[&PlanId::new(one)]
+            .iter()
+            .map(|unit| unit.approval_id)
+            .collect::<Vec<_>>(),
+        [0xb1, 0xb6, 0xb7].map(Uuid::from_u128)
+    );
+    let page = approval_repo::pending_for_plans(&conn, &scope, TENANT, &[PlanId::new(two)])
+        .await
+        .expect("one-plan page");
+    assert_eq!(page.len(), 1);
+    assert!(page.contains_key(&PlanId::new(two)));
+    assert!(
+        approval_repo::pending_for_plans(&conn, &scope, TENANT, &[])
+            .await
+            .expect("empty page")
+            .is_empty()
+    );
+    assert_eq!(
+        approval_repo::find_pending_for_plan(&conn, &scope, TENANT, PlanId::new(one))
+            .await
+            .expect("revision write guard")
+            .expect("revision")
+            .subject_kind,
+        AuditSubjectKind::PlanRevision
+    );
+    assert!(
+        approval_repo::find_pending_for_plan(&conn, &scope, TENANT, PlanId::new(windowed_plan))
+            .await
+            .expect("window is not a revision conflict")
+            .is_none()
+    );
+}
+
+/// Batch taxonomy joins distinguish tenant, class and value, with an explicit
+/// stable order. Approval-read visibility retains its resource constraints.
+#[tokio::test]
+async fn pending_taxonomy_units_and_preview_visibility_are_scoped_independently() {
+    use bss_pricing::domain::overlay::ScopeValue;
+    use bss_pricing::domain::taxonomy::{TaxonomyClass, TaxonomyValuePatch, TaxonomyValueProposal};
+    use toolkit_security::{ScopeConstraint, ScopeFilter, pep_properties};
+
+    let provider = harness().await;
+    let conn = provider.conn().expect("conn");
+    let scope = AccessScope::for_tenant(TENANT);
+    for (id, tenant, class, value) in [
+        (3, TENANT, TaxonomyClass::Brand, "same"),
+        (2, TENANT, TaxonomyClass::Brand, "same"),
+        (1, TENANT, TaxonomyClass::Brand, "same"),
+        (4, TENANT, TaxonomyClass::Region, "same"),
+        (5, TENANT, TaxonomyClass::Brand, "off-page"),
+        (6, OTHER_TENANT, TaxonomyClass::Brand, "same"),
+    ] {
+        let proposal = TaxonomyValueProposal {
+            class,
+            value: ScopeValue::new(value).unwrap(),
+            patch: TaxonomyValuePatch {
+                display_name: Some(format!("Label {id}")),
+                ..TaxonomyValuePatch::default()
+            },
+        };
+        approval_repo::open(
+            &conn,
+            &AccessScope::for_tenant(tenant),
+            pending_over(
+                Uuid::from_u128(id),
+                tenant,
+                &approval_repo::taxonomy_value_subject_ref(&proposal).expect("encode"),
+                AuditSubjectKind::TaxonomyValue,
+            ),
+            opened_under(),
+        )
+        .await
+        .expect("open");
+    }
+    approval_repo::decide(
+        &conn,
+        &scope,
+        TENANT,
+        Uuid::from_u128(3),
+        ApprovalDecision::Reject,
+        Some(APPROVER),
+        Some("not needed".to_owned()),
+        stamp_of(APPROVER, at(10)),
+    )
+    .await
+    .expect("decide");
+    let units = approval_repo::pending_for_taxonomy_values(
+        &conn,
+        &scope,
+        TENANT,
+        TaxonomyClass::Brand,
+        &["same".to_owned()],
+    )
+    .await
+    .expect("batch read");
+    assert_eq!(units.len(), 1);
+    assert_eq!(
+        units["same"]
+            .iter()
+            .map(|unit| unit.record.approval_id)
+            .collect::<Vec<_>>(),
+        [1, 2].map(Uuid::from_u128)
+    );
+    assert_eq!(
+        units["same"][0].proposal.patch.display_name.as_deref(),
+        Some("Label 1")
+    );
+
+    let pinned = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![TENANT]),
+        ScopeFilter::in_uuids(pep_properties::RESOURCE_ID, vec![Uuid::from_u128(2)]),
+    ]));
+    let visible =
+        approval_repo::visible_ids(&conn, &pinned, TENANT, &[1, 2, 6].map(Uuid::from_u128))
+            .await
+            .expect("readable intersection");
+    assert_eq!(visible, [Uuid::from_u128(2)].into_iter().collect());
+    assert!(
+        approval_repo::visible_ids(
+            &conn,
+            &AccessScope::for_tenant(OTHER_TENANT),
+            TENANT,
+            &[1, 2, 6].map(Uuid::from_u128)
+        )
+        .await
+        .expect("foreign scope")
+        .is_empty()
+    );
+    assert!(
+        approval_repo::pending_for_taxonomy_values(
+            &conn,
+            &AccessScope::for_tenant(OTHER_TENANT),
+            TENANT,
+            TaxonomyClass::Brand,
+            &["same".to_owned()]
+        )
+        .await
+        .expect("foreign scope")
+        .is_empty()
+    );
+    assert!(
+        approval_repo::pending_for_taxonomy_values(
+            &conn,
+            &scope,
+            TENANT,
+            TaxonomyClass::Brand,
+            &[]
+        )
+        .await
+        .expect("empty values")
+        .is_empty()
+    );
+    assert!(
+        approval_repo::visible_ids(&conn, &pinned, TENANT, &[])
+            .await
+            .expect("empty ids")
+            .is_empty()
+    );
+}
+
+/// Corruption is a failure, not "nothing pending", and diagnostics cannot leak
+/// the proposal through a metadata-only config read.
+#[tokio::test]
+async fn a_malformed_pending_taxonomy_subject_fails_without_exposing_content() {
+    use bss_pricing::domain::taxonomy::TaxonomyClass;
+    use bss_pricing::infra::storage::entity::approval;
+    use sea_orm::{ActiveValue::Set, EntityTrait};
+
+    let provider = harness().await;
+    let conn = provider.conn().expect("conn");
+    let scope = AccessScope::for_tenant(TENANT);
+    let row = approval::ActiveModel {
+        approval_id: Set(Uuid::from_u128(0xc077)),
+        tenant_id: Set(TENANT),
+        subject_ref: Set("taxonomy-value/secret-proposal-invalid-json".to_owned()),
+        subject_kind: Set("taxonomy_value".to_owned()),
+        content_hash: Set(vec![1; 32]),
+        state: Set("submitted".to_owned()),
+        submitter_principal: Set(SUBMITTER),
+        approver_principal: Set(None),
+        reason: Set(None),
+        materiality: Set(json!({})),
+        submitted_at: Set(at(9)),
+        decided_at: Set(None),
+    };
+    approval::Entity::insert(row.clone())
+        .secure()
+        .scope_with_model(&scope, &row)
+        .expect("scope")
+        .exec(&conn)
+        .await
+        .expect("insert corrupt fixture");
+    let err = approval_repo::pending_for_taxonomy_values(
+        &conn,
+        &scope,
+        TENANT,
+        TaxonomyClass::Brand,
+        &["acme".to_owned()],
+    )
+    .await
+    .expect_err("corrupt proposal");
+    assert!(matches!(err, RepoError::CorruptRow(_)));
+    assert!(!err.to_string().contains("secret-proposal"));
 }

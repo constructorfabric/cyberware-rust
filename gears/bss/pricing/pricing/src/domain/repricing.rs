@@ -76,7 +76,7 @@ use crate::domain::price_row::ModelKind;
 use crate::domain::scope_key::{
     ChargeKind, Cohort, DimensionKey, Meter, PhaseId, PlanId, PriceEligibility, Region,
 };
-use chrono::{DateTime, Utc};
+use time::OffsetDateTime;
 
 /// §5's refusal for a run whose selector matched nothing (architectural 422,
 /// rendered 400 — Foundation §3.3).
@@ -677,7 +677,7 @@ pub(crate) fn adjustment_of_report(report: &serde_json::Value) -> Result<Adjustm
 /// corruption rather than a caller's mistake.
 pub(crate) fn changeover_of_report(
     report: &serde_json::Value,
-) -> Result<DateTime<Utc>, DomainError> {
+) -> Result<OffsetDateTime, DomainError> {
     let raw = report
         .get("changeover")
         .and_then(serde_json::Value::as_str)
@@ -686,11 +686,9 @@ pub(crate) fn changeover_of_report(
                 "bss-pricing: repricing run report: changeover missing or malformed".to_owned(),
             )
         })?;
-    DateTime::parse_from_rfc3339(raw)
-        .map(|dt| dt.with_timezone(&Utc))
-        .map_err(|e| {
-            DomainError::Internal(format!(
-                "bss-pricing: repricing run report: changeover `{raw}` is not RFC 3339: {e}"
-            ))
-        })
+    crate::domain::instant::parse_rfc3339(raw).map_err(|e| {
+        DomainError::Internal(format!(
+            "bss-pricing: repricing run report: changeover `{raw}` is not RFC 3339: {e}"
+        ))
+    })
 }

@@ -183,7 +183,7 @@ TABLE pricing_approval
   CONSTRAINT chk_pricing_approval_distinct_principals CHECK (approver_principal IS NULL OR approver_principal <> submitter_principal)
   CONSTRAINT chk_pricing_approval_reason CHECK (state <> 'rejected' OR reason IS NOT NULL)
   CONSTRAINT chk_pricing_approval_state CHECK (state IN ('submitted','approved','rejected','voided'))
-  CONSTRAINT chk_pricing_approval_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership'))
+  CONSTRAINT chk_pricing_approval_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership','taxonomy_value'))
 TABLE pricing_approval_key
   COLUMN approval_id TEXT NOT NULL DEFAULT - PK 1
   COLUMN scope_key TEXT NOT NULL DEFAULT - PK 2
@@ -232,7 +232,7 @@ TABLE pricing_audit_log
   CONSTRAINT chk_pricing_audit_log_entry_kind CHECK (entry_kind IN ('mutation','rollup'))
   CONSTRAINT chk_pricing_audit_log_rollup CHECK ((entry_kind = 'rollup') = (segment_heads IS NOT NULL))
   CONSTRAINT chk_pricing_audit_log_seq CHECK (seq >= 0)
-  CONSTRAINT chk_pricing_audit_log_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership'))
+  CONSTRAINT chk_pricing_audit_log_subject_kind CHECK (subject_kind IN ('plan_revision','price_unit','window','policy','overlay','bulk_operation','membership','taxonomy_value'))
 TABLE pricing_brand_taxonomy
   COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
   COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
@@ -346,6 +346,13 @@ TABLE pricing_customer_group_taxonomy
   COLUMN value TEXT NOT NULL DEFAULT - PK 2
   CONSTRAINT chk_pricing_customer_group_taxonomy_state CHECK (state IN ('active', 'retired'))
   CONSTRAINT chk_pricing_customer_group_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
+TABLE pricing_gl_code_taxonomy
+  COLUMN display_name TEXT NOT NULL DEFAULT - PK 0
+  COLUMN state TEXT NOT NULL DEFAULT 'active' PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN value TEXT NOT NULL DEFAULT - PK 2
+  CONSTRAINT chk_pricing_gl_code_taxonomy_state CHECK (state IN ('active', 'retired'))
+  CONSTRAINT chk_pricing_gl_code_taxonomy_value_present CHECK (length(trim(value, char(9,10,11,12,13,32))) > 0)
 TABLE pricing_group_membership
   COLUMN created_at_utc TEXT NOT NULL DEFAULT strftime('%Y-%m-%dT%H:%M:%S', 'now') || '+00:00' PK 0
   COLUMN created_by TEXT NOT NULL DEFAULT - PK 0
@@ -526,6 +533,7 @@ TABLE pricing_plan_period_floor_cap
   FK plan_revision -> pricing_plan.revision
 TABLE pricing_plan_phase
   COLUMN converts_to_phase_id TEXT NULL DEFAULT - PK 0
+  COLUMN display_name TEXT NULL DEFAULT - PK 0
   COLUMN display_trial_days INT NULL DEFAULT - PK 0
   COLUMN kind TEXT NOT NULL DEFAULT - PK 0
   COLUMN ordinal INT NOT NULL DEFAULT - PK 0
@@ -536,7 +544,7 @@ TABLE pricing_plan_phase
   COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 1
   CONSTRAINT chk_pricing_plan_phase_display_trial_days CHECK (display_trial_days IS NULL OR display_trial_days = phase_duration_days)
   CONSTRAINT chk_pricing_plan_phase_duration_non_negative CHECK (phase_duration_days IS NULL OR phase_duration_days >= 0)
-  CONSTRAINT chk_pricing_plan_phase_kind CHECK (kind IN ('trial','intro','evergreen'))
+  CONSTRAINT chk_pricing_plan_phase_kind CHECK (kind IN ('trial','interim','evergreen'))
   CONSTRAINT chk_pricing_plan_phase_trial_projection_non_negative CHECK (display_trial_days IS NULL OR display_trial_days >= 0)
   CONSTRAINT fk_pricing_plan_phase_revision FOREIGN KEY (plan_id, plan_revision)
   FK plan_id -> pricing_plan.plan_id

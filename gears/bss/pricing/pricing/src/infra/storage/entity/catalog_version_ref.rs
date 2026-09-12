@@ -12,10 +12,11 @@
 //! no path from a pending handle back to what it published. The four tokens are
 //! `pricing_read_model`'s, rendered from `domain::read_model::SubjectKind`.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
+use time::OffsetDateTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
 #[sea_orm(table_name = "pricing_catalog_version_ref")]
@@ -56,10 +57,10 @@ pub struct Model {
     /// and the projector refuses a membership subject that arrives without one:
     /// the presence of the pin is read off that column, so this one is free to
     /// carry a fact rather than an absence.
-    pub subject_effective_to: Option<DateTime<Utc>>,
+    pub subject_effective_to: Option<OffsetDateTime>,
     /// `None` until `CatalogVersionPublished` resolves the handle.
     pub catalog_version: Option<i64>,
-    pub requested_at: DateTime<Utc>,
+    pub requested_at: OffsetDateTime,
     /// When this gear first saw the registry's answer for the handle (D-166).
     ///
     /// Deliberately **not** paired with `catalog_version`: it is set while that
@@ -67,8 +68,8 @@ pub struct Model {
     /// migration's doc for why a recorded observation cannot be derived from the
     /// commit — the finalize and the warm share a transaction, so "committed but
     /// unwarm" is unreachable in storage.
-    pub commit_observed_at: Option<DateTime<Utc>>,
-    pub committed_at: Option<DateTime<Utc>>,
+    pub commit_observed_at: Option<OffsetDateTime>,
+    pub committed_at: Option<OffsetDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

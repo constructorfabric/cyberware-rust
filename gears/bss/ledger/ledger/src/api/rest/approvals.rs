@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::extract::{Extension, Path, Query};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
-use chrono::{DateTime, Utc};
+
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
 use toolkit_db::secure::AccessScope;
@@ -27,8 +27,10 @@ use crate::api::rest::dto::DualControlPolicyView;
 use crate::api::rest::error::authz_error_to_canonical;
 use crate::domain::approval::intent::ApprovalIntent;
 use crate::domain::error::DomainError;
+use crate::domain::instant::rfc3339;
 use crate::infra::approval::service::ApprovalService;
 use crate::infra::storage::entity::{dual_control_approval, dual_control_comment};
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the approval operations.
 const TAG: &str = "BSS Ledger Approvals";
@@ -54,10 +56,16 @@ pub struct ApprovalDto {
     pub business_key: String,
     pub reason_code: String,
     pub prepared_by: Uuid,
-    pub prepared_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub prepared_at: OffsetDateTime,
     pub approved_by: Option<Uuid>,
-    pub decided_at: Option<DateTime<Utc>>,
-    pub expires_at: DateTime<Utc>,
+    #[serde(default, with = "rfc3339::option")]
+    pub decided_at: Option<OffsetDateTime>,
+    // Without this `time`'s own `Serialize` runs and writes its default
+    // human-readable form (`2026-09-08 12:00:00.0 +00:00:00`), not the RFC 3339
+    // string the `date-time` schema promises and `prepared_at` beside it emits.
+    #[serde(with = "rfc3339")]
+    pub expires_at: OffsetDateTime,
     pub amount_usd_eq_minor: Option<i64>,
 }
 
@@ -88,7 +96,8 @@ pub struct ApprovalCommentDto {
     pub revision: i32,
     pub author_actor: Uuid,
     pub body: String,
-    pub created_at: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 impl From<dual_control_comment::Model> for ApprovalCommentDto {
@@ -154,7 +163,8 @@ pub struct SetDualControlPolicyRequest {
     pub d2_threshold_minor: i64,
     pub a6_backdating_biz_days: i32,
     pub pending_ttl_seconds: i64,
-    pub effective_from: Option<DateTime<Utc>>,
+    #[serde(default, with = "rfc3339::option")]
+    pub effective_from: Option<OffsetDateTime>,
 }
 
 /// The written dual-control policy version (the minted `version` + the thresholds
@@ -163,7 +173,8 @@ pub struct SetDualControlPolicyRequest {
 #[toolkit_macros::api_dto(response)]
 pub struct DualControlPolicyResponse {
     pub version: i64,
-    pub effective_from: DateTime<Utc>,
+    #[serde(with = "rfc3339")]
+    pub effective_from: OffsetDateTime,
     pub d2_threshold_minor: i64,
     pub a6_backdating_biz_days: i32,
     pub pending_ttl_seconds: i64,
@@ -565,7 +576,7 @@ async fn set_policy(
 ) -> Result<Response, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
     let scope = policy_scope(&enforcer, &ctx).await?;
-    let effective_from = body.effective_from.unwrap_or_else(Utc::now);
+    let effective_from = body.effective_from.unwrap_or_else(OffsetDateTime::now_utc);
     let version = state
         .service
         .set_policy(
@@ -621,7 +632,7 @@ async fn get_policy(
     .map_err(authz_error_to_canonical)?;
     let effective = state
         .service
-        .read_effective_policy(&scope, tenant_id, Utc::now())
+        .read_effective_policy(&scope, tenant_id, OffsetDateTime::now_utc())
         .await?;
     Ok(Json(DualControlPolicyView::from_effective(effective)))
 }
@@ -797,4 +808,53 @@ async fn list(
         approvals: rows.into_iter().map(ApprovalDto::from).collect(),
     };
     Ok((StatusCode::OK, Json(dto)).into_response())
+}
+
+#[cfg(test)]
+mod dto_wire_tests {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+    use uuid::Uuid;
+
+    use super::ApprovalDto;
+
+    // Every instant on the DTO must be RFC 3339 on the wire. `expires_at` was
+    // the one field without the serde attribute, so it rendered through `time`'s
+    // default form and contradicted the `date-time` schema beside its siblings.
+    #[test]
+    fn every_instant_on_the_approval_dto_is_rfc3339() {
+        let at = OffsetDateTime::from_unix_timestamp(1_757_000_000).expect("fixed instant");
+        let dto = ApprovalDto {
+            approval_id: Uuid::nil(),
+            kind: "refund".to_owned(),
+            state: "pending".to_owned(),
+            revision: 1,
+            business_key: "k".to_owned(),
+            reason_code: "r".to_owned(),
+            prepared_by: Uuid::nil(),
+            prepared_at: at,
+            approved_by: None,
+            decided_at: Some(at),
+            expires_at: at,
+            amount_usd_eq_minor: None,
+        };
+        let json = serde_json::to_value(&dto).expect("serialize");
+        for field in ["prepared_at", "decided_at", "expires_at"] {
+            let raw = json[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{field} must be a string"));
+            // **The rendering, and then the round-trip.** Parsing the field back
+            // and comparing instants was the whole test, and it holds for every
+            // RFC 3339 spelling of the same moment — `…20+00:00`, `…20.000000Z`,
+            // `…20Z` — so the `date-time` wire form it exists to pin was the one
+            // thing it could not fail on.
+            assert_eq!(
+                raw, "2025-09-04T15:33:20.000000Z",
+                "{field} is `format_rfc3339`'s rendering, byte for byte"
+            );
+            let back = OffsetDateTime::parse(raw, &Rfc3339)
+                .unwrap_or_else(|e| panic!("{field} must be RFC 3339, got {raw:?}: {e}"));
+            assert_eq!(back, at, "{field} round-trips to the same instant");
+        }
+    }
 }

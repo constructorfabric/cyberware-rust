@@ -15,7 +15,6 @@
 //! so an enum minted here would be a second registration of a rule this slice
 //! does not own, free to disagree with the one that does.
 
-use chrono::{DateTime, Utc};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
@@ -24,6 +23,7 @@ use crate::domain::contracts::ProrationContract;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::price_row::PriceRow;
 use crate::domain::scope_key::{DimensionKey, Meter, ScopeKey};
+use time::OffsetDateTime;
 
 /// Everything about a price row that an open draft may still change.
 ///
@@ -67,7 +67,7 @@ pub struct PriceContent {
     pub rounding_policy_ref: Option<String>,
     /// The grandfathering horizon. Only an `existing_grandfathered` row may
     /// carry one, and once published it may be tightened but never loosened.
-    pub grandfather_until: Option<DateTime<Utc>>,
+    pub grandfather_until: Option<OffsetDateTime>,
     /// The predecessor this row supersedes on its canonical scope key.
     ///
     /// Set by the two sanctioned producers of `published -> superseded` — the
@@ -121,7 +121,7 @@ pub struct PriceRecord {
     /// The named rounding policy resolved for this row, when one is set on it.
     pub rounding_policy_ref: Option<String>,
     /// The grandfathering horizon, on a grandfathered row.
-    pub grandfather_until: Option<DateTime<Utc>>,
+    pub grandfather_until: Option<OffsetDateTime>,
     /// The predecessor this row supersedes on its key, when it has one.
     pub supersedes_price_id: Option<Uuid>,
     /// Where the row stands. `draft` is the only state whose content may still
@@ -131,7 +131,7 @@ pub struct PriceRecord {
     /// the Slice-12 history surface never needs the Auditor-only audit log.
     pub created_by: Uuid,
     /// When the row was authored, UTC.
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// The optimistic-concurrency version, and therefore the row's `ETag`.
     ///
     /// It covers the **band set as well as the row**: bands carry no entity tag

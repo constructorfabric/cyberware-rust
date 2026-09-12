@@ -46,17 +46,21 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
+
 use serde_json::Value as JsonValue;
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
 use crate::api::rest::cursor::{DEFAULT_LIMIT, MAX_LIMIT};
 use crate::domain::error::DomainError;
+use crate::domain::instant::from_unix;
 use crate::infra::storage::RepoError;
 use crate::infra::storage::entity::audit_log;
+use crate::infra::storage::odata_mapping::OdataPageError;
 use crate::infra::storage::repo::audit_repo::{self, AuditPosition};
+use time::OffsetDateTime;
 
 /// One page's worth of request against the audit read.
 ///
@@ -127,10 +131,10 @@ impl AuditPageRequest {
 pub fn encode(position: AuditPosition) -> String {
     let raw: Vec<u8> = position
         .recorded_at
-        .timestamp()
+        .unix_timestamp()
         .to_be_bytes()
         .into_iter()
-        .chain(position.recorded_at.timestamp_subsec_nanos().to_be_bytes())
+        .chain(position.recorded_at.nanosecond().to_be_bytes())
         .chain(*position.chain_id.as_bytes())
         .chain(position.seq.to_be_bytes())
         .collect();
@@ -142,7 +146,7 @@ pub fn encode(position: AuditPosition) -> String {
 /// # Errors
 /// [`DomainError::InvalidRequest`] when the token is not URL-safe base64, is not
 /// exactly the 36 bytes [`encode`] writes, or names an instant outside the range a
-/// [`DateTime<Utc>`] holds. One refusal for all of them, because a caller can act
+/// [`OffsetDateTime`] holds. One refusal for all of them, because a caller can act
 /// no differently on any: the token did not come from this surface.
 pub fn decode(raw: &str) -> Result<AuditPosition, DomainError> {
     let refuse = || {
@@ -160,8 +164,7 @@ pub fn decode(raw: &str) -> Result<AuditPosition, DomainError> {
     // than eight bytes here and is refused.
     let seq: [u8; 8] = seq.try_into().map_err(|_| refuse())?;
     let recorded_at =
-        DateTime::from_timestamp(i64::from_be_bytes(*seconds), u32::from_be_bytes(*nanos))
-            .ok_or_else(refuse)?;
+        from_unix(i64::from_be_bytes(*seconds), u32::from_be_bytes(*nanos)).ok_or_else(refuse)?;
     Ok(AuditPosition {
         recorded_at,
         chain_id: Uuid::from_bytes(*chain),
@@ -196,7 +199,7 @@ pub struct AuditEntry {
     /// `mutation` | `rollup`.
     pub entry_kind: String,
     /// When the mutation was recorded, UTC.
-    pub recorded_at: DateTime<Utc>,
+    pub recorded_at: OffsetDateTime,
     /// The **pseudonymous** principal who acted (`inst-au-pii`).
     pub actor_principal_id: Uuid,
     /// What was done, as the column holds it.
@@ -295,6 +298,26 @@ impl AuditReader {
         };
         let entries = rows.into_iter().map(entry_of).collect();
         Ok(AuditPage { entries, next })
+    }
+
+    /// One `OData` page of the audit trail. Envelope mapping is the handler's.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on a
+    /// malformed `$filter` / `$orderby` / cursor.
+    pub async fn read_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<(Vec<AuditEntry>, Option<String>), OdataPageError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| OdataPageError::Db(format!("conn: {e}")))?;
+        let page = audit_repo::list_odata(&conn, scope, tenant_id, query).await?;
+        let entries = page.items.into_iter().map(entry_of).collect();
+        Ok((entries, page.page_info.next_cursor))
     }
 }
 

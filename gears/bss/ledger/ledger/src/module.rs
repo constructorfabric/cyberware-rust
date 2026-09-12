@@ -32,6 +32,7 @@ use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::metrics::LedgerMetricsMeter;
 use crate::infra::storage::migrations::Migrator;
+use time::OffsetDateTime;
 
 /// Typed bundle of the per-process state that `init()` builds and the
 /// lifecycle reads: `register_rest()` reads `provisioning`; `serve()` reads
@@ -855,7 +856,7 @@ async fn dual_control_maintenance_tick(
     metrics: &Arc<dyn LedgerMetricsPort>,
 ) {
     let approvals = crate::infra::storage::repo::ApprovalRepo::new(db);
-    match approvals.expire_due_all(chrono::Utc::now()).await {
+    match approvals.expire_due_all(OffsetDateTime::now_utc()).await {
         Ok(n) if n > 0 => tracing::info!(
             expired = n,
             "bss-ledger: dual-control TTL sweep expired stale approvals"

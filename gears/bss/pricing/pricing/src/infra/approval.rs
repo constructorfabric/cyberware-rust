@@ -116,24 +116,25 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value as JsonValue, json};
 use toolkit_db::secure::{AccessScope, DBRunner};
 use toolkit_db::{DBProvider, DbError};
+use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::approval::content_pin::{
     bundle_content_hash, membership_content_hash, overlay_content_hash, repricing_run_content_hash,
-    threshold_content_hash,
+    taxonomy_value_content_hash, threshold_content_hash,
 };
 use crate::domain::approval::{
-    DecisionBy, DecisionRefusal, DecisionRequest, WithdrawAuthority, authorize_decision,
-    content_hash,
+    ApprovalState, DecisionBy, DecisionRefusal, DecisionRequest, WithdrawAuthority,
+    authorize_decision, content_hash,
 };
 use crate::domain::audit::{AuditAction, AuditStamp, AuditSubjectKind};
 use crate::domain::concurrency::RowVersion;
 use crate::domain::error::DomainError;
+use crate::domain::instant::format_rfc3339;
 use crate::domain::materiality::{ThresholdEntry, ThresholdVersion};
 use crate::domain::membership_change::MembershipMoveSet;
 use crate::domain::money::CurrencyCode;
@@ -141,6 +142,8 @@ use crate::domain::overlay::{OverlayRevision, ScopeClass};
 use crate::domain::plan_shape::PlanShape;
 use crate::domain::ports::CatalogVersionRegistryV1;
 use crate::domain::scope_key::{PlanId, Region};
+use crate::domain::taxonomy::{TaxonomyClass, TaxonomyEntry, TaxonomyValueChange};
+use crate::infra::storage::odata_mapping::OdataPageError;
 use crate::infra::storage::repo::approval_repo::{ApprovalRecord, NewApproval};
 use crate::infra::storage::repo::bundle_repo::{self, CompositionDraft};
 use crate::infra::storage::repo::{
@@ -148,6 +151,7 @@ use crate::infra::storage::repo::{
     repricing_journal_repo, threshold_repo,
 };
 use crate::infra::storage::{RepoError, repo_failure};
+use time::OffsetDateTime;
 
 /// The `reason` a TOCTOU void writes on the record it closes.
 ///
@@ -362,6 +366,12 @@ pub enum PinnedSubject {
     /// changed since the transaction that wrote it — there is no world for it
     /// to have moved in. See [`re_derive`]'s `Membership` arm.
     Membership(MembershipMoveSet),
+    /// A proposed edit of one taxonomy value, read against the value as it
+    /// stands (D-353). Like a membership move the proposal rides the record's
+    /// own `subject_ref`; unlike it the **held** half is re-read from the store,
+    /// which is what lets `content_matches_pin` answer `false` when the value
+    /// moves under a submitted unit.
+    TaxonomyValue(Box<TaxonomyValueChange>),
     /// A **mass-repricing run's batch approval** (`inst-bs-approval`, D-267).
     ///
     /// The run's own frozen `report` — its selector, adjustment, changeover
@@ -421,6 +431,7 @@ impl PinnedSubject {
             Self::Overlay(revision) => overlay_content_hash(revision),
             Self::BundleComposition(shape, version, _) => bundle_content_hash(shape, *version),
             Self::Membership(set) => membership_content_hash(set),
+            Self::TaxonomyValue(change) => taxonomy_value_content_hash(change),
             Self::BulkRun {
                 report,
                 operation_id,
@@ -439,10 +450,13 @@ impl PinnedSubject {
     /// region-restricted `FinanceReviewer` may decide a policy unit; the reading
     /// that makes that right is that the policy is tenant-wide, so there is no
     /// region a restricted reviewer would be reaching outside of.
-    #[must_use]
-    pub fn regions(&self) -> BTreeSet<Region> {
+    /// # Errors
+    ///
+    /// [`DomainError::InvalidRequest`] when a stored region value does not parse
+    /// as a [`Region`] — a value the declare door should have refused.
+    pub fn regions(&self) -> Result<BTreeSet<Region>, DomainError> {
         match self {
-            Self::Plan(shape) | Self::BundleComposition(shape, ..) => regions_of(shape),
+            Self::Plan(shape) | Self::BundleComposition(shape, ..) => Ok(regions_of(shape)),
             // **Neither a policy version nor a membership move reaches a
             // region, and that is one reading applied twice rather than two.**
             // A threshold policy has no rows and a payer's group membership
@@ -450,11 +464,37 @@ impl PinnedSubject {
             // tenant-wide — so both answer the empty set, which every grant
             // covers: there is no region a restricted reviewer would be
             // reaching outside of by deciding either.
-            Self::ThresholdPolicy(_) | Self::Membership(_) => BTreeSet::new(),
+            Self::ThresholdPolicy(_) | Self::Membership(_) => Ok(BTreeSet::new()),
+            // **A region value reaches exactly its own region.** Retiring `EU` or
+            // moving its tax markers is a decision about `EU`, so a reviewer whose
+            // grant stops short of it must not be the second principal on it; the
+            // other three universes have no region axis and answer the empty set,
+            // for the policy arm's reason.
+            //
+            // The parse is propagated rather than discarded. It used to end in
+            // `.ok()`, on the premise that `ScopeValue::new` having admitted the
+            // value made a failure unreachable — and that premise was false:
+            // `ScopeValue::new` refuses only a blank, while `Region::new` also
+            // refuses `KEY_SEPARATOR`. The two disagreed, and where they disagreed
+            // the discarded error became an **empty** reach set, which is a subset
+            // of every grant — so the one arm whose whole purpose is to narrow who
+            // may be the second principal widened it to everybody instead. The
+            // declare door now runs `Region::new` too, which is what makes this
+            // arm's premise true; propagating is what keeps it true if that ever
+            // stops being so.
+            Self::TaxonomyValue(change) => {
+                if change.proposal.class == TaxonomyClass::Region {
+                    Ok(BTreeSet::from([Region::new(
+                        change.proposal.value.as_str(),
+                    )?]))
+                } else {
+                    Ok(BTreeSet::new())
+                }
+            }
             // The run's rows' own regions, resolved when the subject was
             // re-derived — see the variant's doc for why this is the existing
             // rule applied rather than a new one.
-            Self::BulkRun { regions, .. } => regions.clone(),
+            Self::BulkRun { regions, .. } => Ok(regions.clone()),
             // **An overlay reaches a region exactly when it is scoped to one.** A
             // brand- or partner-scoped overlay has no region axis at all and answers
             // the empty set, which every grant covers — the same reading the policy
@@ -462,16 +502,18 @@ impl PinnedSubject {
             // restricted reviewer would be reaching outside of.
             //
             // A `region`-scoped overlay is the case where that reading would be
-            // wrong, and it fails **closed** rather than open: a value the region
-            // vocabulary cannot parse yields a set containing nothing a grant can
-            // match is not what happens — it yields the empty set, so the guard
-            // below is that `inst-plv-scope` refuses an unparseable region at
-            // authoring, and a stored one is a row written around the gear.
+            // wrong, and the parse is propagated for the taxonomy arm's reason.
+            // It used to end in `.into_iter().collect()`, which on a `Result` keeps
+            // the `Ok` and drops the `Err` — so an unparseable stored region became
+            // the **empty** set, a subset of every grant, widening who may decide
+            // the unit at exactly the point the arm exists to narrow it. That it is
+            // guarded upstream by `inst-plv-scope` is why it has no reachable
+            // caller today, not why it would be safe if it did.
             Self::Overlay(revision) => match revision.scope.value() {
                 Some(value) if revision.scope.class() == ScopeClass::Region => {
-                    Region::new(value.as_str()).into_iter().collect()
+                    Ok(BTreeSet::from([Region::new(value.as_str())?]))
                 }
-                _ => BTreeSet::new(),
+                _ => Ok(BTreeSet::new()),
             },
         }
     }
@@ -484,7 +526,8 @@ impl PinnedSubject {
             Self::ThresholdPolicy(_)
             | Self::Overlay(_)
             | Self::Membership(_)
-            | Self::BulkRun { .. } => None,
+            | Self::BulkRun { .. }
+            | Self::TaxonomyValue(_) => None,
         }
     }
 
@@ -497,7 +540,17 @@ impl PinnedSubject {
             | Self::Overlay(_)
             | Self::BundleComposition(..)
             | Self::Membership(_)
-            | Self::BulkRun { .. } => None,
+            | Self::BulkRun { .. }
+            | Self::TaxonomyValue(_) => None,
+        }
+    }
+
+    /// The taxonomy-value edit, on a `taxonomy_value` unit; `None` on every other kind.
+    #[must_use]
+    pub fn taxonomy_value(&self) -> Option<&TaxonomyValueChange> {
+        match self {
+            Self::TaxonomyValue(change) => Some(change),
+            _ => None,
         }
     }
 
@@ -513,7 +566,8 @@ impl PinnedSubject {
             | Self::ThresholdPolicy(_)
             | Self::Overlay(_)
             | Self::Membership(_)
-            | Self::BulkRun { .. } => None,
+            | Self::BulkRun { .. }
+            | Self::TaxonomyValue(_) => None,
         }
     }
 
@@ -528,7 +582,8 @@ impl PinnedSubject {
             | Self::ThresholdPolicy(_)
             | Self::Overlay(_)
             | Self::BundleComposition(..)
-            | Self::Membership(_) => None,
+            | Self::Membership(_)
+            | Self::TaxonomyValue(_) => None,
         }
     }
 
@@ -541,7 +596,8 @@ impl PinnedSubject {
             | Self::ThresholdPolicy(_)
             | Self::BundleComposition(..)
             | Self::Membership(_)
-            | Self::BulkRun { .. } => None,
+            | Self::BulkRun { .. }
+            | Self::TaxonomyValue(_) => None,
         }
     }
 }
@@ -781,10 +837,9 @@ impl ApprovalService {
         // naming only the window let an approval taken for one act authorize any other
         // on it, and for a schedule it carries no window id at all, that id being
         // minted per request and therefore unreproducible by the retry.
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "window {window_id}: approval {} is still submitted over it; decide it, or \
@@ -877,10 +932,9 @@ impl ApprovalService {
         let shape =
             crate::infra::publish::assemble_from(runner, scope, tenant_id, plan_id, revision, now)
                 .await?;
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "price row {price_id}: approval {} is still submitted over this horizon \
@@ -1000,10 +1054,9 @@ impl ApprovalService {
     ) -> Result<ApprovalRecord, DomainError> {
         let subject_ref =
             audit_repo::overlay_revision_ref(revision.price_overlay_id, revision.revision);
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, &subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "overlay revision {subject_ref}: approval {} is still submitted over it; decide \
@@ -1078,7 +1131,7 @@ impl ApprovalService {
         scope: &AccessScope,
         tenant_id: Uuid,
         key: &crate::domain::scope_key::ScopeKey,
-        changeover: DateTime<Utc>,
+        changeover: OffsetDateTime,
         approval_id: Uuid,
         materiality: JsonValue,
         stamp: AuditStamp,
@@ -1098,15 +1151,14 @@ impl ApprovalService {
         let subject_ref =
             crate::infra::supersession::supersession_unit_ref(plan_id, key, changeover);
 
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, &subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "this supersession of {key} at {}: approval {} is still submitted over it; decide \
                  it, or withdraw it to free the subject",
-                changeover.to_rfc3339(),
+                format_rfc3339(changeover),
                 held.approval_id
             )));
         }
@@ -1180,7 +1232,7 @@ impl ApprovalService {
         scope: &AccessScope,
         tenant_id: Uuid,
         selected: &[crate::domain::scope_key::ScopeKey],
-        cutover_at: DateTime<Utc>,
+        cutover_at: OffsetDateTime,
         approval_id: Uuid,
         materiality: JsonValue,
         stamp: AuditStamp,
@@ -1219,15 +1271,14 @@ impl ApprovalService {
                 .await?;
         let subject_ref = crate::infra::cutover::cutover_unit_ref(plan_id, selected, cutover_at);
 
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, &subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "this cutover of plan {plan_id} at {}: approval {} is still submitted over it; \
                  decide it, or withdraw it to free the subject",
-                cutover_at.to_rfc3339(),
+                format_rfc3339(cutover_at),
                 held.approval_id
             )));
         }
@@ -1311,10 +1362,9 @@ impl ApprovalService {
             crate::infra::publish::assemble_from(runner, scope, tenant_id, plan_id, current, now)
                 .await?;
         let subject_ref = retirement_unit_ref(plan_id, revision);
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, &subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "plan {plan_id}: approval {} is still submitted over its retirement; decide it, \
@@ -1390,10 +1440,9 @@ impl ApprovalService {
         stamp: AuditStamp,
     ) -> Result<ApprovalRecord, DomainError> {
         let subject_ref = bundle_composition_unit_ref(plan_id, plan_revision);
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, &subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "plan {plan_id}: approval {} is still submitted over its composition; decide it, \
@@ -1501,10 +1550,9 @@ impl ApprovalService {
     ) -> Result<ApprovalRecord, DomainError> {
         let subject_ref =
             approval_repo::membership_move_subject_ref(set).map_err(|e| repo_failure(&e))?;
-        if let Some(held) =
-            approval_repo::find_pending_for_subject(runner, scope, tenant_id, &subject_ref)
-                .await
-                .map_err(|e| repo_failure(&e))?
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
         {
             return Err(DomainError::PendingChangeUnitExists(format!(
                 "this membership move: approval {} is still submitted over it; decide it, or \
@@ -1655,6 +1703,271 @@ impl ApprovalService {
     ///
     /// # Errors
     /// [`DomainError::Internal`] on a storage failure.
+    /// Open the **taxonomy-value edit** unit (D-353), inside the caller's
+    /// transaction — [`Self::submit_membership_move_on`]'s shape: the proposal is
+    /// the subject (`approval_repo::taxonomy_value_subject_ref`), the pin is
+    /// [`taxonomy_value_content_hash`] over the proposal **and the value as held**,
+    /// and no scope key is held (a taxonomy value is not a price row).
+    ///
+    /// # Errors
+    /// [`DomainError::PendingChangeUnitExists`] when a unit over this exact
+    /// proposal is already submitted; [`DomainError::Internal`] on a storage
+    /// failure.
+    pub async fn submit_taxonomy_value_on(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        change: &TaxonomyValueChange,
+        approval_id: Uuid,
+        materiality: JsonValue,
+        stamp: AuditStamp,
+    ) -> Result<ApprovalRecord, DomainError> {
+        let subject_ref = approval_repo::taxonomy_value_subject_ref(&change.proposal)
+            .map_err(|e| repo_failure(&e))?;
+        if let Some(held) = approval_repo::find_pending_for_subject(runner, tenant_id, &subject_ref)
+            .await
+            .map_err(|e| repo_failure(&e))?
+        {
+            return Err(DomainError::PendingChangeUnitExists(format!(
+                "this edit of `{}` in the {} taxonomy: approval {} is still submitted over it; \
+                 decide it, or withdraw it to submit again",
+                change.proposal.value, change.proposal.class, held.approval_id
+            )));
+        }
+        let new = NewApproval {
+            approval_id,
+            tenant_id,
+            subject_ref,
+            subject_kind: AuditSubjectKind::TaxonomyValue,
+            content_hash: taxonomy_value_content_hash(change).to_vec(),
+            materiality,
+            held_keys: BTreeSet::new(),
+        };
+        approval_repo::open(runner, scope, new, stamp)
+            .await
+            .map_err(|e| repo_failure(&e))
+    }
+
+    /// Apply an **approved** taxonomy-value edit, inside the caller's
+    /// transaction — [`Self::commit_membership_move_in`]'s shape.
+    ///
+    /// The pin is re-derived here and compared to the record's: the value as it
+    /// stands **now** must still be the one the reviewer saw, or the commit is
+    /// refused `APPROVAL_CONTENT_MISMATCH` — the unit was decided over a document
+    /// that no longer exists. The two guards run again, because a row may have
+    /// been published against the value between approve and commit.
+    ///
+    /// # Errors
+    /// [`DomainError::ApprovalContentMismatch`] when the held value moved or is
+    /// gone; [`DomainError::TaxonomyValueInUse`] when a guard refuses now;
+    /// [`DomainError::Internal`] when the record is not a taxonomy-value unit or
+    /// on a storage failure.
+    pub async fn commit_taxonomy_value_in(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        approved: &ApprovalRecord,
+        stamp: AuditStamp,
+    ) -> Result<TaxonomyEntry, DomainError> {
+        independent_approver(approved)?;
+        if approved.subject_kind != AuditSubjectKind::TaxonomyValue {
+            return Err(DomainError::Internal(format!(
+                "approval {} is not a taxonomy-value unit ({}); refusing to apply it as one",
+                approved.approval_id,
+                approved.subject_kind.as_str()
+            )));
+        }
+        let proposal =
+            approval_repo::subject_taxonomy_value(approved).map_err(|e| repo_failure(&e))?;
+        let held = crate::infra::storage::repo::taxonomy_repo::find_value_on(
+            runner,
+            scope,
+            tenant_id,
+            proposal.class,
+            &proposal.value,
+        )
+        .await
+        .map_err(|e| repo_failure(&e))?
+        .ok_or_else(|| {
+            DomainError::ApprovalContentMismatch(format!(
+                "approval {} was decided over `{}` in the {} taxonomy, which is no longer \
+                 declared",
+                approved.approval_id, proposal.value, proposal.class
+            ))
+        })?;
+        let change = TaxonomyValueChange { proposal, held };
+        if taxonomy_value_content_hash(&change).as_slice() != approved.content_hash.as_slice() {
+            return Err(DomainError::ApprovalContentMismatch(format!(
+                "approval {} was decided over `{}` in the {} taxonomy as it then stood; the \
+                 value has moved since, so the document the reviewer saw is not the one this \
+                 commit would change",
+                approved.approval_id, change.proposal.value, change.proposal.class
+            )));
+        }
+        let next = change.next();
+        let class = change.proposal.class;
+        let report = crate::infra::storage::repo::taxonomy_repo::judge_value_patch(
+            runner,
+            tenant_id,
+            class,
+            &change.held,
+            &next,
+        )
+        .await
+        .map_err(|e| repo_failure(&e))?;
+        if let Some(violation) = report.violations.first() {
+            return Err(DomainError::TaxonomyValueInUse(violation.detail.clone()));
+        }
+        crate::infra::storage::repo::taxonomy_repo::write_value_patch(
+            runner,
+            scope,
+            tenant_id,
+            class,
+            &change.held,
+            &next,
+            Some(approved.approval_id),
+            stamp,
+        )
+        .await
+        .map_err(|e| repo_failure(&e))?;
+        Ok(next)
+    }
+
+    /// D-355: commit an edit whose value **nothing published names**, with no
+    /// second principal — the direct twin of [`Self::commit_taxonomy_value_in`].
+    ///
+    /// Re-judges the guards **inside this transaction** (a retirement that became
+    /// referenced between the handler's read and here is refused
+    /// `TAXONOMY_VALUE_IN_USE`), then writes the row and the audit record with
+    /// **`approval_ref = None`**: the edit ran under no unit, exactly as a
+    /// declaration does. The governance predicate itself is **not** re-checked
+    /// here — that snapshot race is the one D-243 already declines to serialise
+    /// for the guard's own counts.
+    ///
+    /// # Errors
+    /// [`DomainError::TaxonomyValueInUse`] when a guard refuses the edit, and
+    /// [`DomainError::Internal`] when the store fails.
+    pub async fn commit_taxonomy_value_direct_in(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        change: &TaxonomyValueChange,
+        stamp: AuditStamp,
+    ) -> Result<TaxonomyEntry, DomainError> {
+        let next = change.next();
+        let class = change.proposal.class;
+        // **The `If-Match` premise, re-tested inside this transaction.**
+        //
+        // The handler compared `tag_of_value` against the header on a plain
+        // connection, and `update_entry` below is an unconditional `UPDATE`
+        // filtered on `(tenant_id, value)` over tables that carry no row
+        // version — so the handler-side comparison alone is the shape
+        // `taxonomy_repo::apply_replace` refuses in writing: two callers whose
+        // reads both precede either commit each pass it, the second write
+        // overwrites the first, and both callers are answered `200`. The
+        // governed twin cannot reach that state because it re-reads the value
+        // and re-derives the pin here; this arm has no unit to re-derive, so it
+        // tests the premise directly.
+        //
+        // Compared against `change.held` — the value the caller's tag described
+        // — and not against a freshly rendered tag, because `held` is what the
+        // patch was authored over and what the audit record names as `before`.
+        let standing = crate::infra::storage::repo::taxonomy_repo::find_value_on(
+            runner,
+            scope,
+            tenant_id,
+            class,
+            &change.proposal.value,
+        )
+        .await
+        .map_err(|e| repo_failure(&e))?;
+        if standing.as_ref() != Some(&change.held) {
+            return Err(DomainError::StaleVersion(format!(
+                "`{}` in the {} taxonomy moved after you read it and before this edit could \
+                commit; nothing was written. Re-read the value and author against the tag it \
+                hands back",
+                change.proposal.value, class
+            )));
+        }
+        // **The governance premise, re-tested inside this transaction.**
+        //
+        // The handler chose this arm because `references_to` answered zero on a
+        // plain connection: nothing published named the value, so D-355 makes the
+        // edit the operator's own. That read and this write are not the same
+        // transaction, and the gap is writable — a price row or an overlay scope
+        // published against the value in between makes the very same edit one the
+        // dual control owns. Without this re-test the request that lost the race
+        // still commits on a single principal, which is the control failing open
+        // rather than a stale read.
+        //
+        // `ConcurrentMutation` and not `StaleVersion`: nothing the caller
+        // presented was wrong, and the whole remedy is to re-send — the retry
+        // reads the reference that now exists and opens the unit.
+        let references = crate::infra::storage::repo::taxonomy_repo::references_to(
+            runner,
+            tenant_id,
+            class,
+            &change.proposal.value,
+        )
+        .await
+        .map_err(|e| repo_failure(&e))?;
+        if crate::domain::taxonomy::edit_is_governed(references) {
+            return Err(DomainError::ConcurrentMutation(format!(
+                "`{}` in the {} taxonomy became referenced by a published row while this edit \
+                 was committing, so it is no longer an edit one operator may make alone; \
+                 nothing was written. Re-send it and it will open an approval unit",
+                change.proposal.value, class
+            )));
+        }
+        let report = crate::infra::storage::repo::taxonomy_repo::judge_value_patch(
+            runner,
+            tenant_id,
+            class,
+            &change.held,
+            &next,
+        )
+        .await
+        .map_err(|e| repo_failure(&e))?;
+        if let Some(violation) = report.violations.first() {
+            return Err(DomainError::TaxonomyValueInUse(violation.detail.clone()));
+        }
+        // **The one-principal commit, said out loud.**
+        //
+        // D-355 gives a taxonomy-value edit two doors, and which one a request
+        // took is not recoverable from the audit record afterwards: the record
+        // this writes names the same actor, value and states as a governed commit
+        // does, and only the absent approval id distinguishes them — an absence,
+        // and the governed twin writes that column from a unit the reader would
+        // have to go and fetch. An operator asking "who changed the region
+        // taxonomy without a second pair of eyes, and when" has no query. `warn`
+        // rather than `info` for the reason `infra::approval`'s skipped-threshold
+        // arms use it: a control that did not run is not routine traffic, even
+        // when not running it was correct.
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            actor_principal_id = %stamp.actor_principal_id,
+            correlation_id = %stamp.correlation_id,
+            class = %class,
+            value = %change.proposal.value,
+            "bss-pricing: taxonomy value edited on a single principal; no published price row \
+             or overlay scope names it, so D-355 makes the edit the operator's own and no \
+             approval unit was opened"
+        );
+        crate::infra::storage::repo::taxonomy_repo::write_value_patch(
+            runner,
+            scope,
+            tenant_id,
+            class,
+            &change.held,
+            &next,
+            None,
+            stamp,
+        )
+        .await
+        .map_err(|e| repo_failure(&e))?;
+        Ok(next)
+    }
+
     pub async fn list(
         &self,
         scope: &AccessScope,
@@ -1670,6 +1983,95 @@ impl ApprovalService {
         approval_repo::list_page(&conn, scope, tenant_id, states, after, limit)
             .await
             .map_err(|e| repo_failure(&e))
+    }
+
+    /// Pending units for plans the caller has already been authorized to read.
+    /// Includes direct revision, window and price units; never indirect effects.
+    ///
+    /// # Why the scope is minted here and not taken from the caller
+    ///
+    /// Every other method on this service takes the caller's `&AccessScope`,
+    /// because the caller's gate is the right constraint. This read cannot, and
+    /// the reason is a mismatch between two resources: the plan reads pass the
+    /// PDP a scope pinned `resource_id = plan_id`, while `pricing_approval`
+    /// declares `resource_col = approval_id` — so under a real PDP that pin
+    /// compiles to `approval_id IN (plan_id)` and matches nothing. A plan in
+    /// review would read as *not* in review, in production, with every
+    /// in-process test green: the test enforcer is flat and cannot express the
+    /// pin at all.
+    ///
+    /// So the narrowing happens here rather than in the handler, which is also
+    /// what `rest_authz::no_handler_can_build_an_access_scope_of_its_own`
+    /// requires: *"the only producer of one on a REST path is
+    /// `crate::authz::access_scope`, which **is** the gate"*. `infra` is where a
+    /// narrowed scope is sanctioned — `infra::repricing`'s per-tenant writes do
+    /// the same — and `for_tenant` only ever **narrows**: it constrains
+    /// `OWNER_TENANT_ID` alone and can admit nothing the caller's own tenant
+    /// does not own.
+    ///
+    /// What the caller still owes is its own gate. Pass only ids returned by a
+    /// scoped plan read **after** `plan × read` has been answered. Only those
+    /// plans' units are returned, and handlers expose only pending metadata;
+    /// the unit's content stays behind `approval × read`.
+    ///
+    /// # Errors
+    /// [`RepoError`] on a scope or storage failure.
+    pub async fn pending_for_plans(
+        &self,
+        tenant_id: Uuid,
+        plan_ids: &[crate::domain::scope_key::PlanId],
+    ) -> Result<
+        std::collections::BTreeMap<
+            crate::domain::scope_key::PlanId,
+            Vec<approval_repo::ApprovalRecord>,
+        >,
+        RepoError,
+    > {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| RepoError::Db(format!("bss-pricing: pending unit: {e}")))?;
+        approval_repo::pending_for_plans(
+            &conn,
+            &AccessScope::for_tenant(tenant_id),
+            tenant_id,
+            plan_ids,
+        )
+        .await
+    }
+
+    /// Totals over all approvals visible under the caller's original read scope.
+    ///
+    /// # Errors
+    /// [`RepoError`] on a scope, storage or corrupt persisted value failure.
+    pub async fn counts(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<approval_repo::ApprovalCounts, RepoError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| RepoError::Db(format!("bss-pricing: approval counts: {e}")))?;
+        approval_repo::counts(&conn, scope, tenant_id).await
+    }
+
+    /// One `OData` page of the tenant's approval records.
+    ///
+    /// # Errors
+    /// [`OdataPageError::Db`] on storage failure; [`OdataPageError::Odata`] on an
+    /// invalid query or cursor.
+    pub async fn list_odata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<ApprovalRecord>, OdataPageError> {
+        let conn = self
+            .db
+            .conn()
+            .map_err(|e| OdataPageError::Db(format!("bss-pricing: approval list: {e}")))?;
+        approval_repo::list_odata(&conn, scope, tenant_id, query).await
     }
 
     /// One record **and the content its pin covers** — D-61's reviewability
@@ -1701,7 +2103,7 @@ impl ApprovalService {
         scope: &AccessScope,
         tenant_id: Uuid,
         approval_id: Uuid,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<ApprovalDetail>, DomainError> {
         let conn = self
             .db
@@ -1713,7 +2115,10 @@ impl ApprovalService {
         else {
             return Ok(None);
         };
-        let subject = re_derive(&conn, scope, tenant_id, &record, now).await?;
+        // The record was read through the caller's approval scope. Its taxonomy
+        // subject is tenant configuration, not a row keyed by approval_id.
+        let subject_scope = taxonomy_effect_scope(scope, &record);
+        let subject = re_derive(&conn, &subject_scope, tenant_id, &record, now).await?;
         let content_matches_pin = subject
             .as_ref()
             .map(PinnedSubject::content_hash)
@@ -1755,6 +2160,10 @@ impl ApprovalService {
 
     /// Decide a pending unit, or refuse and record the attempt.
     ///
+    /// Approving a taxonomy-value unit also applies its pinned patch and writes
+    /// the taxonomy audit in this transaction. Failure rolls back the decision
+    /// too; callers must not re-send PATCH to apply a newly approved unit.
+    ///
     /// # Errors
     /// [`DomainError::NotFound`] when no record in scope answers to the id.
     /// One of [`DomainError::SelfApprovalForbidden`],
@@ -1790,6 +2199,23 @@ impl ApprovalService {
                 approval_id,
             } => Err(refusal_to_domain(refusal, approval_id)),
         }
+    }
+}
+
+/// Scope for a taxonomy unit's already-authorized subject and audit effects.
+///
+/// Call only after reading the specific approval under the original PDP scope.
+/// `approval × approve` authorizes the proposal stored in that record, not an
+/// arbitrary config write. Keep the PDP's tenant constraints, and use exact
+/// tenant/class/value predicates from the record for the effect. The approval
+/// resource pin cannot be reused as a taxonomy tenant id or audit chain id.
+/// `tenant_only` fails closed when no tenant constraint exists; it never mints
+/// a new allow or asks the reviewer to hold the submitter's config-write role.
+fn taxonomy_effect_scope(scope: &AccessScope, record: &ApprovalRecord) -> AccessScope {
+    if record.subject_kind == AuditSubjectKind::TaxonomyValue {
+        scope.tenant_only()
+    } else {
+        scope.clone()
     }
 }
 
@@ -1876,6 +2302,7 @@ async fn judge(
             subject: "approval".to_owned(),
             id: request.approval_id.to_string(),
         })?;
+    let effect_scope = taxonomy_effect_scope(scope, &record);
 
     // A withdraw judges nothing about the content and is exempt from both the
     // pin and the scope rule, so the subject is not re-derived for it at all —
@@ -1885,12 +2312,20 @@ async fn judge(
     let subject = if matches!(request.decision, DecisionBy::Void(_)) {
         None
     } else {
-        re_derive(runner, scope, tenant_id, &record, request.stamp.recorded_at).await?
+        re_derive(
+            runner,
+            &effect_scope,
+            tenant_id,
+            &record,
+            request.stamp.recorded_at,
+        )
+        .await?
     };
 
     let change_set_regions = subject
         .as_ref()
         .map(PinnedSubject::regions)
+        .transpose()?
         .unwrap_or_default();
     let current_content_hash = subject.as_ref().map(PinnedSubject::content_hash);
     // **Both sides of the scope rule come from this transaction's one
@@ -1933,7 +2368,7 @@ async fn judge(
         // authority ones; the other three are races and malformed requests, and
         // recording those would bury the two that matter.
         if refusal.is_an_audited_violation() {
-            record_denial(runner, scope, tenant_id, &record, refusal, request).await?;
+            record_denial(runner, &effect_scope, tenant_id, &record, refusal, request).await?;
         }
         return Ok(Outcome::Refused {
             refusal,
@@ -1960,7 +2395,7 @@ async fn judge(
     // about, which is the whole reason the trail is the right home for it.
     let decided = approval_repo::decide(
         runner,
-        scope,
+        &effect_scope,
         tenant_id,
         request.approval_id,
         request.decision.decision(),
@@ -1970,6 +2405,20 @@ async fn judge(
     )
     .await
     .map_err(|e| repo_failure(&e))?;
+    if decided.subject_kind == AuditSubjectKind::TaxonomyValue
+        && decided.state == ApprovalState::Approved
+    {
+        // Re-read the held value and run domain guards inside this transaction.
+        // A failure propagates as Err, rolling back the verdict and both audits.
+        ApprovalService::commit_taxonomy_value_in(
+            runner,
+            &effect_scope,
+            tenant_id,
+            &decided,
+            request.stamp,
+        )
+        .await?;
+    }
     Ok(Outcome::Decided(Box::new(decided)))
 }
 
@@ -2235,7 +2684,7 @@ async fn current_revision_shape(
     scope: &AccessScope,
     tenant_id: Uuid,
     plan_id: PlanId,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<Option<PinnedSubject>, DomainError> {
     let Some(revision) = plan_repo::load_current(runner, scope, tenant_id, plan_id)
         .await
@@ -2264,7 +2713,7 @@ async fn re_derive(
     scope: &AccessScope,
     tenant_id: Uuid,
     record: &ApprovalRecord,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<Option<PinnedSubject>, DomainError> {
     // **The same assembly the pin was taken under, per subject kind**, and that is
     // the whole of what makes a re-derivation comparable to a pin rather than to a
@@ -2478,6 +2927,26 @@ async fn re_derive(
             let set =
                 approval_repo::subject_membership_move(record).map_err(|e| repo_failure(&e))?;
             Ok(Some(PinnedSubject::Membership(set)))
+        }
+        // D-353: the proposal decodes off the ref like a membership move's; the
+        // **held** half is re-read from the taxonomy store, so a value that moved
+        // (or was never there) under the unit is the `None` / mismatch every other
+        // re-derived arm answers.
+        AuditSubjectKind::TaxonomyValue => {
+            let proposal =
+                approval_repo::subject_taxonomy_value(record).map_err(|e| repo_failure(&e))?;
+            let held = crate::infra::storage::repo::taxonomy_repo::find_value_on(
+                runner,
+                scope,
+                tenant_id,
+                proposal.class,
+                &proposal.value,
+            )
+            .await
+            .map_err(|e| repo_failure(&e))?;
+            Ok(held.map(|held| {
+                PinnedSubject::TaxonomyValue(Box::new(TaxonomyValueChange { proposal, held }))
+            }))
         }
     }
 }
@@ -2877,7 +3346,7 @@ pub async fn void_pending_units_of(
     scope: &AccessScope,
     tenant_id: Uuid,
     plan_id: PlanId,
-    voided_at: DateTime<Utc>,
+    voided_at: OffsetDateTime,
 ) -> Result<u64, RepoError> {
     approval_repo::void_pending_for_plan(runner, scope, tenant_id, plan_id, voided_at).await
 }

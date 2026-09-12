@@ -76,11 +76,11 @@
 use std::time::Duration;
 
 use aws_lc_rs::digest::{SHA256, digest as sha256};
-use chrono::{DateTime, TimeDelta, Utc};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{ColumnTrait, Condition, DbErr, EntityTrait};
 use serde_json::Value as JsonValue;
+use time::OffsetDateTime;
 use toolkit_db::secure::{
     AccessScope, DbTx, ScopeError, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
@@ -124,7 +124,7 @@ pub enum ClaimOutcome {
 pub struct IdempotencyGate {
     /// How long a claim keeps its key. Past it the key is forgotten and the next
     /// request carrying it claims afresh.
-    ttl: TimeDelta,
+    ttl: time::Duration,
 }
 
 impl IdempotencyGate {
@@ -138,7 +138,7 @@ impl IdempotencyGate {
     #[must_use]
     pub fn new(ttl: Duration) -> Self {
         Self {
-            ttl: TimeDelta::from_std(ttl).unwrap_or(TimeDelta::MAX),
+            ttl: time::Duration::try_from(ttl).unwrap_or(time::Duration::MAX),
         }
     }
 
@@ -178,7 +178,7 @@ impl IdempotencyGate {
         operation: &str,
         client_key: &str,
         request_hash: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<ClaimOutcome, RepoError> {
         let am = idempotency_dedup::ActiveModel {
             tenant_id: Set(tenant_id),
@@ -227,7 +227,7 @@ impl IdempotencyGate {
         // claim at all, so there is nothing for the arriving request to
         // contradict. Asking about the hash first would let one payload poison
         // its key past the TTL and — with no reaper in the gear — forever.
-        if now.signed_duration_since(held.created_at_utc) > self.ttl {
+        if (now - held.created_at_utc) > self.ttl {
             return take_over(txn, scope, &held, request_hash, now).await;
         }
 
@@ -294,7 +294,7 @@ impl IdempotencyGate {
         operation: &str,
         client_key: &str,
         request_hash: &[u8],
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<Option<(i32, JsonValue)>, RepoError> {
         // **Only the absent row is `Ok(None)`.** A storage fault propagates: this
         // read's one caller asks it in order to decide whether the act it is about
@@ -304,7 +304,7 @@ impl IdempotencyGate {
         let Some(held) = read_held(txn, scope, tenant_id, operation, client_key).await? else {
             return Ok(None);
         };
-        if now.signed_duration_since(held.created_at_utc) > self.ttl {
+        if (now - held.created_at_utc) > self.ttl {
             return Ok(None);
         }
         if held.request_hash != request_hash {
@@ -459,7 +459,7 @@ async fn take_over(
     scope: &AccessScope,
     held: &idempotency_dedup::Model,
     request_hash: &[u8],
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> Result<ClaimOutcome, RepoError> {
     let result = idempotency_dedup::Entity::update_many()
         .secure()

@@ -24,6 +24,7 @@
 // suite; not implemented here (it needs a live cluster, out of this slice's
 // build-only scope).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query};
@@ -51,6 +52,7 @@ use crate::api::rest::dto::{
 use crate::api::rest::error::{
     authz_error_to_canonical, recognition_run_not_found, recognition_schedule_not_found,
 };
+use crate::api::rest::odata_list::{list_seller_tenant, reject_non_odata_list_params};
 use crate::infra::storage::repo::RecognitionRepo;
 use crate::odata::RecognitionRunFilterField;
 
@@ -380,20 +382,16 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .summary("List recorded ASC 606 recognition runs (cursor-paginated)")
         .description(
             "Cursor-paginated list of the recorded recognition runs for the \
-             `tenant_id` query (the caller's own by default). Supports OData \
-             `$filter` over `run_id`, `period_id`, and `status`. The `$filter` ANDs \
-             the caller's authorized subtree, so runs outside it are never returned \
-             (SQL-level BOLA). Each item is the same `RecognitionRunView` the by-id \
-             read returns. Mirrors `list_disputes`.",
+             seller named by `$filter=tenant_id eq <uuid>` (the caller's own by \
+             default). Supports OData `$filter` over `tenant_id`, `run_id`, \
+             `period_id`, and `status`. The `$filter` ANDs the caller's \
+             authorized subtree, so runs outside it are never returned \
+             (SQL-level BOLA). Each item is the same `RecognitionRunView` the \
+             by-id read returns. Mirrors `list_disputes`.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .query_param(
-            "tenant_id",
-            false,
-            "The runs' owning seller tenant (defaults to the caller's own).",
-        )
         .query_param_typed(
             "limit",
             false,
@@ -403,6 +401,7 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param("cursor", false, "Opaque base64url pagination cursor")
         .handler(list_recognition_runs)
         .with_odata_filter::<RecognitionRunFilterField>()
+        .with_odata_orderby::<RecognitionRunFilterField>()
         .json_response_with_schema::<Page<RecognitionRunView>>(
             openapi,
             StatusCode::OK,
@@ -773,24 +772,18 @@ async fn get_recognition_run(
     Ok(Json(RecognitionRunView::from(run)))
 }
 
-/// `GET /recognition-runs` non-OData query: the runs' owning tenant (the caller's
-/// own when omitted). The `OData` `$filter` / `$orderby` / `limit` / `cursor` are
-/// parsed separately by the `OData` extractor from the same query string;
-/// `tenant_id` stays a plain param alongside them (the list convention).
-#[derive(Debug, serde::Deserialize)]
-struct RunListQuery {
-    tenant_id: Option<Uuid>,
-}
-
+/// `GET /recognition-runs`: seller from `$filter=tenant_id eq`, else the caller.
+#[allow(clippy::implicit_hasher)]
 async fn list_recognition_runs(
     Extension(state): Extension<Arc<ApiState>>,
     Extension(enforcer): Extension<authz_resolver_sdk::PolicyEnforcer>,
     extension_ctx: Option<Extension<SecurityContext>>,
-    Query(query): Query<RunListQuery>,
+    Query(extras): Query<HashMap<String, String>>,
     OData(odata): OData,
 ) -> Result<Json<Page<RecognitionRunView>>, CanonicalError> {
     let ctx = require_authenticated(extension_ctx)?;
-    let tenant_id = query.tenant_id.unwrap_or_else(|| ctx.subject_tenant_id());
+    reject_non_odata_list_params(&extras)?;
+    let tenant_id = list_seller_tenant(odata.filter.as_deref(), ctx.subject_tenant_id())?;
     // (recognition, read) PEP gate against the runs' owning tenant — the SAME action the
     // by-id read / schedule list run under. The returned scope is the SQL-level
     // BOLA filter the repo binds, so the page never contains a foreign-tenant run

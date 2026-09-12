@@ -66,7 +66,7 @@
 //! — over **no sentinel**: a `NULL` bound reads as "no bound" directly rather
 //! than through a synthesized far-future timestamp, which would only be as
 //! correct as its format agreeing with whatever `SeaORM` happens to serialize a
-//! `DateTime<Utc>` as as text.
+//! `OffsetDateTime` as as text.
 //!
 //! Neither trigger's guard lives in its `WHEN` clause: `pricing_bulk_row_lock`'s
 //! module doc records that a `SQLite` trigger's `WHEN` may not contain a

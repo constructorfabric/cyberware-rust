@@ -34,9 +34,11 @@ use bss_pricing::infra::storage::RepoError;
 use bss_pricing::infra::storage::entity::audit_log;
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::group_membership_repo::{self, NewMembership};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use sea_orm::{ColumnTrait, Condition, EntityTrait, Order};
 use sea_orm_migration::MigratorTrait;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::{AccessScope, SecureEntityExt};
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -52,7 +54,7 @@ const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_c0_11_a7_10);
 const GROUP_A: &str = "groupA";
 const GROUP_B: &str = "groupB";
 
-fn stamp_at(when: DateTime<Utc>) -> AuditStamp {
+fn stamp_at(when: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: ACTOR,
         recorded_at: when,
@@ -63,8 +65,8 @@ fn stamp_at(when: DateTime<Utc>) -> AuditStamp {
 /// `2099-09-<day>T00:00:00Z` — `window_repo`'s own test helper's reason: every
 /// instant here is a **fact rather than a fixture that ages**, so "future" stays
 /// true no matter when this suite runs.
-fn t(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, day, 0, 0, 0).unwrap()
+fn t(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, day, 0, 0, 0)
 }
 
 async fn provider() -> DBProvider<DbError> {
@@ -85,8 +87,8 @@ fn new_membership(
     membership_id: Uuid,
     payer_tenant_id: Uuid,
     group_value: &str,
-    from: DateTime<Utc>,
-    to: Option<DateTime<Utc>>,
+    from: OffsetDateTime,
+    to: Option<OffsetDateTime>,
 ) -> NewMembership {
     NewMembership {
         membership_id,

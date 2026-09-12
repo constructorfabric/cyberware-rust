@@ -73,6 +73,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use toolkit_macros::domain_model;
 
+use crate::domain::instant::format_rfc3339;
 use crate::domain::money::CurrencyCode;
 use crate::domain::plan_rules::{
     AVAILABLE_FROM_IN_PAST, BASE_MARKET_INCOMPLETE, CYCLE_METADATA_MISSING, HYBRID_INCOMPLETE,
@@ -737,8 +738,8 @@ impl ValidationRule<PlanShape> for AvailableFromNotBackdated {
                  {}: a plan may not be made available in the past. The historical-import path is \
                  the only sanctioned backdating; re-publishing the date this plan already \
                  published with is not backdating and is allowed",
-                available_from.to_rfc3339(),
-                subject.evaluated_at.to_rfc3339()
+                format_rfc3339(available_from),
+                format_rfc3339(subject.evaluated_at)
             ),
         );
     }

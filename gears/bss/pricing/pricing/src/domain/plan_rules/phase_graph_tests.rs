@@ -14,7 +14,7 @@
 //! one thing it broke.
 
 use bss_fixtures::ModelKind;
-use chrono::{DateTime, TimeZone, Utc};
+
 use uuid::Uuid;
 
 use super::{
@@ -23,6 +23,7 @@ use super::{
     TerminalPhaseKind, TerminalPhaseStable,
 };
 use crate::domain::concurrency::RowVersion;
+use crate::domain::instant::utc_ymd_hms;
 use crate::domain::lifecycle::LifecycleState;
 use crate::domain::money::{CurrencyCode, MinorAmount, RateMinor};
 use crate::domain::plan_rules::{
@@ -42,6 +43,7 @@ use crate::domain::scope_key::{
     ChargeKind, Cohort, PhaseId, PlanId, PriceEligibility, Region, ScopeKey,
 };
 use crate::domain::validation::{Stage, ValidationReport, ValidationRule, Violation};
+use time::OffsetDateTime;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -71,10 +73,8 @@ fn region(value: &str) -> Region {
     Region::new(value).expect("test region is non-blank")
 }
 
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, 12, 0, 0)
-        .single()
-        .expect("the fixed instant is unambiguous")
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, 12, 0, 0)
 }
 
 fn minor(units: i64) -> MinorAmount {
@@ -93,6 +93,7 @@ fn phase(seed: u128, kind: PhaseKind, ordinal: i32, converts_to: Option<PhaseId>
     PlanPhase {
         phase_id: phase_id(seed),
         kind,
+        display_name: None,
         ordinal,
         converts_to_phase_id: converts_to,
         phase_duration_days: converts_to.is_some().then_some(14),
@@ -104,7 +105,7 @@ fn phase(seed: u128, kind: PhaseKind, ordinal: i32, converts_to: Option<PhaseId>
 fn linear_chain() -> Vec<PlanPhase> {
     vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(INTRO))),
-        phase(INTRO, PhaseKind::Intro, 1, Some(phase_id(EVERGREEN))),
+        phase(INTRO, PhaseKind::Interim, 1, Some(phase_id(EVERGREEN))),
         phase(EVERGREEN, PhaseKind::Evergreen, 2, None),
     ]
 }
@@ -295,7 +296,7 @@ fn a_two_cycle_fails_and_names_both_of_its_phases() {
     // thing this shape breaks is acyclicity.
     let subject = shape_of(vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(INTRO))),
-        phase(INTRO, PhaseKind::Intro, 1, Some(phase_id(TRIAL))),
+        phase(INTRO, PhaseKind::Interim, 1, Some(phase_id(TRIAL))),
         phase(EVERGREEN, PhaseKind::Evergreen, 2, None),
     ]);
 
@@ -328,8 +329,8 @@ fn a_two_cycle_fails_and_names_both_of_its_phases() {
 fn a_phase_leading_into_a_cycle_is_not_named_as_being_on_it() {
     let subject = shape_of(vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(INTRO))),
-        phase(INTRO, PhaseKind::Intro, 1, Some(phase_id(GHOST))),
-        phase(GHOST, PhaseKind::Intro, 2, Some(phase_id(INTRO))),
+        phase(INTRO, PhaseKind::Interim, 1, Some(phase_id(GHOST))),
+        phase(GHOST, PhaseKind::Interim, 2, Some(phase_id(INTRO))),
         phase(EVERGREEN, PhaseKind::Evergreen, 3, None),
     ]);
 
@@ -374,7 +375,7 @@ fn a_phase_set_with_no_terminal_phase_fails() {
 fn a_chain_that_only_cycles_reports_both_the_cycle_and_the_missing_terminal() {
     let subject = shape_of(vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(INTRO))),
-        phase(INTRO, PhaseKind::Intro, 1, Some(phase_id(TRIAL))),
+        phase(INTRO, PhaseKind::Interim, 1, Some(phase_id(TRIAL))),
     ]);
 
     let report = judge(&PhaseGraphIntegrity::default(), &subject);
@@ -432,7 +433,7 @@ fn this_rules_default_instance_is_publish_stage_and_the_phases_door_asks_for_wri
     dangling[1].converts_to_phase_id = Some(phase_id(0x99));
     let cyclic = shape_of(vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(INTRO))),
-        phase(INTRO, PhaseKind::Intro, 1, Some(phase_id(TRIAL))),
+        phase(INTRO, PhaseKind::Interim, 1, Some(phase_id(TRIAL))),
         phase(EVERGREEN, PhaseKind::Evergreen, 2, None),
     ]);
 
@@ -490,7 +491,7 @@ fn a_chain_that_skips_a_phase_in_the_ordinal_order_fails() {
     // coverage rows for a phase no subscription ever enters.
     let subject = shape_of(vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(EVERGREEN))),
-        phase(INTRO, PhaseKind::Intro, 1, Some(phase_id(EVERGREEN))),
+        phase(INTRO, PhaseKind::Interim, 1, Some(phase_id(EVERGREEN))),
         phase(EVERGREEN, PhaseKind::Evergreen, 2, None),
     ]);
 
@@ -508,8 +509,8 @@ fn a_chain_that_branches_over_the_ordinal_order_fails() {
     // branch, and it is the edge that strands the third.
     let subject = shape_of(vec![
         phase(0x1, PhaseKind::Trial, 0, Some(phase_id(0x2))),
-        phase(0x2, PhaseKind::Intro, 1, Some(phase_id(0x4))),
-        phase(0x3, PhaseKind::Intro, 2, Some(phase_id(0x4))),
+        phase(0x2, PhaseKind::Interim, 1, Some(phase_id(0x4))),
+        phase(0x3, PhaseKind::Interim, 2, Some(phase_id(0x4))),
         phase(0x4, PhaseKind::Evergreen, 3, None),
     ]);
 
@@ -565,7 +566,7 @@ fn a_duplicate_ordinal_fails() {
     // names both and D-39's first non-trial phase is undefined again.
     let subject = shape_of(vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(INTRO))),
-        phase(INTRO, PhaseKind::Intro, 0, Some(phase_id(EVERGREEN))),
+        phase(INTRO, PhaseKind::Interim, 0, Some(phase_id(EVERGREEN))),
         phase(EVERGREEN, PhaseKind::Evergreen, 2, None),
     ]);
 
@@ -602,7 +603,7 @@ fn the_chain_is_read_in_ordinal_order_and_not_in_authored_order() {
 #[test]
 fn a_trial_terminal_phase_fails_and_says_what_to_author_instead() {
     let subject = shape_of(vec![
-        phase(TRIAL, PhaseKind::Intro, 0, Some(phase_id(EVERGREEN))),
+        phase(TRIAL, PhaseKind::Interim, 0, Some(phase_id(EVERGREEN))),
         phase(EVERGREEN, PhaseKind::Trial, 1, None),
     ]);
 
@@ -624,14 +625,22 @@ fn an_intro_terminal_phase_fails() {
     // Intro pricing forever is an evergreen terminal phase at the intro price.
     let subject = shape_of(vec![
         phase(TRIAL, PhaseKind::Trial, 0, Some(phase_id(EVERGREEN))),
-        phase(EVERGREEN, PhaseKind::Intro, 1, None),
+        phase(EVERGREEN, PhaseKind::Interim, 1, None),
     ]);
 
     let report = judge(&TerminalPhaseKind, &subject);
     let violation = only(&report);
 
     assert_eq!(violation.code, TERMINAL_PHASE_KIND_INVALID);
-    assert!(violation.detail.contains("intro"));
+    // **On the rendered kind, not on the word.** The template's own prose says
+    // "priced at the interim rate, never an interim terminal", so
+    // `contains("interim")` held whatever `terminal.kind` rendered - and held
+    // just as vacuously before the rename, when it read `contains("intro")`.
+    assert!(
+        violation.detail.contains("has kind interim"),
+        "the refusal must name the offending kind: {}",
+        violation.detail
+    );
 }
 
 #[test]
@@ -1265,6 +1274,7 @@ fn a_revision_moving_the_terminal_phase_fails() {
         PlanPhase {
             phase_id: t0,
             kind: PhaseKind::Evergreen,
+            display_name: None,
             ordinal: 1,
             converts_to_phase_id: Some(phase_id(EVERGREEN)),
             phase_duration_days: Some(30),
@@ -1401,14 +1411,14 @@ fn an_intro_phase_carrying_a_trial_length_is_refused_too() {
     // here would report two faults and this case is about the `kind` alone. The
     // fixtures are clean in every dimension a test is not attacking (this file's
     // own header).
-    let mut intro = phase(0x11_10, PhaseKind::Intro, 0, Some(phase_id(0x7e_11)));
+    let mut intro = phase(0x11_10, PhaseKind::Interim, 0, Some(phase_id(0x7e_11)));
     intro.display_trial_days = Some(14);
     let subject = shape_of(vec![intro, phase(0x7e_11, PhaseKind::Evergreen, 1, None)]);
 
     let report = judge(&DisplayTrialDaysOnTrialPhase, &subject);
     let violation = only(&report);
     assert_eq!(violation.code, DISPLAY_TRIAL_DAYS_INVALID);
-    assert!(violation.detail.contains("intro"), "{}", violation.detail);
+    assert!(violation.detail.contains("interim"), "{}", violation.detail);
 }
 
 #[test]
@@ -1496,7 +1506,7 @@ fn a_trial_phase_whose_display_days_drift_from_its_duration_is_refused_at_the_wr
 /// draft under D-151, and the publish pre-check still carries both.
 #[test]
 fn a_non_trial_phase_whose_display_days_drift_reports_both_and_refuses_the_write_for_one() {
-    let mut intro = phase(0x11_10, PhaseKind::Intro, 0, Some(phase_id(0x7e_11)));
+    let mut intro = phase(0x11_10, PhaseKind::Interim, 0, Some(phase_id(0x7e_11)));
     intro.display_trial_days = Some(30);
     let subject = shape_of(vec![intro, phase(0x7e_11, PhaseKind::Evergreen, 1, None)]);
 
@@ -1554,7 +1564,7 @@ fn every_offending_phase_is_reported_and_not_only_the_first() {
     // intro, and the terminal one has none to disagree with — so each contributes
     // exactly one fault: the `kind`. Without that the drift arm would make this a
     // three-violation report and the count below would be asserting two things.
-    let mut intro = phase(0x11_10, PhaseKind::Intro, 0, Some(phase_id(0x7e_11)));
+    let mut intro = phase(0x11_10, PhaseKind::Interim, 0, Some(phase_id(0x7e_11)));
     intro.display_trial_days = Some(14);
     let mut terminal = phase(0x7e_11, PhaseKind::Evergreen, 1, None);
     terminal.display_trial_days = Some(14);

@@ -23,16 +23,22 @@
 mod common;
 mod pg_support;
 
+#[path = "postgres_plan_listing/list_query.rs"]
+mod list_query;
+
 use bss_pricing::domain::audit::AuditStamp;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::plan::PlanRevision;
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::infra::storage::entity::plan;
+use bss_pricing::infra::storage::repo::plan_repo::count_plans_by_authoring_state;
 use bss_pricing::infra::storage::repo::{NewPlanDraft, PlanRepo, plan_repo};
-use chrono::{DateTime, TimeZone, Utc};
+
+use bss_pricing::domain::instant::utc_ymd_hms;
 use pg_support::Pg;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
+use time::OffsetDateTime;
 use toolkit_db::secure::{AccessScope, DBRunner, SecureUpdateExt};
 use toolkit_db::{DBProvider, DbError};
 use uuid::Uuid;
@@ -45,8 +51,8 @@ fn scope() -> AccessScope {
     AccessScope::for_tenant(TENANT)
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 11, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 11, hour, 0, 0)
 }
 
 fn stamp() -> AuditStamp {
@@ -315,4 +321,91 @@ async fn supersede_plan_directly(provider: &DBProvider<DbError>, plan_id: PlanId
         .await
         .expect("supersede the seeded plan revision");
     assert_eq!(result.rows_affected, 1, "the seed must have moved one row");
+}
+
+/// **The catalogue counts are computed by the engine, and the draft shadow is a
+/// subtraction there.**
+///
+/// On this tier and not the `SQLite` one for this suite's own stated reason. The
+/// counts read answers four integers from two grouped statements and takes
+/// `COUNT(*)` per state as the count of *plans* in that state — which is only
+/// sound because `uq_pricing_plan_open_draft` and `uq_pricing_plan_current` bound
+/// a plan to one draft row and one current row, and those are partial indexes
+/// that exist on the engine that has them. The second statement subtracts, per
+/// current state, the plans that also hold a draft; an `IN (subquery)` and a
+/// `GROUP BY` are the two pieces of SQL that the in-memory tier cannot vouch
+/// for.
+///
+/// Three plans, one per bucket, and the middle one is the case the subtraction
+/// exists for: published with a draft opened over it, which must count as
+/// `draft` and **not** as `published`.
+#[tokio::test]
+#[ignore = "requires Postgres; run with --ignored"]
+async fn the_authoring_counts_group_in_the_engine_and_subtract_the_draft_shadow() {
+    let pg = Pg::applied().await;
+    let provider = DBProvider::<DbError>::new(pg.db().await);
+    let plans = PlanRepo::new(provider.clone());
+
+    // Published, no draft.
+    let published = PlanId::new(Uuid::from_u128(0x50_61));
+    seed_published_plan(&provider, published).await;
+
+    // Published *and* holding a draft — the shadow.
+    let shadowed = PlanId::new(Uuid::from_u128(0x50_62));
+    seed_published_plan(&provider, shadowed).await;
+    plans
+        .open_revision(&scope(), TENANT, shadowed, stamp())
+        .await
+        .expect("reopen the shadowed plan as a draft");
+
+    // A plain draft, never published.
+    let drafted = PlanId::new(Uuid::from_u128(0x50_63));
+    plans
+        .create_draft(
+            &scope(),
+            NewPlanDraft {
+                plan_name: None,
+                plan_id: drafted,
+                tenant_id: TENANT,
+                created_by: ACTOR,
+                created_at_utc: at(10),
+                sku_id: None,
+                plan_tier: Some("gold".to_owned()),
+                billing_cycle: None,
+                frequency: None,
+                plan_tier_override: false,
+                purchase_min_qty: None,
+                purchase_max_qty: None,
+                invoice_grouping_key: None,
+                available_from: None,
+                available_to: None,
+                cloned_from: None,
+                correlation_id: CORRELATION,
+            },
+        )
+        .await
+        .expect("create a draft-only plan");
+
+    let conn = provider.conn().expect("conn");
+    let counts = count_plans_by_authoring_state(&conn, &scope(), TENANT)
+        .await
+        .expect("count the catalogue");
+
+    assert_eq!(
+        counts.draft, 2,
+        "the draft-only plan and the shadowed one: {counts:?}"
+    );
+    assert_eq!(
+        counts.published, 1,
+        "only the plan with no draft over it stays published: {counts:?}"
+    );
+    assert_eq!(counts.retired, 0, "{counts:?}");
+    // **Three, not the sum of the buckets.** `count_plans_by_authoring_state`
+    // computes `total` as exactly that sum, so comparing against it would assert
+    // that a value equals itself; the seeded plan count is what can actually
+    // catch a shadowed plan counted twice.
+    assert_eq!(
+        counts.total, 3,
+        "three plans seeded, each in exactly one bucket: {counts:?}"
+    );
 }

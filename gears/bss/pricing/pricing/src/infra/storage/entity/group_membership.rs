@@ -31,8 +31,9 @@
 //! arrangement every guarded table in this crate takes, since a `SeaORM`
 //! `Model` carries columns and not constraints.
 
-use chrono::{DateTime, Utc};
+
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -56,13 +57,13 @@ pub struct Model {
     /// value. See the module doc for why this is not a foreign key.
     pub group_value: String,
     /// Inclusive start of the half-open interval, UTC.
-    pub effective_from: DateTime<Utc>,
+    pub effective_from: OffsetDateTime,
     /// **Exclusive** end, UTC. `None` is open-ended — a membership not (yet)
     /// ended.
-    pub effective_to: Option<DateTime<Utc>>,
+    pub effective_to: Option<OffsetDateTime>,
     /// **Pseudonymous** principal id of whoever recorded the membership.
     pub created_by: Uuid,
-    pub created_at_utc: DateTime<Utc>,
+    pub created_at_utc: OffsetDateTime,
     /// The row's concurrency token, the `pricing_plan` / `pricing_price_overlay`
     /// revision's column under the same name — an authoring `PATCH` (ending or
     /// adjusting an interval) answers `If-Match` against it.

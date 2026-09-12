@@ -73,6 +73,7 @@ use std::time::Duration;
 use bss_pricing::config::JobsConfig;
 use bss_pricing::domain::audit::AuditStamp;
 use bss_pricing::domain::events::CatalogEvent;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::scope_key::PlanId;
 use bss_pricing::domain::window::WindowState;
 use bss_pricing::infra::jobs::window_activation::WindowActivationJob;
@@ -82,7 +83,8 @@ use bss_pricing::infra::storage::repo::window_repo::{self, NewWindow};
 use bss_pricing::infra::storage::repo::{
     NewOutboxEvent, PriceWindowTransitionPayload, outbox_repo,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use pg_support::Pg;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
@@ -109,8 +111,8 @@ const RACE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `2099-09-<day>T00:00:00Z` — a fact rather than a fixture that ages, in
 /// `tests/sqlite_window_repo.rs`'s sense.
-fn t(day: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 9, day, 0, 0, 0).unwrap()
+fn t(day: u32) -> OffsetDateTime {
+    utc_ymd_hms(2099, 9, day, 0, 0, 0)
 }
 
 fn scope() -> AccessScope {
@@ -170,7 +172,7 @@ async fn seed(pg: &Pg) {
 }
 
 /// The window's state and the instant it took effect at.
-async fn window_at_rest(pg: &Pg) -> (WindowState, Option<DateTime<Utc>>) {
+async fn window_at_rest(pg: &Pg) -> (WindowState, Option<OffsetDateTime>) {
     let db = pg.db().await;
     let provider = DBProvider::<DbError>::new(db);
     let conn = provider.conn().expect("scoped connection");

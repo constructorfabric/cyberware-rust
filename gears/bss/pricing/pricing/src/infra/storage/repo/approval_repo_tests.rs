@@ -25,7 +25,6 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, TimeZone, Utc};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use toolkit::api::canonical_prelude::CanonicalError;
@@ -37,10 +36,12 @@ use uuid::Uuid;
 use super::{NewApproval, SUBJECT_KINDS_WITH_A_WRITER, decide, open, read, swap, to_domain};
 use crate::domain::approval::{ApprovalDecision, ApprovalState};
 use crate::domain::audit::{AuditStamp, AuditSubjectKind};
+use crate::domain::instant::utc_ymd_hms;
 use crate::infra::storage::entity::approval;
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::{RepoError, repo_failure};
 use crate::source_scan::{blank_comments_and_literals, matching_brace};
+use time::OffsetDateTime;
 
 fn row(state: &str, subject_kind: &str) -> approval::Model {
     approval::Model {
@@ -54,7 +55,7 @@ fn row(state: &str, subject_kind: &str) -> approval::Model {
         approver_principal: None,
         reason: None,
         materiality: json!({}),
-        submitted_at: Utc.with_ymd_and_hms(2026, 8, 3, 9, 0, 0).unwrap(),
+        submitted_at: utc_ymd_hms(2026, 8, 3, 9, 0, 0),
         decided_at: None,
     }
 }
@@ -517,8 +518,8 @@ async fn harness() -> DBProvider<DbError> {
     DBProvider::<DbError>::new(db)
 }
 
-fn at(hour: u32) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 8, 3, hour, 0, 0).unwrap()
+fn at(hour: u32) -> OffsetDateTime {
+    utc_ymd_hms(2026, 8, 3, hour, 0, 0)
 }
 
 fn pending(approval_id: Uuid) -> NewApproval {
@@ -541,7 +542,7 @@ fn pending(approval_id: Uuid) -> NewApproval {
 const TEST_CORRELATION: Uuid = Uuid::from_u128(0x_c0_11_a7_10);
 
 /// The stamp an audited call is made under.
-fn stamp_of(actor: Uuid, when: DateTime<Utc>) -> AuditStamp {
+fn stamp_of(actor: Uuid, when: OffsetDateTime) -> AuditStamp {
     AuditStamp {
         actor_principal_id: actor,
         recorded_at: when,
@@ -704,4 +705,113 @@ async fn a_foreign_scope_writes_nothing_on_the_decision_path() {
     );
     assert_eq!(stored.approver_principal, None);
     assert_eq!(stored.decided_at, None);
+}
+
+#[test]
+fn membership_move_subject_ref_writes_rfc3339_effective_from() {
+    use crate::domain::membership_change::{MembershipMoveProposal, MembershipMoveSet};
+
+    let at = utc_ymd_hms(2026, 1, 1, 0, 0, 0);
+    let set = MembershipMoveSet::new(vec![MembershipMoveProposal {
+        payer_tenant_id: Uuid::from_u128(1),
+        group_value: "gold".to_owned(),
+        effective_from: at,
+    }])
+    .expect("one payer is a valid set");
+    let rendered = super::membership_move_subject_ref(&set).expect("render");
+    // **The whole ref, against a literal.** This value is the approval unit's
+    // key: `find_pending_for_subject` matches it whole, so a retry that renders
+    // the instant one byte differently opens a second unit over the same move.
+    // Asserting `contains("2026-01-01T00:00:00")` on the instant alone survived
+    // every spelling that substring is a prefix of — `+00:00`, `.000Z`,
+    // `.000000Z` — which is exactly the class of change that re-keys the register.
+    assert_eq!(
+        rendered,
+        "membership-move/[{\"payer_tenant_id\":\"00000000-0000-0000-0000-000000000001\",\
+         \"group_value\":\"gold\",\"effective_from\":\"2026-01-01T00:00:00.000000Z\"}]"
+    );
+    let json = rendered
+        .strip_prefix("membership-move/")
+        .expect("subject_ref prefix");
+    let value: serde_json::Value = serde_json::from_str(json).expect("json");
+    assert_eq!(
+        value[0]["effective_from"]
+            .as_str()
+            .expect("effective_from must be an RFC3339 string, not a time tuple"),
+        "2026-01-01T00:00:00.000000Z"
+    );
+}
+
+#[test]
+fn a_taxonomy_value_proposal_round_trips_through_its_ref_including_a_cleared_category() {
+    use super::{
+        ApprovalRecord, TAXONOMY_VALUE_REF_PREFIX, subject_taxonomy_value,
+        taxonomy_value_subject_ref,
+    };
+    use crate::domain::overlay::ScopeValue;
+    use crate::domain::taxonomy::{
+        TaxCategoryPatch, TaxonomyClass, TaxonomyState, TaxonomyValuePatch, TaxonomyValueProposal,
+    };
+
+    let record_over = |subject_ref: String| ApprovalRecord {
+        approval_id: Uuid::from_u128(7),
+        tenant_id: Uuid::from_u128(1),
+        subject_ref,
+        subject_kind: AuditSubjectKind::TaxonomyValue,
+        content_hash: vec![0; 32],
+        state: ApprovalState::Submitted,
+        submitter_principal: Uuid::from_u128(2),
+        approver_principal: None,
+        reason: None,
+        materiality: json!({}),
+        submitted_at: utc_ymd_hms(2026, 1, 1, 0, 0, 0),
+        decided_at: None,
+    };
+
+    for patch in [
+        TaxonomyValuePatch {
+            display_name: Some("Europe".to_owned()),
+            ..TaxonomyValuePatch::default()
+        },
+        TaxonomyValuePatch {
+            state: Some(TaxonomyState::Retired),
+            ..TaxonomyValuePatch::default()
+        },
+        TaxonomyValuePatch {
+            tax_category: TaxCategoryPatch::Set("vat_standard".to_owned()),
+            ..TaxonomyValuePatch::default()
+        },
+        // The clear must survive the wire, where a nullable member alone would
+        // fold it into "keep".
+        TaxonomyValuePatch {
+            tax_category: TaxCategoryPatch::Clear,
+            ..TaxonomyValuePatch::default()
+        },
+        TaxonomyValuePatch {
+            tax_rate_present: Some(false),
+            ..TaxonomyValuePatch::default()
+        },
+    ] {
+        let proposal = TaxonomyValueProposal {
+            class: TaxonomyClass::Region,
+            value: ScopeValue::new("eu").expect("a value"),
+            patch: patch.clone(),
+        };
+        let subject_ref = taxonomy_value_subject_ref(&proposal).expect("renders");
+        assert!(
+            subject_ref.starts_with(TAXONOMY_VALUE_REF_PREFIX),
+            "{subject_ref}"
+        );
+        assert_eq!(
+            subject_taxonomy_value(&record_over(subject_ref)).expect("decodes"),
+            proposal,
+            "{patch:?}"
+        );
+    }
+
+    let corrupt = record_over("taxonomy-value/not json".to_owned());
+    assert!(matches!(
+        subject_taxonomy_value(&corrupt),
+        Err(RepoError::CorruptRow(_))
+    ));
 }

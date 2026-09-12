@@ -17,7 +17,6 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use toolkit_db::secure::AccessScope;
 use uuid::Uuid;
 
@@ -25,6 +24,7 @@ use crate::config::FxConfig;
 use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::LedgerMetricsPort;
 use crate::infra::storage::repo::FxRepo;
+use time::OffsetDateTime;
 
 /// G10 currencies — the major, deeply-liquid pairs held to the tighter
 /// `stale_g10_hours` freshness window (design F3). A pair is "G10" if EITHER side
@@ -44,7 +44,7 @@ const G10: &[&str] = &[
 pub struct ResolvedRate {
     pub rate_micro: i64,
     pub provider: String,
-    pub as_of: DateTime<Utc>,
+    pub as_of: OffsetDateTime,
     pub stale: bool,
     pub fallback_order: i32,
     pub triangulated_via: Option<String>,
@@ -68,11 +68,11 @@ fn order_index(provider: &str, provider_order: &[String]) -> usize {
 /// i.e. clock skew) is never stale (`age <= window` holds). Pure — unit-tested
 /// without a DB.
 #[must_use]
-fn is_stale(base: &str, quote: &str, age: chrono::Duration, cfg: &FxConfig) -> bool {
+fn is_stale(base: &str, quote: &str, age: time::Duration, cfg: &FxConfig) -> bool {
     let window = if is_g10_pair(base, quote) {
-        chrono::Duration::hours(i64::try_from(cfg.stale_g10_hours).unwrap_or(i64::MAX))
+        time::Duration::hours(i64::try_from(cfg.stale_g10_hours).unwrap_or(i64::MAX))
     } else {
-        chrono::Duration::days(i64::try_from(cfg.stale_default_max_days).unwrap_or(i64::MAX))
+        time::Duration::days(i64::try_from(cfg.stale_default_max_days).unwrap_or(i64::MAX))
     };
     age > window
 }
@@ -145,7 +145,7 @@ impl RateSource {
         tenant: Uuid,
         base: &str,
         quote: &str,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Result<ResolvedRate, DomainError> {
         // Direct pairs only — see the §4.6 triangulation deferral above.
         let mut candidates = self

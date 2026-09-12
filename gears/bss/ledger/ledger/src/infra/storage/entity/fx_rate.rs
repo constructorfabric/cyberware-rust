@@ -12,8 +12,8 @@
 //! `.filter(tenant_id)`, which is the only mechanically available way to run a
 //! query against the toolkit connection.
 
-use chrono::{DateTime, Utc};
 use sea_orm::entity::prelude::*;
+use time::OffsetDateTime;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
@@ -30,9 +30,9 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub provider: String,
     pub rate_micro: i64,
-    pub as_of: DateTime<Utc>,
+    pub as_of: OffsetDateTime,
     pub fallback_order: i32,
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: OffsetDateTime,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

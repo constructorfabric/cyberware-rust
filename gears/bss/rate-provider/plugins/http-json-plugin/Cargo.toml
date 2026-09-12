@@ -30,8 +30,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# DateTime<Utc> parse for the publication timestamp; no `clock` feature.
-chrono = { workspace = true }
+# RFC3339 parse of the publication timestamp.
+time = { workspace = true }
 # `SecretString` for `api_key`: redacts on Debug/log, matches the
 # authn-resolver convention for optional secret config fields.
 secrecy = { workspace = true }

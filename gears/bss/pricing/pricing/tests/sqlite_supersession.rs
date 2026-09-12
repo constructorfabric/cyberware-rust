@@ -24,6 +24,7 @@ mod rest_support;
 
 use bss_pricing::domain::audit::AuditStamp;
 use bss_pricing::domain::concurrency::RowVersion;
+use bss_pricing::domain::instant::utc_ymd_hms;
 use bss_pricing::domain::lifecycle::LifecycleState;
 use bss_pricing::domain::money::{CurrencyCode, MinorAmount};
 use bss_pricing::domain::price_record::PriceContent;
@@ -38,7 +39,8 @@ use bss_pricing::infra::storage::entity::{price, price_window};
 use bss_pricing::infra::storage::migrations::Migrator;
 use bss_pricing::infra::storage::repo::{NewPriceDraft, PriceRepo, price_repo, window_repo};
 use bss_pricing::infra::supersession::{SupersessionCommit, commit_supersession};
-use chrono::{DateTime, TimeZone, Utc};
+use time::OffsetDateTime;
+
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use sea_orm_migration::MigratorTrait;
@@ -63,18 +65,18 @@ const SUCCESSOR: Uuid = Uuid::from_u128(0xb_7002);
 const SUCCESSOR_WINDOW: Uuid = Uuid::from_u128(0xb_7f02);
 
 /// The suite's fixed reading of "now" — every instant below is placed against it.
-fn now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()
+fn now() -> OffsetDateTime {
+    utc_ymd_hms(2099, 1, 1, 0, 0, 0)
 }
 
 /// The predecessor's coverage: open-ended from before `now`.
-fn coverage_from() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2098, 6, 1, 0, 0, 0).unwrap()
+fn coverage_from() -> OffsetDateTime {
+    utc_ymd_hms(2098, 6, 1, 0, 0, 0)
 }
 
 /// The changeover: well clear of both of `inst-su-instant`'s floors.
-fn changeover() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 4, 1, 0, 0, 0).unwrap()
+fn changeover() -> OffsetDateTime {
+    utc_ymd_hms(2099, 4, 1, 0, 0, 0)
 }
 
 fn stamp() -> AuditStamp {
@@ -534,7 +536,7 @@ async fn the_shorten_carries_the_act_sequence_it_was_composed_against() {
         &scope,
         tenant(),
         predecessor_window(),
-        Some(Utc.with_ymd_and_hms(2099, 8, 1, 0, 0, 0).unwrap()),
+        Some(utc_ymd_hms(2099, 8, 1, 0, 0, 0)),
         seq,
         stamp(),
     )
@@ -870,12 +872,12 @@ const REVIEWER: Uuid = Uuid::from_u128(0x_7a_22);
 
 /// The act's instant: inside `common`'s 2099 coverage window and clear of both of
 /// `inst-su-instant`'s floors, as the sibling unit suite's constants are.
-fn unit_now() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 5, 0, 0, 0).unwrap()
+fn unit_now() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 5, 0, 0, 0)
 }
 
-fn unit_changeover() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2099, 8, 20, 0, 0, 0).unwrap()
+fn unit_changeover() -> OffsetDateTime {
+    utc_ymd_hms(2099, 8, 20, 0, 0, 0)
 }
 
 /// Clear one declared region's `taxCategory` marker, leaving the region itself

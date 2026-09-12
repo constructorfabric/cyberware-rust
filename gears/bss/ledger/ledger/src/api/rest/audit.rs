@@ -45,6 +45,7 @@ use crate::infra::authz::cross_tenant::{CrossTenantGateway, TargetScope};
 use crate::infra::inquiry::AuditPackExporter;
 use crate::infra::pii::ErasureService;
 use crate::infra::storage::entity::audit_pack_export;
+use time::OffsetDateTime;
 
 /// `OpenAPI` tag applied to the audit-retrieval operations.
 const TAG: &str = "BSS Ledger Audit";
@@ -881,7 +882,7 @@ async fn audit_pack_in_txn(
             "audit-pack row_count {row_count} exceeds i64::MAX"
         ))
     })?;
-    let now = chrono::Utc::now();
+    let now = OffsetDateTime::now_utc();
     let model = audit_pack_export::Model {
         export_id: Uuid::now_v7(),
         tenant_id: home_tenant,

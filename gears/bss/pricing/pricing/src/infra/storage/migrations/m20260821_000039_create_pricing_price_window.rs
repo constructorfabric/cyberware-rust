@@ -216,13 +216,13 @@
 //! * **Between two stored instants**, lexicographic comparison is exact — but
 //!   **not for the reason this paragraph gave until 2026-08-18** (review Z2-8). It
 //!   said the rendering is "fixed-width, zero-padded and monotonic". It is not
-//!   fixed-width: `sqlx-sqlite` encodes a `DateTime<Utc>` as
+//!   fixed-width: `sqlx-sqlite` encodes a `OffsetDateTime` as
 //!   `to_rfc3339_opts(SecondsFormat::AutoSi, false)`, and `AutoSi` picks 0, 3, 6 or
 //!   9 fractional digits **per value**, so one column holds 25-, 29-, 32- and
 //!   35-character renderings side by side. This gear's own writers mix them:
 //!   `check_authored_instant` refuses an *authored* instant finer than a
 //!   millisecond and its doc explicitly excludes storage bookkeeping, so
-//!   `Utc::now()` reaches `created_at_utc`, `submitted_at`, `enqueued_at` and
+//!   `OffsetDateTime::now_utc()` reaches `created_at_utc`, `submitted_at`, `enqueued_at` and
 //!   `recorded_at` at nanosecond precision.
 //!
 //!   The conclusion survives on a different argument, and it is the argument that

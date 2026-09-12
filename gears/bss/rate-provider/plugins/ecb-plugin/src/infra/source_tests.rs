@@ -1,7 +1,8 @@
 //! ECB parser + mapping tests over the daily-XML fixture.
 
 use bss_ledger_sdk::{CurrencyPair, RateProviderError};
-use chrono::{Datelike, NaiveDate, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate};
+use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 use super::{ecb_rates_to_provider_rates, parse_ecb_xml};
 
@@ -10,12 +11,33 @@ const FIXTURE: &[u8] = include_bytes!("../../tests/fixtures/eurofxref-daily.xml"
 /// The `provider_id` the mapper stamps onto every rate under test.
 const PROVIDER: &str = "ecb";
 
+fn midnight_utc(year: i32, month: u8, day: u8) -> OffsetDateTime {
+    let month = Month::try_from(month).unwrap();
+    let date = Date::from_calendar_date(year, month, day).unwrap();
+    PrimitiveDateTime::new(date, Time::MIDNIGHT).assume_utc()
+}
+
 #[test]
 fn parses_date_and_all_pairs() {
     let (date, raw) = parse_ecb_xml(FIXTURE).unwrap();
     assert_eq!((date.year(), date.month(), date.day()), (2026, 7, 21));
     assert_eq!(raw.len(), 3);
     assert!(raw.iter().any(|(c, r)| c == "USD" && r == "1.0856"));
+}
+
+/// chrono's `%Y-%m-%d` accepts a signed year past 9999 and `time` does not hold
+/// it. On main the far-future `as_of` was refused by the publication-time guard;
+/// an epoch fallback would pass that guard and store the feed permanently stale,
+/// so the date is refused at the parse stage instead.
+#[test]
+fn a_publication_date_time_cannot_hold_is_refused_not_the_epoch() {
+    let date = NaiveDate::from_ymd_opt(12345, 1, 1).unwrap();
+    let raw = vec![("USD".to_owned(), "1.0856".to_owned())];
+    let err = ecb_rates_to_provider_rates(date, &raw, &[], PROVIDER).unwrap_err();
+    assert!(
+        matches!(&err, RateProviderError::Internal(detail) if detail.contains("12345-01-01")),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -26,10 +48,7 @@ fn whole_table_when_no_pairs_requested() {
     let usd = rates.iter().find(|r| r.quote == "USD").unwrap();
     assert_eq!(usd.base, "EUR");
     assert_eq!(usd.rate_micro, 1_085_600);
-    assert_eq!(
-        usd.as_of,
-        Utc.with_ymd_and_hms(2026, 7, 21, 0, 0, 0).unwrap()
-    );
+    assert_eq!(usd.as_of, midnight_utc(2026, 7, 21));
 }
 
 #[test]

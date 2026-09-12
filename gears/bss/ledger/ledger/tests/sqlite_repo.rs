@@ -18,9 +18,10 @@ use bss_ledger::domain::model::{EntryKey, NewEntry, NewLine};
 use bss_ledger::infra::storage::migrations::Migrator;
 use bss_ledger::infra::storage::repo::JournalRepo;
 use bss_ledger_sdk::{AccountClass, MappingStatus, Side, SourceDocType};
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
+use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::secure::AccessScope;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
@@ -52,7 +53,7 @@ async fn balanced_entry_round_trips_on_sqlite() {
         source_business_id: "inv-1".to_owned(),
         reverses_entry_id: None,
         reverses_period_id: None,
-        posted_at_utc: Utc::now(),
+        posted_at_utc: OffsetDateTime::now_utc(),
         effective_at: NaiveDate::from_ymd_opt(2026, 6, 18).unwrap(),
         origin: "SYSTEM".to_owned(),
         posted_by_actor_id: Uuid::now_v7(),
