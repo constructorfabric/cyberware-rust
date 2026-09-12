@@ -104,14 +104,14 @@ The service is delivered as a **Constructor Fabric Gear** — the platform's uni
 | `cpt-cf-settings-service-fr-settings-category-model` | Category Management + Declaration Management components; flat categories with no-orphan delete enforced by the `ON DELETE RESTRICT` FK; declaration mutation classes (immediate / immutable / step-up gated) |
 | `cpt-cf-settings-service-fr-module-contributed-declarations` | Contribution Reconciler: idempotent `register_declarations` from gear init, gear-namespaced keys, `source=module_contributed` immutable to admins |
 | `cpt-cf-settings-service-fr-contributed-lifecycle` | Reconciler match by version-stripped path; new/compatible/upgrade cases; retire → `status=retired` with values retained; re-declare-to-revive |
-| `cpt-cf-settings-service-fr-setting-scope-class` | `ScopeClass` enum on the declaration drives resolution; per-class algorithm in the Value Resolver; `global ⇒ tenant_overridable=false` enforced by a DB check |
-| `cpt-cf-settings-service-fr-typed-value-validation` | Type Validator against the setting's `value_type_id` + traits; `secret` routed to the Secret Manager; `public`/`pii`/`secret` classification drives masking |
+| `cpt-cf-settings-service-fr-setting-scope-class` | `ScopeClass` enum on the declaration drives resolution; per-class algorithm in the Value Resolver; a `global` setting takes no tenant-scoped value at all, whatever a tenant's permission says |
+| `cpt-cf-settings-service-fr-typed-value-validation` | Type Validator against the setting's own `value_schema` + traits; `secret` routed to the Secret Manager; `public`/`pii`/`secret` classification drives masking |
 | `cpt-cf-settings-service-fr-set-value` | Value Writer validates then commits per change; a `set` may carry several settings with per-item results and no atomicity across them |
 | `cpt-cf-settings-service-fr-validate-before-set` | Value Writer `validate` is read-only and repeatable; a write to a declaration that requires elevated confirmation additionally needs a fresh step-up assertion verified by a `StepUpVerifier` |
 | `cpt-cf-settings-service-fr-live-read-activation` | Commit-per-change, then local eviction, then signal publish; per-change result in the response; consumers self-react on `change_notification` |
 | `cpt-cf-settings-service-fr-tenant-overrides` | `set` / `clone` at any tenant inside the caller's subtree; the override row is created at the target tenant |
 | `cpt-cf-settings-service-fr-cascading-inheritance` | Ancestor-id walk via the Tenant Resolver, nearest-match wins; `inheritance_trail` on the read; bounded `cascading_impact` report |
-| `cpt-cf-settings-service-fr-tenant-scope-enforcement` | Enforced by the platform data path, not by hand-written predicates: `PolicyEnforcer` compiles the decision into an `AccessScope` and `SecureConn` applies it as automatic `WHERE` clauses (§4.8 *The Data Path*). Reads are further gated by `tenant_visible`, writes by `tenant_overridable` |
+| `cpt-cf-settings-service-fr-tenant-scope-enforcement` | Sparse `tenant_permissions` rows store `read_only` or `hidden`; absence means `overridable`. The strictest row on the tenant's root-to-self chain wins. `PolicyEnforcer` and `SecureConn` enforce the caller's subtree, while effective tenant access gates administrative reads and writes (§4.1 *TenantAccessRestriction*, §4.2 *Tenant Access*). |
 | `cpt-cf-settings-service-fr-authn-role-gating` | Bearer token via the AuthN Resolver, then a fail-closed `PolicyEnforcer` decision; step-up on a write to a declaration that requires it and on behavior-affecting declaration actions |
 | `cpt-cf-settings-service-fr-per-setting-access` | §4.8 *Authorization Model*: a value operation names the setting's own key as the resource, so a grant covers one setting, a wildcarded subtree, or — on the base type — all of them; lists resolve it in two steps (*Listing under a narrowed grant*) |
 | `cpt-cf-settings-service-fr-file-valued-settings` | §3 *Files*: a `file-reference`-trait value is an inline reference (`value`, §4.1) to a file in the `file-storage` gear, never the bytes. **Validated for shape only** — the two-field object `{ file_id, version_id }`, both required — with existence, content type, size and caller entitlement deliberately unchecked, so this service takes no dependency on `file-storage`. The reference is always pinned to a version, so a `bind` under it changes nothing until the setting is repointed; content is never indexed (§4.2 *Search*); `secret` + `file-reference` is rejected (`422`) while `pii` is carried. |
@@ -138,7 +138,7 @@ The service is delivered as a **Constructor Fabric Gear** — the platform's uni
 | `cpt-cf-settings-service-nfr-availability` | Read path stays available | Cache + Settings Reader | Warm reads served from cache; distinguishable `Unavailable` error so consumers own their degradation posture | Operational SLO from liveness aggregation |
 | `cpt-cf-settings-service-nfr-scale-growth` | Tenant, setting, and audit volume | Data model + Audit Subsystem | Bounds in §7 *NFR Mapping & Scale Model*; audit volume and retention are requirements on the platform Audit Subsystem | Load test against the declared bounds |
 | `cpt-cf-settings-service-nfr-ops-set-monitoring` | Aggregate change-failure visibility | Metrics | `settings_value_write_failure_ratio` on shared dashboards plus an alert-routing rule | Dashboard and alert-rule review |
-| `cpt-cf-settings-service-nfr-versatility-gts-scope-class` | New types and gear declarations need no core change | Type Validator + Reconciler | Values validated against a curated catalog value type; declarations arrive at runtime | Add a value type and a gear declaration without touching the gear |
+| `cpt-cf-settings-service-nfr-versatility-gts-scope-class` | New types and gear declarations need no core change | Type Validator + Reconciler | Values validated against the setting's own schema; declarations arrive at runtime | Add a schema template and a gear declaration without touching the gear |
 
 ### 1.3 Architecture Layers
 
@@ -178,12 +178,12 @@ The service is delivered as a **Constructor Fabric Gear** — the platform's uni
 C4Context
  title Settings Service - System Context
 
- Person(platform_admin, "Platform Admin", "Configures platform-wide settings, governs tenant visibility/override")
+ Person(platform_admin, "Platform Admin", "Configures platform-wide settings and governs tenant access")
  Person(tenant_admin, "Tenant Admin", "Configures delegated settings within own tenant scope")
 
  Enterprise_Boundary(vhp, "the platform OSS") {
  System(settings_service, "Settings Service", "Declarative, centralized platform configuration; includes Settings Activation — publishes change_notification + cache_invalidate on a value change")
- System(types_registry, "GTS Schema Registry", "Type + trait validation for values")
+ System(types_registry, "GTS Schema Registry", "Registers each setting's own GTS type")
  System(authz, "AuthZ Resolver", "Access gating for read/mutate")
  System(tenant_resolver, "Tenant Resolver (the Tenant Resolver)", "Org-hierarchy ancestry for cascade")
  System(idp, "IdP / AuthN Resolver", "Authentication; issues step-up (re-auth) tokens")
@@ -200,7 +200,7 @@ C4Context
  Rel(tenant_admin, settings_service, "configures own scope", "REST API")
  Rel(modules, settings_service, "register/retire declarations; read values", "in-process (ClientHub)")
  Rel(settings_service, settings_db, "reads/writes", "SQL")
- Rel(settings_service, types_registry, "validate value vs type+traits", "in-process (ClientHub)")
+ Rel(settings_service, types_registry, "register setting type · compatibility verdict", "in-process (ClientHub)")
  Rel(settings_service, authz, "authorize read/mutate (fail-closed)", "in-process (PEP)")
  Rel(settings_service, tenant_resolver, "resolve scope ancestry", "in-process (ClientHub)")
  Rel(settings_service, idp, "validate step-up token claims (local)", "JWKS")
@@ -222,7 +222,7 @@ C4Container
  Container(domain, "Domain Core", "ToolKit gear", "Resolver, writer, validation, search")
  ContainerDb(postgres, "PostgreSQL", "Database", "Declarations, categories, values, audit")
  Container(cache, "Effective-Value Cache", "In-memory + local invalidation", "Hot-path read cache keyed by (key, scope)")
- Container_Ext(types_registry, "GTS Schema Registry", "ClientHub", "Type + trait validation")
+ Container_Ext(types_registry, "GTS Schema Registry", "ClientHub", "Setting-type registration")
  Container_Ext(authz, "AuthZ Resolver", "ClientHub", "Fail-closed access gating via AuthZResolverClient")
  Container_Ext(tenant_resolver, "Tenant Resolver", "ClientHub", "Org-hierarchy ancestry")
  Container_Ext(idp, "IdP / AuthN Resolver", "JWKS", "Step-up token validation (local, no per-write call)")
@@ -236,7 +236,7 @@ C4Container
  Rel(clienthub, domain, "resolves on cache miss", "in-process")
  Rel(domain, postgres, "reads/writes", "SQL")
  Rel(domain, cache, "populate / invalidate (local + event-driven)", "in-process")
- Rel(domain, types_registry, "validate", "ClientHub")
+ Rel(domain, types_registry, "register setting type", "ClientHub")
  Rel(domain, authz, "authorize (fail-closed)", "ClientHub")
  Rel(domain, tenant_resolver, "ancestry", "ClientHub")
  Rel(domain, idp, "validate step-up token claims (local)", "JWKS")
@@ -251,7 +251,7 @@ C4Container
 ### 2.1 Goals
 
 - Category CRUD with no-orphan deletion. Categories are flat (single-level, no nesting) per PRD.
-- Setting **Declaration** lifecycle — admin-authored and **module-contributed** (register/retire). The setting's **key** is a **GTS type identifier** for **both** authors — `gts.cf.toolkit.settings.value.v1~<vendor>.<package>.<category>.<name>.v1~`, a type derived from the gear's own `value` entity type and registered when the declaration is created (§4.7). The shape its value must take is separate: a curated **value type** (`gts.cf.toolkit.settings.type_*~`) named by `value_type_id`. The declaration is kept separate from the value.
+- Setting **Declaration** lifecycle — admin-authored and **module-contributed** (register/retire). The setting's **key** is a **GTS type identifier** for **both** authors — `gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~`, derived from the Settings gear-owned base type and registered when the declaration is created (§4.7). The shape its value must take is carried by that same type: the declaration supplies a **value schema**, which the Settings gear composes into the registered type (§4.7). The declaration is kept separate from the value.
 - First-class **Scope Class** (`global` / `cascading` / `local`) deriving cascade/override behaviour deterministically.
 - **Typed values** validated against GTS schema + traits (scalar and structured), with rendering metadata exposure.
 - **Secret values** — `secret`-trait settings backed by the Credential Store: plaintext never enters the settings DB, cache, search index, or audit trail; masked on every **administrative** read/search/list, with **no human reveal path**. Plaintext resolves only through the **machine-only runtime path** — the `SettingsReaderClient` SDK trait (§4.5), which `ClientHub` may bind locally or to a remote client (§4.9) — and only for a consuming service authorized to that specific setting; every resolution is audited as a secret-use event (§4.2 *Secret Manager*).
@@ -284,7 +284,7 @@ This document describes the whole gear. It does not all ship at once, and the se
 
 **The defining property: R1 depends on no gear that does not exist.**
 
-Categories and declarations with their lifecycle (`cpt-cf-settings-service-fr-settings-category-model`, `cpt-cf-settings-service-fr-module-contributed-declarations`, `cpt-cf-settings-service-fr-contributed-lifecycle`); GTS typing, validation and secret protection (`cpt-cf-settings-service-fr-typed-value-validation`); Scope Class with cascade, override and source trace (`cpt-cf-settings-service-fr-setting-scope-class`, `cpt-cf-settings-service-fr-tenant-overrides`, `cpt-cf-settings-service-fr-cascading-inheritance`); tenant permission and subtree isolation including the standalone-tenant seam (`cpt-cf-settings-service-fr-tenant-scope-enforcement`, `cpt-cf-settings-service-fr-barrier-default-seam`); authentication and access-level gating, per setting (`cpt-cf-settings-service-fr-authn-role-gating`, `cpt-cf-settings-service-fr-per-setting-access`); a validated, step-up-verified write, effective on next read (`cpt-cf-settings-service-fr-set-value`, `cpt-cf-settings-service-fr-validate-before-set`, `cpt-cf-settings-service-fr-live-read-activation`); revert to ancestor or Schema Default (`cpt-cf-settings-service-fr-defaults-revert`); audited mutations and secret reveals (`cpt-cf-settings-service-fr-audit-mutations`); single and bulk effective reads (`cpt-cf-settings-service-fr-bulk-effective-read`).
+Categories and declarations with their lifecycle (`cpt-cf-settings-service-fr-settings-category-model`, `cpt-cf-settings-service-fr-module-contributed-declarations`, `cpt-cf-settings-service-fr-contributed-lifecycle`); GTS typing, validation and secret protection (`cpt-cf-settings-service-fr-typed-value-validation`); Scope Class with cascade, override and source trace (`cpt-cf-settings-service-fr-setting-scope-class`, `cpt-cf-settings-service-fr-tenant-overrides`, `cpt-cf-settings-service-fr-cascading-inheritance`); per-tenant permission and subtree isolation including the standalone-tenant seam (`cpt-cf-settings-service-fr-tenant-scope-enforcement`, `cpt-cf-settings-service-fr-barrier-default-seam`); authentication and access-level gating, per setting (`cpt-cf-settings-service-fr-authn-role-gating`, `cpt-cf-settings-service-fr-per-setting-access`); a validated, step-up-verified write, effective on next read (`cpt-cf-settings-service-fr-set-value`, `cpt-cf-settings-service-fr-validate-before-set`, `cpt-cf-settings-service-fr-live-read-activation`); revert to ancestor or Schema Default (`cpt-cf-settings-service-fr-defaults-revert`); audited mutations and secret reveals (`cpt-cf-settings-service-fr-audit-mutations`); single and bulk effective reads (`cpt-cf-settings-service-fr-bulk-effective-read`).
 
 Subject-scoped values (`cpt-cf-settings-service-fr-subject-scoped-values`) enter here as **identity model only** — the columns, the partial unique indexes and the subject-aware API shape (§4.1, §4.7) — with resolution over subjects deferred to R2, which is the split the PRD asks for.
 
@@ -318,13 +318,13 @@ Consumer activation in full (`cpt-cf-settings-service-fr-consumer-activation`) �
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-principle-declaration-value-split`
 
-A setting's **declaration** (key, value type, Schema Default, Scope Class, metadata) is distinct from its **values** at each scope. Declarations are authored — by an administrator or contributed by a gear — and are addressed by immutable UUID on the management plane. Values are written and read by `key`. Keeping the planes separate is what allows a gear to own a setting's shape while an administrator owns its runtime value.
+A setting's **declaration** (key, value schema, Schema Default, Scope Class, metadata) is distinct from its **values** at each scope. Declarations are authored — by an administrator or contributed by a gear — and are addressed by immutable UUID on the management plane. Values are written and read by `key`. Keeping the planes separate is what allows a gear to own a setting's shape while an administrator owns its runtime value.
 
 #### Values Are Written; Declarations Are Gated by Immutability
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-principle-write-scope`
 
-The value write path covers value operations only. A declaration edit has no in-effect value to gate, so descriptive metadata applies immediately — but the fields that *would* change live resolution (Schema Default, value type, Scope Class) are immutable, and the two actions that change whether a setting resolves at all (retire, reactivate) require credential step-up. No ungated path can alter a live setting's resolution.
+The value write path covers value operations only. A declaration edit has no in-effect value to gate, so descriptive metadata applies immediately — but the fields that *would* change live resolution (Schema Default, value schema, Scope Class) are immutable, and the two actions that change whether a setting resolves at all (retire, reactivate) require credential step-up. No ungated path can alter a live setting's resolution.
 
 #### Behaviour Derives From One Declared Attribute
 
@@ -342,7 +342,7 @@ Tenant ancestry is owned by the Tenant Resolver. This gear stores a flat `tenant
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-principle-consume-gts`
 
-Values are validated against a curated catalog value type resolved from `types-registry`. This gear builds no parallel type system. A setting is registered as a GTS type (§4.7), but nothing on the read path asks the registry: declarations and values live in this gear's own tables.
+Values are validated against the setting's own value schema, held with the declaration. This gear builds no parallel type system. A setting is registered as a GTS type (§4.7), but nothing on the read path asks the registry: declarations and values live in this gear's own tables.
 
 #### Secrets Never Take a Human Path
 
@@ -394,15 +394,15 @@ Settings Service is **supplied as a Constructor Fabric Gear** — an SDK crate p
 
 #### Setting key by author
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-key-is-gts-instance-id`
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-key-is-gts-type-id`
 
-The setting `key` is a **GTS type identifier** `gts.cf.toolkit.settings.value.v1~<vendor>.<package>.<category>.<name>.v1~` for **both** authors: the base is the gear's own `value` entity type, the derived half is the setting. That half is **four segments** before the version — `<vendor>.<package>.<namespace>.<type>` per the GTS grammar (§4.7), with no `gts.` prefix of its own — and the category is always the third: a **module** provides its own half and the category is **extracted from the `<namespace>` slot**; an **admin** setting's is `<vendor>.settings.<category>.<name>.v1`, where `<vendor>`/`<name>` are the admin's inputs. The trailing `~` makes the key a type rather than an instance, which is what lets a policy name one setting (§4.8). The value type the value is checked against is a separate field, `value_type_id`.
+The setting `key` is a **GTS type identifier** `gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~` for **both** authors. The base type is owned and registered by the Settings gear. A contributing gear supplies the derived half of its setting's id — `<vendor>.<package>.<namespace>.<type>` per the GTS grammar — and the Settings gear registers the derived type for it (§4.7).
 
 #### GTS validation
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-gts-value-validation`
 
-Every value is checked against the setting's **value type** (`value_type_id`) + traits via `TypesRegistryClient`. This service builds no parallel type system: value shapes come from the curated catalog, never from the setting's own type. Values live in our own tables — never in the Registry.
+Every value is checked against the setting's own **value schema** (`value_schema`) + traits. This service builds no parallel type system: the schema it validates against is the one it composed into the setting's registered GTS type, and the shapes an author starts from come from a curated template library (§4.7). Values live in our own tables — never in the Registry.
 
 #### Scope hierarchy
 
@@ -456,7 +456,7 @@ OIDC bearer via the AuthN Resolver / IdP. A value write requires **step-up = re-
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-rbac-policy-enforcer`
 
-The AuthZ Resolver gates read/mutate against `gts.cf.toolkit.settings.*` resources. The gear resolves `AuthZResolverClient` through `ClientHub` and builds the SDK's `PolicyEnforcer` over it — the enforcer is a struct from that SDK, not a separately resolvable trait — then adapts it behind a gear-local port so the domain layer never imports infra. A category may additionally be **restricted**, and then reaching its settings needs a grant on that category (§4.8 *Category access*).
+The AuthZ Resolver gates read/mutate against `gts.cf.core.settings.*` resources. The gear resolves `AuthZResolverClient` through `ClientHub` and builds the SDK's `PolicyEnforcer` over it — the enforcer is a struct from that SDK, not a separately resolvable trait — then adapts it behind a gear-local port so the domain layer never imports infra. A category may additionally be **restricted**, and then reaching its settings needs a grant on that category (§4.8 *Category access*).
 
 #### Feature/licence entitlement
 
@@ -490,19 +490,18 @@ A committed value is **effective on next read**; consumers read on demand (pull,
 
 | Constant | GTS Type Identifier |
 |----------|---------------------|
-| Category | `gts.cf.toolkit.settings.category.v1~` |
-| Setting Declaration | `gts.cf.toolkit.settings.declaration.v1~` |
-| Setting Value | `gts.cf.toolkit.settings.value.v1~` |
-| Effective Value | `gts.cf.toolkit.settings.effective_value.v1~` |
-| Change Set | `gts.cf.toolkit.settings.change_set.v1~` |
+| Category | `gts.cf.core.settings.category.v1~` |
+| Setting Declaration | `gts.cf.core.settings.declaration.v1~` |
+| Setting Value | `gts.cf.core.settings.value.v1~` |
+| Effective Value | `gts.cf.core.settings.effective_value.v1~` |
+| Change Set | `gts.cf.core.settings.change_set.v1~` |
+| Setting Type (base) | `gts.cf.core.settings.setting_type.v1~` |
 
-GTS identifiers follow `gts.<vendor>.<package>.<namespace>.<type>.v<MAJOR>[.<MINOR>]~`. **These are the control-plane entity types** — the shape of a category row, a declaration row, and so on — used as RBAC resource types and internal schemas. They are authored by the gear itself, so they carry vendor `cf` (Constructor Fabric), package `toolkit`, namespace `settings`.
+GTS identifiers follow `gts.<vendor>.<package>.<namespace>.<type>.v<MAJOR>[.<MINOR>]~`. These types are authored by the Settings gear, so their owner namespace is `cf.core.settings`, following other gear-owned types such as `cf.core.am.*`. They are registered from the Settings gear SDK, not shipped as toolkit-owned base types from `libs/toolkit-gts`.
 
-**Why `toolkit`, not `core`.** In the Constructor Fabric namespace, `core` holds ambient primitives with no service in front of them — the error taxonomy, the event bus, monitoring metrics, the account model's tenant-type (`gts.cf.core.{errors,events,mon,am}.*`); nobody calls "the errors service". `toolkit` holds a discrete subsystem with its own registry, RBAC, and lifecycle (e.g. authz, `gts.cf.toolkit.authz.*`). The Settings Service is the second kind — a gear with its own declaration registry, RBAC resource types, and change lifecycle — so it is a peer of authz under `toolkit`, not of the error taxonomy under `core`.
+A setting `key` derives from `gts.cf.core.settings.setting_type.v1~`; its derived half is authored by the deploying party (module or admin), whose vendor is not necessarily `cf`. The value's shape is **part of that derived type** rather than a type of its own: the declaration carries a `value_schema`, which is composed into the registered schema (§4.7).
 
-These control-plane types are **separate** from **setting keys** and **value types**. A setting `key` is a GTS **type** id derived from `gts.cf.toolkit.settings.value.v1~` (§4.1); its **derived** half is authored by the *deploying party* (module or admin) and its vendor is that party's — not necessarily `cf` — see §4.2 *Declaration Management* / *Contribution Reconciler* and §4.7. The **value type** it validates against is a curated catalog type under `gts.cf.toolkit.settings.type_*~`, named by `value_type_id`.
-
-**Policies may target settings by GTS type id, wildcards included.** A setting's `key` is a type id, so a policy can name one setting exactly, or a wildcarded subtree of them — `gts.cf.toolkit.settings.value.v1~acme.billing.*`, every setting a vendor contributed. Matching is the **platform authorization layer's** to perform: this gear passes the key as the resource and does not interpret patterns itself, so wildcard semantics stay owned by `authz-resolver` and cannot drift into a second, gear-local matcher (`cpt-cf-settings-service-fr-authn-role-gating`).
+**Policies may target settings by GTS type id, wildcards included.** A policy can name one setting exactly, or a wildcarded subtree — `gts.cf.core.settings.setting_type.v1~acme.settings.billing.*`. Matching belongs to the platform authorization layer: this gear passes the key as the resource and does not interpret patterns itself (`cpt-cf-settings-service-fr-authn-role-gating`).
 
 #### Entity: `Category`
 
@@ -526,19 +525,17 @@ The *definition* of a setting — distinct from its runtime value(s). Authored b
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `id` | UUID | Yes | Unique declaration ID (UUIDv7). |
-| `key` | string | Yes | Globally-unique setting id passed to `resolve` and used in REST value paths — a **GTS type identifier** `gts.cf.toolkit.settings.value.v1~<vendor>.<package>.<category>.<name>.v1~` for **both** authors (§4.2 *Declaration Management*, *Contribution Reconciler*), registered in `types-registry` when the declaration is created (§4.7). The derived half is the setting: for a **module** setting, the half the gear supplies, whose namespace segment names the category (§4.2 *Contribution Reconciler*); for an **admin** setting, `<vendor>.settings.<category>.<name>.v1` (§4.2 *Declaration Management*). Consumers treat the whole `key` as an opaque identifier. |
+| `key` | string | Yes | Globally-unique setting id passed to `resolve` and used in REST value paths — a **GTS type identifier** `gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~` for **both** authors (§4.2 *Declaration Management*, *Contribution Reconciler*), registered in `types-registry` when the declaration is created (§4.7). The Settings gear owns the base; the derived half identifies the setting. A module supplies its half, whose namespace segment names the category; an admin setting uses `<vendor>.settings.<category>.<name>.v1`. Consumers treat the whole `key` as opaque. |
 | `category_id` | UUID | Yes | Owning category (FK). The category slug is embedded in the `key` (admin: the `<category>` segment; module: the namespace segment of the supplied id), and neither the slug nor this binding is editable, so the `key` is stable (invariants above). |
-| `value_type_id` | string | Yes | GTS id of the **value type** the value is validated against — a curated type from the catalog `gts.cf.toolkit.settings.type_*~`, **registered** in GTS. Independent of `key` (§4.7). Carries the trait set (incl. `secret`). |
-| `default_value` | JSON | Yes | Schema Default — the **authoritative** default: this column, not the value type, is the source of truth. Value types are **validation-only** (they carry no JSON-Schema `default` keyword), so there is no second, divergent default. **Mandatory** — every declaration carries a default, which is what makes resolution total (§4.2 *Value Resolver*); a declaration that omits it is rejected (`422 DefaultRequired`, §4.3). A setting with no *meaningful* default declares a value type that **admits `null`** and sets the default to JSON `null` — a value, not its absence. Read locally with the value rows — the GTS Registry is **not** on the resolution path. |
+| `value_schema` | JSON | Yes | The **value schema** — the draft-07 subschema the setting's value must satisfy. Authored with the declaration (a gear ships its own; an admin generates one from a curated template, §4.7) and composed into the registered GTS type as the envelope's `value` (§4.7). Any shape is admissible, scalar included. Authoritative here: validation reads it locally, never from the Registry. |
+| `default_value` | JSON | Yes | Schema Default — the **authoritative** default: this column, not the schema, is the source of truth. `value_schema` is **validation-only** (it carries no JSON-Schema `default` keyword), so there is no second, divergent default. **Mandatory** — every declaration carries a default, which is what makes resolution total (§4.2 *Value Resolver*); a declaration that omits it is rejected (`422 DefaultRequired`, §4.3). A setting with no *meaningful* default declares a schema that **admits `null`** and sets the default to JSON `null` — a value, not its absence. Read locally with the value rows — the GTS Registry is **not** on the resolution path. |
 | `scope_class` | `ScopeClass` | Yes | `global` / `cascading` / `local` — derives cascade/override behaviour deterministically. |
 | `mode` | `Mode` | Yes | `standard` or `advanced` — complexity split governing default visibility in the hub (§4.1 `Mode`; default `standard`). |
-| `tenant_visible` | boolean | Yes | Whether tenants may *see* the setting (orthogonal to Scope Class). |
-| `tenant_overridable` | boolean | Yes | Whether tenants may *change* the setting. Forced `false` when `scope_class = global`. |
 | `requires_step_up` | boolean | Yes | Whether changing this setting's value requires elevated confirmation. **Defaults to `true`** — a declaration that says nothing is protected. Clearing it is itself step-up-gated (§4.2 *Declaration Management*), and while it is `true` no service principal may write the setting (§4.2 *Value Writer*) (`cpt-cf-settings-service-fr-service-writes`). |
 | `anonymous_exposable` | boolean | Yes | Whether the effective value may be served on the unauthenticated read surface (§4.3). Default `false`; **refused** when `data_classification` is `secret` or `pii` (`cpt-cf-settings-service-fr-anonymous-exposable`). |
 | `domain_affinity` | `DomainAffinity` | No | Optional domain binding (overrides category default). |
-| `has_secret_trait` | boolean | Yes | Denormalized from the value type's trait set for fast masking; `true` when `value_type_id` carries the `secret` trait (§4.2 *Secret Manager*). |
-| `data_classification` | `DataClassification` | Yes | Sensitivity class of the setting's **value**: `public` / `pii` / `secret`. `secret` is *derived* from the value type's `secret` trait (it always accompanies `has_secret_trait = true`); `pii` is *declared* by the author, because a PII-bearing value — an alerting contact address, an operator name — need not carry the `secret` trait yet must not reach a caller unauthorized for unmasked PII. Default `public`. Drives masking (§4.2 *Secret Manager*) and the search corpus (§4.2 *Search*). |
+| `has_secret_trait` | boolean | Yes | Denormalized from the declaration's trait set for fast masking; `true` when the declaration carries the `secret` trait (§4.2 *Secret Manager*). |
+| `data_classification` | `DataClassification` | Yes | Sensitivity class of the setting's **value**: `public` / `pii` / `secret`. `secret` is *derived* from the declaration's `secret` trait (it always accompanies `has_secret_trait = true`); `pii` is *declared* by the author, because a PII-bearing value — an alerting contact address, an operator name — need not carry the `secret` trait yet must not reach a caller unauthorized for unmasked PII. Default `public`. Drives masking (§4.2 *Secret Manager*) and the search corpus (§4.2 *Search*). |
 | `source` | `DeclarationSource` | Yes | `admin_authored` or `module_contributed`. |
 | `owner_module` | string | No | Owning module namespace; required when `source = module_contributed`. |
 | `licence_feature` | string | No | Feature/licence flag gating visibility; enforced server-side on the REST read paths via the License Resolver (`LicenseResolverClient`; see §4.2 *Category Management* / *Declaration Management*/§4.2 *Search* and §4.8). |
@@ -549,20 +546,24 @@ The *definition* of a setting — distinct from its runtime value(s). Authored b
 | `created_by` | string | Yes | Author subject ID (or `system`/module for contributed). |
 
 **Invariants:**
-- `key` is globally unique and is a **GTS type identifier** for both authors (§4.7). Uniqueness is enforced by the Settings DB (`uq_declaration_key` on `key`; plus `UNIQUE(category_id, leaf_slug)` for the leaf-within-category rule, §4.7). The same key is what the gear registers in `types-registry`, so the DB and the Registry cannot name different settings.
+- `key` is globally unique and is a **GTS type identifier** for both authors (§4.7). Uniqueness is enforced by the Settings DB (`uq_declaration_key` on `key`; plus `UNIQUE(category_id, leaf_slug) WHERE status = 'active'` for the leaf-within-category rule, §4.7). The same key is what the gear registers in `types-registry`, so the DB and the Registry cannot name different settings.
 - The `key`'s right (instance) half embeds the **category**: an admin id is `gts.<vendor>.settings.<category>.<name>.v1`; a gear id carries the category in its namespace segment (§4.2 *Contribution Reconciler*). The category is part of what the setting **is** — `network.timeout` and `database.timeout` are two settings, distinguished by that segment — not of how it is displayed, which is what `sort_order`, `icon` and the category's display `name` carry.
 - The `key` is therefore **immutable for the life of the declaration**, and nothing an administrator can edit changes it: no operation renames a category slug (`update_category` covers `name`, `description`, `domain_affinity`, `sort_order`, `icon` — §4.2 *Category Management*) and none re-binds a setting's category (`update_declaration` is metadata only — §4.2 *Declaration Management*), while `key` itself is rejected in a `PATCH` (`422`, §4.3). A consumer that resolves a key keeps resolving it for as long as the declaration is active. Evolution mints a **new** declaration under a new key rather than rewriting this one (§5.1).
-- The **version lives in the derived half's `.vN` suffix**. An **upgrade** — including a **breaking** value-shape change (a different `value_type_id`) — is a **new setting major** under the same version-stripped path, hence a **new key**; the old version and its values are retained and old values are copied to the new key with re-validation (§4.2 *Contribution Reconciler*). A same-major in-place metadata/compatible change keeps the key (§6).
+- The **version lives in the derived half's `.vN` suffix**. An **upgrade** — including a **breaking** value-shape change (a different `value_schema`) — is a **new setting major** under the same version-stripped path, hence a **new key**; the old version and its values are retained and old values are copied to the new key with re-validation (§4.2 *Contribution Reconciler*). A same-major in-place metadata/compatible change keeps the key (§6).
 - A declaration's identity (key/type, scope_class, source) is immutable for `module_contributed` declarations except through the register/retire lifecycle (§4.2 *Contribution Reconciler*); administrators MUST NOT alter a contributed declaration, only its values.
-- `scope_class = global` ⇒ `tenant_overridable = false` (enforced regardless of the supplied flag); `tenant_visible` MAY still be `true` (read-only to tenants).
+- `scope_class = global` ⇒ no tenant ever writes a tenant-scoped value, whatever its tenant access; a `global` setting MAY still be visible read-only.
 
 #### Enum: `ScopeClass`
 
 | Value | Override behaviour | Inheritance |
 |-------|--------------------|-------------|
-| `global` | Value lives only at `/`. Never tenant-overridable. | Not inherited by tenants; tenant access governed solely by `tenant_visible` (read-only). |
+| `global` | Value lives only at `/`. Never overridable by a tenant. | Not inherited by tenants; tenant access decides whether the platform value is visible read-only. |
 | `cascading` | Overridable at any permitted scope. | Inherits down the org hierarchy; descendants without an own override inherit the nearest ancestor override. |
 | `local` | Overridable at a scope. | Applies only at the scope where set; never inherited by descendants. |
+
+#### Enum: `TenantAccess`
+
+`overridable` permits administrative reads and writes, `read_only` permits reads only, and `hidden` permits neither. Only `read_only` and `hidden` are stored; no restriction row means `overridable`.
 
 #### Enum: `DeclarationSource` / `DeclarationStatus` / `DomainAffinity`
 
@@ -591,7 +592,32 @@ An **applied** override at a specific scope, distinct from the Schema Default.
 | `created_at` / `updated_at` | `timestamptz` | Yes | UTC timestamps. |
 | `set_by` | string | Yes | Subject who set the value. |
 
-**Invariants:** at most one applied value per scope shape — with a subject and without — enforced by the two partial unique indexes (§4.7), with a subject named by both of its columns or by neither; exactly one of `value`/`secret_ref` is set — and **which** one follows the declaration's `secret` trait, both enforced by `CHECK` (§4.7); the serialized `value` MUST NOT exceed the **64 KiB** size cap (enforced on write by the Type Validator, §4.2 *Type Validator*); `global` declarations may only have a value at platform scope (`tenant_id` = the root tenant); `local` and `cascading` may have per-tenant values (`tenant_id` set) subject to `tenant_overridable`.
+**Invariants:** at most one applied value per scope shape — with a subject and without — enforced by the two partial unique indexes (§4.7), with a subject named by both of its columns or by neither; exactly one of `value`/`secret_ref` is set — and **which** one follows the declaration's `secret` trait, both enforced by `CHECK` (§4.7); the serialized `value` MUST NOT exceed the **64 KiB** size cap (enforced on write by the Type Validator, §4.2 *Type Validator*); `global` declarations may only have a value at platform scope (`tenant_id` = the root tenant); `local` and `cascading` may have per-tenant values. For a tenant caller, the caller's own effective access must be `overridable`; an authorized ancestor may manage a restricted descendant (§4.1 *TenantAccessRestriction*).
+
+#### Entity: `TenantAccessRestriction`
+
+A row restricts one tenant's administrative access to one setting. No row means full tenant access (`overridable`).
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `id` | UUID | Yes | Unique row ID (UUIDv7). |
+| `declaration_id` | UUID | Yes | Declaration this decision is about (FK). |
+| `tenant_id` | UUID | Yes | The tenant it is about — the one **restricted**, not the one who decided. |
+| `access` | `TenantAccess` | Yes | `read_only` or `hidden`. `overridable` is represented by no row. |
+| `set_by` | string | Yes | Subject who recorded the decision — always an administrator of a **strict ancestor** of `tenant_id` (§4.2 *Tenant Access*). |
+| `created_at` / `updated_at` | `timestamptz` | Yes | UTC timestamps. |
+
+**Invariants:** one row per `(declaration_id, tenant_id)`; `access` is only `read_only` or `hidden`.
+
+Effective access is the strictest value on the root-to-self chain:
+
+```text
+overridable < read_only < hidden
+```
+
+This makes access narrowing-only. A restriction is stored even when a stricter ancestor already dominates it, allowing a narrower exception to be prepared before a broader restriction is removed.
+
+Restrictions gate tenant callers, not stored values. An existing override remains effective and inheritable after access becomes `read_only` or `hidden`.
 
 #### Entity: `EffectiveValue` (computed, not persisted)
 
@@ -604,7 +630,7 @@ Returned by the resolver and the Settings Reader.
 | `value` | JSON | Resolved value. |
 | `source` | `EffectiveSource` | Where the value resolved from. |
 | `source_scope` | string \| `null` | Scope that provided the value (`null` for Schema Default). |
-| `traits` | object | Resolved trait set (for rendering / pre-validation), from the setting's `value_type_id` (§1.3). |
+| `traits` | object | Resolved trait set (for rendering / pre-validation), from the declaration (§1.3). |
 | `inheritance_trail` | `TrailEntry[]` | Ordered scopes inspected during resolution — **limited to the caller's own ancestor chain** (root→self), never a sibling/descendant scope (same cross-tenant leak-safety invariant as `last_change_at`). The per-entry **who/when** (`set_by` + timestamp) is surfaced **only on the admin read** (§4.3), **not** on the consumer SDK `EffectiveValue` (§4.5) — an ancestor's setter identity is not exposed to a subordinate tenant. |
 
 #### Enum: `EffectiveSource`
@@ -613,7 +639,7 @@ Returned by the resolver and the Settings Reader.
 |-------|-------------|
 | `own_override` | An override exists at the requested scope. |
 | `inherited` | Resolved from a nearest-ancestor override (cascading). |
-| `schema_default` | No override in the chain; the declaration's own default (§4.1 `default_value` — a declaration field, not a property of the value type). |
+| `schema_default` | No override in the chain; the declaration's own default (§4.1 `default_value` — a declaration field, not a property of the schema). |
 
 #### Entity Relationships
 
@@ -621,6 +647,7 @@ Returned by the resolver and the Settings Reader.
 erDiagram
  Category ||--o{ SettingDeclaration : "groups"
  SettingDeclaration ||--o{ SettingValue : "scoped value"
+ SettingDeclaration ||--o{ TenantAccessRestriction : "per-tenant restriction"
 
  Category {
  uuid id PK
@@ -631,15 +658,13 @@ erDiagram
  }
  SettingDeclaration {
  uuid id PK
- string key "GTS type id: settings.value.v1~<derived>~ (both authors)"
+ string key "GTS type id: core.settings.setting_type.v1~<derived>~ (both authors)"
  string leaf_slug "unique per category"
- string value_type_id "catalog value type"
+ jsonb value_schema "value shape"
  uuid category_id FK
  jsonb default_value
  string scope_class
  string mode
- bool tenant_visible
- bool tenant_overridable
  bool has_secret_trait
  string data_classification
  string source
@@ -656,6 +681,12 @@ erDiagram
  string data_classification "denormalized for index predicates"
  timestamptz last_change_at
  }
+ TenantAccessRestriction {
+ uuid id PK
+ uuid declaration_id FK
+ uuid tenant_id "the tenant restricted"
+ string access "read_only | hidden"
+ }
 ```
 
 ### 4.2 Component Model
@@ -671,7 +702,7 @@ graph TD
  cat["Category Mgmt"]
  decl["Declaration Mgmt"]
  reconciler["Contribution Reconciler<br/><small>register/retire</small>"]
- validator["Type Validator<br/><small>GTS + traits</small>"]
+ validator["Type Validator<br/><small>draft-07 + traits, local</small>"]
  resolver["Value Resolver<br/><small>effective value + source trace</small>"]
  writer["Value Writer<br/><small>validate · step-up · commit · publish change_notification + cache_invalidate</small>"]
  secrets["Secret Manager<br/><small>store · mask · resolve (machine-only)</small>"]
@@ -714,7 +745,8 @@ graph TD
  resolver -->|ancestry walk| tenant
  resolver -->|reads| pg
  resolver -->|mask secret| secrets
- validator -->|type+traits| types
+ decl -->|register setting type| types
+ reconciler -->|register setting type| types
  writer -->|invalidate (local)| cache
  writer -->|validate step-up token| idp
  writer -->|publish change_notification + cache_invalidate| broker
@@ -750,9 +782,9 @@ graph TD
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|--------------|
-| `create_category` | `CreateCategoryRequest`, `Context` | `Category` | Authorize `create` on `gts.cf.toolkit.settings.category.v1~` (category governance is per-resource-type CRUD — create/read/update/delete — per §4.8). Reject duplicate `key`/`name` (`409`). Insert; audit. (`cpt-cf-settings-service-fr-settings-category-model`) |
-| `update_category` | `id`, `UpdateCategoryRequest`, `Context` | `Category` | Authorize `update` on `gts.cf.toolkit.settings.category.v1~`. Partial update (`name`, `description`, `domain_affinity`, `sort_order`, `icon`). Requires `If-Match` (optimistic concurrency, §4.3). |
-| `delete_category` | `id`, `Context` | — | Authorize `delete` on `gts.cf.toolkit.settings.category.v1~`. Reject (`409 CategoryNotEmpty`) if any declaration row references it — **including `retired` ones** (a retired declaration still occupies the category and its values are retained, §4.2 *Declaration Management*; no-orphan, `cpt-cf-settings-service-fr-settings-category-model`). Hard-delete only when no declaration row remains. Authoritative guard is the declaration→category FK `ON DELETE RESTRICT` (§4.7), which blocks regardless of `status`. |
+| `create_category` | `CreateCategoryRequest`, `Context` | `Category` | Authorize `create` on `gts.cf.core.settings.category.v1~` (category governance is per-resource-type CRUD — create/read/update/delete — per §4.8). Reject duplicate `key`/`name` (`409`). Insert; audit. (`cpt-cf-settings-service-fr-settings-category-model`) |
+| `update_category` | `id`, `UpdateCategoryRequest`, `Context` | `Category` | Authorize `update` on `gts.cf.core.settings.category.v1~`. Partial update (`name`, `description`, `domain_affinity`, `sort_order`, `icon`). Requires `If-Match` (optimistic concurrency, §4.3). |
+| `delete_category` | `id`, `Context` | — | Authorize `delete` on `gts.cf.core.settings.category.v1~`. Reject (`409 CategoryNotEmpty`) if any declaration row references it — **including `retired` ones** (a retired declaration still occupies the category and its values are retained, §4.2 *Declaration Management*; no-orphan, `cpt-cf-settings-service-fr-settings-category-model`). Hard-delete only when no declaration row remains. Authoritative guard is the declaration→category FK `ON DELETE RESTRICT` (§4.7), which blocks regardless of `status`. |
 | `get_category` / `list_categories` | filter, `Context` | `Category` / `Category[]` | Domain-filtered, visibility-gated, paginated. |
 
 #### Component: Declaration Management
@@ -767,16 +799,16 @@ Manages **admin-authored** declarations and serves reads for both authored and c
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|--------------|
-| `create_declaration` | `CreateDeclarationRequest`, `Context` | `SettingDeclaration` | Authorize `create` on `gts.cf.toolkit.settings.declaration.v1~`. Verify category exists (`404`). The admin supplies `value_type_id` (a curated **value type** from `gts.cf.toolkit.settings.type_*~`), plus a `vendor` and a leaf `name`. Build the setting's **derived half** `<vendor>.settings.<category>.<name>.v1` — four segments, `<package>` fixed to `settings`, `<namespace>` = the target category's slug, `<type>` = the admin's leaf `name` (validate each segment against the GTS grammar — lowercase, `[a-z0-9_]`, no `/`, `422` otherwise). The `key` is the **GTS type identifier** `gts.cf.toolkit.settings.value.v1~<derived-half>~`, **registered** in `types-registry` before the row is inserted (§4.7). `key` is **globally unique** (`uq_declaration_key`) and the leaf `name` is unique within its category (`UNIQUE(category_id, leaf_slug)`, `cpt-cf-settings-service-fr-settings-category-model`). The `<category>` segment names the owning category and is fixed at creation: the slug is not editable and the binding is not re-bindable (§4.1 invariants). The Schema Default lives solely in the `default_value` column — the value type is validation-only. Validate `default_value` against `value_type_id` via Type Validator. Resolve `has_secret_trait` from that type's trait set; when `true`, the setting is secret-backed and its **values** are stored via the Secret Manager (§4.2 *Secret Manager*) — its **default** is not: reject a non-empty `default_value` on a secret-trait type (`422`), see *A secret setting has no secret default* there. Set `data_classification` (§4.1): **`secret` is derived** from the trait, never author-supplied; otherwise take the author's declared class — `pii` or `public` (default `public`). Reject an author-supplied `secret` on a non-secret type (`422`). Force `tenant_overridable=false` when `scope_class=global`. Set `mode` (default `standard`). Reject duplicate `key` (`409`). Set `source=admin_authored`. Insert; audit. (`cpt-cf-settings-service-fr-settings-category-model`) |
-| `update_declaration` | `id`, `UpdateDeclarationRequest`, `Context` | `SettingDeclaration` | Authorize `update` on `gts.cf.toolkit.settings.declaration.v1~` (metadata, incl. `tenant_visible`/`tenant_overridable` — platform-scope-gated). Reject if `source=module_contributed` (`409 ContributedDeclarationImmutable`). Partial update of **metadata only** (`description`, `tenant_visible`, `tenant_overridable`, `domain_affinity`, `licence_feature`, `mode`, `requires_step_up`, `anonymous_exposable`). Two of those are **weakening** edits and are gated like a classification loosening: clearing `requires_step_up`, and setting `anonymous_exposable`, each require step-up whatever the field currently holds, are platform-administrator-only, and are audited (§4.2 *Value Writer*, *Two gates, two questions*). **`default_value` (the Schema Default) is NOT editable here** — the PRD treats it as a **read-only** stable declared floor and a revert target: change the effective baseline via a **platform-scope override** (§4.2 *Value Writer*/§4.3), not by editing the default. The value **type** is immutable too (baked into the `key` — a type change is a re-key, §4.2 *Contribution Reconciler*, never a `PATCH`). Requires `If-Match` (optimistic concurrency, §4.3). |
-| `delete_declaration` | `id`, `Context` | `SettingDeclaration` (retired) | Authorize `delete` on `gts.cf.toolkit.settings.declaration.v1~` (retire = soft-delete) **and require credential step-up** — retire drops a live setting out of resolution at once, so it is a **behavior-affecting authoring action** gated like a value change (step-up contract §4.2 *Value Writer*, authz §4.8). Reject if `source=module_contributed` (`409 ContributedDeclarationImmutable` — gear declarations retire via §4.2 *Contribution Reconciler*, they are not admin-deletable). **Immediate soft-delete** (retire) — it does not go through the value write path (`cpt-cf-settings-service-fr-set-value`): sets `status=retired` on the declaration (same terminal state as a gear retire, §4.2 *Contribution Reconciler*) in one transaction, invalidates cache, and publishes `cache_invalidate` for affected scopes + `event_declaration_retired` (§4.4). **Values are retained** in `setting_values` (not deleted) but are **excluded from resolution** — a read of a retired key returns the distinct `Retired` outcome (§4.2 *Value Resolver*/§4.5), symmetric with a gear retire. Recovery is by **re-declaring the key** — a `POST /settings-service/v1/declarations` at the same key revives this retired row (§4.3 re-declare-to-revive); full disposition of the retained values (purge / archive / keep) is the same open lifecycle question as gear removal (§6). Requires `If-Match` (§4.3). Audit the retire with pre-images (§4.2 *Audit Emitter*). |
-| `get_declaration` / `list_declarations` | filter, `Context` | declaration(s) | Visibility-, domain-, and licence-gated. Returns the setting `key` (a GTS type id), its `value_type_id`, and resolved `traits` for client rendering (`cpt-cf-settings-service-fr-typed-value-validation`). |
+| `create_declaration` | `CreateDeclarationRequest`, `Context` | `SettingDeclaration` | Authorize `create` on `gts.cf.core.settings.declaration.v1~`. Verify category exists (`404`). The admin supplies a **`value_schema`** — generated from a curated template (§4.7) or given outright — plus a `vendor` and a leaf `name`; validate each segment against the GTS grammar (lowercase, `[a-z0-9_]`, no `/`, `422` otherwise). Derive the version-stripped path `<vendor>.settings.<category>.<name>` and **look up its active declaration before composing a new key**. If one exists and the request changes a behavior-affecting field that requires a new major, evolve that declaration to the next free major (§4.3), even when the request's default `v1` key belongs to a retired predecessor; this precedence makes repeated evolution (`v1 → v2 → v3`) reachable. An exact repeat, or a request differing only in editable metadata, returns `409 DeclarationKeyConflict` (metadata uses `PATCH`) and never creates another major. With no active declaration on the path, compose `<vendor>.settings.<category>.<name>.v1`: revive that exact retired key if present, otherwise create it. Register a newly minted key in `types-registry` before inserting its row (§4.7). `key` is globally unique (`uq_declaration_key`) and leaf `name` is unique within its category among active declarations (`UNIQUE(category_id, leaf_slug) WHERE status = 'active'`). The category binding is fixed (§4.1). Validate the `value_schema` as draft-07 and the Schema Default against it; resolve `has_secret_trait` from the declaration's traits, reject a non-empty secret default, derive `secret` classification from the trait, otherwise accept `pii` or `public` (default `public`), and reject caller-supplied `secret` on a non-secret type. Default `mode` to `standard`. Set `source=admin_authored`; insert and audit. (`cpt-cf-settings-service-fr-settings-category-model`) |
+| `update_declaration` | `id`, `UpdateDeclarationRequest`, `Context` | `SettingDeclaration` | Authorize `update` on `gts.cf.core.settings.declaration.v1~` (metadata; platform-scope-gated). Reject if `source=module_contributed` (`409 ContributedDeclarationImmutable`). Partial update of **metadata only** (`description`, `domain_affinity`, `licence_feature`, `mode`, `requires_step_up`, `anonymous_exposable`). Tenant access is managed separately (§4.2 *Tenant Access*). Clearing `requires_step_up` or enabling `anonymous_exposable` requires step-up, is platform-admin-only, and is audited. `default_value`, `value_schema`, and key are immutable. Requires `If-Match` (§4.3). |
+| `delete_declaration` | `id`, `Context` | `SettingDeclaration` (retired) | Authorize `delete` on `gts.cf.core.settings.declaration.v1~` (retire = soft-delete) **and require credential step-up** — retire drops a live setting out of resolution at once, so it is a **behavior-affecting authoring action** gated like a value change (step-up contract §4.2 *Value Writer*, authz §4.8). Reject if `source=module_contributed` (`409 ContributedDeclarationImmutable` — gear declarations retire via §4.2 *Contribution Reconciler*, they are not admin-deletable). **Immediate soft-delete** (retire) — it does not go through the value write path (`cpt-cf-settings-service-fr-set-value`): sets `status=retired` on the declaration (same terminal state as a gear retire, §4.2 *Contribution Reconciler*) in one transaction, invalidates cache, and publishes `cache_invalidate` for affected scopes + `event_declaration_retired` (§4.4). **Values are retained** in `setting_values` (not deleted) but are **excluded from resolution** — a read of a retired key returns the distinct `Retired` outcome (§4.2 *Value Resolver*/§4.5), symmetric with a gear retire. Recovery is by **re-declaring the key** — a `POST /settings-service/v1/declarations` at the same key revives this retired row (§4.3 re-declare-to-revive); full disposition of the retained values (purge / archive / keep) is the same open lifecycle question as gear removal (§6). Requires `If-Match` (§4.3). Audit the retire with pre-images (§4.2 *Audit Emitter*). |
+| `get_declaration` / `list_declarations` | filter, `Context` | declaration(s) | Visibility-, domain-, and licence-gated. Returns the setting `key` (a GTS type id), its `value_schema`, and resolved `traits` for client rendering (`cpt-cf-settings-service-fr-typed-value-validation`). |
 
 **Declaration mutation classes — what is immediate, what is immutable, what is step-up gated.** Declaration operations do not go through the value write path (§4.2 *Value Writer*), but they are **not** uniformly ungated: each field falls into one of three classes by its effect on live resolution.
 
 | Class | Fields / actions | Gate |
 |-------|------------------|------|
-| **Descriptive metadata** | `description`, `mode`, `domain_affinity`, `licence_feature`, and — for admin-authored settings — `tenant_visible` / `tenant_overridable` | **Immediate**, `update` permission + `If-Match`. No gate needed: none of these changes an effective value. |
+| **Descriptive metadata** | `description`, `mode`, `domain_affinity`, `licence_feature` | **Immediate**, `update` permission + `If-Match`. No gate needed: none of these changes an effective value. |
 | **Behavior-affecting fields** | `default_value` (Schema Default), value **type**, `scope_class` | **Immutable** — an in-place edit is rejected (`422`, §4.3). The change is expressible only as a **replacement declaration** (a new key) or, for the type, a **new major version** (§4.2 *Contribution Reconciler*). No ungated edit can alter a live setting's resolution. |
 | **Behavior-affecting actions** | **retire** (soft-delete, §4.2 *Declaration Management*) and **reactivate** (re-declare-to-revive, §4.3) | **Immediate + credential step-up** — each changes whether a live setting resolves at all, so both are gated like a value change (§4.2 *Value Writer*, §4.8). |
 | **Classification change** | `data_classification` (§4.1) | **Tightening** (`public` → `pii`) is immediate. **Loosening** (`pii` → `public`) requires **credential step-up** — it un-masks content previously withheld from callers without PII entitlement (§4.2 *Secret Manager*, *Search*). Neither alters effective-value resolution, so neither goes through the value write path. |
@@ -802,45 +834,47 @@ Realizes **Module-Contributed Settings** (`cpt-cf-settings-service-fr-module-con
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|--------------|
-| `register_declarations` | `owner_module`, `ContributedDeclaration[]` | `ReconcileResult` | Idempotent reconcile of the gear's settings. Each `ContributedDeclaration` carries its own **derived half** (`<vendor>.<package>.<category>.<name>.vN`) and a **`value_type_id`** (a curated value type from `gts.cf.toolkit.settings.type_*~`). The reconciler **extracts the category from the `<namespace>` slot** — the third of the id's four segments — and **auto-vivifies the category**: reuse the existing category by that slug or create it, then bind `category_id` (gears need no pre-seeded categories). The setting `key` is the **GTS type identifier** `gts.cf.toolkit.settings.value.v1~<derived-half>~`, registered by the gear as part of the reconcile (§4.7) — the module registers nothing itself. **Version lives in the derived half's `.vN` suffix**; "the same setting across versions" is the **version-stripped path** (e.g. `cf.toolkit.settings.cat.sett1`). Per setting, matched by that stripped path: **(a) new** (no prior version) → insert with `source=module_contributed`; **(b) same major, metadata/compatible change** → update metadata in place, **preserving** administrator-set values; **(c) upgrade — a higher setting major** (`…sett1.v1` → `…sett1.v2`, optionally with a different `value_type_id`, e.g. `bool_flag.v1~`→`string.v1~`) → run the **upgrade migration** (below). A matched declaration that is currently **`retired`** is **reactivated** by the reconcile (status→active, cache invalidated, `event_declaration_reactivated` §4.4) — re-declaring revives it, symmetric with the admin re-declare-to-revive path (§4.3); the retained same-type values become live again as-is. The derived half's vendor/package/namespace MUST be well-formed and the `<category>` segment present (`422 KeyNotNamespaced` otherwise). The category is the gear's own namespace segment, so for a contributed setting the slug is the gear's property: it changes only when the gear ships a new id, which is a new declaration (§4.1 invariants). |
+| `register_declarations` | `owner_module`, `ContributedDeclaration[]` | `ReconcileResult` | Idempotent reconcile of the gear's settings. Each `ContributedDeclaration` carries its own **derived half** (`<vendor>.<package>.<category>.<name>.vN`) and its own **`value_schema`**. The reconciler **extracts the category from the `<namespace>` slot** — the third of the id's four segments — and **auto-vivifies the category**: reuse the existing category by that slug or create it, then bind `category_id` (gears need no pre-seeded categories). The setting `key` is the **GTS type identifier** `gts.cf.core.settings.setting_type.v1~<derived-half>~`, whose base type is owned and registered by the Settings gear; the module supplies only the derived half. **Version lives in the derived half's `.vN` suffix**; "the same setting across versions" is the **version-stripped path** (e.g. `cf.toolkit.cat.sett1`). Per setting, matched by that stripped path: **(a) new** (no prior version) → insert with `source=module_contributed`; **(b) same major, metadata/compatible change** → update metadata in place, **preserving** administrator-set values — but a **changed `value_schema` at the same major is not a metadata change**: it is rejected `422 ValueSchemaChanged` **even when the Registry would accept the revision** — reconcile runs unattended on every gear start, and a shape change is not something to apply with nobody watching; the contribution is telling us a new major (case (c)) rather than an edit; **(c) upgrade — a higher setting major** (`…sett1.v1` → `…sett1.v2`, optionally with a different `value_schema`, e.g. a `boolean` retyped to a `string`) → run the **upgrade migration** (below). A matched declaration that is currently **`retired`** is **reactivated** by the reconcile (status→active, cache invalidated, `event_declaration_reactivated` §4.4) — re-declaring revives it, as on the admin path (§4.3), and the retained values are re-validated before they go live, failures flagged `needs_review`. Unlike the admin, a **module may not retype on revive**: a contributed `value_schema` differing from the stored one is `422 ValueSchemaChanged` whatever the declaration's status. The reconcile runs unattended on every gear start, so a retype here would be applied with nobody watching; the module has the major it needs (case (c)) and is told to use it. The derived half's vendor/package/namespace MUST be well-formed and the `<category>` segment present (`422 KeyNotNamespaced` otherwise). The category is the gear's own namespace segment, so for a contributed setting the slug is the gear's property: it changes only when the gear ships a new id, which is a new declaration (§4.1 invariants). |
 | `retire_declarations` | `owner_module`, `key[]` | `ReconcileResult` | Mark declarations `status=retired`. Values are retained but excluded from effective resolution — a read of a retired key returns the distinct `Retired` outcome, not `NotFound` and not the retained value (§4.2 *Value Resolver*/§4.5). Full disposition on gear removal is **OPEN** (§6). |
 | `list_contributed` | `owner_module` | `SettingDeclaration[]` | Read the gear's contributed set (for upgrade diffing). |
 
-**Contributed classification.** A `ContributedDeclaration` carries its own `data_classification` (§4.1): a gear contributing a PII-bearing setting — an alerting contact address, an operator name — MUST declare `pii`, while `secret` is **derived** from the value type's trait and never accepted from the caller. A gear upgrade may correct the class in place (reconcile case **b**), and the change re-syncs the denormalized copy on that setting's value rows (§4.7). Loosening the class (`pii` → `public`) on the machine path is governed by the contribution trust model (§4.8) rather than step-up, since a gear has no interactive session — a further reason the trust model matters (§6).
+**Contributed classification.** A `ContributedDeclaration` carries its own `data_classification` (§4.1): a gear contributing a PII-bearing setting — an alerting contact address, an operator name — MUST declare `pii`, while `secret` is **derived** from the declaration's `secret` trait and never accepted from the caller. A gear upgrade may correct the class in place (reconcile case **b**), and the change re-syncs the denormalized copy on that setting's value rows (§4.7). Loosening the class (`pii` → `public`) on the machine path is governed by the contribution trust model (§4.8) rather than step-up, since a gear has no interactive session — a further reason the trust model matters (§6).
 
-**Upgrade migration (new setting major).** A setting is upgraded by registering a **higher setting major** under the same version-stripped path — with any `value_type_id`, including a different value type (`bool_flag.v1~` → `string.v1~`). Both versions then coexist:
+**Upgrade migration (new setting major).** A setting is upgraded by registering a **higher setting major** under the same version-stripped path — with any `value_schema`, including an incompatible one (a `boolean` retyped to a `string`). Both versions then coexist:
 
-1. **Old version retained.** The prior declaration (old `key`, old value type) and **all its override values are kept** — read-only, resolving in the old shape. It is **not** retired or deleted by the upgrade; existing readers on the old key keep working (*eternal compatibility*).
+1. **Old version retained.** The prior declaration (old `key`, old schema) and **all its override values are kept** — read-only, resolving in the old shape. It is **not** retired or deleted by the upgrade; existing readers on the old key keep working (*eternal compatibility*).
 2. **New version created.** The new declaration is inserted at the new `key`.
-3. **Values copied + re-validated.** Each old override value is **copied** to the new declaration and **re-validated against the new value type** (§4.2 *Type Validator*). Copies that validate become normal overrides on the new key; copies that **fail** are inserted flagged **`needs_review`** (with `needs_review_detail`), excluded from resolution until an admin corrects them (§4.2 *Value Resolver*/§4.7) — no silent coercion.
+3. **Values copied + re-validated.** Each old override value is **copied** to the new declaration and **re-validated against the new `value_schema`** (§4.2 *Type Validator*). Copies that validate become normal overrides on the new key; copies that **fail** are inserted flagged **`needs_review`** (with `needs_review_detail`), excluded from resolution until an admin corrects them (§4.2 *Value Resolver*/§4.7) — no silent coercion.
 4. **Succession is derived, not stored.** New and old share the same version-stripped path, so "which is the predecessor of `…v2`" is a query — the same-path row with the highest major `< 2` — and "all versions of this setting" is `GROUP BY` the version-stripped path. No `predecessor_key` column: the link is already encoded in the keys (consistent with the single-source-of-truth stance). The migration already holds both keys in the `register_declarations` call, so it needs no stored pointer to find the source.
 
-Defaults (`default_value`) are re-validated against the new value type the same way; a failing default blocks the new declaration (`422`) since a declaration MUST have a valid default. This is the general form of the `needs-review` flow — a *compatible* (same-major, in-place) metadata change (case **b** above) still just updates metadata and preserves values with no copy.
+Defaults (`default_value`) are re-validated against the new schema the same way; a failing default blocks the new declaration (`422`) since a declaration MUST have a valid default. This is the general form of the `needs-review` flow — a *compatible* (same-major, in-place) metadata change (case **b** above) still just updates metadata and preserves values with no copy.
 
 **Worked example.** A `bool` setting upgraded to a `string`:
 
-```
-before: gts.cf.toolkit.settings.type_bool_flag.v1~cf.toolkit.settings.cat.sett1.v1
-after: gts.cf.toolkit.settings.type_string.v1~cf.toolkit.settings.cat.sett1.v2
- └──── new value type ────────────────────┘└─ same stripped path, new major ─┘
+```text
+before key:          gts.cf.core.settings.setting_type.v1~cf.toolkit.cat.sett1.v1~
+before value_schema: { "type": "boolean" }
+
+after key:           gts.cf.core.settings.setting_type.v1~cf.toolkit.cat.sett1.v2~
+after value_schema:  { "type": "string" }
 ```
 
-Both rows coexist, matched by the version-stripped path `cf.toolkit.settings.cat.sett1`. The `…sett1.v1` declaration and every `bool` override under it are **retained** (read-only). The `…sett1.v2` declaration is created; each old `bool` override is **copied** and re-validated against `string.v1~` — those that coerce cleanly become `string` overrides on the new key, those that do not are flagged `needs_review`. `…v2`'s predecessor is found by query (same stripped path, highest major below 2) — nothing is stored. (Per GTS grammar the derived half carries no `gts.` prefix — that prefix appears once at the head of the chain.)
+Both rows exist, matched by the version-stripped path `cf.toolkit.cat.sett1`, but only the successor is **active**: the `…sett1.v1` declaration is retired and its overrides are retained, while `…sett1.v2` is created. Each old `bool` override is copied and re-validated against the new schema; failures are flagged `needs_review`. The setting key's base stays `setting_type.v1~`; only the derived setting major and the schema it carries change.
 
-#### Component: Type Validator (GTS + traits)
+#### Component: Type Validator (draft-07 + traits)
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-component-type-validator`
 
-**Dependencies:** `TypesRegistryClient` (GTS Schema Registry, in-process via ClientHub)
+**Dependencies:** none — the schema and traits it validates against are the declaration's own (§1.3), read with the row.
 
 **Operations:**
 
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|--------------|
-| `validate_value` | `gts_type_id`, `value` | `ValidationResult` | Resolve the type's JSON Schema + `x-gts-traits`. Validate structurally (JSON Schema 2020-12). Assert `format` keywords (`uri`, `ipv4`/`ipv6`, …) and trait-driven rules (cron dialect parses, regex compiles, dynamic-enum membership, entity-reference resolves) as **hard** checks, not advisory (`cpt-cf-settings-service-fr-typed-value-validation`). Reject any value whose serialized JSON exceeds the **64 KiB** size cap (`413`/`422 ValueTooLarge`) — a settings value is a configuration datum, not a blob store; the cap bounds the hot cache, audit pre/post-images, and change-preview payloads. Reject any **number** that a round trip through IEEE-754 binary64 does not return unchanged in value (`422 ValueNotCanonical`) — integers beyond ±2⁵³ and decimals finer than a double resolves collapse, and activation compares values through a canonical encoding that cannot carry them ([Settings Activation](./DESIGN-activation.md) §4.1 *Canonical value encoding*); a setting needing more range or precision declares a **string** type instead. Return field-level errors on failure. |
-| `resolve_traits` | `gts_type_id` | `TraitSet` | Return the resolved trait set (incl. `secret`, `multiline`, cron dialect, dynamic-enum source, entity-reference) for rendering metadata (`cpt-cf-settings-service-fr-typed-value-validation`) and for create-time classification — a resolved `secret` trait marks the setting secret-backed so its values route through the Secret Manager (§4.2 *Declaration Management*, *Secret Manager*). |
+| `validate_value` | `value_schema`, `traits`, `value` | `ValidationResult` | Take the declaration's schema and trait set as given (§1.3) — no Registry call. Validate structurally (JSON Schema **draft-07** — the dialect `types-registry` admits; a schema declaring any other is rejected on admission, §4.7). Assert `format` keywords (`uri`, `ipv4`/`ipv6`, …) and trait-driven rules (cron dialect parses, regex compiles, dynamic-enum membership, entity-reference resolves) as **hard** checks, not advisory (`cpt-cf-settings-service-fr-typed-value-validation`). Reject any value whose serialized JSON exceeds the **64 KiB** size cap (`413`/`422 ValueTooLarge`) — a settings value is a configuration datum, not a blob store; the cap bounds the hot cache, audit pre/post-images, and change-preview payloads. Reject any **number** that a round trip through IEEE-754 binary64 does not return unchanged in value (`422 ValueNotCanonical`) — integers beyond ±2⁵³ and decimals finer than a double resolves collapse, and activation compares values through a canonical encoding that cannot carry them ([Settings Activation](./DESIGN-activation.md) §4.1 *Canonical value encoding*); a setting needing more range or precision declares a **string** type instead. Return field-level errors on failure. |
+| `resolve_traits` | `declaration` | `TraitSet` | Return the resolved trait set (incl. `secret`, `multiline`, cron dialect, dynamic-enum source, entity-reference) for rendering metadata (`cpt-cf-settings-service-fr-typed-value-validation`) and for create-time classification — a declared `secret` trait marks the setting secret-backed so its values route through the Secret Manager (§4.2 *Declaration Management*, *Secret Manager*). |
 
-> For a setting, the `gts_type_id` passed here is the setting's **`value_type_id`** (§1.3) — the curated catalog value type the declaration names, for both module and admin settings. The Type Validator itself is generic — it validates a value against any GTS type id.
+> For a setting, the schema applied here is the declaration's **`value_schema`** (§1.3), read locally for both module and admin settings — the same subschema the registered GTS type carries as its envelope's `value` (§4.7). The Type Validator itself is generic — it validates a value against any draft-07 schema.
 
 **Trusted-input note:** structured values are validated in full before they are stored; a `needs-review` flag covers the case where the type changes afterwards.
 
@@ -864,9 +898,16 @@ Resolves the **effective value** with source trace; the hot read path (`cpt-cf-s
 
 | Scope Class | Algorithm |
 |-------------|-----------|
-| `global` | Read the platform-scope row (`tenant_id` = the root tenant) if present, else Schema Default. Tenant requests resolve the platform value **read-only** when `tenant_visible`; never inherited as overridable. |
+| `global` | Read the platform-scope row (`tenant_id` = the root tenant) if present, else Schema Default. Tenant requests resolve the platform value **read-only** when the tenant is visible for this setting (below); never overridable by a tenant. |
 | `cascading` | Ask `TenantResolverClient.get_ancestors` for the requested tenant's ancestor **ids** (root→…→self); resolve nearest-first over `WHERE declaration_id = ? AND tenant_id IN (<ancestor ids>)`, preferring the deepest match. The chain begins at the root tenant, so the platform-scope row is simply its first element and needs no disjunct of its own: return the first override found (`own_override` if it is the requested tenant, else `inherited`), else Schema Default. A **standalone** descendant does not change this walk — see *Standalone tenants* below. |
 | `local` | Read the row for the requested `tenant_id` only. No ancestor walk; absence → Schema Default (no inheritance). |
+
+**Tenant access uses the same ancestor lookup.** Load restriction rows for the root-to-tenant chain with one query, then take the strictest access: `hidden` over `read_only` over the absent-row default `overridable`. `local` and `global` values do not walk ancestors, but their administrative access still does.
+
+Two consequences worth stating because they are easy to get backwards:
+
+- **Access gates the caller, not the value.** A restricted tenant's existing value still resolves and remains inheritable. Resolution never uses access to choose the winning value row.
+- **The in-process reader is not gated.** `SettingsReaderClient` resolves runtime configuration for gears, not administrative access.
 
 **Standalone tenants: the runtime read path is unchanged, the administrative one is blocked.** `tenant-resolver` marks a tenant **standalone** (isolated / unmanaged). Effective-value resolution for that tenant is **exactly as for any other**: a consumer inside it reads through the Settings Read SDK and gets the same answer, inheritance from its parent chain included. It still runs on this platform and still needs the platform's defaults, so cutting its inheritance would leave it with nothing rather than with independence (`cpt-cf-settings-service-fr-barrier-default-seam`).
 
@@ -898,6 +939,29 @@ The consequence worth stating plainly, because it is the part that surprises: co
 
 **Why a single ancestry source:** ancestry is owned by the Tenant Resolver; the resolver never reconstructs the hierarchy from scope strings beyond parsing `/tenants/{id}`. This keeps cascade semantics consistent with the Tenant Resolver and avoids a second source of truth.
 
+#### Component: Tenant Access
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-component-tenant-permission`
+
+Stores tenant restrictions and resolves effective access (`cpt-cf-settings-service-fr-tenant-scope-enforcement`).
+
+**Dependencies:** PostgreSQL, `TenantResolverClient`, Cache
+
+**Operations:**
+
+| Operation | Input | Output | Key Behavior |
+|-----------|-------|--------|--------------|
+| `set_restriction` | `key`, `tenant`, `access`, `if_match`, `Context` | `TenantAccessRestriction` | Authorize `delegate`; require a strict-descendant target and `access ∈ {read_only, hidden}`. Compare `if_match` with the target row state, upsert atomically, audit, and invalidate the target plus **all descendants**, independent of Scope Class. Store the row even when an ancestor already imposes a stricter restriction. |
+| `clear_restriction` | `key`, `tenant`, `if_match`, `Context` | — | Apply the same authorization and concurrency check, then delete the row. Absence means `overridable`; ancestor restrictions still apply. Invalidate the target and all descendants. |
+| `resolve_access` | `key`, `chain`, `Context` | `TenantAccess` | Return the strictest row on the chain, or `overridable` when none exists. The Value Writer resolves the **caller's** access, not the target's. |
+| `list_restrictions` | `key`, `subtree_root`, `Context` | `TenantAccessRestriction[]` | Return stored restrictions and their ETags inside the caller's subtree. |
+
+**Why not oneself.** A tenant that could clear its own row could undo its provider's restriction. The platform is the root and therefore has no row of its own.
+
+**Why `delegate` is distinct from `write`.** Changing a descendant's value and restricting that descendant are different powers.
+
+**Concurrency.** A target-access read returns an ETag for its stored row or for the absent (`overridable`) state. `PUT` and `DELETE` require that token: missing `If-Match` returns `428`, and a changed row returns `412`. Comparison and mutation occur atomically, so concurrent delegates cannot silently overwrite each other.
+
 #### Component: Value Writer
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-component-value-writer`
@@ -911,10 +975,10 @@ Validates and stores value changes (`cpt-cf-settings-service-fr-set-value`, `cpt
 | Operation | Input | Output | Key Behavior |
 |-----------|-------|--------|--------------|
 | `validate` | `key`, `scope`, `value`, `Context`, `limit?` | `ValidationReport` | **Read-only.** Authorize `read` at scope. Validate the value via Type Validator and report: valid or not (with field-level detail), the current effective value and its source, and — for a `cascading` setting — the affected descendants via `cascading_impact`. Stores nothing, needs no step-up, and returns the same answer for the same inputs, so a client may call it as often as it likes (`cpt-cf-settings-service-fr-validate-before-set`). |
-| `set` | `changes[]` (`key`, `tenant`, `value`, `if_match`), `step_up_assertion`, `Context` | `SetResult[]` | **Authorize first**: whether this caller may write these settings at these scopes is decided by the `PolicyEnforcer` before any other check, and an unauthorized caller is refused without reaching validation or step-up. Then, if the request is **interactive** and any change targets a declaration with `requires_step_up`, verify step-up once for the request via the resolved `StepUpVerifier` (the **step-up contract** below; `401`/`403` on failure). A request authenticated as a **service principal** takes no step-up and **MUST** be refused outright if any change targets a `requires_step_up` declaration (*Two gates, two questions* below). Then, **per change**: resolve the target `tenant` (optional; defaults to the caller's own tenant) and authorize `write` — the target MUST be within the caller's **subtree**, else `403` (`cpt-cf-settings-service-fr-tenant-scope-enforcement`). Enforce Scope Class always, and `tenant_overridable` **for a tenant caller** (reject overriding a `global` setting from anyone, or a non-overridable setting from a tenant, `403`/`409`; §4.8). Validate the value via Type Validator. Reject the change if the stored value moved since the caller read it (`412`; *Stale-write rejection* below). For a secret-backed setting, store the plaintext via the Secret Manager (§4.2 *Secret Manager*) and keep only the returned `secret_ref` — plaintext is never persisted in `setting_values`. Commit the value, its audit record and — where present — its `secret_ref` in **one transaction** (*Set atomicity model* below), then evict the local cache. Once **every** change in the request has settled, hand the committed keys to the **Change Set Publisher** ([Settings Activation](./DESIGN-activation.md)) under the request's `change_set_id`: it co-commits the await-records and publishes one filtered `change_notification` per subscriber plus the `cache_invalidate` broadcast. Each change gets its own entry in `SetResult[]`: old → new value, scope, and success or failure; a change that fails commits nothing (`cpt-cf-settings-service-fr-live-read-activation`). |
+| `set` | `changes[]` (`key`, `tenant`, `value`, `if_match`), `step_up_assertion`, `Context` | `SetResult[]` | Authorize `write` first. For an interactive request, verify step-up once when any declaration requires it; refuse a service principal for such a declaration. For each change, require the target to be in the caller's subtree, reject tenant-scoped writes to `global` settings, and require the **caller's own** effective access to be `overridable`. Validate the value and `if_match`, then commit the value and audit record atomically. Secret plaintext goes through the Secret Manager and only `secret_ref` is persisted. After all items settle, evict caches and publish the committed keys under `change_set_id`. Each item reports old value, new value, scope, and success or failure. |
 | `revert` | `key`, `scope`, `if_match`, `step_up_assertion`, `Context` | `SetResult` | Clear the scope's override. The response carries the resulting fallback — nearest ancestor for a tenant scope, Schema Default for `/` (`cpt-cf-settings-service-fr-defaults-revert`); `validate` reports the same fallback beforehand. |
 | `remove_value` | `key`, `scope`, `if_match`, `step_up_assertion`, `Context` | `SetResult` | Remove a **value** at a scope. Declaration removal is a separate, immediate soft-delete (retire) (§4.2 *Declaration Management*). |
-| `clone` | `key`, `from_scope`, `to_scope`, `step_up_assertion`, `Context` | `SetResult` | Copy an effective value as an explicit override at `to_scope` (pin-inheritance, `cpt-cf-settings-service-fr-tenant-overrides`). **Authorize both ends.** The caller MUST be authorized to **read the source effective value** at `from_scope` (`read` + `tenant_visible`, with `from_scope` inside the caller's subtree) **and** to mutate `to_scope` (`write` + `tenant_overridable` + subtree), else `403`. The source check is not optional: a clone that read a scope the caller cannot read would **exfiltrate a value across the scope boundary** — the write authorization on the target says nothing about the right to the source content. **A `secret`-classified value cannot be cloned** — reject with `422 SecretNotCloneable`. Cloning by reference would leave the target holding the **source's** Credential-Store entry, which `delete_secret` removes as soon as the source override is removed (§4.2 *Secret Manager*), so the clone would silently dangle; the credstore gear offers only `get`/`put`/`delete` and no server-side copy, so giving the target its own entry would route an administrative action through the machine-only plaintext path. Nor is the operation meaningful: there is **no human reveal path**, so the administrator would be pinning a credential they cannot see, and materialising an ancestor's credential as the target's own override propagates it across a scope boundary. A secret at the target is set explicitly with `set`. The clone copies the **value only** — not the Declaration — and establishes **no** continuing link, so a later source change does not propagate to the target override. |
+| `clone` | `key`, `from_scope`, `to_scope`, `step_up_assertion`, `Context` | `SetResult` | Authorize `read` at the source and `write` at the target; both scopes must be in the caller's subtree. A tenant caller's own access must be `overridable`. Reject secret values with `422 SecretNotCloneable`; cloning a secret reference would couple the target to the source credential lifecycle. Clone copies only the effective value and creates no continuing link. |
 | `cascading_impact` | `key`, `scope`, `value`, `Context`, `limit?` | `ImpactReport` | For `cascading`, list descendants whose effective value would change (current vs new), via the Tenant Resolver subtree. **Bounded:** returns the **first `limit`** changed descendants **in subtree traversal order** (BFS from the requesting scope — no ranking; there is no notion of a "more important" descendant), plus the **total count** `total_changed` and a `truncated` flag. It does **not** stream the full subtree; on very large subtrees the walk itself is capped (see below) and `truncated=true`. **Non-blocking** — informational only (`cpt-cf-settings-service-fr-cascading-inheritance`). **Standalone descendants are omitted** from `changed[]` and from `total_changed` — they are outside the caller's subtree for reading (§4.2 *Value Resolver*), and a count alone would still disclose them. |
 
 **Impact report bound.** `cascading_impact` is an advisory preview, not a system-of-record query, so it MUST NOT run unbounded on a deep/wide subtree. It walks the requesting scope's subtree breadth-first via `get_descendants`, evaluating changed-vs-unchanged per descendant, and stops at a **node budget** (default 5,000 descendants scanned). `ImpactReport` carries `changed[]` (the first `limit` changed descendants in traversal order — **not** ranked), `total_changed` (the full count, up to the node budget), `scanned`, and `truncated` (true when either the node budget or `limit` was hit). A truncated report is still valid — it warns "≥ N descendants affected" — and the UI presents it as such; because the report is non-blocking (`cpt-cf-settings-service-fr-cascading-inheritance`), truncation never blocks the set.
@@ -929,7 +993,7 @@ Validates and stores value changes (`cpt-cf-settings-service-fr-set-value`, `cpt
 
 The upper-right cell is a rule, not an omission: a setting that needs a person to confirm it is by definition not one a machine may set, so the flag answers both questions at once. What a service may write is bounded by the authorization decision and by nothing else — being a service grants nothing.
 
-**What bounds a service's writes, and what must not.** The decision's **subject** is the verified service principal carried by the caller's token (§4.8), and its **resource** is the setting key. Narrowing a grant to a service's own settings is therefore a matter of the resource pattern: the platform's permission model accepts a GTS wildcard on the resource (`docs/arch/authorization/PERMISSION_GTS_TYPE.md`, GTS §3.5), so a grant reads as the key with a wildcard on its derived half — every setting under a vendor's namespace, rather than every setting sharing a value type. The value type is not part of the key at all (§4.7), so it cannot be granted on by accident: a grant that covered every setting of the same shape would have to be written deliberately, and would cross gear boundaries.
+**What bounds a service's writes, and what must not.** The decision's **subject** is the verified service principal carried by the caller's token (§4.8), and its **resource** is the setting key. Narrowing a grant to a service's own settings is therefore a matter of the resource pattern: the platform's permission model accepts a GTS wildcard on the resource (`docs/arch/authorization/PERMISSION_GTS_TYPE.md`, GTS §3.5), so a grant reads as the key with a wildcard on its derived half — every setting under a vendor's namespace, rather than every setting sharing a shape. The value schema is not part of the key at all (§4.7), so it cannot be granted on by accident: a grant that covered every setting of the same shape would have to be written deliberately, and would cross gear boundaries.
 
 **`owner_module` is not an authorization input.** It is caller-supplied on registration (§4.8) — authorizing a write by matching it against the caller would be checking a claim against a field the same caller filled in. It stays an attribute of the declaration, recording who contributed it, and never a right. Even once verified caller identity lands (§6), it would add an indirection the decision does not need: a verified `subject_id` is a service principal, not a module name, and the policy decision already answers the question directly.
 
@@ -1039,7 +1103,7 @@ The corpus covers only Schema Defaults and overrides the caller may **already re
 |-----------|-------|--------|--------------|
 | `get` | `key`, `scope` | `EffectiveValue?` | Hot-path lookup keyed by `(key, scope)`. |
 | `populate` | `key`, `scope`, `EffectiveValue` | — | Store the resolved value with the resolved source trace. |
-| `invalidate` | `key`, `scope` \| key-wide | — | Evict on the write, on the **local** instance. Cross-instance convergence is driven by the **`cache_invalidate` broadcast** (Settings Activation): every replica evicts on receipt of the event. For a `cascading` write, evict every cached scope for the changed declaration key so descendants re-resolve lazily on next read. |
+| `invalidate` | `key`, `scope` \| key-wide | — | Evict on the write, on the **local** instance. An access change evicts the target tenant and all descendants because their effective access may change, regardless of Scope Class (§4.2 *Tenant Access*). Cross-instance convergence is driven by the `cache_invalidate` broadcast. For a `cascading` value write, evict every cached scope for the changed key so descendants re-resolve lazily. |
 
 **Why key-wide eviction:** a write at an ancestor does not activate descendant services (it activates its own scope only). Evicting the affected cached scopes for that key lets reads re-resolve the new effective value rather than serving stale values. Cross-instance convergence is signal-driven: the writing instance evicts locally, and peers evict on the `cache_invalidate` broadcast (Settings Activation, §4.4) so they do not serve stale values.
 
@@ -1132,7 +1196,7 @@ All REST APIs follow the shared DNA REST contract: `snake_case` JSON; UUIDv7 IDs
 
 **Create idempotency.** Resource-creating `POST`s (`/settings-service/v1/categories`, `/settings-service/v1/declarations`) use the guideline §4.8 idempotency strategy for **critical operations** — a **permanent DB unique constraint → `409`** (`uq_declaration_key`, category-key uniqueness), a *permanent* uniqueness guarantee, not a time-windowed cache. Because of that, a client's **lost-response retry** also lands on `409`; a client **MUST disambiguate** its own retry from a genuine conflict by **re-reading** (`GET` by key / list) — the service keeps **no `Idempotency-Key` store**. `POST` (not a key-addressed `PUT`-create) is required: the `key` is **server-composed** from the category slug plus the admin's `vendor` and `name` (§4.2 *Declaration Management*), so the client does not hold it before the call, while identity is the server-assigned UUIDv7 (§4.3 /). (The write path has its own retry story — `If-Match`-guarded, §4.2 *Value Writer*.)
 
-**Success codes.** `GET` → `200`; `PUT`/`PATCH` → `200`. A resource-creating `POST` → `201 Created` + `Location`; an action `POST` on a sub-resource segment (`settings/{key}/validate`, `settings/{key}/value/revert`, `settings/{key}/value/clone`) → `200 OK` with a result body. A `DELETE` on a **category** → `204 No Content` (hard deletes, no body); a **declaration retire** (`DELETE /settings-service/v1/declarations/{id}`, soft-delete) → **`200 OK`** with the retired declaration body (`status=retired`, `updated_at` = retire time — the soft-delete tombstone per guideline §4.2, distinguishable from a hard delete); **declaration create** (`POST /settings-service/v1/declarations`) → `201 Created` (or `200 OK` with `reactivated: true` when the key belongs to a **retired** declaration — re-declare-to-revive, §4.3); **declaration metadata edit** (`PATCH /settings-service/v1/declarations/{id}`) → `200 OK` — all take effect at once (declaration operations do not go through the value write path, `cpt-cf-settings-service-fr-set-value`).
+**Success codes.** `GET` → `200`; `PUT`/`PATCH` → `200`. A resource-creating `POST` → `201 Created` + `Location`; an action `POST` on a sub-resource segment (`settings/{key}/validate`, `settings/{key}/value/revert`, `settings/{key}/value/clone`) → `200 OK` with a result body. A `DELETE` on a **category** → `204 No Content` (hard deletes, no body); a **declaration retire** (`DELETE /settings-service/v1/declarations/{id}`, soft-delete) → **`200 OK`** with the retired declaration body (`status=retired`, `updated_at` = retire time — the soft-delete tombstone per guideline §4.2, distinguishable from a hard delete); **declaration create** (`POST /settings-service/v1/declarations`) → `201 Created`, or `200 OK` with `reactivated: true` on revive / `evolved: true` on evolution (§4.3); **declaration metadata edit** (`PATCH /settings-service/v1/declarations/{id}`) → `200 OK` — all take effect at once (declaration operations do not go through the value write path, `cpt-cf-settings-service-fr-set-value`).
 
 **Action naming — one rule.** A non-CRUD action is a `POST` on a **path segment** under the resource it acts on (`settings/{key}/value/revert`, `settings/{key}/value/clone`). A **`GET`** computed sub-resource is a segment too (`settings/{key}/impact`, `settings/{key}/history`) — a sub-resource read, not an action. `POST /settings-service/v1/settings/{key}/validate` is a `POST` because the candidate value travels in the body, not because it mutates: it stores nothing.
 
@@ -1156,15 +1220,15 @@ All REST APIs follow the shared DNA REST contract: `snake_case` JSON; UUIDv7 IDs
 |-----------|-------|-------------|
 | Category exists | `404` | Not found |
 | Category empty | `409 CategoryNotEmpty` | Must contain no declarations (`cpt-cf-settings-service-fr-settings-category-model`) |
-| Actor authorized | `403` | `delete` on `gts.cf.toolkit.settings.category.v1~` |
+| Actor authorized | `403` | `delete` on `gts.cf.core.settings.category.v1~` |
 
 #### REST API — Setting Declarations
 
 | Method | Endpoint | Description | Idempotency |
 |--------|----------|-------------|-------------|
-| `POST` | `/settings-service/v1/declarations` | Create an admin-authored declaration — **or reactivate** a retired one at the same key (re-declare-to-revive), in which case **credential step-up is required** (reactivation is behavior-affecting, §4.2 *Declaration Management*) | No — unique key → `409`; lost-response retry disambiguated by re-read (§4.3 DNA) |
+| `POST` | `/settings-service/v1/declarations` | Create an admin-authored declaration, evolve the active declaration on the same version-stripped path, or revive its exact retired `v1` key when no active declaration exists. Evolve and revive require credential step-up | No — lost-response retry disambiguated by re-read (§4.3 DNA) |
 | `GET` | `/settings-service/v1/declarations` | List declarations — OData `$filter` (e.g. `category_id`, `domain_affinity`), `$orderby`/`$select` (§4.3 DNA); visibility/licence gated | Yes |
-| `GET` | `/settings-service/v1/declarations/{id}` | Get a declaration (incl. `value_type_id` + resolved `traits`) | Yes |
+| `GET` | `/settings-service/v1/declarations/{id}` | Get a declaration (incl. `value_schema` + resolved `traits`) | Yes |
 | `PATCH` | `/settings-service/v1/declarations/{id}` | Update declaration metadata — **immediate** (admin-authored only) | Yes |
 | `DELETE` | `/settings-service/v1/declarations/{id}` | **Immediately** retire a declaration — `status=retired`, values retained but excluded from resolution (**`200`** with the retired body — soft-delete tombstone; admin-authored only) — **step-up gated** (§4.2 *Declaration Management*) | Yes |
 
@@ -1173,15 +1237,25 @@ All REST APIs follow the shared DNA REST contract: `snake_case` JSON; UUIDv7 IDs
 
 | Condition | Error | Description |
 |-----------|-------|-------------|
-| Actor authorized | `403` | `create` on `gts.cf.toolkit.settings.declaration.v1~` |
+| Actor authorized | `403` | `create` on `gts.cf.core.settings.declaration.v1~` |
 | Category exists | `404` | `category_id` must reference an existing category |
-| Key unique | `409 DeclarationKeyConflict` **/ revive** | `key` is globally unique — a GTS type id (both authors). A key held by an **active** declaration → `409 DeclarationKeyConflict`; a key held by a **retired** declaration → **revive** (re-declare-to-revive, below), not a conflict. The same leaf name MAY recur in a different category (`cpt-cf-settings-service-fr-settings-category-model` — `UNIQUE(category_id, leaf_slug)`) |
+| Existing identity | evolve / revive / `409 DeclarationKeyConflict` | First query the version-stripped path derived from `(vendor, category, leaf name)`. If it has an active declaration and the request changes a behavior-affecting field that requires a new major, evolve **that active major**. If the request repeats the active declaration or changes only editable metadata, return `409`; the client re-reads after a lost response, and metadata changes use `PATCH`. Only when no active declaration exists, inspect the normally composed `v1` key and revive it if retired; otherwise create `v1`. The active-path lookup takes precedence over the retired exact-key lookup. The same leaf name MAY recur in a different category, and a retired declaration does not hold its name (`UNIQUE(category_id, leaf_slug) WHERE status = 'active'`) |
 | Default present | `422 DefaultRequired` | `default_value` is **mandatory** (§4.1) — it is what makes resolution total. A setting with no meaningful default sends JSON `null` on a type that admits it; **omitting the field is not the same thing** and is rejected. Same rule for `register_declarations` (§4.2 *Contribution Reconciler*). |
-| Default valid | `422` | `default_value` validated against the setting's value type (`value_type_id`) (field-level errors) |
+| Default valid | `422` | `default_value` validated against the setting's `value_schema` (field-level errors) |
 | Scope Class present | `422 ScopeClassRequired` | Every declaration MUST declare a Scope Class (`cpt-cf-settings-service-fr-setting-scope-class`) |
-| Step-up verified — **revive only** | `401`/`403` | When the `key` belongs to a **retired** declaration the call is a **reactivation**, a behavior-affecting action requiring credential step-up (§4.2 *Declaration Management*). A genuinely new key needs no step-up: a fresh declaration has no live resolution to change. |
+| Secret boundary unchanged — **revive only** | `409 SecretnessChanged` | A re-declaration at a retired key MAY bring a different `value_schema`, but not one that flips `has_secret_trait`: secret and non-secret values are stored differently (§4.3 *Re-declare to revive*) |
+| Schema accepted at the key — **revive only** | `422 IncompatibleSchema` | A re-declaration's `value_schema` is registered at the existing key, so the Registry adjudicates it: a revision it refuses cannot be applied there at all, and the response names the successor path — a new major (§4.7 *Compatibility mode*). The declaration stays retired and its values are untouched. |
+| Scope Class unchanged — **revive only** | `409 ScopeClassChanged` | Scope Class decides where a value may exist; changing it rides the new-major path, not a revive (§4.3) |
+| Leaf name free — **revive only** | `409 LeafNameTaken` | A retired declaration cannot be revived once an active declaration holds its leaf name in that category — the name was re-used, and the two cannot both be live (§4.3 *Re-declare to revive*) |
+| Step-up verified — **evolve / revive** | `401`/`403` | Evolution retires the active predecessor; revive reactivates a retired declaration. Both affect live resolution and require step-up. A genuinely new declaration does not (§4.2 *Declaration Management*). |
 
-**Re-declare to revive.** A retired declaration is brought back by **re-declaration**, not a separate reactivate operation: a `POST /settings-service/v1/declarations` with the **exact** retired `key` (admin), or a `register_declarations` of the same version-stripped path (module, §4.2 *Contribution Reconciler*), **reactivates** the retired row — keeps its UUID, sets `status=active`, invalidates cache, emits `event_declaration_reactivated` (§4.4) — and returns **`200`** (not `201`) with `reactivated: true`. The **administrative** revive requires **credential step-up** (§4.2 *Declaration Management*): it puts a setting back into live resolution, which is behavior-affecting. The **module** revive through `register_declarations` does not — it is a machine caller with no interactive session, governed by the contribution trust model (§4.8). The **retained** `setting_values` become live again as-is: the value type + version are baked into the `key` (`<value_type_id>~<instance-id>`), so an exact-key revive cannot have a type mismatch — the retained values are the same type and stay valid. (A change of value type is a **different** key → an ordinary fresh create, or the gear upgrade migration, §4.2 *Contribution Reconciler*.) Consequently a genuinely *fresh* declaration at a retired key is not possible while the retired row and its values exist — that awaits the retained-value disposition decision (§6).
+**Evolve by re-declaring.** Before considering the normally composed `v1` key, the service looks for the active declaration on the request's version-stripped path. When the request changes a behavior-affecting field that requires a new major, the service evolves **that active major**: it mints the next free major (`…retry_policy.v1~ → …v2~`, then a later shape change `…v2~ → …v3~`), runs the upgrade migration (§4.2 *Contribution Reconciler*) — every value copied to the new key and re-validated, failures flagged `needs_review` — and retires the predecessor, so exactly one major is active. The response carries the new `key` and `evolved: true`; the operation requires credential step-up. A request matching the active declaration is not evolution: it returns `409 DeclarationKeyConflict`, preserving the lost-response retry contract instead of minting an accidental major.
+
+**Re-declare to revive.** Revive is considered only when the request's version-stripped path has no active declaration. On the admin path, the normally composed `v1` key is revived if that exact declaration is retired; on the module path, `register_declarations` carries the explicit major and can revive that exact retired key. Revive keeps the row UUID, sets `status=active`, invalidates cache, emits `event_declaration_reactivated` (§4.4), and returns `200` with `reactivated: true`. Administrative revive requires credential step-up; module revive is governed by the contribution trust model (§4.8). A revive is refused with `409 LeafNameTaken` if another active declaration already holds `(category, leaf name)`. Its values remain retained; what was re-used is the name, not the history.
+>
+> **A revive may change the value schema, within what the Registry accepts at the same key.** The key carries no shape of its own (§4.7) — it is built from vendor, category and leaf name — so a re-declaration may bring a different `value_schema` and compose the same key. Because that schema now lives **inside** the registered type, re-registering it is a revision of an existing type: the Registry adjudicates compatibility and refuses a breaking one (§4.7 *Compatibility mode*), which the service surfaces as `422 IncompatibleSchema` with the successor path — a **new major** — named in the detail. Within that boundary the retype is the administrator's to make: the row adopts the new `value_schema`, and every **retained** `setting_value` is re-validated against it before it goes live. What validates goes live unchanged; what does not is flagged `needs_review` with its detail rather than discarded — admin-visible, and it falls through on read (§4.2 *Value Resolver*), exactly as an upgrade migration leaves it (§4.2 *Contribution Reconciler*).
+>
+> **Two changes a revive may not make, because they move values rather than re-interpret them.** The **secret boundary** is one: a non-secret setting's values live inline in `value`, a secret setting's live as `secret_ref` (§4.2 *Secret Manager*), so a re-declaration whose type flips `has_secret_trait` is refused `409 SecretnessChanged` — plaintext left in the value column is not a validation outcome. **Scope Class** is the other: it decides *where* a value may exist at all, so a re-declaration that changes it is refused `409 ScopeClassChanged` (a `global` setting has no tenant-scoped values to inherit). Both remain what they always were — behaviour-affecting fields that ride the new-major path (§6). Consequently a genuinely *fresh* declaration at a retired key is not possible while the retired row and its values exist — that awaits the retained-value disposition decision (§6).
 
 ##### `PATCH`/`DELETE /settings-service/v1/declarations/{id}` — Rules
 
@@ -1201,20 +1275,41 @@ Both are **immediate** — declaration operations do not go through the value wr
 |--------|----------|-------------|-------------|
 | `GET` | `/settings-service/v1/settings/{key}?tenant={tenant_id}` | Read the effective value with source trace + type/traits | Yes |
 | `GET` | `/settings-service/v1/settings?tenant={tenant_id}` | Bulk effective read (browse) — OData `$filter` over `category_id`, `needs_review` (e.g. `$filter=needs_review eq true` — the migration prompt), plus `$orderby`/`$select` (§4.3 DNA); `tenant` is resolution context. **By key set** as well as by category: `$filter=key in (…)` returns the named keys with **per-key outcomes** in the item list — a key the caller may not see or that does not exist is reported in its own entry, never as a failure of the whole request (`cpt-cf-settings-service-fr-bulk-effective-read`). Same visibility, scope, and secret-masking rules as the single read above | Yes |
+| `GET` | `/settings-service/v1/settings/{key}/permissions?tenant={tenant_id}` | Read one descendant's stored restriction, effective access, and ETag; absence is reported as `overridable` with an absent-state ETag | Yes |
+| `PUT` | `/settings-service/v1/settings/{key}/permissions?tenant={tenant_id}` | Store `read_only` or `hidden` for one descendant; requires `If-Match` | Conditional |
+| `DELETE` | `/settings-service/v1/settings/{key}/permissions?tenant={tenant_id}` | Delete the restriction, making this pair `overridable`; requires `If-Match` | Conditional |
+| `GET` | `/settings-service/v1/settings/{key}/permissions` | List stored restrictions and ETags inside the caller's subtree | Yes |
 | `GET` | `/settings-service/v1/settings/{key}/impact?tenant={tenant_id}&limit={n}` | Non-blocking cascading-impact report (affected descendants); bounded — `limit` (default 100, max 500) plus `total_changed`/`truncated` (§4.2 *Value Writer*) | Yes |
 
 > `{key}` in these paths is the setting `key` (URL-encoded) — a **GTS type identifier** for both authors; the `~`/`.` in the key are URL-encoded like any other characters and matched as an opaque string, not parsed. `{tenant_id}` is a bare the Tenant Resolver **tenant id** (UUID), not a path; **omitted ⇒ platform scope**. The service resolves ancestry from the id via the Tenant Resolver — it never parses a scope path (§4.2 *Value Resolver*, §4.7).
 
+##### `PUT`/`DELETE /settings-service/v1/settings/{key}/permissions` — Permission Rules
+
+`tenant` is the tenant being restricted, never the caller. The rules follow §4.2 *Tenant Access*:
+
+| Condition | Error | Description |
+|-----------|-------|-------------|
+| Authorized | `403` | `delegate` on the setting's key (§4.8) |
+| Target is a **strict descendant** | `403` | Inside the caller's subtree and not the caller itself. A caller restricting itself would be able to lift it again, which is the whole point of the rule |
+| Access valid | `422` | `PUT` accepts only `read_only` or `hidden`; `overridable` is represented by `DELETE` |
+| Setting exists and is visible to the caller | `404` | A caller cannot restrict what it cannot see; the response does not distinguish that from a missing setting (`cpt-cf-settings-service-nfr-scope-isolation`) |
+| Current state matches | `428` / `412` | `If-Match` is required. It matches the stored-row ETag or the absent-state ETag returned by `GET`; comparison and mutation are atomic |
+
+- **Recorded even when it changes nothing yet.** If an ancestor already imposes a stricter mode, the row is still written and may take effect when that restriction is lifted (§4.1 *TenantAccessRestriction*).
+- **The read shows the source.** It returns effective access and the tenant whose row supplied the strictest restriction.
+- **`DELETE` clears one row, not the chain.** It makes this pair `overridable`; an ancestor restriction may still determine the effective result.
+- **No value is touched.** Values already set stay stored, keep resolving and keep being inherited (§4.2 *Value Resolver*).
+
 ##### `GET /settings-service/v1/settings/{key}` — Read Rules
 
-- Returns `value`, `source`, `source_scope`, resolved `traits`, `inheritance_trail`, `last_change_at`, and — when the **scope's own override** is flagged `needs_review` (resolution falls through past it, §4.2 *Value Resolver*, but the admin must still see it) — `needs_review` + `needs_review_detail` (§4.7), so the admin sees both the effective (fallthrough) value and that the own override needs fixing; the value type is `value_type_id` (§1.3) for both authors (`cpt-cf-settings-service-fr-typed-value-validation`, `cpt-cf-settings-service-fr-cascading-inheritance`).
+- Returns `value`, `source`, `source_scope`, resolved `traits`, `inheritance_trail`, `last_change_at`, and — when the **scope's own override** is flagged `needs_review` (resolution falls through past it, §4.2 *Value Resolver*, but the admin must still see it) — `needs_review` + `needs_review_detail` (§4.7), so the admin sees both the effective (fallthrough) value and that the own override needs fixing; the value shape is the declaration's `value_schema` (§1.3) for both authors (`cpt-cf-settings-service-fr-typed-value-validation`, `cpt-cf-settings-service-fr-cascading-inheritance`).
 - **`last_change_at` — recency of the effective value the caller sees.** Computed as **`max(declaration.last_change_at, resolved_row.last_change_at)`**, since the effective value is a function of both the declaration's definition (Schema Default / type) and the resolved override. The `max` is the correct semantics; the **only** care is that each arm stays leak-safe:
   - **declaration arm** = definition changes only (§1.3) — never an aggregate over the setting's values, so it carries no other tenant's activity;
   - **value arm** = the `last_change_at` of the **resolved** row only (own override → nearest-ancestor override → none if the effective value is the Schema Default) — always within the caller's own ancestor chain, which it may already read; **never** a max over sibling/descendant scopes.
  Hence the returned timestamp reveals nothing the caller cannot already see. A "when did this setting change **anywhere** in the subtree" view (a max over all overrides) is a **different** semantic, sound only for a platform-admin entitled to every scope, and is deliberately **not** provided on this read.
 - This recency is **admin-facing only** — it is part of the `GET /settings-service/v1/settings/{key}` admin read, **not** the consumer effective-value read path (`SettingsReaderClient.get_effective` / `EffectiveValue`, §4.5, which carry no recency — consumers resolve values, they do not display recency).
 - **Needs-review listing:** `GET /settings-service/v1/settings?tenant={tenant_id}&$filter=needs_review eq true` returns the overrides in the caller's subtree whose value no longer validates against the current type (backed by `idx_values_needs_review`, §4.7) — the data source for the admin migration prompt. Same visibility/subtree gating as browse. Resolution of a flagged override **falls through** to the nearest valid value (§4.2 *Value Resolver*) — never served, but visible here, and it blocks a write until fixed; the flag is cleared when a valid value is set or the override is reverted — the exact Reconciler flag-**set** rule (§4.2 *Contribution Reconciler*) and flag-**clear**-on-write step (§4.2 *Value Writer*) are the remaining follow-up.
-- **Visibility-gated**, not Scope-Class-gated: a `global` setting marked `tenant_visible` is returned **read-only** to tenants; a setting not visible to the caller's scope returns `404` (never leaks existence) (`cpt-cf-settings-service-fr-tenant-scope-enforcement`, `cpt-cf-settings-service-nfr-scope-isolation`).
+- **Visibility-gated**, not Scope-Class-gated: a `global` setting a tenant is visible for is returned **read-only** to it; a setting not visible to the caller's scope returns `404` (never leaks existence) (`cpt-cf-settings-service-fr-tenant-scope-enforcement`, `cpt-cf-settings-service-nfr-scope-isolation`).
 - Tenant callers are constrained server-side to their own subtree regardless of client-supplied `tenant`; a target outside the subtree is rejected (`cpt-cf-settings-service-fr-tenant-scope-enforcement`).
 
 > **Writes live under `/value`.** Set / revert / clone / remove act on `/settings-service/v1/settings/{key}/value`, not on this read-only URI; rules below. The read always returns the **live** effective value, and its `last_change_at` is the ETag a write submits as `If-Match`.
@@ -1237,7 +1332,7 @@ Both are **immediate** — declaration operations do not go through the value wr
 | Condition | Error | Description |
 |-----------|-------|-------------|
 | Setting visible to caller | `404` | Hidden settings never leak |
-| Overridable at this tenant | `403`/`409` | `global` not tenant-overridable; `tenant_overridable=false` rejects a tenant change (`cpt-cf-settings-service-fr-setting-scope-class`, `cpt-cf-settings-service-fr-tenant-scope-enforcement`) |
+| Caller may write | `403`/`409` | No tenant overrides a `global` setting. A tenant caller's own effective access must be `overridable`; the target tenant's access does not restrict an authorized ancestor writing there (`cpt-cf-settings-service-fr-setting-scope-class`, `cpt-cf-settings-service-fr-tenant-scope-enforcement`) |
 | Value valid | `422` | Validated against type + traits (`cpt-cf-settings-service-fr-typed-value-validation`) |
 | Value within size cap | `413`/`422 ValueTooLarge` | Serialized value MUST NOT exceed 64 KiB (§4.2 *Type Validator*) |
 | Target within caller's subtree | `403` | The optional `tenant` targets the caller's own tenant or any **descendant**; an ancestor or sibling is rejected server-side. Omitted ⇒ the caller's own tenant. The override is created **at the target tenant** (`cpt-cf-settings-service-fr-tenant-overrides`) |
@@ -1278,7 +1373,7 @@ The single route in this gear declared `.anonymous().exposed()` — anonymous on
 
 | Condition | Behaviour |
 |-----------|-----------|
-| Selection | Only declarations with `anonymous_exposable = true`, resolved at `tenant` by the ordinary cascade (§4.2 *Value Resolver*). `tenant_visible` and Scope Class apply as always; the flag narrows, it never widens |
+| Selection | Only declarations with `anonymous_exposable = true`, resolved at `tenant` by the ordinary cascade (§4.2 *Value Resolver*). Scope Class still applies. Tenant access restrictions govern administrative callers, not this explicitly public surface |
 | Everything else | Absent, with no trace. Not listed, not counted, not reported as forbidden — a caller cannot learn that another setting exists |
 | Unknown or empty tenant | The **same** response as a tenant with no exposable values: `200` with an empty set. Never `404`, never a distinguishable error — otherwise the route enumerates tenants |
 | Secrets and PII | Unreachable by construction: the flag cannot be set on those classifications (§4.7 `CHECK`), so no masking decision is taken here and none can be got wrong |
@@ -1320,7 +1415,7 @@ All 4xx/5xx responses use `Content-Type: application/problem+json` (RFC 9457).
 
 ```json
 {
- "type": "gts://gts.cf.toolkit.settings.error_validation.v1~",
+ "type": "gts://gts.cf.core.settings.error_validation.v1~",
  "title": "Validation failed",
  "status": 422,
  "trace_id": "01JXYZ...",
@@ -1340,20 +1435,20 @@ Event type identifiers follow `gts.<vendor>.<package>.<namespace>.<type>.v<MAJOR
 
 | Event Type (GTS) | Description | Payload Fields |
 |------------------|-------------|----------------|
-| `gts.cf.toolkit.settings.event_value_changed.v1~` | A value was stored | `declaration_key`, `scope`, `actor` |
-| `gts.cf.toolkit.settings.event_value_change_failed.v1~` | A value change was rejected (durable notification, `cpt-cf-settings-service-nfr-reliability-validated-set`) | `declaration_key`, `scope`, `reason`, `detail` |
-| `gts.cf.toolkit.settings.event_declaration_registered.v1~` | Module contributed/upgraded a declaration | `owner_module`, `key` |
-| `gts.cf.toolkit.settings.event_declaration_retired.v1~` | Module retired a declaration | `owner_module`, `key` |
-| `gts.cf.toolkit.settings.event_declaration_reactivated.v1~` | A retired declaration was revived by re-declaring its key (admin `POST` or gear reconcile, §4.2 *Declaration Management* / *Contribution Reconciler*/§4.3) | `key`, `source`, `actor` |
-| `gts.cf.toolkit.settings.event_secret_used.v1~` | Security audit event for a **machine secret-use** — a plaintext resolution through the machine-only reader path; value masked (§4.2 *Secret Manager*) | `declaration_key`, `scope`, `resolving_service`, `request_id` |
+| `gts.cf.core.settings.event_value_changed.v1~` | A value was stored | `declaration_key`, `scope`, `actor` |
+| `gts.cf.core.settings.event_value_change_failed.v1~` | A value change was rejected (durable notification, `cpt-cf-settings-service-nfr-reliability-validated-set`) | `declaration_key`, `scope`, `reason`, `detail` |
+| `gts.cf.core.settings.event_declaration_registered.v1~` | Module contributed/upgraded a declaration | `owner_module`, `key` |
+| `gts.cf.core.settings.event_declaration_retired.v1~` | Module retired a declaration | `owner_module`, `key` |
+| `gts.cf.core.settings.event_declaration_reactivated.v1~` | A retired declaration was revived by re-declaring its key (admin `POST` or gear reconcile, §4.2 *Declaration Management* / *Contribution Reconciler*/§4.3) | `key`, `source`, `actor` |
+| `gts.cf.core.settings.event_secret_used.v1~` | Security audit event for a **machine secret-use** — a plaintext resolution through the machine-only reader path; value masked (§4.2 *Secret Manager*) | `declaration_key`, `scope`, `resolving_service`, `request_id` |
 
-> The identifiers above are the **payload `type`** constants (bare GTS type IDs). The corresponding **registered schema `$id`s** are the base-event-composed forms, derived from `gts.cf.core.events.type.v1~` (e.g. `gts://gts.cf.core.events.type.v1~cf.toolkit.settings.event_value_changed.v1~`); the two forms denote the same event. These schemas are registered at gear init (§4.7). The consumer-facing **`change_notification`** signal and the **`cache_invalidate`** cross-instance cache broadcast are defined and owned by the [Settings Activation](./DESIGN-activation.md); this service publishes them on a write (§4.2 *Value Writer*).
+> The identifiers above are the **payload `type`** constants (bare GTS type IDs). The corresponding **registered schema `$id`s** are the base-event-composed forms, derived from `gts.cf.core.events.type.v1~` (e.g. `gts://gts.cf.core.events.type.v1~cf.core.settings.event_value_changed.v1~`); the two forms denote the same event. These schemas are registered at gear init (§4.7). The consumer-facing **`change_notification`** signal and the **`cache_invalidate`** cross-instance cache broadcast are defined and owned by the [Settings Activation](./DESIGN-activation.md); this service publishes them on a write (§4.2 *Value Writer*).
 
 #### Events Consumed
 
 | Event Type | Source | Purpose |
 |------------|--------|---------|
-| `gts.cf.core.events.type.v1~cf.core.am.tenant_deleted.v1~` | Account Management (owns tenant lifecycle) | Clean up tenant-scoped overrides, in-flight change sets, and secret refs for deleted tenant scopes, per the disposition policy in §6. **Not published by Account Management today** — no tenant-lifecycle event type is defined and the gear has no publish path; tracked as a dependency (§6). Until it exists, tenant-scoped rows outlive their tenant and cleanup is operational, not event-driven. Note that AM `delete_tenant` is a **scheduled deletion saga restricted to leaf tenants** (it rejects a tenant with children), so the event — once it exists — will arrive per tenant, never for a subtree. |
+| `gts.cf.core.events.type.v1~cf.core.am.tenant_deleted.v1~` | Account Management (owns tenant lifecycle) | Clean up tenant-scoped overrides, permission rows (§4.7 `tenant_permissions`), in-flight change sets, and secret refs for deleted tenant scopes, per the disposition policy in §6. **Not published by Account Management today** — no tenant-lifecycle event type is defined and the gear has no publish path; tracked as a dependency (§6). Until it exists, tenant-scoped rows outlive their tenant and cleanup is operational, not event-driven. Note that AM `delete_tenant` is a **scheduled deletion saga restricted to leaf tenants** (it rejects a tenant with children), so the event — once it exists — will arrive per tenant, never for a subtree. |
 | Subject-deleted signal, per registered subject type | The gear that owns that subject type | Clean up values scoped to a deleted subject — `WHERE subject_type = ? AND subject_id = ?` across every tenant — generalizing the `tenant_deleted` row above to the subject dimension (`cpt-cf-settings-service-fr-subject-scoped-values`, §4.7). One subscription per registered subject type rather than one universal event, because the owning gear differs per type and only that gear knows when its instance is gone. **Not consumed in v1**, which writes no subject-scoped rows; the subscription lands with the first subject type that does. Without it a subject's values would outlive the subject exactly as tenant-scoped rows outlive their tenant today. |
 | Hierarchy-change signal (e.g. `gts.cf.core.events.type.v1~cf.core.am.tenant_reparented.v1~`) | Account Management (owns tenant lifecycle) | Evict cached effective values for the affected subtree: a re-parent or a mid-chain tenant insert changes the ancestor chain, and therefore the correct `cascading` effective value, with **no** settings change involved (§4.2 *Cache & Invalidation*). **Neither the event nor the underlying operation exists today** — AM maintains the hierarchy (`tenants.parent_id` + a `tenant_closure` table) but subtree reparenting is explicitly deferred post-v1, and `UpdateTenantRequest` carries no `parent_id`, so an established ancestor chain is immutable in v1. The staleness window this row guards against is therefore **not reachable in v1**; it becomes live only when AM ships `move_subtree`. Tracked as a dependency (§6); `cache_ttl_seconds` bounds the window if it lands before this service consumes the signal. |
 
@@ -1408,7 +1503,7 @@ The second is the **anonymous read surface** (§4.3), and it exists because the 
 
 The two are not alternatives. The gateway path stays for everything a gateway legitimately assembles from authenticated reads; the flag covers what should be publishable without an edge service deciding it. `data_classification` still describes **sensitivity**, not audience — which is exactly why the flag is a separate field, and why the two classifications that must never leave cannot carry it.
 
-On **that** path, deciding what is safe to expose is the gateway's responsibility — `data_classification` (§4.1) describes sensitivity, not audience, and `tenant_visible` scopes to tenant administrators, so neither answers "may an anonymous visitor see this". The `anonymous_exposable` flag (§4.3) is the field that does answer it, and the difference between the two paths is exactly this. Two consequences follow for the gateway path, and they differ:
+On the gateway path, deciding what is safe to expose remains the gateway's responsibility. Tenant access governs administrators, not anonymous publication. Two consequences differ:
 
 - a **`secret`** value cannot leak this way by construction — the reader returns an opaque `SecretHandle` and plaintext requires `resolve_secret`, which is per-setting authorized and audited as a secret-use event (§4.2 *Secret Manager*);
 - a **`pii`** value can. PII masking is defined for **administrative** reads (§4.1 `DataClassification`, §4.2 *Secret Manager* `mask`), while the reader hands a trusted caller the unmasked value on purpose — a consumer that needs an alerting contact address must receive it. Nothing on this path prevents a gateway from republishing a `pii`-classified setting anonymously; that restraint lives in the gateway. On the anonymous read surface it is not a matter of restraint: `pii` cannot carry `anonymous_exposable` at all, refused by a `CHECK` rather than by a handler (§4.7).
@@ -1434,7 +1529,7 @@ sequenceDiagram
  participant Broker as Event Broker
 
  Admin->>API: POST /settings-service/v1/settings/{key}/validate (value, scope)
- API->>VW: validate against the key's value type (TypesRegistryClient)
+ API->>VW: validate against the declaration's value_schema (local — no Registry call)
  VW-->>Admin: valid? · current effective value + source · affected descendants (paged)
  Admin->>API: PUT /settings-service/v1/settings/{key}/value (value, If-Match, step-up token)
  VW->>VW: verify token locally — JWKS signature, sub-match, auth_time ≤ 5 min, acr/amr
@@ -1478,7 +1573,7 @@ sequenceDiagram
   Cache-->>R: effective value
   Note over Cache: hot path, p95 ≤ 2 ms (§7)
  else miss
-  VR->>DB: load declaration (value type, Scope Class, Schema Default)
+  VR->>DB: load declaration (value schema, Scope Class, Schema Default)
   alt no declaration row
    VR-->>C: NotFound
   else retired declaration
@@ -1569,19 +1664,17 @@ Two things follow from the shape of this flow. An orphan is possible by construc
 |--------|------|----------|---------|-------------|
 | `id` | UUID | No | auto-generated | **PK** |
 | `key` | text | No | — | **Unique** (`uq_declaration_key`) — GTS type id (both authors); see §1.3 |
-| `leaf_slug` | text | No | — | Setting's own name slug — the `<name>` segment of the derived half (no `/`); **Unique per category** (`uq_declaration_category_slug` on `(category_id, leaf_slug)`, `cpt-cf-settings-service-fr-settings-category-model`) |
-| `value_type_id` | text | No | — | GTS id of the value type (catalog `gts.cf.toolkit.settings.type_*~`), independent of `key` (both authors, §1.3) |
+| `leaf_slug` | text | No | — | Setting's own name slug — the `<name>` segment of the derived half (no `/`); **Unique per category among active declarations** (`uq_declaration_category_slug` on `(category_id, leaf_slug) WHERE status = 'active'` — a retired predecessor must not block its own successor, §4.3 *Re-declare to revive*), `cpt-cf-settings-service-fr-settings-category-model`) |
+| `value_schema` | JSONB | No | — | The setting's value schema (draft-07), composed into the registered type as the envelope's `value` (both authors, §1.3/§4.7) |
 | `category_id` | UUID | No | — | **FK** → `categories(id)` ON DELETE RESTRICT |
-| `default_value` | JSONB | No | — | Schema Default — **authoritative** source of the default; the value type is validation-only (no `default` keyword). Independent of overrides. **NOT NULL** — every declaration carries a default, so the resolution chain always terminates in one (§4.2 *Value Resolver*) and no resolution outcome for "declared but valueless" has to exist. A setting with no meaningful default stores `'null'::jsonb`: a non-`NULL` column holding the JSON value `null`, the same distinction drawn on `setting_values.value` below. |
+| `default_value` | JSONB | No | — | Schema Default — **authoritative** source of the default; `value_schema` is validation-only (it carries no `default` keyword). Independent of overrides. **NOT NULL** — every declaration carries a default, so the resolution chain always terminates in one (§4.2 *Value Resolver*) and no resolution outcome for "declared but valueless" has to exist. A setting with no meaningful default stores `'null'::jsonb`: a non-`NULL` column holding the JSON value `null`, the same distinction drawn on `setting_values.value` below. |
 | `scope_class` | text | No | — | Check: `global`, `cascading`, `local` |
 | `mode` | text | No | `'standard'` | Check: `standard`, `advanced` |
-| `tenant_visible` | boolean | No | `false` | |
-| `tenant_overridable` | boolean | No | `false` | Check: `NOT (scope_class = 'global' AND tenant_overridable)` |
 | `domain_affinity` | text | Yes | — | |
 | `has_secret_trait` | boolean | No | `false` | Denormalized from GTS traits for fast masking (§4.2 *Secret Manager*) |
 | `requires_step_up` | boolean | No | **`true`** | Default is the protective value: a row inserted without an opinion demands elevated confirmation |
 | `anonymous_exposable` | boolean | No | `false` | Check: `NOT (anonymous_exposable AND data_classification IN ('secret','pii'))` — the flag and the two classifications that must never leave are mutually exclusive **in the schema**, not only in the handler (§4.3) |
-| `data_classification` | text | No | `'public'` | Check: `public`, `pii`, `secret`; Check: `(data_classification = 'secret') = has_secret_trait` — the `secret` class is **derived** from the value type's trait and never set independently (§4.1) |
+| `data_classification` | text | No | `'public'` | Check: `public`, `pii`, `secret`; Check: `(data_classification = 'secret') = has_secret_trait` — the `secret` class is **derived** from the declaration's `secret` trait and never set independently (§4.1) |
 | `source` | text | No | `'admin_authored'` | Check: `admin_authored`, `module_contributed` |
 | `owner_module` | text | Yes | — | Check: `(source='module_contributed') = (owner_module IS NOT NULL)` |
 | `licence_feature` | text | Yes | — | |
@@ -1632,6 +1725,23 @@ Both subject columns are **load-bearing** in the subject index: `subject_id` is 
 
 **Scope is an id, resolution is by ancestor-id lookup.** `tenant_id` holds a single id — never a path, and never `NULL` — so ancestry is **not** encoded in the column and is never derived from it. The subject columns extend the scope **sideways, not upward**: a subject-scoped row belongs to exactly one tenant and never participates in the ancestor walk, so ancestry stays a property of `tenant_id` alone and the query below is unchanged for tenant-scoped resolution. Cascade resolution asks `TenantResolverClient.get_ancestors` (§4.2 *Value Resolver*) for the ancestor id list and reads with one exact-match set query: `WHERE declaration_id = ? AND tenant_id IN (<ancestor ids>))` — served by `idx_values_declaration` + the partial unique indexes. There is no prefix/`LIKE` scan and no scope-prefix index: the Tenant Resolver is the single source of ancestry, so a tenant re-parent needs no stored-scope rewrite.
 
+#### Table: `tenant_permissions`
+
+| Column | Type | Nullable | Default | Constraints |
+|--------|------|----------|---------|-------------|
+| `id` | UUID | No | auto-generated | **PK** |
+| `declaration_id` | UUID | No | — | **FK** → `setting_declarations(id)` ON DELETE CASCADE |
+| `tenant_id` | UUID | No | — | The tenant this row restricts (never the one that recorded it) |
+| `access` | text | No | — | Check: `access IN ('read_only', 'hidden')`. `overridable` is represented by no row (§4.1 *TenantAccessRestriction*) |
+| `set_by` | text | No | — | Subject who recorded it, an administrator of a strict ancestor |
+| `created_at` / `updated_at` | `timestamptz` | No | current timestamp | |
+
+**Indexes:** `uq_tenant_permission` — unique on `(declaration_id, tenant_id)`, one restriction per pair and the upsert target of `set_restriction` (§4.2 *Tenant Access*); `idx_tenant_permission_tenant` (`tenant_id`) supports subtree listings.
+
+**Restrictions survive soft-retire.** Retiring a declaration changes its status; it does not delete its access rows. Re-declaring the same key revives the declaration with the restrictions unchanged. The FK cascade applies only to a hard deletion of the declaration. Tenant deletion removes that tenant's rows with its values (§4.4 `tenant_deleted`).
+
+**No row for the root tenant.** Nobody is above the root to record one. A `global` setting's platform value is unaffected: it has no tenant-scoped value to write (§4.1).
+
 #### Table: `audit_records`
 
 The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no `DELETE` outside retention pruning.
@@ -1658,24 +1768,25 @@ The gear-local audit store (§4.2 *Audit Emitter*). Append-only: no `UPDATE`, no
 
 #### GTS Type & Schema Identifiers
 
-Settings domain entities have canonical JSON Schemas with GTS-compliant `$id` identifiers, registered during gear init via `TypesRegistryClient.register(...)`. Naming follows the four-segment shape `gts.cf.toolkit.settings.<type>.v1~`: `<type>` encodes the category — entities (`category`, `declaration`, `value`, `effective_value`, `change_set`), errors (`error_<name>`), events (`event_<name>`, §4.4).
+Settings domain entities have canonical JSON Schemas with GTS-compliant `$id` identifiers, registered during gear init via `TypesRegistryClient.register(...)`. Naming follows the four-segment shape `gts.cf.core.settings.<type>.v1~`: `<type>` encodes the category — entities (`category`, `declaration`, `value`, `effective_value`, `change_set`), errors (`error_<name>`), events (`event_<name>`, §4.4).
 
 | Schema | GTS `$id` | Status |
 |--------|-----------|--------|
-| Category | `gts://gts.cf.toolkit.settings.category.v1~` | Registered at gear init |
-| Setting Declaration | `gts://gts.cf.toolkit.settings.declaration.v1~` | Registered at gear init |
-| Setting Value | `gts://gts.cf.toolkit.settings.value.v1~` | Registered at gear init |
-| Effective Value | `gts://gts.cf.toolkit.settings.effective_value.v1~` | Registered at gear init |
-| Change Set | `gts://gts.cf.toolkit.settings.change_set.v1~` | Registered at gear init (activation status resource type, §4.8 / Settings Activation) |
+| Category | `gts://gts.cf.core.settings.category.v1~` | Registered at gear init |
+| Setting Declaration | `gts://gts.cf.core.settings.declaration.v1~` | Registered at gear init |
+| Setting Value | `gts://gts.cf.core.settings.value.v1~` | Registered at gear init |
+| Effective Value | `gts://gts.cf.core.settings.effective_value.v1~` | Registered at gear init |
+| Change Set | `gts://gts.cf.core.settings.change_set.v1~` | Registered at gear init (activation status resource type, §4.8 / Settings Activation) |
+| Setting Type (base) | `gts://gts.cf.core.settings.setting_type.v1~` | Gear-owned abstract base (`x-gts-abstract: true`) for every concrete setting key; registered at gear init |
 
-The settings **event** schemas (`event_value_changed`, `event_value_change_failed`, `event_declaration_registered`, `event_declaration_retired`, `event_declaration_reactivated`, `event_secret_used`; §4.4) are also registered at gear init; their registered `$id`s are the base-event-composed forms, derived from `gts.cf.core.events.type.v1~` (e.g. `gts://gts.cf.core.events.type.v1~cf.toolkit.settings.event_value_changed.v1~`). The `change_notification` and `cache_invalidate` signal schemas are owned by the Settings Activation. The `change_set` **resource type** (read scope for activation status, activation §4.8) is a control-plane type registered **here** — the signal schemas stay with Activation, the RBAC resource type sits under the settings registry.
+The settings **event** schemas (`event_value_changed`, `event_value_change_failed`, `event_declaration_registered`, `event_declaration_retired`, `event_declaration_reactivated`, `event_secret_used`; §4.4) are also registered at gear init; their registered `$id`s are the base-event-composed forms, derived from `gts.cf.core.events.type.v1~` (e.g. `gts://gts.cf.core.events.type.v1~cf.core.settings.event_value_changed.v1~`). The `change_notification` and `cache_invalidate` signal schemas are owned by the Settings Activation. The `change_set` **resource type** (read scope for activation status, activation §4.8) is a control-plane type registered **here** — the signal schemas stay with Activation, the RBAC resource type sits under the settings registry.
 
-> **Two families of GTS identifiers.** The identifiers above are the settings **control-plane** entity/event types — the shape of our rows (a category, a declaration, a value, and so on), authored by the gear itself under `gts.cf.toolkit.settings.*~`. Separate from them: the **value types** a setting's value conforms to — a small **curated catalog** under `gts.cf.toolkit.settings.type_*~` (`bool_flag`, number ranges, `url`, choice lists, …), each a registered GTS **type**, named by a declaration's `value_type_id`.
+> **Three roles, with ownership visible in the identifier.** The Settings gear owns its **control-plane** entity/event types — the shape of our rows and messages (a category, a declaration, a value, and so on) — under `gts.cf.core.settings.*~`. It also owns the abstract `gts.cf.core.settings.setting_type.v1~` base from which concrete setting keys derive. Separately, the gear SDK ships a curated library of **schema templates** — `bool_flag`, number ranges, `url`, choice lists, … — that an author starts a `value_schema` from. These are schema fragments, not registered types: a GTS chain has a single parent, already spent on `setting_type`, so a value shape cannot sit in the chain as a second ancestor, and a registration nothing references would buy nothing.
 >
-> A **setting is itself a registered GTS type**, derived from the control-plane `value` entity type above:
+> A **setting is itself a registered GTS type**, derived from the Settings gear-owned `setting_type` base:
 >
 > ```text
-> gts.cf.toolkit.settings.value.v1~<vendor>.<package>.<category>.<name>.v1~
+> gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~
 > ```
 >
 > The derived half is four segments before the version and carries no `gts.` prefix — that prefix appears once, at the head of the chain. The trailing `~` is the entire difference between a type identifier and an instance identifier, and it is what lets an authorization policy name one setting, or a wildcarded subtree of settings, in a permission's `resource_type` (§4.8, `docs/arch/authorization/PERMISSION_GTS_TYPE.md`).
@@ -1683,18 +1794,26 @@ The settings **event** schemas (`event_value_changed`, `event_value_change_faile
 > - **Module** settings: the gear supplies the derived half; its vendor/package segments follow **who authored the gear** — CF-authored modules use `cf.settings.<category>.<name>.v1`, third-party-vendor modules `<vendor>.<vendor_package>.<category>.<name>.v1`. The `<category>` segment is the category the setting belongs to (extracted by the reconciler — §4.2 *Contribution Reconciler*).
 > - **Admin** settings: the derived half is `<vendor>.settings.<category>.<name>.v1` — `<vendor>`/`<name>` entered by the admin, `<category>` = the category it was created in (§4.2 *Declaration Management*).
 >
-> **When the type is registered.** Both authoring paths call `TypesRegistryClient::register_type_schemas` before inserting the row, composing the schema from the base type and the setting's `value_type_id`. The composed schema carries **no `default`** — the Schema Default lives in the `default_value` column alone (§4.1), and registration must not give it a second home. The base is registered at gear init (above), so the chain parent always exists — the registry rejects a child whose parent is absent (`FailedPrecondition`). Registration is idempotent, so a retry after a failed create re-registers the same type rather than minting a second one, and a create that fails leaves no declaration behind. The reverse — a type registered whose insert then failed — is possible and harmless: a type with no declaration resolves but names nothing, and the retry reuses it.
+> **What the composed schema describes.** The registered type describes a setting's **value envelope**, not the bare value: `type` (the setting's own key), `tenant_id`, the optional `subject_type`/`subject_id` pair, and `value`. The envelope is **closed** (`additionalProperties: false`) — it is this service's own record shape, and a party needing another field declares it inside `value`. The subject pair is enforced by the schema rather than described in prose (`dependencies: { "subject_type": ["subject_id"] }`), matching the `CHECK` that requires a subject to be named by **both** of its columns or by neither (§4.1). At platform scope `tenant_id` is the **root tenant's id** — platform scope is an ordinary tenant id here as everywhere else (§4.2 *Value Resolver*), never a reserved all-zeros sentinel.
 >
-> **Retiring a declaration does not unregister its type.** The registry has no unregister operation, so a retired setting's type stays resolvable — which is what makes re-declare-to-revive (§4.3) a lookup rather than a re-mint. The service still never invents value *shapes*: those come from the curated catalog, added as reviewed design-time changes.
+> **`value` carries whatever shape the setting declares, scalar included.** Nothing constrains it to an object. Forcing one would give every `bool` or `string` setting an invented wrapper field, and would make the in-process reader (§4.5) hand a consumer an object where it asked for a `bool`. draft-07 describes a scalar as readily as a structure, so the envelope leaves `value` unconstrained and the setting's own schema says what it is.
+>
+> **When the type is registered.** The abstract `setting_type` base is defined in the Settings gear SDK and registered at gear init; it is not part of `libs/toolkit-gts`. Both declaration-authoring paths then call `TypesRegistryClient::register_type_schemas` before inserting the row, composing the concrete setting schema from that base and the declaration's `value_schema`. The composed schema declares **JSON Schema draft-07**: the Registry admits that dialect alone and refuses anything else on admission (`UnsupportedDialect`), so the dialect is a registration precondition rather than a preference. The composed schema carries **no `default`** — the Schema Default lives in the `default_value` column alone (§4.1), and registration must not give it a second home. It carries **no declaration metadata** either: `x-gts-traits` on a setting type describes the **value** — `secret`, `multiline`, the cron dialect, a dynamic-enum source, an entity reference — while Scope Class, Mode, Domain Affinity, `data_classification`, `requires_step_up` and `anonymous_exposable` stay **declaration columns**. Each is read where it is enforced: the resolver loads Scope Class on every resolve, search filtering and a DB `CHECK` stand on `data_classification`, and the two gated flags are written in the same transaction that verifies step-up and audits the change (§4.2 *Declaration Management*). Mirroring them into the type would not move them out of the database — it would only give each a second home. Because the parent is registered first, the Registry can resolve the chain; it rejects a child whose parent is absent (`FailedPrecondition`). Registration is idempotent, so a retry after a failed create re-registers the same type rather than minting a second one, and a create that fails leaves no declaration behind. The reverse — a type registered whose insert then failed — is possible and harmless: a type with no declaration resolves but names nothing, and the retry reuses it.
+>
+> **Retiring a declaration does not unregister its type.** The registry has no unregister operation, so a retired setting's type stays resolvable — which is what makes re-declare-to-revive (§4.3) a lookup rather than a re-mint. The service still never invents value *shapes*: a gear brings its own, an administrator starts from a reviewed template.
 
-#### Compatibility mode for value types
+#### Compatibility mode for setting types
 
-**Value types** (`value_type_id`, §1.3) are registered under **`backward`** compatibility with a **closed** content model. The GTS Registry decides — automatically, by schema diff at registration time — whether a new value-type version is compatible; the Settings Service does not adjudicate this itself. The mode defines the boundary the rest of this design relies on:
+Setting types are registered under **`backward`** compatibility with a **closed** content model. The GTS Registry decides — automatically, by schema diff at registration time — whether a revision of an already-registered type is compatible; the Settings Service does not adjudicate this itself. Because a setting's value schema sits **inside** its registered type, that verdict governs every re-registration at an existing key:
 
-- A revision the Registry accepts as **backward-compatible** is a **minor** version of the value type (e.g. add an optional field, widen an enum). A setting referencing it needs no upgrade: its `key` and `value_type_id` are unchanged and a `vN` lookup on the value type resolves to the latest minor; old stored overrides still validate, so values are preserved.
-- A change that would break already-stored values (add a required field, retype a field) — or any switch to a **different value type** (`bool_flag`→`string`) — is expressed as an **upgrade of the setting**: a **new setting major** whose `value_type_id` names the new value type (§4.2 *Contribution Reconciler*). The old version and its values are **retained**; old values are **copied** to the new key and re-validated, failures flagged `needs_review` (§4.2 *Contribution Reconciler*). The value-type change itself is not shoe-horned into the *value type's* own major — the value type is a shared catalog entry — it drives a **new setting version** instead.
+- A revision the Registry **accepts** keeps the key. The declaration adopts the new `value_schema`, stored overrides still validate, and a widening (add an optional field, widen an enum) is therefore an ordinary edit rather than a migration.
+- A revision it **refuses** cannot be applied at that key at all. The change is expressed as an **upgrade of the setting** — a **new setting major** carrying the new schema (§4.2 *Contribution Reconciler*). The old version and its values are **retained**; old values are **copied** to the new key and re-validated, failures flagged `needs_review`.
 
-We pin `backward` (not `forward` or `full`) for value types because the reader that must survive is a **new schema reading an already-stored value** — exactly the backward guarantee. `forward` optimizes the opposite direction (old readers, new data), which this service has no need for.
+**The contribution path is stricter than the Registry.** A gear may not change `value_schema` at the same major at all, compatible or not (§4.2 *Contribution Reconciler*); only the administrator's revive works up to the Registry's verdict. The Registry's boundary is the outer limit, not the licence.
+
+**Metadata edits cannot fail this check.** `description`, `default`, `x-gts-traits` and the other JSON Schema annotations are excluded from the compatibility diff, so editing what a setting *says about itself* never forces a major — only the shape of the values it admits does.
+
+We pin `backward` (not `forward` or `full`) because the reader that must survive is a **new schema reading an already-stored value** — exactly the backward guarantee. `forward` optimizes the opposite direction (old readers, new data), which this service has no need for.
 
 ### 4.8 Security & Authorization
 
@@ -1706,35 +1825,39 @@ Authorization is enforced server-side via `PolicyEnforcer` over the AuthZ Resolv
 - **`read`** — resolve / browse / search effective values; list declarations and categories.
 - **`write`** — change a *value* (set / revert / remove / clone).
 - **`create`** — create a `declaration` or a `category`.
-- **`update`** — edit a `declaration`'s metadata (including `tenant_visible` / `tenant_overridable`, platform-scope-gated) or a `category`.
+- **`update`** — edit a `declaration`'s metadata (platform-scope-gated) or a `category`.
+- **`delegate`** — set or clear a descendant tenant's access restriction (`read_only` / `hidden`, §4.2 *Tenant Access*). Distinct from `write`: changing a value and restricting its administrator are different powers.
 - **`delete`** — **retire** a `declaration` (soft-delete, `status=retired`, §4.2 *Declaration Management*) or delete an (empty) `category`.
 - **No `reveal` action** — secret plaintext has no administrative action or endpoint at all. It resolves only through the **machine-only** reader path (`resolve_secret`, §4.5), authorized per setting against the calling service and audited as a secret-use event (§4.2 *Secret Manager*).
 
 > **No coarse `manage` action.** Definition governance is **per-resource-type CRUD** (`declaration` / `category` → `create` / `read` / `update` / `delete`), matching the platform PEP pattern (AM, RMS, RBAC service), so "may edit but not retire" or "may create but not delete categories" are grantable via `{operation, target_type}` role rules. A platform-admin bundle aggregates these through a role definition with `operation: "*"` (RBAC engine) — no umbrella action needed. **Value** actions stay upsert-style: `value` keeps `write` (a value write is an upsert at `(key, tenant)`, §4.2 *Value Writer*), distinct from the UUID-addressed `update` of declarations/categories.
 
-**What a value operation names as its resource.** A value operation — resolve, browse, search, set, revert, clone, validate — names **the setting itself**: its `key`, which is a GTS type id (§4.7). A definition operation names the control-plane type of the row it touches (`declaration`, `category`, `change_set`). That single choice is the access model: a grant on the base `gts.cf.toolkit.settings.value.v1~` reaches every setting derived from it (implicit derived-type coverage, GTS §3.6), a wildcard grant reaches a subtree — `…value.v1~acme.billing.*`, everything one vendor contributed — and a grant naming one key reaches exactly that setting. The gear interprets none of it: it passes the key as the resource and the platform matches (§4.1).
+**What a value operation names as its resource.** A value operation — resolve, browse, search, set, revert, clone, validate — names **the setting itself**: its `key`, which is a GTS type id (§4.7). A definition operation names the control-plane type of the row it touches (`declaration`, `category`, `change_set`). A grant on the gear-owned base `gts.cf.core.settings.setting_type.v1~` reaches every setting derived from it (implicit derived-type coverage, GTS §3.6); a wildcard such as `…setting_type.v1~acme.settings.billing.*` reaches a subtree; a grant naming one key reaches exactly that setting. The gear passes the key as the resource and leaves matching to the platform.
 
 | Operation | Required permission | Scope | Unauthorized response |
 |-----------|---------------------|-------|------------------------|
 | Any call without valid authentication | Valid bearer token (AuthN Resolver) | — | `401`. AuthN runs before AuthZ. |
-| Read effective value / browse / search | `read` on the **setting's key** (§4.7) — a grant on the base type covers every setting, a narrower grant only its own subtree (*Listing under a narrowed grant*, below); further gated by `tenant_visible` + licence | Caller scope subtree | `404` for not-visible settings (no existence leak, `cpt-cf-settings-service-nfr-scope-isolation`) |
-| Set a value (set/revert/remove) | `write` on the **setting's key** (§4.7); **for a tenant caller** also `tenant_overridable` (see the note below) | Target scope, within the caller's subtree | `403`/`409` |
-| **Clone** a value | `read` on the **setting's key** at the **source** scope **and** `write` on it at the **target**, plus `tenant_overridable` there **when the caller is a tenant** — both within the caller's subtree (§4.2 *Value Writer*). Read authorization on the source is mandatory: without it, clone would exfiltrate a value the caller may not read. | Source + target scope | `403`/`409` |
-| Create declaration / category | `create` on `gts.cf.toolkit.settings.declaration.v1~` / `gts.cf.toolkit.settings.category.v1~` | Platform (admin) | `403` |
-| Update declaration / category (metadata; declaration incl. `tenant_visible`/`tenant_overridable`) | `update` on `gts.cf.toolkit.settings.declaration.v1~` / `gts.cf.toolkit.settings.category.v1~` | Platform only | `403` — tenants MUST NOT change their own visibility/override (`cpt-cf-settings-service-fr-tenant-scope-enforcement`) |
-| Retire declaration (soft-delete) | `delete` on `gts.cf.toolkit.settings.declaration.v1~` **+ IdP step-up** — behavior-affecting: it drops a live setting out of resolution (§4.2 *Declaration Management*) | Platform (admin) | `401`/`403`/`409` |
-| Reactivate declaration (re-declare-to-revive) | `create` on `gts.cf.toolkit.settings.declaration.v1~` **+ IdP step-up** — behavior-affecting: it puts a setting back into live resolution (§4.3). The **module** revive path is machine-side and not step-up gated (§4.2 *Contribution Reconciler*). | Platform (admin) | `401`/`403` |
-| Delete (empty) category | `delete` on `gts.cf.toolkit.settings.category.v1~` — **no step-up**: an empty category holds no setting, so its removal changes no effective value | Platform (admin) | `403`/`409` |
+| Read effective value / browse / search | `read` on the **setting's key** (§4.7), plus caller access other than `hidden` and licence | Caller scope subtree | `404` for hidden settings (no existence leak, `cpt-cf-settings-service-nfr-scope-isolation`) |
+| Set a value (set/revert/remove) | `write` on the **setting's key** (§4.7); a tenant caller's own effective access must be `overridable` | Target scope, within the caller's subtree | `403`/`409` |
+| Set or clear a tenant's access restriction | `delegate` on the **setting's key**; target is a strict descendant, never the caller itself (§4.2 *Tenant Access*) | Strictly below the caller | `403` |
+| **Clone** a value | `read` at the source and `write` at the target; a tenant caller's own effective access must be `overridable`. Both scopes must be in its subtree (§4.2 *Value Writer*) | Source + target scope | `403`/`409` |
+| Create declaration / category | `create` on `gts.cf.core.settings.declaration.v1~` / `gts.cf.core.settings.category.v1~` | Platform (admin) | `403` |
+| Update declaration / category (metadata) | `update` on `gts.cf.core.settings.declaration.v1~` / `update` on `gts.cf.core.settings.category.v1~` | Platform only | `403`; tenant access is changed only through the strict-descendant `delegate` operation (`cpt-cf-settings-service-fr-tenant-scope-enforcement`) |
+| Retire declaration (soft-delete) | `delete` on `gts.cf.core.settings.declaration.v1~` **+ IdP step-up** — behavior-affecting: it drops a live setting out of resolution (§4.2 *Declaration Management*) | Platform (admin) | `401`/`403`/`409` |
+| Reactivate declaration (re-declare-to-revive) | `create` on `gts.cf.core.settings.declaration.v1~` **+ IdP step-up** — behavior-affecting: it puts a setting back into live resolution (§4.3). The **module** revive path is machine-side and not step-up gated (§4.2 *Contribution Reconciler*). | Platform (admin) | `401`/`403` |
+| Delete (empty) category | `delete` on `gts.cf.core.settings.category.v1~` — **no step-up**: an empty category holds no setting, so its removal changes no effective value | Platform (admin) | `403`/`409` |
 | Set a value as a **service principal** | `write` at the target scope, with the **verified service principal from the token** as subject and the setting key as resource; a grant is narrowed by a GTS wildcard on the key's derived half, never by the declaration's caller-supplied `owner_module` (§4.2 *Value Writer*). **No step-up** — a service has no interactive re-authentication to offer — and a declaration with `requires_step_up` is refused `403` before validation (§4.2 *Value Writer*) | The scopes the decision allows | `403` |
 | Read anonymous-exposable values (`GET /settings-service/v1/public/settings`) | **None** — the one unauthenticated route (§4.3). Selection is the `anonymous_exposable` flag, not a permission; `secret`/`pii` cannot carry it (§4.7) | The tenant named in the parameter | `200` with an empty set for an unknown tenant — never a distinguishable error |
 | Validate a value (`POST /settings-service/v1/settings/{key}/validate`) | `read` on the **setting's key** — **no step-up** (read-only, §4.2 *Value Writer*) | Own scope subtree | `403` |
-| Read activation status (`GET /settings-service/v1/change-sets/{change_set_id}/activation`) | `read` on `gts.cf.toolkit.settings.change_set.v1~` | The change set's tenant subtree | `404` when not visible (activation §4.8) |
+| Read activation status (`GET /settings-service/v1/change-sets/{change_set_id}/activation`) | `read` on `gts.cf.core.settings.change_set.v1~` | The change set's tenant subtree | `404` when not visible (activation §4.8) |
 | Resolve a secret's plaintext (`resolve_secret`, machine path) | **Machine-only — no administrative action exists.** Authorized **per setting** — the resource is that setting's key, so a service is granted the secrets it needs one at a time or by wildcard — against the **calling service**, and audited as a secret-use event (§4.2 *Secret Manager*); but against a **declared** identity while a verified one is still a prerequisite (§6), so both the check and the attribution are bounded by the trusted-caller boundary below, not stronger than it. | Caller's scope | `403` |
 | Internal **SDK traits** (`SettingsReaderClient` read; `SettingsContributionClient` register/retire) | **Trusted caller** — no in-service service-identity check (§6). Caller owns `tenant_id` correctness/scope-read right (read) and `owner_module` correctness (contribution). Valid **within the deployment's trust boundary** only. | — | — |
 
 `PATCH`/`DELETE` on categories and declarations additionally require the `If-Match` precondition (§4.3).
 
-**`tenant_overridable` binds tenant callers, not the platform administrator.** The flag answers "may a **tenant** set its own value for this setting" (§4.1, `cpt-cf-settings-service-fr-tenant-scope-enforcement`), so a platform administrator targeting a specific tenant (§4.3 *Revert & Clone Rules*) is not blocked by it. Reading the flag as an unconditional gate would erase a shape the model deliberately supports: a `cascading` or `local` setting with `tenant_overridable = false` carries **different values per tenant, inherited by their subtrees, writable only centrally** — a per-tenant quota or limit set by the platform. `scope_class = global` is the separate case: there the flag is forced `false` by a `CHECK` (§4.7) and **nobody**, platform administrator included, writes a tenant-scoped value, because a `global` setting has none to write.
+**Access binds the writer, not the target.** A tenant caller may write only when its own effective access is `overridable`. An authorized ancestor may still write at a restricted descendant, which supports centrally managed per-tenant limits. The descendant's stored value remains effective and inheritable.
+
+`scope_class = global` is the separate case, and it is stronger than any row: **nobody**, platform administrator included, writes a tenant-scoped value, because a `global` setting has none to write.
 
 > Grants live in the deployment's policy manager, not here: this gear asks and enforces, stores no roles, and cannot assign anything. It owes the platform a published list of what can be granted — its actions as permission entries of `gts.cf.toolkit.authz.permission.v1~` — and that is not done yet.
 
@@ -1748,9 +1871,9 @@ A point read asks about one setting and is answered by one decision. A list — 
 
 Three properties hold whichever step answers:
 
-- **Absent, not marked.** A setting the caller may not read is missing from the page — not returned with a flag, not counted in the total — and a single read of it answers `404` (`cpt-cf-settings-service-nfr-scope-isolation`). It is the rule `tenant_visible` already follows.
+- **Absent, not marked.** A setting the caller may not read is missing from the page and count; a point read answers `404` (`cpt-cf-settings-service-nfr-scope-isolation`).
 - **A decision filter, not a row scope.** Tenant scoping still arrives as constraints compiled into an `AccessScope` (*The Data Path*, below). The batch answers only "may this caller see this setting".
-- **Narrowing only.** A grant adds no visibility: `tenant_visible`, licence and the caller's subtree are checked on top of it, exactly as before.
+- **Narrowing only.** A grant does not override `hidden`, licence, or subtree checks.
 
 **What it costs.** One decision for the whole page in the common case; one batch request per refill round in the narrowed one — never one request per setting. The platform's decision cache would remove most of what remains, but its protocol is explicitly unspecified (`docs/arch/authorization/DESIGN.md`, *Authorization Decision Caching*), so nothing here leans on it.
 
@@ -1766,7 +1889,7 @@ Every query this gear issues goes through `SecureConn`, which takes an `AccessSc
 | Reading or listing definitions | `categories`, `setting_declarations` | **unconstrained — these entities have no tenant dimension** | not an exception, see below |
 | **Resolving an effective value** | `setting_values` | **elevated to the caller's ancestor chain** | the one exception |
 
-**Definitions carry no tenant, so there is nothing to scope.** A category or a declaration is a platform-wide definition: neither table has a `tenant_id`, and a scope filtering on `owner_tenant_id` would reference a property that does not resolve — which the platform treats as a failed constraint, denying every row (rule 9: an unknown property makes its constraint false). An unconstrained scope here is not a boundary being crossed but the accurate statement that this table has no boundary. What governs access is the authorization *decision* — may this caller read declarations at all — together with ordinary predicates of this design's own: `tenant_visible`, licence and mode filtering. Those are business rules on our columns, not row-level scoping, and they are applied as query predicates exactly as they are today.
+**Definitions carry no tenant, so there is nothing to scope.** Categories and declarations are platform-wide and have no `tenant_id`; applying a tenant property would deny every row. Access is instead narrowed by the authorization decision plus tenant access, licence, and mode predicates.
 
 **The ancestor walk is a real elevation, and it is the only one.** Resolving a `cascading` value reads rows belonging to the caller's ancestors, and an ancestor is never inside the caller's closure — a closure runs downward. So this read cannot be expressed with the caller's own scope, and it should not be: **receiving a value inherited from an ancestor is not the same as being entitled to read that ancestor's settings.** A tenant administrator must not be able to enumerate a parent's overrides or see what the parent set for a sibling. The walk is therefore the service deriving a result on the caller's behalf, not the caller exercising authority — the case the platform's trust elevation exists for, and the shape Account Management already uses for its own hierarchy reads (`AccessScope::allow_all()` behind a single named call site).
 
@@ -1785,7 +1908,7 @@ Three rules keep it reviewable:
 | API authentication | OIDC bearer via AuthN Resolver; a write to a declaration that requires elevated confirmation also requires IdP credential step-up. |
 | API authorization | `PolicyEnforcer` over the AuthZ Resolver, fail-closed; tenant scope forced server-side. |
 | Tenant subtree isolation | Every read/search/list/mutate is constrained to the caller's own subtree server-side (own tenant or a descendant); a target outside the subtree is rejected; never relies on client-side filtering (`cpt-cf-settings-service-fr-tenant-scope-enforcement`, `cpt-cf-settings-service-nfr-scope-isolation`). |
-| Visibility vs Scope Class | Reads gated by `tenant_visible` (a `global` setting may be tenant-visible read-only); overrides gated by Scope Class + `tenant_overridable`. |
+| Tenant Access vs Scope Class | Administrative reads require access other than `hidden`; tenant writes require the writer's access to be `overridable`. Scope Class independently determines where values may exist (§4.1 *TenantAccessRestriction*). |
 | Feature/licence gating | Gated settings/categories excluded server-side across all REST read/browse/search paths via License Resolver entitlement checks (`LicenseResolverClient`, fail-closed); the in-process `SettingsReaderClient` hot path is not licence-gated — services receive values regardless of UI entitlement (`cpt-cf-settings-service-fr-feature-license-gating`). |
 | Audit | Every mutation writes an immutable audit record (`cpt-cf-settings-service-fr-audit-mutations`). |
 | Secret confidentiality | `secret`-trait values are stored by reference in the Credential Store (the credstore backend); masked on every **administrative** read/search/list/audit path, with **no human reveal path**. Plaintext is returned only through the **machine-only** reader path (`resolve_secret`, §4.5), authorized per setting against the calling service and audited as a secret-use event; never cached in plaintext (§4.2 *Secret Manager*, *Cache & Invalidation*). |
@@ -1794,7 +1917,7 @@ Three rules keep it reviewable:
 | Input validation | GTS type + trait validation on every value; Scope Class / overridability checks; scope-path validation; namespaced-key check for contributed declarations. |
 | Contributed-declaration protection | Module-contributed declarations are immutable to admins (values only). |
 | Optimistic concurrency | Every mutating call requires `If-Match`, so a concurrent edit fails `412` instead of overwriting (§4.2 *Value Writer*). |
-| Declaration mutation gating | No declaration edit can silently change a live setting's resolution: descriptive metadata is immediate, resolution-affecting fields (`default_value`, value type, `scope_class`) are **immutable** (`422`; change via replacement declaration / new major version), and the two resolution-affecting actions — **retire** and **reactivate** — require credential step-up (§4.2 *Declaration Management*, §4.3, §4.8). |
+| Declaration mutation gating | No declaration edit can silently change a live setting's resolution: descriptive metadata is immediate, resolution-affecting fields (`default_value`, `value_schema`, `scope_class`) are **immutable** (`422`; change via replacement declaration / new major version), and the two resolution-affecting actions — **retire** and **reactivate** — require credential step-up (§4.2 *Declaration Management*, §4.3, §4.8). |
 | Fail-safe writes | A value changes only through an explicit, step-up-verified write that validates first; a rejected change stores nothing and raises an `event_value_change_failed` notification (§4.4) (`cpt-cf-settings-service-nfr-reliability-validated-set`). |
 
 #### Trusted-Caller Boundary
@@ -1805,7 +1928,7 @@ The gear's two internal SDK traits — `SettingsReaderClient` and `SettingsContr
 
 **Bound remotely, the boundary is gone and must be rebuilt.** Same trait, a network hop, no code difference (§4.5, §4.9) — and the gear cannot tell the two cases apart. What such an exposure permits, concretely:
 
-- **Read** — the caller supplies `tenant_id` and the service resolves against it without checking the caller's right to that scope, so any reachable caller reads any tenant's effective values, `tenant_visible` notwithstanding.
+- **Read** — the caller supplies `tenant_id` and the service resolves against it without checking the caller's right to that scope, so any reachable caller reads any tenant's effective values, permission rows notwithstanding.
 - **Contribution** — `owner_module` is caller-supplied, so any reachable caller can register declarations under another gear's namespace or **retire** that gear's settings, removing them from resolution platform-wide.
 - **Secret plaintext** — `resolve_secret` authorizes and attributes against a **declared** caller identity (§6), so both the per-setting check and the audit record are only as strong as this boundary.
 
@@ -1872,7 +1995,7 @@ The Settings Service is **supplied as a Constructor Fabric Gear** — a composab
 | HTTP surface | Axum, OpenAPI-documented REST | RFC 9457 problem details; OData on collection lists via `toolkit_odata` |
 | Persistence | PostgreSQL via `toolkit-db`, reached through `SecureConn` with a `PolicyEnforcer`-compiled `AccessScope` (§4.8 *The Data Path*) | Partial and trigram GIN indexes; UUIDv7 keys. Postgres is required rather than one backend of three — recorded as a deviation in §3.2 |
 | In-process wiring | `ClientHub` | Resolves each dependency to a local implementation or a generated REST client per deployment profile |
-| Type validation | JSON Schema 2020-12 + `x-gts-traits` | Resolved from `types-registry`; validation only, never a second default |
+| Type validation | JSON Schema draft-07 + `x-gts-traits` | The declaration's own `value_schema`, read locally — no Registry call on the write path; validation only, never a second default |
 | Secret storage | `credstore` gear | Values held by opaque reference; plaintext never in this gear's database, cache, index, or audit |
 | Eventing | Event Broker | Change lifecycle, declaration lifecycle, secret-use, and the two activation signals |
 | Search | `pg_trgm` GIN | Substring match over key, description, category name, and non-secret value projections |
@@ -1884,30 +2007,30 @@ The Settings Service is **supplied as a Constructor Fabric Gear** — a composab
 
 Decisions taken during design, with the alternative that was rejected and the residual cost.
 
-- **Upgrade & old-key reader support — RESOLVED: eternal compatibility + migrate**. An **upgrade** is a **new setting major** under the same version-stripped path (`…sett1.v1`→`…sett1.v2`), optionally referencing a different value type (§4.2 *Contribution Reconciler*). The service keeps **both** versions:
-  - **Old version retained forever, read-only.** The old `key`, its declaration, and its override values are **kept** — never auto-retired by the upgrade — and resolve in the **old shape**, so existing readers on the old key keep working. `v1`/`v2` values diverge from that point (the old snapshot is frozen; there is no `v2→v1` down-conversion — a breaking shape change makes it impossible in general, which is the point of a new major).
-  - **Values migrated to the new version.** Old override values are **copied** to the new key and **re-validated** against the new value type; failures are flagged **`needs_review`** and excluded from resolution until fixed (§4.2 *Contribution Reconciler* / *Value Resolver*). Old↔new succession is **derived from the shared version-stripped path** (no stored pointer).
-  - **A deprecation *window* is deliberately NOT used** — the service cannot know when all old-key readers are gone (reads are unregistered pull, §4.5), so any timer either never safely closes or breaks a live reader. Eternal retention side-steps that; a version is removed only by an explicit `retire_declarations` (§4.2 *Contribution Reconciler*), not on a timer.
-  - **Legacy-version visibility (follow-up):** because each version is a separate declaration, the admin UI/`list_declarations` MUST be able to surface **all live versions** of a setting (grouped by version-stripped path, older majors marked superseded) so old-key overrides remain viewable/editable/purgeable — otherwise they are unmanageable. Grouping and predecessor are **derived from the key** (stripped path + major); with `needs_review` already present, the grouped listing/UX affordance is a **DESIGN follow-up** (not a blocker for the model).
+- **Upgrade & old-key reader support — RESOLVED: eternal compatibility + migrate**. An **upgrade** is a **new setting major** under the same version-stripped path (`…sett1.v1`→`…sett1.v2`), optionally carrying a different value schema (§4.2 *Contribution Reconciler*). The service keeps **both** versions:
+  - **Old version retained, retired.** The old `key`, its declaration and its override values are **kept** — nothing is deleted — but the upgrade **retires** the old declaration, so the leaf name is free for the successor (§4.7) and only one major of a setting is ever active. A reader still holding the old key gets the distinct `Retired` outcome rather than a stale value (§4.2 *Contribution Reconciler*); that is the cost of one live major, and it is paid deliberately — the alternative, two majors resolving side by side, splits a tenant's value across keys and leaves an administrator unable to say what a tenant's value is without naming a version. `v1`/`v2` values diverge from that point (the old snapshot is frozen; there is no `v2→v1` down-conversion — a breaking shape change makes it impossible in general, which is the point of a new major).
+  - **Values migrated to the new version.** Old override values are **copied** to the new key and **re-validated** against the new schema; failures are flagged **`needs_review`** and excluded from resolution until fixed (§4.2 *Contribution Reconciler* / *Value Resolver*). Old↔new succession is **derived from the shared version-stripped path** (no stored pointer).
+  - **No deprecation *window*, and no timer** — the retirement happens **at the upgrade**, not after a grace period the service could not size: reads are unregistered pull (§4.5), so it cannot know when the last old-key reader is gone. Values are never removed on a timer either; a declaration and its retained values leave only by an explicit purge, whose disposition is still open (§13).
+  - **Legacy-version visibility (follow-up):** because each version is a separate declaration, the admin UI/`list_declarations` MUST be able to surface a setting's **retired predecessors** (grouped by version-stripped path, older majors marked superseded) so old-key overrides remain viewable/editable/purgeable — otherwise they are unmanageable. Grouping and predecessor are **derived from the key** (stripped path + major); with `needs_review` already present, the grouped listing/UX affordance is a **DESIGN follow-up** (not a blocker for the model).
 - **Admin type-evolution & module-level type versioning — RESOLVED: evolution rides the re-key/upgrade path; no `module_type_version` field**. An admin-authored setting evolves by the **same major re-key path** as a gear setting: a value-shape change is a **new setting major** under the shared version-stripped path → a **new key**, with old values **copied to the new key and re-validated** (§4.2 *Contribution Reconciler*). There is **no dedicated `evolve_declaration` operation** — the generic re-key mechanism is the single evolution path for both authors, so an admin setting evolves **without value loss** — no retire-and-recreate that would drop every scoped value. There is **no `module_type_version` field** (§1.3, §4.2 *Contribution Reconciler* `register_declarations`, §4.4 event, §4.7 schema): compatible-vs-upgrade detection is driven entirely by the instance id's `.vN` **major** on the version-stripped path (§4.2 *Contribution Reconciler* cases a/b/c), so a separate module-level version would be inert while still requiring ordering/comparison semantics to be defined; the design omits it rather than specifying it.
 - **Service-to-service authorization for the SDK traits — RESOLVED: out of scope; trusted caller**. The gear's two internal SDK traits — `SettingsReaderClient` (read) and `SettingsContributionClient` (contribution write) — treat the **caller as trusted**, whether resolved in-process via `ClientHub` or served over REST out-of-process (§4.9). The Settings Service does **not** implement a service-identity AuthN/AuthZ model of its own for them.
-  - **Read (`get_effective`):** the caller **supplies the `tenant_id`** for effective-value resolution and is **responsible for its correctness and for its own right to read that scope**. The service resolves against the given `tenant_id` and does **not** verify caller↔tenant authorization, nor re-gate `tenant_visible`/`global` for a service reader. Scope-read authorization over the network hop is the **caller's** responsibility.
+  - **Read (`get_effective`):** the caller **supplies the `tenant_id`** for effective-value resolution and is **responsible for its correctness and for its own right to read that scope**. The service resolves against the given `tenant_id` and does **not** verify caller↔tenant authorization, nor re-gate permission or `global` for a service reader. Scope-read authorization over the network hop is the **caller's** responsibility.
   - **Contribution (`register_declarations`/`retire_declarations`):** `owner_module` stays **caller-supplied and taken on trust** — the service verifies only that keys sit under the *claimed* gear's namespace (§4.2 *Contribution Reconciler*), not that the caller *is* that module. **Accepted risk:** a caller that can reach the contribution trait can register or **retire** declarations under another gear's `owner_module` (silently removing another gear's settings from resolution). This is accepted under the trust assumption below, not mitigated in-service.
   - **What this rests on, and until when:** the caller is trusted because it is **in the same process** — R1 binds these traits in-process only, publishes no REST contract for them, and fails at startup if configuration asks for a remote binding (§4.8 *Trusted-Caller Boundary*). So the assumption is enforced rather than declared. R2 allows the remote binding and closes the gap with the platform's accepted two-plane model: a `SecurityContext` from an S2S client-credentials exchange, with `owner_module` bound to its verified `subject_id` instead of taken as a string.
   - **Unaffected:** the **user-facing** REST surface (§4.3) keeps full RBAC + tenant-subtree enforcement (§4.8) — admin value/declaration writes and reads are authorization-checked. This decision covers **only** the gear's internal service-to-service SDK traits, not any human-initiated operation.
-- **Write scope for declaration create/metadata/remove — RESOLVED: declaration operations do not go through the value write path** (`cpt-cf-settings-service-fr-set-value`). That path covers **value** operations only (set / revert / remove-value / clone). **All** declaration operations apply **immediately**: `create_declaration` inserts directly, `update_declaration` edits metadata in place, and `delete_declaration` is an immediate **soft-delete (retire)** — `status=retired`, values **retained** but excluded from resolution, symmetric with a gear retire (§4.2 *Declaration Management*, *Contribution Reconciler*, §4.3). Rationale: a declaration edit has no in-effect value to gate — a fresh declaration has no reader, metadata has no runtime effect, and a retire takes the setting out of resolution at once. The exposure that `tenant_visible`/`tenant_overridable` cause is governed by RBAC (platform-admin-only, `cpt-cf-settings-service-fr-tenant-scope-enforcement`).
+- **Declaration operations do not use the value-write path.** Create and metadata update apply immediately; delete soft-retires the declaration while retaining values and access restrictions. Changing a descendant's access is also separate: it requires `delegate` and a strict-descendant target (§4.2 *Tenant Access*, §4.8).
 - **Last-change recency — RESOLVED: `max` of definition-change and resolved-value-change, no cross-tenant leak**. The admin read (§4.3) returns `last_change_at = max(declaration.last_change_at, resolved_row.last_change_at)` — the honest recency of the effective value the caller sees. The `max` is the right semantics only with both arms scoped narrowly: were the declaration `last_change_at` to mean "the declaration **or any of its values**," it would fold every tenant's override into a platform-visible field. So the declaration arm is definition-only (§1.3), and the value arm is the **resolved** row only (own→ancestor→default) — always in the caller's ancestor chain, never a max over sibling/descendant scopes. Recency is **admin-only** — not on the SDK reader / `EffectiveValue` (§4.5). A "changed anywhere in the subtree" view is a distinct, platform-admin-only semantic, deliberately not provided here.
-- **Schema Default authority — RESOLVED: the `default_value` column is authoritative**. The setting's **value type** is **validation-only** and carries no `default` keyword, so the default has a single home (the DB column), read locally with the values (GTS Registry off the resolution path). No column-vs-type divergence, no sync rule.
+- **Schema Default authority — RESOLVED: the `default_value` column is authoritative**. The setting's **`value_schema`** is **validation-only** and carries no `default` keyword, so the default has a single home (the DB column), read locally with the values (GTS Registry off the resolution path). No column-vs-type divergence, no sync rule.
 - **Reader degradation — RESOLVED: consumer's responsibility**. The service returns a distinguishable `Unavailable` error (§4.5); consumers handle resolve-failure like any dependency outage. (A `needs_review` override is not a consumer error — it falls through to a valid value, §4.2 *Value Resolver*.) The service does not substitute a Schema Default on failure; the SDK MAY serve stale-from-cache (bounded TTL) best-effort. Settings are a boot-time dependency and cold-boot failure surfaces via the consumer's readiness.
-- **Setting discovery — RESOLVED: settings are listed from the Settings DB, value types from the Registry.** A setting is a registered GTS type, but "list all settings" is still a Settings-DB query (§4.3 `list_declarations`): the Registry holds the type, the DB holds the declaration with its values and lifecycle. What the Registry lists is the small curated **value-type** catalog (`gts.cf.toolkit.settings.type_*~`) — the shapes an admin may pick from. Eligibility is built in: `create_declaration`/`register_declarations` reference a catalog value type via `value_type_id`, so an arbitrary/inappropriate shape cannot slip in; a genuinely new shape is a reviewed design-time addition to the catalog.
-- **Setting identity — RESOLVED: key is a GTS *type* id for both authors**. `gts.cf.toolkit.settings.value.v1~<derived-half>~`, registered when the declaration is created (§4.7). The shape the value must take is separate: a curated catalog type (`gts.cf.toolkit.settings.type_*~`) named by `value_type_id`. Both module and admin settings are uniformly GTS-referenceable, and nameable in a policy, by that type id.
-  - **Key = `gts.cf.toolkit.settings.value.v1~<vendor>.<package>.<category>.<name>.v1~`.** Base = the gear's own `value` entity type. Derived half = the setting: a **module** supplies its own (`<vendor>.[<pkg>|settings].<category>.<name>.v1`), and the reconciler extracts `<category>` from the namespace segment (§4.2 *Contribution Reconciler*); an **admin** half is `<vendor>.settings.<category>.<name>.v1`, `<vendor>`/`<name>` entered by the admin, `<category>` = the target category (§4.2 *Declaration Management*).
+- **Setting discovery — RESOLVED: settings are listed from the Settings DB.** A setting is a registered GTS type, but "list all settings" is still a Settings-DB query (§4.3 `list_declarations`): the Registry holds the type, the DB holds the declaration with its schema, values and lifecycle. The shapes an administrator may start from are the SDK's **schema templates** (§4.7), a reviewed design-time set — not a Registry listing.
+- **Setting identity — RESOLVED: key is a GTS *type* id for both authors**. `gts.cf.core.settings.setting_type.v1~<derived-half>~`, registered when the declaration is created (§4.7). The base belongs to the Settings gear; the value shape is carried **inside** that type as the envelope's `value` (§4.7). Both module and admin settings are uniformly GTS-referenceable and policy-addressable.
+  - **Key = `gts.cf.core.settings.setting_type.v1~<vendor>.<package>.<category>.<name>.v1~`.** A module supplies its derived half and the reconciler extracts `<category>` from its namespace segment; an admin half is `<vendor>.settings.<category>.<name>.v1`. The Settings gear registers the base from its SDK rather than adding it to `libs/toolkit-gts`.
 - **Dual addressing (declarations by UUID, values/history by key) — OPEN: the split holds, its justification is unwritten.** Consumers read by `key`; the management plane addresses declarations by UUIDv7 (§4.3). Deriving the split from key mutability does not work, because the `key` is immutable (§4.1). What it does rest on — server-composed keys, CRUD over a row identified by its primary key, and keeping the consumer contract off management-plane identifiers — is a **DESIGN follow-up**, not a blocker: the surface itself is unaffected either way.
-  - **Uniqueness lives in the Settings DB.** `key` is globally unique (`uq_declaration_key`, §4.7) and the leaf `name` is unique within its category (`UNIQUE(category_id, leaf_slug)`, `cpt-cf-settings-service-fr-settings-category-model`). The type registered in `types-registry` carries that same key, so the two cannot name different settings.
-  - **Value shapes come from the catalog.** The value is validated against the value type named by `value_type_id` (§1.3/§4.7). `secret` trait, structured shapes, etc. all come from that catalog type, never from the setting's own type.
+  - **Uniqueness lives in the Settings DB.** `key` is globally unique (`uq_declaration_key`, §4.7) and the leaf `name` is unique within its category **among active declarations** (`UNIQUE(category_id, leaf_slug) WHERE status = 'active'`, `cpt-cf-settings-service-fr-settings-category-model`). The type registered in `types-registry` carries that same key, so the two cannot name different settings.
+  - **Value shapes come from the setting's own type.** The value is validated against the declaration's `value_schema` (§1.3/§4.7) — the same subschema the registered type carries. The `secret` trait and the rest of the trait set are declared alongside it, not inherited from a shared catalog entry.
   - **The category binding is fixed — RESOLVED: a closed door, not a trade.** The category is part of the setting's identity (`network.timeout` vs `database.timeout`), so it sits in the key; presentation lives on the category row (`sort_order`, `icon`, display `name`). Consequently **a category slug cannot be renamed and a setting cannot be moved between categories**: `update_category` does not expose the slug, `update_declaration` does not re-bind `category_id`, and `key` is rejected in a `PATCH`. This costs consumers nothing — there is no transition for a read to survive — and it is recorded because the limit is real and easy to mistake for an oversight. Should product later want re-shelving, the path is a new declaration under a new key plus a value migration: a scoped addition, not a gap.
 
- **Consequence — reference-only-GTS rule is satisfied for all settings.** Because every setting key is a valid GTS type id, declaration **events** (§4.4) and **audit** (§4.2 *Audit Emitter*) reference settings by a GTS-conformant `key` uniformly; there is **no admin-vs-module referenceability asymmetry**. Setting types and value types occupy the Registry; per-tenant values and overrides stay in the Settings DB, off the Registry hot path.
+ **Consequence — reference-only-GTS rule is satisfied for all settings.** Because every setting key is a valid GTS type id, declaration **events** (§4.4) and **audit** (§4.2 *Audit Emitter*) reference settings by a GTS-conformant `key` uniformly; there is **no admin-vs-module referenceability asymmetry**. Setting types occupy the Registry; per-tenant values and overrides stay in the Settings DB, off the Registry hot path.
 - **Step-up model — RESOLVED: re-authentication at the IdP; the service never receives raw credentials**. Step-up is a re-auth ceremony at the IdP (`prompt=login`/`acr_values`/`max_age=0`) that produces a fresh token; the Settings Service performs **local claims validation only** — JWKS signature, `sub`-match, `auth_time` freshness (≤ 5 min), `acr`/`amr` level — and never handles a password (§4.2 *Value Writer*). This supports SSO/WebAuthn/passwordless admins and keeps the service off the credential-attack surface. No IdP **runtime** dependency is added (only its JWKS is configured, §4.9), so there is no per-write IdP-outage failure mode; the C4 IdP relationship denotes token/JWKS trust, not a synchronous call. The step-up **contract itself is owned by the `authn-resolver` gear** and referenced here. **IAM integration prerequisites:** the IdP MUST emit `auth_time`/`acr`/`amr` (often off by default) and the freshness window MUST be agreed.
 - **Step-up verification is a swappable `StepUpVerifier` plugin — RESOLVED**. The OIDC/JWKS local-claims logic is the **default** `ClientHub` binding (§4.2 *Value Writer*/§4.9), not hard-coded gear logic; a deployment may bind a non-OIDC verifier (SAML/LDAP/…) or an added-factor verifier **without editing the gear** — consistent with how `authn`/`policy`/`tenant` are resolved — but **not** an always-satisfied one: the mechanism is pluggable, the requirement is not (§4.2 *Value Writer*). The default binding is preserved: local JWKS validation, the step-up contract owned by the `authn-resolver` gear, and no per-write IdP call.
 
@@ -1918,7 +2041,7 @@ Decisions taken during design, with the alternative that was rejected and the re
 - **Cross-instance cache coherence depends on the broadcast** — peers evict on the `cache_invalidate` broadcast (§4.2 *Cache & Invalidation*); a dropped broadcast could leave a peer serving a stale value until its own TTL. Mitigation: the `cache_ttl_seconds` backstop (§4.2 *Cache & Invalidation*). Broadcast durability and transport (Event Broker) are owned by the [Settings Activation](./DESIGN-activation.md).
 - **Durable failure notification depends on the Event Broker** — `event_value_change_failed` (§4.4) requires the Event Broker; the write's own response and the audit trail remain the authoritative, broker-independent record.
 - **GTS type versioning of stored values** — the `needs-review` flow has a representation (`setting_values.needs_review`, §4.7), a resolver contract (**fall through** past the flagged override — admin-visible, excluded from resolution — §4.2 *Value Resolver*), a listing API (§4.3), and a stuck detector (`settings_needs_review_total`, §7 *Feature Metrics*). What still depends on **GTS Schema Registry compatibility rules landing** is the *automatic* compatible-vs-breaking classification at upgrade time; until those land, whether a given type change invalidates existing values must be determined conservatively (treat as invalidating → flag `needs_review`) rather than auto-classified.
-- **GTS Registry unavailable** — the Registry is on the **validate** path (resolving a setting's **value type** to check a value at write time; registering **value types**, and the setting's own type when its declaration is created, §4.7), not on the effective-value **read** hot path (values resolve from local tables) and not on setting listing (settings are DB rows, §4.3). If the Registry is slow or down: **creating a setting fails-closed** if its referenced value type cannot be resolved/validated or its own type cannot be registered; **setting a value also fails-closed**, since the value is validated against its value type via the Registry; value-type registration and gear reconcile **retry** with backoff idempotently; existing value reads and setting listing are unaffected. Validation verdicts MUST NOT be cached to "ride out" an outage, to avoid accepting values against a stale type.
+- **GTS Registry unavailable** — the Registry is on the **registration** path (registering a setting's own type when its declaration is created, revived or evolved, and giving the compatibility verdict on a re-registration, §4.7). It is **not** on the value-**validate** path — a value is checked against the declaration's locally held `value_schema` (§4.2 *Type Validator*) — nor on the effective-value **read** hot path (values resolve from local tables), nor on setting listing (settings are DB rows, §4.3). If the Registry is slow or down: **creating, reviving or evolving a setting fails-closed**, since the type cannot be registered and the compatibility verdict is the Registry's alone to give; **setting a value is unaffected**, validation being local; gear reconcile **retries** with backoff idempotently; reads and listing are unaffected.
 - **Secret storage model — OPEN** — credential store (the credstore backend) by reference vs. inline envelope encryption in the persistence layer (§4.2 *Secret Manager*). The credstore approach is the working choice for stronger isolation and reuse of the existing deployment; confirm with persistence/security owners.
 
 ## 6. Open Questions
@@ -2058,11 +2181,30 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 | Declaration create — default mandatory | repos | An **omitted** `default_value` → `422 DefaultRequired`; an explicit JSON `null` on a type admitting `null` is **accepted**, stored as `'null'::jsonb`, and resolves with `source=schema_default` — the two are not the same input (§4.1) |
 | Declaration create — secret-trait type | `MockGtsValidator` resolves `secret` trait, `MockSecretManager` | `has_secret_trait=true`; a **non-empty** `default_value` → `422`; an **empty** placeholder is accepted and stored inline, with the Secret Manager **not** called for it; an **omitted** default → `422 DefaultRequired` like any other declaration (§4.2 *Secret Manager*) |
 | Secret masking on read | `MockSecretManager` | Read/search/list return the mask token, never plaintext (`cpt-cf-settings-service-fr-typed-value-validation`) |
-| Per-setting access — a base grant covers everything | a caller granted `read` on `gts.cf.toolkit.settings.value.v1~` | The page returns after **one** decision; no per-setting evaluation is issued |
-| Per-setting access — a wildcard grant admits its subtree | `…value.v1~acme.billing.*` over a mixed catalogue | Browse and search return that vendor's billing settings only; a single read of any other answers `404` |
+| Tenant access — open by default | a freshly contributed setting, no restriction rows | Effective access is `overridable`; no row is created by the read |
+| Tenant access — strictest mode wins | an ancestor has `hidden`, a descendant has `read_only` | Effective access remains `hidden`; siblings outside the restricted branch are unaffected |
+| Tenant access — cannot restrict oneself | a tenant administrator targeting its own tenant | `403`, no row written |
+| Tenant access — redundant row is recorded | a child is already `hidden`; its child is set to `read_only` | The row is stored and becomes effective if the ancestor restriction is cleared |
+| Tenant access — a value outlives a restriction | a value exists, then the tenant becomes `read_only` | The value still resolves and is inherited; a write by that tenant is refused `403` |
+| Tenant access — writer, not target, is checked | an overridable ancestor writes at a read-only descendant | The write is allowed; the descendant's own write remains refused |
+| Tenant access — the in-process reader is not gated | a tenant is `hidden`, a gear reads through `SettingsReaderClient` | The effective value is returned; access governs administrative paths only |
+| Tenant access — invalid stored mode refused | `PUT` with `access=overridable` | `422`; the client must use `DELETE` to remove the restriction |
+| Tenant access — missing precondition | permission `PUT` or `DELETE` without `If-Match` | `428`; nothing changes |
+| Tenant access — stale precondition | another delegate changes the row after it was read | `412`; the newer restriction remains stored |
+| Per-setting access — a base grant covers everything | a caller granted `read` on `gts.cf.core.settings.setting_type.v1~` | The page returns after **one** decision; no per-setting evaluation is issued |
+| Per-setting access — a wildcard grant admits its subtree | `…setting_type.v1~acme.settings.billing.*` over a mixed catalogue | Browse and search return that vendor's billing settings only; a single read of any other answers `404` |
 | Per-setting access — a grant naming one key | a grant on exactly one setting | That setting reads; its neighbour in the same category does not |
 | Per-setting access — the page is refilled, not shortened | denials scattered through the candidate rows | The page comes back full, assembled from more than one batch round, and the total excludes the denied settings |
-| Per-setting access — narrows only | a granted setting carrying `tenant_visible = false` | Still not returned to a tenant caller: the grant adds no visibility |
+| Per-setting access — narrows only | a granted setting whose caller access is `hidden` | Still not returned: the grant does not widen tenant access |
+| Evolve — active path mints the next major | an active `…retry_policy.v1~` with stored values, re-declared with a different value schema | `…retry_policy.v2~` created and active, values copied and re-validated (failures `needs_review`), `v1` retired, response carries `evolved: true` |
+| Evolve — repeated evolution follows the active major | retired `…retry_policy.v1~`, active `…retry_policy.v2~`, then the same admin identity is re-declared with another behavior-affecting shape change | The active-path lookup wins over the retired `v1` key: `v3` is created, `v2` is retired, and `v1` stays retired |
+| Evolve — lost-response retry does not mint a major | `v1 → v2` succeeds but its response is lost; the same request is repeated while matching `v2` | `409 DeclarationKeyConflict`; `v2` stays active and no `v3` is created; the client re-reads `v2` |
+| Revive — refused once the name was re-used | a retired `…retry_policy.v1~` and an active `…retry_policy.v2~` in the same category | `409 LeafNameTaken`; the retired declaration and its retained values are untouched |
+| Revive — compatible retype with re-validation | a retired `boolean` declaration with stored values, re-declared with a widened schema the Registry accepts | Reactivated with the new schema; values that still validate go live, the rest are flagged `needs_review` with a detail and fall through on read (§4.3 *Re-declare to revive*) |
+| Revive — breaking retype refused | a retired `boolean` declaration re-declared as `string` | `422 IncompatibleSchema` naming the successor path; the declaration stays retired and its values are untouched — the retype is a new major (§4.7 *Compatibility mode*) |
+| Revive — secret boundary refused | a retired non-secret declaration re-declared with a `secret`-trait type | `409 SecretnessChanged`; nothing is reactivated and no plaintext value is left under a secret type |
+| Revive — Scope Class refused | a retired `cascading` declaration with tenant values, re-declared as `global` | `409 ScopeClassChanged`; the tenant-scoped values are untouched |
+| Module contribution — value schema changed at the same major | a gear re-registering one setting with a different `value_schema` and no major bump | `422 ValueSchemaChanged`; the stored declaration and its values are untouched |
 | File-valued setting — stored by reference, unvalidated | a reference naming a file id and version that do not exist | Accepted and stored inline in `value`; **no call leaves the service**; no bytes in the database, cache, search index, or audit record |
 | File-valued setting — a `bind` under a pinned reference changes nothing | `bind` swaps the file's current version while a setting pins the old one | No value change and no activation signal; consumers keep reading the pinned version until the setting is repointed |
 | File-valued setting — secret exclusivity | a type carrying both `secret` and `file-reference` | Rejected at declaration (`422`) |
@@ -2095,7 +2237,7 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 | Declaration key uniqueness | Insert duplicate `key` | `uq_declaration_key` violation |
 | Value uniqueness per tenant | Insert duplicate `(declaration_id, tenant_id)` for a non-null tenant | `uq_value_tenant` violation |
 | Platform-row uniqueness | Insert two rows for one declaration at the root tenant | `uq_value_scope` violation (NULLs collide via the partial index) |
-| `global` overridability | Insert `global` + `tenant_overridable=true` | `CHECK` violation |
+| Permission row invariant | Insert `access='overridable'` | `CHECK` violation; only `read_only` and `hidden` are stored (§4.7 `tenant_permissions`) |
 | Ancestor-id cascade query | Seed a platform row (the root tenant) + rows for tenants `A` and `B`; resolve for `B` with ancestor ids `[root, A, B]` from `MockTenantResolver` | `WHERE declaration_id = ? AND tenant_id IN (ancestor ids)` returns nearest-ancestor override; no prefix/`LIKE` scan |
 | Partial active-declaration index | Mix `active`/`retired` | Index filters retired from active reads |
 | Tenant isolation | Seed tenant A values; query as tenant B | Empty result set (real WHERE generation) |
@@ -2141,6 +2283,8 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 | Set value at subtree tenant — own / descendant / out-of-subtree | `PUT /settings-service/v1/settings/{key}/value?tenant={tenant_id}` | Stored at own tenant and at a descendant (override created at target); out-of-subtree target (ancestor/sibling) → `403` (`cpt-cf-settings-service-fr-tenant-overrides`, `cpt-cf-settings-service-fr-tenant-scope-enforcement`) |
 | Set without step-up | `PUT /settings-service/v1/settings/{key}/value` (step-up fails) | `401`/`403` with the RFC 9470 challenge; nothing stored |
 | Set with stale `If-Match` | `PUT /settings-service/v1/settings/{key}/value` (value changed since read) | `412`; nothing stored |
+| Set/clear tenant access with stale or missing `If-Match` | `PUT`/`DELETE /settings-service/v1/settings/{key}/permissions?tenant={tenant_id}` | `428` when missing; `412` when the row changed; the newer restriction remains stored |
+| Retire and revive preserve tenant access | retire a declaration with restriction rows, then re-declare its key | The same rows and effective access are restored; no restriction is deleted or reset |
 | Revert to default/inherited | `POST /settings-service/v1/settings/{key}/value/revert` | `200` with the resolved fallback; platform → Schema Default, tenant → nearest ancestor else Schema Default (`cpt-cf-settings-service-fr-defaults-revert`) |
 | Read-your-write | `PUT /settings-service/v1/settings/{key}/value` then `GET /settings-service/v1/settings/{key}` | The read returns the value just written, with the `etag` the write returned |
 | Bulk set — mixed outcomes | `POST /settings-service/v1/settings/batch` (one item invalid) | One entry per item; the invalid one carries its error and stored nothing, the others are stored; over 500 items → `422` |
