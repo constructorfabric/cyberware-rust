@@ -533,7 +533,7 @@ rand = "0.10"
 rusty-s3 = { version = "0.10", default-features = false }
 # XML response/error parsing for the S3 backend (ADR-0005). Pinned >= 0.41.0: RUSTSEC-2026-0194 and
 # RUSTSEC-2026-0195 (DoS) are fixed only as of this release.
-quick-xml = "0.41"
+quick-xml = "0.42"
 
 # Synchronous locks for better performance
 parking_lot = "0.12"
