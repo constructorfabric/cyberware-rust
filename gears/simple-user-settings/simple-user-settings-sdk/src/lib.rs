@@ -21,6 +21,8 @@
 
 pub mod api;
 pub mod models;
+pub mod owner;
 
 pub use api::SimpleUserSettingsClientV1;
 pub use models::{SimpleUserSettings, SimpleUserSettingsPatch, SimpleUserSettingsUpdate};
+pub use owner::SettingsOwnerResolver;
